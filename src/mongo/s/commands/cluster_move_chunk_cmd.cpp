@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +38,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
@@ -45,7 +46,6 @@
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
-#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -116,11 +116,13 @@ public:
 
         const auto toStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, toString);
         if (!toStatus.isOK()) {
-            std::string msg(str::stream()
-                            << "Could not move chunk in '" << nss.ns() << "' to shard '" << toString
-                            << "' because that shard does not exist");
-            log() << msg;
-            uasserted(ErrorCodes::ShardNotFound, msg);
+            LOGV2_OPTIONS(22755,
+                          {logv2::UserAssertAfterLog(ErrorCodes::ShardNotFound)},
+                          "Could not move chunk in {namespace} to {toShardId} because that shard"
+                          " does not exist",
+                          "moveChunk destination shard does not exist",
+                          "toShardId"_attr = toString,
+                          "namespace"_attr = nss.ns());
         }
 
         const auto to = toStatus.getValue();
@@ -147,8 +149,8 @@ public:
 
         if (!find.isEmpty()) {
             // find
-            BSONObj shardKey =
-                uassertStatusOK(cm->getShardKeyPattern().extractShardKeyFromQuery(opCtx, find));
+            BSONObj shardKey = uassertStatusOK(
+                cm->getShardKeyPattern().extractShardKeyFromQuery(opCtx, nss, find));
             if (shardKey.isEmpty()) {
                 errmsg = str::stream() << "no shard key found in chunk query " << find;
                 return false;
@@ -197,9 +199,9 @@ public:
                                                         cmdObj["waitForDelete"].trueValue(),
                                                     forceJumbo));
 
-        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo),
-                                                              chunk->getShardId());
-        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo), to->getId());
+        Grid::get(opCtx)->catalogCache()->invalidateShardForShardedCollection(nss,
+                                                                              chunk->getShardId());
+        Grid::get(opCtx)->catalogCache()->invalidateShardForShardedCollection(nss, to->getId());
 
         result.append("millis", t.millis());
         return true;

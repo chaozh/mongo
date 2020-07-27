@@ -29,30 +29,36 @@
 
 #pragma once
 
-#include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
+#include "mongo/client/remote_command_targeter_factory_mock.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/network_test_env.h"
 #include "mongo/s/grid.h"
 #include "mongo/transport/session.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
+class DistLockCatalog;
+class DistLockManager;
+
 namespace executor {
-class NetworkInterfaceMock;
 class TaskExecutor;
 }  // namespace executor
 
 /**
  * Contains common functionality and tools, which apply to both mongos and mongod unit-tests.
  */
-class ShardingTestFixtureCommon {
-public:
+class ShardingTestFixtureCommon : public virtual ServiceContextTest {
+protected:
     ShardingTestFixtureCommon();
     ~ShardingTestFixtureCommon();
 
+    OperationContext* operationContext() const {
+        return _opCtxHolder.get();
+    }
+
     template <typename Lambda>
-    executor::NetworkTestEnv::FutureHandle<typename std::result_of<Lambda()>::type> launchAsync(
+    executor::NetworkTestEnv::FutureHandle<typename std::invoke_result<Lambda>::type> launchAsync(
         Lambda&& func) const {
         return _networkTestEnv->launchAsync(std::forward<Lambda>(func));
     }
@@ -62,6 +68,25 @@ public:
         return _mockNetwork;
     }
 
+    RemoteCommandTargeterFactoryMock* targeterFactory() const {
+        invariant(_targeterFactory);
+        return _targeterFactory;
+    }
+
+    DistLockCatalog* distLockCatalog() const {
+        invariant(_distLockCatalog);
+        return _distLockCatalog;
+    }
+
+    DistLockManager* distLock() const {
+        invariant(_distLockManager);
+        return _distLockManager;
+    }
+
+    std::shared_ptr<ThreadPool> catalogCacheExecutor() const {
+        invariant(_catalogCacheExecutor);
+        return _catalogCacheExecutor;
+    }
     /**
      * Blocking methods, which receive one message from the network and respond using the responses
      * returned from the input function. This is a syntactic sugar for simple, single request +
@@ -74,7 +99,36 @@ public:
     void onFindWithMetadataCommand(
         executor::NetworkTestEnv::OnFindCommandWithMetadataFunction func);
 
+    /**
+     * Waits for an operation which creates a capped config collection with the specified name and
+     * capped size.
+     */
+    void expectConfigCollectionCreate(const HostAndPort& configHost,
+                                      StringData collName,
+                                      int cappedSize,
+                                      const BSONObj& response);
+
+    /**
+     * Wait for a single insert in one of the change or action log collections with the specified
+     * contents and return a successful response.
+     */
+    void expectConfigCollectionInsert(const HostAndPort& configHost,
+                                      StringData collName,
+                                      Date_t timestamp,
+                                      const std::string& what,
+                                      const std::string& ns,
+                                      const BSONObj& detail);
+
 protected:
+    /**
+     * Base class returns nullptr.
+     *
+     * Note: ShardingCatalogClient takes ownership of DistLockManager, so if DistLockManager is not
+     * nulllptr, a real or mock ShardingCatalogClient must be supplied.
+     */
+    virtual std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
+        std::unique_ptr<DistLockManager> distLockManager);
+
     // Since a NetworkInterface is a private member of a TaskExecutor, we store a raw pointer to the
     // fixed TaskExecutor's NetworkInterface here.
     //
@@ -85,6 +139,24 @@ protected:
 
     // Allows for processing tasks through the NetworkInterfaceMock/ThreadPoolMock subsystem
     std::unique_ptr<executor::NetworkTestEnv> _networkTestEnv;
+
+    // Since the RemoteCommandTargeterFactory is currently a private member of ShardFactory, we
+    // store a raw pointer to it here.
+    RemoteCommandTargeterFactoryMock* _targeterFactory = nullptr;
+
+    // Since the DistLockCatalog is currently a private member of ReplSetDistLockManager, we store
+    // a raw pointer to it here.
+    DistLockCatalog* _distLockCatalog = nullptr;
+
+    // Since the DistLockManager is currently a private member of ShardingCatalogClient, we
+    // store a raw pointer to it here.
+    DistLockManager* _distLockManager = nullptr;
+
+    std::shared_ptr<ThreadPool> _catalogCacheExecutor = nullptr;
+
+private:
+    // Keeps the lifetime of the operation context
+    ServiceContext::UniqueOperationContext _opCtxHolder;
 };
 
 }  // namespace mongo

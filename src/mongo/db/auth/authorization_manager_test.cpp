@@ -53,7 +53,7 @@
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/map_util.h"
+#include "mongo/util/net/ssl_peer_info.h"
 
 #define ASSERT_NULL(EXPR) ASSERT_FALSE(EXPR)
 #define ASSERT_NON_NULL(EXPR) ASSERT_TRUE(EXPR)
@@ -72,21 +72,13 @@ void setX509PeerInfo(const transport::SessionHandle& session, SSLPeerInfo info) 
     sslPeerInfo = info;
 }
 
-using std::vector;
-
 class AuthorizationManagerTest : public ServiceContextTest {
 public:
-    virtual ~AuthorizationManagerTest() {
-        if (authzManager)
-            authzManager->invalidateUserCache(opCtx.get());
-    }
-
     AuthorizationManagerTest() {
         auto localExternalState = std::make_unique<AuthzManagerExternalStateMock>();
         externalState = localExternalState.get();
         auto localAuthzManager = std::make_unique<AuthorizationManagerImpl>(
-            std::move(localExternalState),
-            AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
+            getServiceContext(), std::move(localExternalState));
         authzManager = localAuthzManager.get();
         externalState->setAuthorizationManager(authzManager);
         authzManager->setAuthEnabled(true);
@@ -106,6 +98,11 @@ public:
                                   "password", saslGlobalParams.scramSHA256IterationCount.load()));
     }
 
+    ~AuthorizationManagerTest() {
+        if (authzManager)
+            authzManager->invalidateUserCache(opCtx.get());
+    }
+
     transport::TransportLayerMock transportLayer;
     transport::SessionHandle session = transportLayer.createSession();
     AuthorizationManager* authzManager;
@@ -115,8 +112,6 @@ public:
 };
 
 TEST_F(AuthorizationManagerTest, testAcquireV2User) {
-
-
     ASSERT_OK(externalState->insertPrivilegeDocument(opCtx.get(),
                                                      BSON("_id"
                                                           << "admin.v2read"
@@ -235,9 +230,9 @@ public:
      * can control exactly what privileges are returned for the user.
      */
     Status getUserDescription(OperationContext* opCtx,
-                              const UserName& userName,
+                              const UserRequest& user,
                               BSONObj* result) override {
-        return _getUserDocument(opCtx, userName, result);
+        return _getUserDocument(opCtx, user.name, result);
     }
 
 private:
@@ -258,28 +253,8 @@ private:
     }
 };
 
-class AuthorizationManagerWithExplicitUserPrivilegesTest : public ::mongo::unittest::Test {
-public:
-    virtual void setUp() {
-        auto localExternalState =
-            std::make_unique<AuthzManagerExternalStateMockWithExplicitUserPrivileges>();
-        externalState = localExternalState.get();
-        externalState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
-        authzManager = std::make_unique<AuthorizationManagerImpl>(
-            std::move(localExternalState),
-            AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
-        externalState->setAuthorizationManager(authzManager.get());
-        authzManager->setAuthEnabled(true);
-    }
-
-    std::unique_ptr<AuthorizationManager> authzManager;
-    AuthzManagerExternalStateMockWithExplicitUserPrivileges* externalState;
-};
-
 // Tests SERVER-21535, unrecognized actions should be ignored rather than causing errors.
 TEST_F(AuthorizationManagerTest, testAcquireV2UserWithUnrecognizedActions) {
-
-
     ASSERT_OK(externalState->insertPrivilegeDocument(
         opCtx.get(),
         BSON("_id"
@@ -332,7 +307,7 @@ public:
     public:
         MockRecoveryUnit(size_t* registeredChanges) : _registeredChanges(registeredChanges) {}
 
-        virtual void registerChange(std::unique_ptr<Change> change) final {
+        void registerChange(std::unique_ptr<Change> change) final {
             // RecoveryUnitNoop takes ownership of the Change
             RecoveryUnitNoop::registerChange(std::move(change));
             ++(*_registeredChanges);
@@ -342,7 +317,7 @@ public:
         size_t* _registeredChanges;
     };
 
-    virtual void setUp() override {
+    void setUp() override {
         opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(recoveryUnit),
                                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
         AuthorizationManagerTest::setUp();

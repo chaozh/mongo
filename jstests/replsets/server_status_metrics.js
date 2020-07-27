@@ -5,13 +5,16 @@
  * document-level locking because it uses the planExecutorHangBeforeShouldWaitForInserts failpoint
  * to block oplog fetching getMores while trying to do oplog writes. Thus we need a document-level
  * locking storage engine so that oplog writes would not conflict with oplog reads.
- * @tags: [requires_document_locking, requires_fcv_44]
+ * @tags: [
+ *   requires_document_locking,
+ * ]
  */
 
 (function() {
 "use strict";
 
 load("jstests/libs/write_concern_util.js");
+load("jstests/libs/fail_point_util.js");
 
 /**
  * Test replication metrics
@@ -90,8 +93,19 @@ var secondary = rt.getSecondary();
 var primary = rt.getPrimary();
 var testDB = primary.getDB("test");
 
-// Hang oplog getMore before awaitData to avoid races on the oplog metrics between primary and
-// secondary.
+// Even though initial sync has finished, the oplog exhaust cursor used by the oplog fetcher during
+// initial sync could be still alive because it has not yet reached an interrupt point. Do a dummy
+// write to unblock any oplog getMore that is currently waiting for inserts. After this, the oplog
+// exhaust cursor used by initial sync should terminate itself because the connection was closed.
+// Wait until there is only 1 oplog exhaust cursor in progress to avoid races on the oplog metrics.
+assert.commandWorked(testDB.dummy.insert({a: "dummy"}));
+assert.soon(() => testDB.currentOp({"appName": "OplogFetcher", "command.collection": "oplog.rs"})
+                      .inprog.length === 1,
+            `Timed out waiting for initial sync exhaust oplog stream to terminate: ${
+                tojson(testDB.currentOp())}`);
+
+// Hang steady state replication oplog getMore before awaitData to avoid races on the oplog metrics
+// between primary and secondary.
 var hangOplogGetMore = configureFailPoint(
     primary, 'planExecutorHangBeforeShouldWaitForInserts', {namespace: "local.oplog.rs"});
 // Do a dummy write to unblock the oplog getMore that is currently waiting for inserts (if any)
@@ -138,8 +152,8 @@ const oplogCursorId =
 assert.commandWorked(
     localDB.runCommand({"getMore": oplogCursorId, collection: "oplog.rs", batchSize: 1}));
 
-// Hang oplog getMore before awaitData to avoid races on the oplog metrics between primary and
-// secondary.
+// Hang steady state replication oplog getMore before awaitData to avoid races on the oplog metrics
+// between primary and secondary.
 var hangOplogGetMore = configureFailPoint(
     primary, 'planExecutorHangBeforeShouldWaitForInserts', {namespace: "local.oplog.rs"});
 // Do a dummy write to unblock the oplog getMore that is currently waiting for inserts (if any)
@@ -188,6 +202,53 @@ assert.eq(testDB.serverStatus().metrics.getLastError.wtime.num, startNum + 1);
 assert.writeError(testDB.a.insert({x: 1}, {writeConcern: {w: 3, wtimeout: 50}}));
 assert.eq(testDB.serverStatus().metrics.getLastError.wtime.num, startNum + 2);
 
+// Test metrics related to writeConcern timeouts and default writeConcern.
+var startGLEMetrics = testDB.serverStatus().metrics.getLastError;
+
+// Set the default WC to timeout.
+assert.commandWorked(testDB.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 2, wtimeout: 1000}, writeConcern: {w: 1}}));
+var stopReplProducer = configureFailPoint(secondary, 'stopReplProducer');
+stopReplProducer.wait();
+
+// Explicit timeout - increments wtimeouts.
+var res = testDB.a.insert({x: 1}, {writeConcern: {w: 2, wtimeout: 1000}});
+assert.commandWorkedIgnoringWriteConcernErrors(res);
+checkWriteConcernTimedOut({writeConcernError: res.getWriteConcernError()});
+assert.eq(res.getWriteConcernError().errInfo.writeConcern.provenance, "clientSupplied");
+
+// Default timeout - increments wtimeouts and default.wtimeouts.
+var res = testDB.a.insert({x: 1});
+assert.commandWorkedIgnoringWriteConcernErrors(res);
+checkWriteConcernTimedOut({writeConcernError: res.getWriteConcernError()});
+assert.eq(res.getWriteConcernError().errInfo.writeConcern.provenance, "customDefault");
+
+// Set the default WC to unsatisfiable.
+stopReplProducer.off();
+assert.commandWorked(testDB.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 3}, writeConcern: {w: 1}}));
+
+// Explicit unsatisfiable - no counters incremented.
+var res = testDB.a.insert({x: 1}, {writeConcern: {w: 3}});
+assert.commandFailedWithCode(res, ErrorCodes.UnsatisfiableWriteConcern);
+assert.eq(res.getWriteConcernError().errInfo.writeConcern.provenance, "clientSupplied");
+
+// Default unsatisfiable - increments default.unsatisfiable.
+var res = testDB.a.insert({x: 1});
+assert.commandFailedWithCode(res, ErrorCodes.UnsatisfiableWriteConcern);
+assert.eq(res.getWriteConcernError().errInfo.writeConcern.provenance, "customDefault");
+
+// Unset the default WC.
+assert.commandWorked(
+    testDB.adminCommand({setDefaultRWConcern: 1, defaultWriteConcern: {}, writeConcern: {w: 1}}));
+
+// Validate counters.
+var endGLEMetrics = testDB.serverStatus().metrics.getLastError;
+assert.eq(endGLEMetrics.wtimeouts.floatApprox, startGLEMetrics.wtimeouts + 2);
+assert.eq(endGLEMetrics.default.wtimeouts.floatApprox, startGLEMetrics.default.wtimeouts + 1);
+assert.eq(endGLEMetrics.default.unsatisfiable.floatApprox,
+          startGLEMetrics.default.unsatisfiable + 1);
+
 jsTestLog(
     `Primary ${primary.host} metrics #2: ${tojson(primary.getDB("test").serverStatus().metrics)}`);
 
@@ -196,6 +257,12 @@ jsTestLog(`Secondary ${secondary.host} metrics before restarting replication: ${
 
 // Enable periodic noops to aid sync source selection.
 assert.commandWorked(primary.adminCommand({setParameter: 1, writePeriodicNoops: true}));
+
+// Enable the setSmallOplogGetMoreMaxTimeMS failpoint on secondary so that it will start using
+// a small awaitData timeout for oplog fetching after re-choosing the sync source. This is needed to
+// make sync source return empty batches more frequently in order to test the metric
+// numEmptyBatches.
+configureFailPoint(secondary, 'setSmallOplogGetMoreMaxTimeMS');
 
 // Repeatedly restart replication and wait for the sync source to be rechosen. If the sync source
 // gets set to empty between stopping and restarting replication, then the secondary won't
@@ -220,6 +287,17 @@ assert.soon(
 
 assert.gt(ssNew.numSelections, ssOld.numSelections, "num selections not incremented");
 assert.gt(ssNew.numTimesChoseSame, ssOld.numTimesChoseSame, "same sync source not chosen");
+
+// Get the base number of empty batches after the secondary is up to date. Assert that the secondary
+// eventually gets an empty batch due to awaitData timeout.
+rt.awaitLastOpCommitted();
+const targetNumEmptyBatches =
+    secondary.getDB("test").serverStatus().metrics.repl.network.getmores.numEmptyBatches + 1;
+assert.soon(
+    () => secondary.getDB("test").serverStatus().metrics.repl.network.getmores.numEmptyBatches >=
+        targetNumEmptyBatches,
+    `Timed out waiting for numEmptyBatches reach ${targetNumEmptyBatches}, current ${
+        secondary.getDB("test").serverStatus().metrics.repl.network.getmores.numEmptyBatches}`);
 
 // Stop the primary so the secondary cannot choose a sync source.
 ssOld = ssNew;

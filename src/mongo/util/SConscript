@@ -1,15 +1,79 @@
 # -*- mode: python -*-
 
-Import("endian")
-Import("env")
-Import("get_option")
-Import("has_option")
-Import("use_libunwind")
-Import("use_system_version_of_library")
+Import([
+    "endian",
+    "env",
+    "get_option",
+    "has_option",
+    "use_libunwind",
+    "use_system_version_of_library",
+    "version_extra",
+    "version_parts",
+])
 
 env = env.Clone()
 
 env.InjectThirdParty('asio')
+
+js_engine_ver = get_option("js-engine") if get_option("server-js") == "on" else "none"
+
+module_list = ',\n'.join(['"{0}"_sd'.format(x) for x in env['MONGO_MODULES']])
+
+# Render the MONGO_BUILDINFO_ENVIRONMENT_DATA dict into an initializer for a
+# `std::vector<VersionInfoInterface::BuildInfoField>`.
+def fmtBuildInfo(data):
+    def fmtBool(val):
+        return "true" if val else "false"
+    def fmtStr(val):
+        return 'R"({0})"_sd'.format(val.replace("\\", r"\\"))
+    def fmtObj(obj):
+        return '{{{}, {}, {}, {}}}'.format(fmtStr(obj['key']),
+                                           fmtStr(env.subst(obj['value'])),
+                                           fmtBool(obj['inBuildInfo']),
+                                           fmtBool(obj['inVersion']))
+    return ',\n'.join([fmtObj(obj) for _,obj in data.items()])
+
+buildInfoInitializer = fmtBuildInfo(env['MONGO_BUILDINFO_ENVIRONMENT_DATA'])
+
+generatedVersionFile = env.Substfile(
+    'version_constants.h.in',
+    SUBST_DICT=[
+        ('@mongo_version@', env['MONGO_VERSION']),
+        ('@mongo_version_major@', version_parts[0]),
+        ('@mongo_version_minor@', version_parts[1]),
+        ('@mongo_version_patch@', version_parts[2]),
+        ('@mongo_version_extra@', version_parts[3]),
+        ('@mongo_version_extra_str@', version_extra),
+        ('@mongo_git_hash@', env['MONGO_GIT_HASH']),
+        ('@buildinfo_js_engine@', js_engine_ver),
+        ('@buildinfo_allocator@', env['MONGO_ALLOCATOR']),
+        ('@buildinfo_modules@', module_list),
+        ('@buildinfo_environment_data@', buildInfoInitializer),
+    ])
+env.Alias('generated-sources', generatedVersionFile)
+
+if env.TargetOSIs('windows'):
+    enterpriseEnv = env.Clone().InjectModule("enterprise")
+    generatedResourceConstantFile = enterpriseEnv.Substfile(
+        'resource_constants.h.in',
+        SUBST_DICT=[
+            ('@mongo_version@', env['MONGO_VERSION']),
+            ('@mongo_version_major@', version_parts[0]),
+            ('@mongo_version_minor@', version_parts[1]),
+            ('@mongo_version_patch@', version_parts[2]),
+            ('@mongo_git_hash@', env['MONGO_GIT_HASH']),
+        ])
+    env.Alias('generated-sources', generatedResourceConstantFile)
+
+# Shim library for boost to depend on
+env.Library(
+    target='boost_assert_shim',
+    source=[
+        'boost_assert_shim.cpp'
+    ],
+    # NOTE: This library *must not* depend on any mongodb code
+    LIBDEPS=[],
+)
 
 env.SConscript(
     dirs=[
@@ -60,27 +124,10 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/third_party/shim_pcrecpp',
     ],
 )
 
-debuggerEnv = env.Clone()
-if has_option("gdbserver"):
-    debuggerEnv.Append(CPPDEFINES=["USE_GDBSERVER"])
-elif has_option("lldb-server"):
-    debuggerEnv.Append(CPPDEFINES=["USE_LLDB_SERVER"])
-
-debuggerEnv.Library(
-    target='debugger',
-    source=[
-        'debugger.cpp',
-        ],
-    LIBDEPS=[
-        # NOTE: You *must not* add any library dependencies to the debugger library
-    ],
-    LIBDEPS_TAGS=[
-        'init-no-global-side-effects',
-    ]
-)
 
 env.Library(
     target='summation',
@@ -142,6 +189,9 @@ env.Library(
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/third_party/shim_pcrecpp',
+    ],
 )
 
 env.Library(
@@ -153,6 +203,18 @@ env.Library(
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/bson/util/bson_extract",
+        "$BUILD_DIR/mongo/idl/server_parameter",
+    ],
+)
+
+env.Library(
+    target="testing_options",
+    source=[
+        "testing_options.cpp",
+        env.Idlc('testing_options.idl')[0],
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/idl/server_parameter",
     ],
 )
@@ -207,9 +269,20 @@ env.Library(
     source=[
         'read_through_cache.cpp',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+    ]
+)
+
+env.CppUnitTest(
+    target='thread_safety_context_test',
+    source=[
+        'thread_safety_context_test.cpp',
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-    ]
+    ],
 )
 
 if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
@@ -249,10 +322,14 @@ if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
             '$BUILD_DIR/mongo/idl/server_parameter',
             'processinfo',
         ],
-        PROGDEPS_DEPENDENTS=[
-            '$BUILD_DIR/mongo/mongod',
-            '$BUILD_DIR/mongo/mongos',
+        LIBDEPS_DEPENDENTS=[
+            '$BUILD_DIR/mongo/mongos_initializers',
+            '$BUILD_DIR/mongo/mongod_initializers',
         ],
+        LIBDEPS_TAGS=[
+            'lint-allow-nonprivate-on-deps-dependents',
+        ]
+
     )
 
 env.Library(
@@ -285,31 +362,31 @@ env.Library(
     ],
 )
 
-env.Library(
-    target='diagnostic_info',
-    source= [
-        'diagnostic_info.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        "$BUILD_DIR/mongo/db/service_context",
-    ],
-)
+if get_option('use-diagnostic-latches') == 'on':
+    env.Library(
+        target='diagnostic_info',
+        source= [
+            'diagnostic_info.cpp',
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+            "$BUILD_DIR/mongo/db/service_context",
+        ],
+    )
 
-env.Library(
-    target='latch_analyzer',
-    source= [
-        'latch_analyzer.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
-        '$BUILD_DIR/mongo/db/service_context',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/commands/server_status',
-    ],
-)
+    env.Library(
+        target='latch_analyzer',
+        source= [
+            'latch_analyzer.cpp',
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/db/service_context',
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/commands/server_status',
+        ],
+    )
 
 env.Benchmark(
     target='clock_source_bm',
@@ -333,25 +410,6 @@ env.Library(
     ],
 )
 
-quick_exit_env = env.Clone()
-if has_option('gcov'):
-    quick_exit_env.Append(
-        CPPDEFINES=[
-            'MONGO_GCOV',
-        ],
-    )
-
-quick_exit_env.Library(
-    target='quick_exit',
-    source=[
-        'quick_exit.cpp',
-    ],
-    LIBDEPS=[
-        # NOTE: You *must not* add any other library dependencies to
-        # the quick_exit library
-        "$BUILD_DIR/third_party/shim_allocator",
-    ]
-)
 env.Library(
     target="secure_compare_memory",
     source=[
@@ -382,12 +440,7 @@ env.Library(
     ],
 )
 
-signalEnv = env.Clone()
-
-if use_libunwind:
-    signalEnv.InjectThirdParty('unwind')
-
-signalEnv.Library(
+env.Library(
     target="signal_handlers",
     source=[
         "signal_handlers.cpp",
@@ -553,7 +606,7 @@ icuEnv.CppUnitTest(
         'container_size_helper_test.cpp',
         'decimal_counter_test.cpp',
         'decorable_test.cpp',
-        'diagnostic_info_test.cpp',
+        'diagnostic_info_test.cpp' if get_option('use-diagnostic-latches') == 'on' else [],
         'dns_name_test.cpp',
         'dns_query_test.cpp',
         'duration_test.cpp',
@@ -570,14 +623,17 @@ icuEnv.CppUnitTest(
         'future_util_test.cpp',
         'hierarchical_acquisition_test.cpp',
         'icu_test.cpp',
+        'static_immortal_test.cpp',
         'invalidating_lru_cache_test.cpp',
         'interruptible_test.cpp',
         'itoa_test.cpp',
-        'latch_analyzer_test.cpp',
+        'latch_analyzer_test.cpp' if get_option('use-diagnostic-latches') == 'on' else [],
         'lockable_adapter_test.cpp',
+        'log_with_sampling_test.cpp',
         'lru_cache_test.cpp',
         'md5_test.cpp',
         'md5main.cpp',
+        'out_of_line_executor_test.cpp',
         'periodic_runner_impl_test.cpp',
         'processinfo_test.cpp',
         'procparser_test.cpp' if env.TargetOSIs('linux') else [],
@@ -608,11 +664,12 @@ icuEnv.CppUnitTest(
         'caching',
         'clock_source_mock',
         'clock_sources',
-        'diagnostic_info',
+        'concurrency/thread_pool',
+        'diagnostic_info' if get_option('use-diagnostic-latches') == 'on' else [],
         'dns_query',
         'fail_point',
         'icu',
-        'latch_analyzer',
+        'latch_analyzer' if get_option('use-diagnostic-latches') == 'on' else [],
         'md5',
         'periodic_runner_impl',
         'processinfo',
@@ -649,21 +706,13 @@ env.Benchmark(
 stacktraceEnv = env.Clone()
 if use_libunwind:
     stacktraceEnv.InjectThirdParty(libraries=['unwind'])
+    stacktraceEnv.AppendUnique(
+        LIBDEPS=[
+            '$BUILD_DIR/third_party/shim_unwind',
+        ],
+    )
 
-stacktraceEnv.CppUnitTest(
-    target='stacktrace_test',
-    source='stacktrace_test.cpp',
-)
-
-stacktraceEnv.Benchmark(
-    target='stacktrace_bm',
-    source='stacktrace_bm.cpp',
-)
-
-if use_libunwind:
-    unwindTestEnv = env.Clone()
-    unwindTestEnv.InjectThirdParty(libraries=['unwind'])
-    unwindTestEnv.CppUnitTest(
+    stacktraceEnv.CppUnitTest(
         target=[
             'stacktrace_libunwind_test',
         ],
@@ -671,7 +720,32 @@ if use_libunwind:
             'stacktrace_libunwind_test_functions.cpp',
             'stacktrace_libunwind_test.cpp',
         ],
-        LIBDEPS=[
-            '$BUILD_DIR/third_party/shim_unwind',
-        ],
+        # Do not add LIBDEPS the ordinary way here, as they will override
+        # the LIBDEPS settings for stacktraceEnv, configured above. If
+        # you must add new libdeps here, or for the similar cases
+        # below, do it as follows:
+        #
+        # LIBDEPS=(stacktraceEnv.get('LIBDEPS', []) + [
+        #     some_new_libdep,
+        #     another_new_libdep,
+        # ]),
+        #
+        # to ensure that the new library dependency is added to the
+        # existing LIBDEPS state in the environment and does not
+        # overwrite it.
     )
+
+stacktraceEnv.CppUnitTest(
+    target='stacktrace_test',
+    source='stacktrace_test.cpp',
+    LIBDEPS=(stacktraceEnv.get('LIBDEPS', []) + [
+        '$BUILD_DIR/third_party/shim_pcrecpp'
+    ]),
+)
+
+stacktraceEnv.Benchmark(
+    target='stacktrace_bm',
+    source='stacktrace_bm.cpp',
+    # See above for how to handle any future LIBDEPS additions here.
+    # LIBDEPS=...
+)

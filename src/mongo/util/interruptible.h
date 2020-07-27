@@ -262,7 +262,8 @@ public:
      * subclass, please provide the switch on that subclass to noop its functions. It is only safe
      * to add a WaitListener during a MONGO_INITIALIZER.
      */
-    static void addWaitListener(WaitListener* listnener);
+    template <typename WaitListenerT>
+    static void installWaitListener();
 
     /**
      * Returns a statically allocated instance that cannot be interrupted.  Useful as a default
@@ -316,14 +317,14 @@ public:
      * Raises a AssertionException if this operation is in a killed state.
      */
     void checkForInterrupt() {
-        uassertStatusOK(checkForInterruptNoAssert());
+        internalAssert(checkForInterruptNoAssert());
     }
 
     /**
      * Get the name for a Latch
      */
     TEMPLATE(typename LatchT)
-    REQUIRES(std::is_base_of_v<Latch, LatchT>)  //
+    REQUIRES(std::is_base_of_v<latch_detail::Latch, LatchT>)  //
     static StringData getLatchName(const stdx::unique_lock<LatchT>& lk) {
         return lk.mutex()->getName();
     }
@@ -394,7 +395,7 @@ public:
 
             if (!swResult.isOK()) {
                 _onWake(latchName, WakeReason::kInterrupt, speed);
-                uassertStatusOK(std::move(swResult));
+                internalAssert(std::move(swResult));
             }
 
             if (pred()) {
@@ -543,9 +544,11 @@ public:
     virtual void onWake(const StringData& name, WakeReason reason, WakeSpeed speed) = 0;
 };
 
-inline void Interruptible::addWaitListener(WaitListener* listener) {
+template <typename WaitListenerT>
+inline void Interruptible::installWaitListener() {
     auto& state = _getListenerState();
 
+    static auto* listener = new WaitListenerT();  // Intentionally leaked!
     state.list.push_back(listener);
 }
 

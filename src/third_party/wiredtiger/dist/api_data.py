@@ -377,6 +377,8 @@ file_config = format_meta + file_runtime_config + [
 file_meta = file_config + [
     Config('checkpoint', '', r'''
         the file checkpoint entries'''),
+    Config('checkpoint_backup_info', '', r'''
+        the incremental backup durable information'''),
     Config('checkpoint_lsn', '', r'''
         LSN of the last checkpoint'''),
     Config('id', '', r'''
@@ -459,7 +461,19 @@ connection_runtime_config = [
             this size, a panic will be triggered. The default value means that
             the cache overflow file is unbounded and may use as much space as
             the filesystem will accommodate. The minimum non-zero setting is
-            100MB.''',    # !!! Must match WT_LAS_FILE_MIN
+            100MB.''',    # !!! TODO: WT-5585 To be removed when we switch to history_store config
+            min='0')
+        ]),
+    Config('history_store', '', r'''
+        history store configuration options''',
+        type='category', subconfig=[
+        Config('file_max', '0', r'''
+            The maximum number of bytes that WiredTiger is allowed to use for
+            its history store mechanism. If the history store file exceeds
+            this size, a panic will be triggered. The default value means that
+            the history store file is unbounded and may use as much space as
+            the filesystem will accommodate. The minimum non-zero setting is
+            100MB.''',    # !!! Must match WT_HS_FILE_MIN
             min='0')
         ]),
     Config('cache_overhead', '8', r'''
@@ -504,10 +518,18 @@ connection_runtime_config = [
             type='boolean'),
         Config('eviction', 'false', r'''
             if true, modify internal algorithms to change skew to force
-            lookaside eviction to happen more aggressively. This includes but
+            history store eviction to happen more aggressively. This includes but
             is not limited to not skewing newest, not favoring leaf pages,
             and modifying the eviction score mechanism.''',
             type='boolean'),
+        Config('log_retention', '0', r'''
+            adjust log archiving to retain at least this number of log files, ignored if set to 0.
+            (Warning: this option can remove log files required for recovery if no checkpoints
+            have yet been done and the number of log files exceeds the configured value. As
+            WiredTiger cannot detect the difference between a system that has not yet checkpointed
+            and one that will never checkpoint, it might discard log files before any checkpoint is
+            done.)''',
+            min='0', max='1024'),
         Config('realloc_exact', 'false', r'''
             if true, reallocation of memory will only provide the exact
             amount requested. This will help with spotting memory allocation
@@ -570,14 +592,29 @@ connection_runtime_config = [
         perform eviction in worker threads when the cache contains at least
         this much content. It is a percentage of the cache size if the value is
         within the range of 10 to 100 or an absolute size when greater than 100.
-        The value is not allowed to exceed the \c cache_size.''',
+        The value is not allowed to exceed the \c cache_size''',
         min=10, max='10TB'),
     Config('eviction_trigger', '95', r'''
         trigger application threads to perform eviction when the cache contains
         at least this much content. It is a percentage of the cache size if the
         value is within the range of 10 to 100 or an absolute size when greater
-        than 100.  The value is not allowed to exceed the \c cache_size.''',
+        than 100.  The value is not allowed to exceed the \c cache_size''',
         min=10, max='10TB'),
+    Config('eviction_updates_target', '0', r'''
+        perform eviction in worker threads when the cache contains at least
+        this many bytes of updates. It is a percentage of the cache size if the
+        value is within the range of 0 to 100 or an absolute size when greater
+        than 100. Calculated as half of \c eviction_dirty_target by default.
+        The value is not allowed to exceed the \c cache_size''',
+        min=0, max='10TB'),
+    Config('eviction_updates_trigger', '0', r'''
+        trigger application threads to perform eviction when the cache contains
+        at least this many bytes of updates. It is a percentage of the cache size
+        if the value is within the range of 1 to 100 or an absolute size when
+        greater than 100. Calculated as half of \c eviction_dirty_trigger by default.
+        The value is not allowed to exceed the \c cache_size. This setting only
+        alters behavior if it is lower than eviction_trigger''',
+        min=0, max='10TB'),
     Config('file_manager', '', r'''
         control how file handles are managed''',
         type='category', subconfig=[
@@ -685,9 +722,9 @@ connection_runtime_config = [
         intended for use with internal stress testing of WiredTiger.''',
         type='list', undoc=True,
         choices=[
-        'aggressive_sweep', 'checkpoint_slow', 'lookaside_sweep_race',
-        'split_1', 'split_2', 'split_3', 'split_4', 'split_5', 'split_6',
-        'split_7', 'split_8']),
+        'aggressive_sweep', 'checkpoint_slow', 'history_store_checkpoint_delay',
+        'history_store_sweep_race', 'split_1', 'split_2', 'split_3', 'split_4', 'split_5',
+        'split_6', 'split_7', 'split_8']),
     Config('verbose', '', r'''
         enable messages for various events. Options are given as a
         list, such as <code>"verbose=[evictserver,read]"</code>''',
@@ -696,6 +733,7 @@ connection_runtime_config = [
             'backup',
             'block',
             'checkpoint',
+            'checkpoint_cleanup',
             'checkpoint_progress',
             'compact',
             'compact_progress',
@@ -706,8 +744,8 @@ connection_runtime_config = [
             'fileops',
             'handleops',
             'log',
-            'lookaside',
-            'lookaside_activity',
+            'history_store',
+            'history_store_activity',
             'lsm',
             'lsm_manager',
             'metadata',
@@ -718,6 +756,7 @@ connection_runtime_config = [
             'reconcile',
             'recovery',
             'recovery_progress',
+            'rts',
             'salvage',
             'shared_cache',
             'split',
@@ -967,12 +1006,26 @@ wiredtiger_open_common =\
         size and the default config would extend log files in allocations of
         the maximum log file size.''',
         type='list', choices=['data', 'log']),
+    Config('file_close_sync', 'true', r'''
+        control whether to flush modified files to storage independent
+        of a global checkpoint when closing file handles to acquire exclusive
+        access to a table. If set to false, and logging is disabled, API calls that
+        require exclusive access to tables will return EBUSY if there have been
+        changes made to the table since the last global checkpoint. When logging
+        is enabled, the value for <code>file_close_sync</code> has no effect, and,
+        modified file is always flushed to storage when closing file handles to
+        acquire exclusive access to the table''',
+        type='boolean'),
     Config('hazard_max', '1000', r'''
         maximum number of simultaneous hazard pointers per session
         handle''',
         min=15, undoc=True),
     Config('mmap', 'true', r'''
-        Use memory mapping to access files when possible''',
+        Use memory mapping when accessing files in a read-only mode''',
+        type='boolean'),
+    Config('mmap_all', 'false', r'''
+        Use memory mapping to read and write all data files, may not be configured with direct
+        I/O''',
         type='boolean'),
     Config('multiprocess', 'false', r'''
         permit sharing between processes (will automatically start an
@@ -1015,6 +1068,10 @@ wiredtiger_open_common =\
             @ref tune_durability for more information''',
             choices=['dsync', 'fsync', 'none']),
         ]),
+    Config('verify_metadata', 'false', r'''
+        open connection and verify any WiredTiger metadata. This API
+        allows verification and detection of corruption in WiredTiger metadata.''',
+        type='boolean'),
     Config('write_through', '', r'''
         Use \c FILE_FLAG_WRITE_THROUGH on Windows to write to files.  Ignored
         on non-Windows systems.  Options are given as a list, such as
@@ -1218,10 +1275,11 @@ methods = {
         configure the cursor for dump format inputs and outputs: "hex"
         selects a simple hexadecimal format, "json" selects a JSON format
         with each record formatted as fields named by column names if
-        available, and "print" selects a format where only non-printing
-        characters are hexadecimal encoded.  These formats are compatible
-        with the @ref util_dump and @ref util_load commands''',
-        choices=['hex', 'json', 'print']),
+        available, "pretty" selects a human-readable format (making it
+        incompatible with the "load") and "print" selects a format where only
+        non-printing characters are hexadecimal encoded.  These formats are
+        compatible with the @ref util_dump and @ref util_load commands''',
+        choices=['hex', 'json', 'pretty', 'print']),
     Config('incremental', '', r'''
         configure the cursor for block incremental backup usage. These formats
         are only compatible with the backup data source; see @ref backup''',
@@ -1243,7 +1301,7 @@ methods = {
             this setting manages the granularity of how WiredTiger maintains modification
             maps internally. The larger the granularity, the smaller amount of information
             WiredTiger need to maintain''',
-            min='1MB', max='2GB'),
+            min='4KB', max='2GB'),
         Config('src_id', '', r'''
             a string that identifies a previous checkpoint backup source as the source
             of this incremental backup. This identifier must have already been created
@@ -1344,8 +1402,9 @@ methods = {
 'WT_SESSION.upgrade' : Method([]),
 'WT_SESSION.verify' : Method([
     Config('dump_address', 'false', r'''
-        Display addresses and page types as pages are verified,
-        using the application's message handler, intended for debugging''',
+        Display page addresses, time windows, and page types as
+        pages are verified, using the application's message handler,
+        intended for debugging''',
         type='boolean'),
     Config('dump_blocks', 'false', r'''
         Display the contents of on-disk blocks as they are verified,
@@ -1364,11 +1423,15 @@ methods = {
         Display the contents of in-memory pages as they are verified,
         using the application's message handler, intended for debugging''',
         type='boolean'),
+    Config('stable_timestamp', 'false', r'''
+        Ensure that no data has a start timestamp after the stable timestamp,
+        to be run after rollback_to_stable.''',
+        type='boolean'),
     Config('strict', 'false', r'''
         Treat any verification problem as an error; by default, verify will
         warn, but not fail, in the case of errors that won't affect future
         behavior (for example, a leaked block)''',
-        type='boolean')
+        type='boolean'),
 ]),
 
 'WT_SESSION.begin_transaction' : Method([
@@ -1419,9 +1482,6 @@ methods = {
             read timestamp will be rounded up to the oldest timestamp''',
             type='boolean'),
         ]),
-    Config('snapshot', '', r'''
-        use a named, in-memory snapshot, see
-        @ref transaction_named_snapshots'''),
     Config('sync', '', r'''
         whether to sync log records when the transaction commits,
         inherited from ::wiredtiger_open \c transaction_sync''',
@@ -1493,8 +1553,9 @@ methods = {
         including the named checkpoint, or
         \c "to=<checkpoint>" to drop all checkpoints before and
         including the named checkpoint.  Checkpoints cannot be
-        dropped while a hot backup is in progress or if open in
-        a cursor''', type='list'),
+        dropped if open in a cursor.  While a hot backup is in
+        progress, checkpoints created prior to the start of the
+        backup cannot be dropped''', type='list'),
     Config('force', 'false', r'''
         if false (the default), checkpoints may be skipped if the underlying object has not been
         modified, if true, this option forces the checkpoint''',
@@ -1509,28 +1570,6 @@ methods = {
         are in use, or all current updates if there is no stable timestamp set. If false, this
         option generates a checkpoint with all updates including those later than the timestamp''',
         type='boolean'),
-]),
-
-'WT_SESSION.snapshot' : Method([
-    Config('drop', '', r'''
-            if non-empty, specifies which snapshots to drop. Where a group
-            of snapshots are being dropped, the order is based on snapshot
-            creation order not alphanumeric name order''',
-        type='category', subconfig=[
-        Config('all', 'false', r'''
-            drop all named snapshots''', type='boolean'),
-        Config('before', '', r'''
-            drop all snapshots up to but not including the specified name'''),
-        Config('names', '', r'''
-            drop specific named snapshots''', type='list'),
-        Config('to', '', r'''
-            drop all snapshots up to and including the specified name'''),
-    ]),
-    Config('include_updates', 'false', r'''
-        make updates from the current transaction visible to users of the
-        named snapshot.  Transactions started with such a named snapshot are
-        restricted to being read-only''', type='boolean'),
-    Config('name', '', r'''specify a name for the snapshot'''),
 ]),
 
 'WT_CONNECTION.add_collator' : Method([]),

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/mongod_options.h"
 
@@ -53,7 +53,9 @@
 #include "mongo/db/server_options_base.h"
 #include "mongo/db/server_options_nongeneral_gen.h"
 #include "mongo/db/server_options_server_helpers.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_domain_global.h"
+#include "mongo/logv2/log_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/str.h"
@@ -99,17 +101,20 @@ void printMongodHelp(const moe::OptionSection& options) {
 };
 
 namespace {
-void sysRuntimeInfo() {
+
+void appendSysInfo(BSONObjBuilder* obj) {
+    auto o = BSONObjBuilder(obj->subobjStart("sysinfo"));
 #if defined(_SC_PAGE_SIZE)
-    log() << "  page size: " << (int)sysconf(_SC_PAGE_SIZE);
+    o.append("_SC_PAGE_SIZE", (long long)sysconf(_SC_PAGE_SIZE));
 #endif
 #if defined(_SC_PHYS_PAGES)
-    log() << "  _SC_PHYS_PAGES: " << sysconf(_SC_PHYS_PAGES);
+    o.append("_SC_PHYS_PAGES", (long long)sysconf(_SC_PHYS_PAGES));
 #endif
 #if defined(_SC_AVPHYS_PAGES)
-    log() << "  _SC_AVPHYS_PAGES: " << sysconf(_SC_AVPHYS_PAGES);
+    o.append("_SC_AVPHYS_PAGES", (long long)sysconf(_SC_AVPHYS_PAGES));
 #endif
 }
+
 }  // namespace
 
 bool handlePreValidationMongodOptions(const moe::Environment& params,
@@ -119,20 +124,20 @@ bool handlePreValidationMongodOptions(const moe::Environment& params,
         return false;
     }
     if (params.count("version") && params["version"].as<bool>() == true) {
-        setPlainConsoleLogger();
         auto&& vii = VersionInfoInterface::instance();
-        log() << mongodVersion(vii);
-        vii.logBuildInfo();
+        std::cout << mongodVersion(vii) << std::endl;
+        vii.logBuildInfo(&std::cout);
         return false;
     }
     if (params.count("sysinfo") && params["sysinfo"].as<bool>() == true) {
-        setPlainConsoleLogger();
-        sysRuntimeInfo();
+        BSONObjBuilder obj;
+        appendSysInfo(&obj);
+        std::cout << tojson(obj.done(), ExtendedRelaxedV2_0_0, true) << std::endl;
         return false;
     }
 
     if (params.count("master") || params.count("slave")) {
-        severe() << "Master/slave replication is no longer supported";
+        LOGV2_FATAL_CONTINUE(20881, "Master/slave replication is no longer supported");
         return false;
     }
 
@@ -242,20 +247,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
             return ret;
         }
         ret = params->remove("moveParanoia");
-        if (!ret.isOK()) {
-            return ret;
-        }
-    }
-
-    // "storage.indexBuildRetry" comes from the config file, so override it if "noIndexBuildRetry"
-    // is set since that comes from the command line.
-    if (params->count("noIndexBuildRetry")) {
-        Status ret = params->set("storage.indexBuildRetry",
-                                 moe::Value(!(*params)["noIndexBuildRetry"].as<bool>()));
-        if (!ret.isOK()) {
-            return ret;
-        }
-        ret = params->remove("noIndexBuildRetry");
         if (!ret.isOK()) {
             return ret;
         }
@@ -428,7 +419,6 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (params.count("storage.queryableBackupMode") &&
         params["storage.queryableBackupMode"].as<bool>()) {
         storageGlobalParams.readOnly = true;
-        storageGlobalParams.dur = false;
     }
 
     if (params.count("storage.groupCollections")) {
@@ -437,10 +427,6 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("cpu")) {
         serverGlobalParams.cpu = params["cpu"].as<bool>();
-    }
-
-    if (params.count("storage.indexBuildRetry")) {
-        serverGlobalParams.indexBuildRetry = params["storage.indexBuildRetry"].as<bool>();
     }
 
     if (params.count("storage.journal.enabled")) {
@@ -513,11 +499,41 @@ Status storeMongodOptions(const moe::Environment& params) {
         // storage engines will continue to perform regular capped collection handling for the oplog
         // collection, regardless of this parameter setting.
         storageGlobalParams.allowOplogTruncation = false;
+
+        // Standalone mode does not currently support lock-free reads, so we disable it. If the user
+        // tries to explicitly enable it by specifying --disableLockFreeReads=false, log a warning
+        // so that the user knows the feature will not run in standalone mode.
+        if (!storageGlobalParams.disableLockFreeReads) {
+            LOGV2_WARNING(
+                4788400,
+                "Lock-free reads is not supported in standalone mode: disabling lock-free reads.");
+            storageGlobalParams.disableLockFreeReads = true;
+        }
     }
 
     if (params.count("replication.enableMajorityReadConcern")) {
         serverGlobalParams.enableMajorityReadConcern =
             params["replication.enableMajorityReadConcern"].as<bool>();
+
+        if (!serverGlobalParams.enableMajorityReadConcern) {
+            // Lock-free reads are not supported with enableMajorityReadConcern=false, so we disable
+            // them. If the user tries to explicitly enable lock-free reads by specifying
+            // disableLockFreeReads=false, log a warning so that the user knows these are not
+            // compatible settings.
+            if (!storageGlobalParams.disableLockFreeReads) {
+                LOGV2_WARNING(4788401,
+                              "Lock-free reads is not compatible with "
+                              "enableMajorityReadConcern=false: disabling lock-free reads.");
+                storageGlobalParams.disableLockFreeReads = true;
+            }
+        }
+    }
+
+    // TODO (SERVER-49464): remove this development only extra logging.
+    if (storageGlobalParams.disableLockFreeReads) {
+        LOGV2(4788402, "Lock-free reads is disabled.");
+    } else {
+        LOGV2(4788403, "Lock-free reads is enabled.");
     }
 
     if (params.count("replication.oplogSizeMB")) {
@@ -537,6 +553,16 @@ Status storeMongodOptions(const moe::Environment& params) {
         }
         replSettings.setOplogSizeBytes(x * 1024 * 1024);
         invariant(replSettings.getOplogSizeBytes() > 0);
+    }
+
+    if (params.count("storage.oplogMinRetentionHours")) {
+        storageGlobalParams.oplogMinRetentionHours.store(
+            params["storage.oplogMinRetentionHours"].as<double>());
+        if (storageGlobalParams.oplogMinRetentionHours.load() < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "bad --oplogMinRetentionHours, argument must be greater or equal to 0");
+        }
+        invariant(storageGlobalParams.oplogMinRetentionHours.load() >= 0);
     }
 
     if (params.count("cacheSize")) {
@@ -572,10 +598,9 @@ Status storeMongodOptions(const moe::Environment& params) {
 
             if (params.count("replication.enableMajorityReadConcern") &&
                 !params["replication.enableMajorityReadConcern"].as<bool>()) {
-                warning()
-                    << "Config servers require majority read concern, but it was explicitly "
-                       "disabled. The override is being ignored and the process is continuing "
-                       "with majority read concern enabled.";
+                LOGV2_WARNING(20879,
+                              "Ignoring read concern override as config server requires majority "
+                              "read concern");
             }
             serverGlobalParams.enableMajorityReadConcern = true;
 
@@ -629,11 +654,9 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     // Check if we are 32 bit and have not explicitly specified any journaling options
     if (sizeof(void*) == 4 && !params.count("storage.journal.enabled")) {
-        // trying to make this stand out more like startup warnings
-        log() << endl;
-        warning() << "32-bit servers don't have journaling enabled by default. "
-                  << "Please use --journal if you want durability.";
-        log() << endl;
+        LOGV2_WARNING(20880,
+                      "32-bit servers don't have journaling enabled by default. Please use "
+                      "--journal if you want durability");
     }
 
     bool isClusterRoleShard = params.count("shardsvr");

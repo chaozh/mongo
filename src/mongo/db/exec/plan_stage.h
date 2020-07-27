@@ -33,7 +33,9 @@
 #include <vector>
 
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
 
@@ -72,6 +74,10 @@ class RecordId;
  * saveState() if any underlying database state changes.  If saveState() is called,
  * restoreState() must be called again before any work() is done.
  *
+ * If an error occurs at runtime (e.g. we reach resource limits for the request), then work() throws
+ * an exception. At this point, statistics may be extracted from the execution plan, but the
+ * execution tree is otherwise unusable and the plan must be discarded.
+ *
  * Here is a very simple usage example:
  *
  * WorkingSet workingSet;
@@ -90,9 +96,6 @@ class RecordId;
  *     case PlanStage::NEED_TIME:
  *         // Need more time.
  *         break;
- *     case PlanStage::FAILURE:
- *         // Throw exception or return error
- *         break;
  *     }
  *
  *     if (shouldYield) {
@@ -105,16 +108,23 @@ class RecordId;
  */
 class PlanStage {
 public:
-    PlanStage(const char* typeName, OperationContext* opCtx)
-        : _commonStats(typeName), _opCtx(opCtx) {}
+    PlanStage(const char* typeName, ExpressionContext* expCtx)
+        : _commonStats(typeName), _opCtx(expCtx->opCtx), _expCtx(expCtx) {
+        invariant(expCtx);
+        if (expCtx->explain || expCtx->mayDbProfile) {
+            // Populating the field for execution time indicates that this stage should time each
+            // call to work().
+            _commonStats.executionTimeMillis.emplace(0);
+        }
+    }
 
 protected:
     /**
      * Obtain a PlanStage given a child stage. Called during the construction of derived
      * PlanStage types with a single direct descendant.
      */
-    PlanStage(OperationContext* opCtx, std::unique_ptr<PlanStage> child, const char* typeName)
-        : PlanStage(typeName, opCtx) {
+    PlanStage(ExpressionContext* expCtx, std::unique_ptr<PlanStage> child, const char* typeName)
+        : PlanStage(typeName, expCtx) {
         _children.push_back(std::move(child));
     }
 
@@ -161,28 +171,20 @@ public:
         // wants fetched. On the next call to work() that stage can assume a fetch was performed
         // on the WSM that the held WSID refers to.
         NEED_YIELD,
-
-        // Something has gone unrecoverably wrong.  Stop running this query.
-        // If the out parameter does not refer to an invalid working set member,
-        // call WorkingSetCommon::getStatusMemberObject() to get details on the failure.
-        // Any class implementing this interface must set the WSID out parameter to
-        // INVALID_ID or a valid WSM ID if FAILURE is returned.
-        FAILURE,
     };
 
     static std::string stateStr(const StageState& state) {
-        if (ADVANCED == state) {
-            return "ADVANCED";
-        } else if (IS_EOF == state) {
-            return "IS_EOF";
-        } else if (NEED_TIME == state) {
-            return "NEED_TIME";
-        } else if (NEED_YIELD == state) {
-            return "NEED_YIELD";
-        } else {
-            verify(FAILURE == state);
-            return "FAILURE";
+        switch (state) {
+            case PlanStage::ADVANCED:
+                return "ADVANCED";
+            case PlanStage::IS_EOF:
+                return "IS_EOF";
+            case PlanStage::NEED_TIME:
+                return "NEED_TIME";
+            case PlanStage::NEED_YIELD:
+                return "NEED_YIELD";
         }
+        MONGO_UNREACHABLE;
     }
 
 
@@ -190,8 +192,32 @@ public:
      * Perform a unit of work on the query.  Ask the stage to produce the next unit of output.
      * Stage returns StageState::ADVANCED if *out is set to the next unit of output.  Otherwise,
      * returns another value of StageState to indicate the stage's status.
+     *
+     * Throws an exception if an error is encountered while executing the query.
      */
-    StageState work(WorkingSetID* out);
+    StageState work(WorkingSetID* out) {
+        auto optTimer(getOptTimer());
+
+        ++_commonStats.works;
+
+        StageState workResult;
+        try {
+            workResult = doWork(out);
+        } catch (...) {
+            _commonStats.failed = true;
+            throw;
+        }
+
+        if (StageState::ADVANCED == workResult) {
+            ++_commonStats.advanced;
+        } else if (StageState::NEED_TIME == workResult) {
+            ++_commonStats.needTime;
+        } else if (StageState::NEED_YIELD == workResult) {
+            ++_commonStats.needYield;
+        }
+
+        return workResult;
+    }
 
     /**
      * Returns true if no more work can be done on the query / out of results.
@@ -335,6 +361,15 @@ public:
      */
     virtual const SpecificStats* getSpecificStats() const = 0;
 
+    /**
+     * Force this stage to collect timing info during its execution. Must not be called after
+     * execution has started.
+     */
+    void markShouldCollectTimingInfo() {
+        invariant(!_commonStats.executionTimeMillis || *_commonStats.executionTimeMillis == 0);
+        _commonStats.executionTimeMillis.emplace(0);
+    }
+
 protected:
     /**
      * Performs one unit of work.  See comment at work() above.
@@ -358,14 +393,14 @@ protected:
     /**
      * Does stage-specific detaching.
      *
-     * Implementations of this method cannot use the pointer returned from getOpCtx().
+     * Implementations of this method cannot use the pointer returned from opCtx().
      */
     virtual void doDetachFromOperationContext() {}
 
     /**
      * Does stage-specific attaching.
      *
-     * If an OperationContext* is needed, use getOpCtx(), which will return a valid
+     * If an OperationContext* is needed, use opCtx(), which will return a valid
      * OperationContext* (the one to which the stage is reattaching).
      */
     virtual void doReattachToOperationContext() {}
@@ -377,8 +412,24 @@ protected:
 
     ClockSource* getClock() const;
 
-    OperationContext* getOpCtx() const {
+    OperationContext* opCtx() const {
         return _opCtx;
+    }
+
+    ExpressionContext* expCtx() const {
+        return _expCtx;
+    }
+
+    /**
+     * Returns an optional timer which is used to collect time spent executing the current
+     * stage. May return boost::none if it is not necessary to collect timing info.
+     */
+    boost::optional<ScopedTimer> getOptTimer() {
+        if (_commonStats.executionTimeMillis) {
+            return {{getClock(), _commonStats.executionTimeMillis.get_ptr()}};
+        }
+
+        return boost::none;
     }
 
     Children _children;
@@ -386,6 +437,10 @@ protected:
 
 private:
     OperationContext* _opCtx;
+
+    // The PlanExecutor holds a strong reference to this which ensures that this pointer remains
+    // valid for the entire lifetime of the PlanStage.
+    ExpressionContext* _expCtx;
 };
 
 }  // namespace mongo

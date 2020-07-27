@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include "mongo/client/authenticate.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace executor {
@@ -58,7 +58,7 @@ void TLTypeFactory::shutdown() {
 
     stdx::lock_guard<Latch> lk(_mutex);
 
-    log() << "Killing all outstanding egress activity.";
+    LOGV2(22582, "Killing all outstanding egress activity.");
     for (auto collar : _collars) {
         collar->kill();
     }
@@ -94,7 +94,7 @@ void TLTimer::setTimeout(Milliseconds timeoutVal, TimeoutCallback cb) {
     // We will not wait on a timeout if we are in shutdown.
     // The clients will be canceled as an inevitable consequence of pools shutting down.
     if (inShutdown()) {
-        LOG(2) << "Skipping timeout due to impending shutdown.";
+        LOGV2_DEBUG(22583, 2, "Skipping timeout due to impending shutdown.");
         return;
     }
 
@@ -133,6 +133,23 @@ bool TLConnection::isHealthy() {
     return _client->isStillConnected();
 }
 
+bool TLConnection::maybeHealthy() {
+    // The connection has been successfully used after the last time we checked for its health, so
+    // we may assume it's still healthy.
+    if (auto lastUsedWithTimeout = getLastUsed() + kIsHealthyCacheTimeout;
+        lastUsedWithTimeout > _isHealthyExpiresAt) {
+        _isHealthyExpiresAt = lastUsedWithTimeout;
+        // We may reset `_isHealthyCache` below if `now()` has already passed `_isHealthyExpiresAt`.
+        _isHealthyCache = true;
+    }
+
+    if (auto currentTime = now(); !_isHealthyCache || currentTime >= _isHealthyExpiresAt) {
+        _isHealthyCache = isHealthy();
+        _isHealthyExpiresAt = currentTime + kIsHealthyCacheTimeout;
+    }
+    return _isHealthyCache;
+}
+
 AsyncDBClient* TLConnection::client() {
     return _client.get();
 }
@@ -157,6 +174,7 @@ public:
         if (internalSecurity.user) {
             bob.append("saslSupportedMechs", internalSecurity.user->getName().getUnambiguousName());
         }
+        _speculativeAuthType = auth::speculateInternalAuth(&bob, &_session);
 
         return bob.obj();
     }
@@ -164,12 +182,19 @@ public:
     Status validateHost(const HostAndPort& remoteHost,
                         const BSONObj& isMasterRequest,
                         const RemoteCommandResponse& isMasterReply) override try {
-        const auto saslMechsElem = isMasterReply.data.getField("saslSupportedMechs");
+        const auto& reply = isMasterReply.data;
+
+        const auto saslMechsElem = reply.getField("saslSupportedMechs");
         if (saslMechsElem.type() == Array) {
             auto array = saslMechsElem.Array();
             for (const auto& elem : array) {
                 _saslMechsForInternalAuth.push_back(elem.checkAndGetStringData().toString());
             }
+        }
+
+        const auto specAuth = reply.getField(auth::kSpeculativeAuthenticate);
+        if (specAuth.type() == Object) {
+            _speculativeAuthenticate = specAuth.Obj().getOwned();
         }
 
         if (!_wrappedHook) {
@@ -202,8 +227,23 @@ public:
         return _saslMechsForInternalAuth;
     }
 
+    std::shared_ptr<SaslClientSession> getSession() {
+        return _session;
+    }
+
+    auth::SpeculativeAuthType getSpeculativeAuthType() const {
+        return _speculativeAuthType;
+    }
+
+    BSONObj getSpeculativeAuthenticateReply() {
+        return _speculativeAuthenticate;
+    }
+
 private:
     std::vector<std::string> _saslMechsForInternalAuth;
+    std::shared_ptr<SaslClientSession> _session;
+    auth::SpeculativeAuthType _speculativeAuthType;
+    BSONObj _speculativeAuthenticate;
     executor::NetworkConnectionHook* const _wrappedHook = nullptr;
 };
 
@@ -240,8 +280,18 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
             _client = std::move(client);
             return _client->initWireVersion("NetworkInterfaceTL", isMasterHook.get());
         })
-        .then([this, isMasterHook] {
+        .then([this, isMasterHook]() -> Future<bool> {
             if (_skipAuth) {
+                return false;
+            }
+
+            return _client->completeSpeculativeAuth(isMasterHook->getSession(),
+                                                    auth::getInternalAuthDB(),
+                                                    isMasterHook->getSpeculativeAuthenticateReply(),
+                                                    isMasterHook->getSpeculativeAuthType());
+        })
+        .then([this, isMasterHook](bool authenticatedDuringConnect) {
+            if (_skipAuth || authenticatedDuringConnect) {
                 return Future<void>::makeReady();
             }
 
@@ -273,11 +323,16 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
             if (status.isOK()) {
                 handler->promise.emplaceValue();
             } else {
-                LOG(2) << "Failed to connect to " << _peer << " - " << redact(status);
+                LOGV2_DEBUG(22584,
+                            2,
+                            "Failed to connect to {hostAndPort} - {error}",
+                            "Failed to connect",
+                            "hostAndPort"_attr = _peer,
+                            "error"_attr = redact(status));
                 handler->promise.setError(status);
             }
         });
-    LOG(2) << "Finished connection setup.";
+    LOGV2_DEBUG(22585, 2, "Finished connection setup.");
 }
 
 void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {

@@ -27,11 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/logger/redaction.h"
+#include "mongo/logv2/redaction.h"
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
@@ -46,12 +46,12 @@ constexpr auto kRedactionDefaultMask = "###"_sd;
 
 }  // namespace
 
-std::string redact(const BSONObj& objectToRedact) {
+BSONObj redact(const BSONObj& objectToRedact) {
     if (!logger::globalLogDomain()->shouldRedactLogs()) {
-        return objectToRedact.toString(false);
+        return objectToRedact;
     }
 
-    return objectToRedact.toString(true);
+    return objectToRedact.redact();
 }
 
 StringData redact(StringData stringToRedact) {

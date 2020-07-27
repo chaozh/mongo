@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include <fstream>
 #include <iostream>
@@ -40,29 +40,31 @@
 
 #include "mongo/bson/json.h"
 #include "mongo/client/mongo_uri.h"
-#include "mongo/client/sdam/sdam_json_test_runner_cli_options_gen.h"
+#include "mongo/client/sdam/json_test_arg_parser.h"
+#include "mongo/client/sdam/sdam_configuration_parameters_gen.h"
 #include "mongo/client/sdam/topology_manager.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/log.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
 
 /**
  * This program runs the Server Discover and Monitoring JSON test files located in
- * the src/monogo/client/sdam/json_tests sub-directory.
+ * the src/monogo/client/sdam/json_tests/sdam_tests sub-directory.
  *
  * The process return code conforms to the UNIX idiom of 0 to indicate success and non-zero to
  * indicate failure. In the case of test failure, the process will return the number of test cases
  * that failed.
  *
  * Example invocation to run all tests:
- *  sdam_json_test --source-dir src/monogo/client/sdam/json_tests
+ *  sdam_json_test --source-dir src/monogo/client/sdam/json_tests/sdam_tests
  *
  * Example invocation to run a single test:
- *  sdam_json_test --source-dir src/monogo/client/sdam/json_tests --filter normalize_uri_case
+ *  sdam_json_test --source-dir src/monogo/client/sdam/json_tests/sdam_tests --filter
+ * normalize_uri_case
  */
 
 namespace fs = boost::filesystem;
@@ -70,108 +72,6 @@ namespace moe = mongo::optionenvironment;
 using namespace mongo::sdam;
 
 namespace mongo::sdam {
-
-std::string emphasize(const std::string text) {
-    std::stringstream output;
-    const auto border = std::string(3, '#');
-    output << border << " " << text << " " << border << std::endl;
-    return output.str();
-}
-
-class ArgParser {
-public:
-    ArgParser(int argc, char* argv[]) {
-        moe::OptionsParser parser;
-        moe::Environment environment;
-        moe::OptionSection options;
-
-        Status ret = addCliOptions(&options);
-        if (!ret.isOK()) {
-            std::cerr << "Unexpected error adding cli options: " << ret.toString() << std::endl;
-            MONGO_UNREACHABLE;
-        }
-
-        ret = parser.run(options, toStringVector(argc, argv), {}, &environment);
-        if (argc <= 1 || !ret.isOK() || environment.count("help")) {
-            if (!ret.isOK()) {
-                std::cerr << "An error occurred: " << ret.toString() << std::endl;
-            }
-            printHelpAndExit(argv[0], options.helpString());
-        }
-
-        const auto exitIfError = [](Status status) {
-            if (!status.isOK()) {
-                std::cerr << "An error occurred: " << status.toString() << std::endl;
-                std::exit(kArgParseExitCode);
-            }
-        };
-
-        if (environment.count(kSourceDirOption)) {
-            ret = environment.get(kSourceDirOption, &_sourceDirectory);
-            exitIfError(ret);
-        }
-
-        if (environment.count(moe::Key(kFilterOption))) {
-            ret = environment.get(moe::Key(kFilterOption), &_testFilters);
-            exitIfError(ret);
-        }
-
-        if (environment.count(moe::Key(kVerbose))) {
-            std::string value;
-            ret = environment.get(moe::Key(kVerbose), &value);
-            if (!ret.isOK())
-                exitIfError(ret);
-            _verbose = value.size() + 1;
-        }
-    }
-
-    void LogParams() const {
-        log() << "Verbosity: " << _verbose << std::endl;
-        log() << "Source Directory: " << _sourceDirectory << std::endl;
-        if (_testFilters.size()) {
-            log() << "Filters: " << boost::join(_testFilters, ", ");
-        }
-    }
-
-    const std::string& SourceDirectory() const {
-        return _sourceDirectory;
-    }
-
-    const std::vector<std::string>& TestFilters() const {
-        return _testFilters;
-    }
-
-    int Verbose() const {
-        return _verbose;
-    }
-
-private:
-    constexpr static auto kSourceDirOption = "source-dir";
-    constexpr static auto kSourceDirDefault = ".";
-
-    constexpr static auto kFilterOption = "filter";
-
-    constexpr static int kHelpExitCode = 0;
-    constexpr static int kArgParseExitCode = 1024;
-
-    constexpr static auto kVerbose = "verbose";
-
-    std::string _sourceDirectory = kSourceDirDefault;
-    std::vector<std::string> _testFilters;
-    int _verbose = 0;
-
-    void printHelpAndExit(char* programName, const std::string desc) {
-        std::cout << programName << ":" << std::endl << desc << std::endl;
-        std::exit(kHelpExitCode);
-    }
-
-    std::vector<std::string> toStringVector(int n, char** array) {
-        std::vector<std::string> result;
-        for (int i = 0; i < n; ++i)
-            result.push_back(array[i]);
-        return result;
-    }
-};
 
 /**
  * This class is responsible for parsing and executing a single 'phase' of the json test
@@ -182,13 +82,14 @@ public:
         auto bsonResponses = phase.getField("responses").Array();
         for (auto& response : bsonResponses) {
             const auto pair = response.Array();
-            const auto address = pair[0].String();
+            const auto address = HostAndPort(pair[0].String());
             const auto bsonIsMaster = pair[1].Obj();
 
             if (bsonIsMaster.nFields() == 0) {
                 _isMasterResponses.push_back(IsMasterOutcome(address, BSONObj(), "network error"));
             } else {
-                _isMasterResponses.push_back(IsMasterOutcome(address, bsonIsMaster, kLatency));
+                _isMasterResponses.push_back(
+                    IsMasterOutcome(address, bsonIsMaster, duration_cast<IsMasterRTT>(kLatency)));
             }
         }
         _topologyOutcome = phase["outcome"].Obj();
@@ -212,13 +113,17 @@ public:
         for (auto response : _isMasterResponses) {
             auto descriptionStr =
                 (response.getResponse()) ? response.getResponse()->toString() : "[ Network Error ]";
-            log() << "Sending server description: " << response.getServer() << " : "
-                  << descriptionStr << std::endl;
+            LOGV2(20202,
+                  "Sending server description",
+                  "server"_attr = response.getServer(),
+                  "description"_attr = descriptionStr);
             topology.onServerDescription(response);
         }
 
-        log() << "TopologyDescription after Phase " << _phaseNum << ": "
-              << topology.getTopologyDescription()->toString() << std::endl;
+        LOGV2(20203,
+              "TopologyDescription after phase",
+              "phaseNumber"_attr = _phaseNum,
+              "topologyDescription"_attr = topology.getTopologyDescription()->toString());
 
         validateServers(
             &testResult, topology.getTopologyDescription(), _topologyOutcome["servers"].Obj());
@@ -385,7 +290,7 @@ private:
         }
 
         for (const BSONElement& bsonExpectedServer : bsonServers) {
-            const auto& serverAddress = bsonExpectedServer.fieldName();
+            const auto& serverAddress = HostAndPort(bsonExpectedServer.fieldName());
             const auto& expectedServerDescriptionFields = bsonExpectedServer.Obj();
 
             const auto& serverDescription = topologyDescription->findServerByAddress(serverAddress);
@@ -544,7 +449,9 @@ public:
         auto config =
             std::make_unique<SdamConfiguration>(getSeedList(),
                                                 _initialType,
-                                                SdamConfiguration::kDefaultHeartbeatFrequencyMs,
+                                                Milliseconds{kHeartBeatFrequencyMsDefault},
+                                                Milliseconds{kConnectTimeoutMsDefault},
+                                                Milliseconds{kLocalThresholdMsDefault},
                                                 _replicaSetName);
 
         auto clockSource = std::make_unique<ClockSourceMock>();
@@ -553,11 +460,11 @@ public:
         TestCaseResult result{{}, _testFilePath, _testName};
 
         for (const auto& testPhase : _testPhases) {
-            log() << emphasize("Phase " + std::to_string(testPhase.getPhaseNum()));
+            LOGV2(20204, "### Phase Number ###", "phase"_attr = testPhase.getPhaseNum());
             auto phaseResult = testPhase.execute(topology);
             result.phaseResults.push_back(phaseResult);
             if (!result.Success()) {
-                log() << "Phase " << phaseResult.phaseNumber << " failed.";
+                LOGV2(20205, "Phase failed", "phase"_attr = phaseResult.phaseNumber);
                 break;
             }
         }
@@ -572,8 +479,7 @@ public:
 private:
     void parseTest(fs::path testFilePath) {
         _testFilePath = testFilePath.string();
-        log() << "";
-        log() << emphasize("Parsing " + testFilePath.string());
+        LOGV2(20207, "### Parsing Test File ###", "testFilePath"_attr = testFilePath.string());
         {
             std::ifstream testFile(_testFilePath);
             std::ostringstream json;
@@ -591,7 +497,7 @@ private:
             } else {
                 // We can technically choose either kUnknown or kSharded and be compliant,
                 // but it seems that some of the json tests assume kUnknown as the initial state.
-                // see: json_tests/sharded/normalize_uri_case.json
+                // see: json_tests/sdam_tests/sharded/normalize_uri_case.json
                 _initialType = TopologyType::kUnknown;
             }
         } else {
@@ -605,10 +511,10 @@ private:
         }
     }
 
-    std::vector<ServerAddress> getSeedList() {
-        std::vector<ServerAddress> result;
+    std::vector<HostAndPort> getSeedList() {
+        std::vector<HostAndPort> result;
         for (const auto& hostAndPort : _testUri.getServers()) {
-            result.push_back(hostAndPort.toString());
+            result.push_back(hostAndPort);
         }
         return result;
     }
@@ -636,7 +542,7 @@ public:
         for (auto jsonTest : testFiles) {
             auto testCase = JsonTestCase(jsonTest);
             try {
-                log() << emphasize("Executing " + testCase.Name());
+                LOGV2(20208, "### Executing Test Case ###", "test"_attr = testCase.Name());
                 results.push_back(testCase.execute());
             } catch (const DBException& ex) {
                 std::stringstream error;
@@ -661,7 +567,7 @@ public:
                 results.begin(), results.end(), [](const JsonTestCase::TestCaseResult& result) {
                     return !result.Success();
                 })) {
-            log() << emphasize("Failed Test Results");
+            LOGV2(20209, "### Failed Test Results ###");
         }
 
         for (const auto result : results) {
@@ -671,22 +577,28 @@ public:
             if (result.Success()) {
                 ++numSuccess;
             } else {
-                log() << emphasize(testName);
-                log() << "error in file: " << file;
+                LOGV2(20210, "### Test Name ###", "name"_attr = testName);
+                LOGV2(20211, "Error in file", "file"_attr = file);
                 ++numFailed;
                 for (auto phaseResult : phaseResults) {
-                    log() << "Phase " << phaseResult.phaseNumber << ": " << std::endl;
+                    LOGV2(20212, "Phase", "phaseNumber"_attr = phaseResult.phaseNumber);
                     if (!phaseResult.Success()) {
                         for (auto error : phaseResult.errorDescriptions) {
-                            log() << "\t" << error.first << ": " << error.second << std::endl;
+                            LOGV2(20213,
+                                  "Errors",
+                                  "errorFirst"_attr = error.first,
+                                  "errorSecond"_attr = error.second);
                         }
                     }
                 }
-                log() << std::endl;
+                LOGV2(20214, "");
             }
         }
-        log() << numTestCases << " test cases; " << numSuccess << " success; " << numFailed
-              << " failed.";
+        LOGV2(20215,
+              "Test cases summary",
+              "numTestCases"_attr = numTestCases,
+              "numSuccess"_attr = numSuccess,
+              "numFailed"_attr = numFailed);
 
         return numFailed;
     }
@@ -721,7 +633,10 @@ private:
             if (filePath.string().find(filter) != std::string::npos) {
                 return true;
             } else {
-                LOG(2) << "'" << filePath.string() << "' skipped due to filter configuration.";
+                LOGV2_DEBUG(20216,
+                            2,
+                            "Test skipped due to filter configuration",
+                            "filePath"_attr = filePath.string());
             }
         }
 
@@ -736,7 +651,7 @@ int main(int argc, char* argv[]) {
     ArgParser args(argc, argv);
 
     ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(
-        ::mongo::logger::LogSeverity::Debug(args.Verbose()));
+        ::mongo::logv2::LogSeverity::Debug(args.Verbose()));
     args.LogParams();
 
     SdamJsonTestRunner testRunner(args.SourceDirectory(), args.TestFilters());

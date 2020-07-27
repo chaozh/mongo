@@ -39,6 +39,7 @@
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/operation_context_noop.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 #include "mongo/db/storage/kv/kv_engine.h"
@@ -60,8 +61,12 @@ class DurableCatalogTest : public ServiceContextTest {
 public:
     DurableCatalogTest()
         : _nss("unittests.durable_catalog"),
-          _storageEngine(new DevNullKVEngine(), StorageEngineOptions()) {
+          _storageEngine(std::make_unique<DevNullKVEngine>(), StorageEngineOptions()) {
         _storageEngine.finishInit();
+        repl::ReplicationCoordinator::set(
+            getGlobalServiceContext(),
+            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
+                getGlobalServiceContext(), repl::ReplSettings())));
     }
 
     ~DurableCatalogTest() {
@@ -170,7 +175,7 @@ TEST_F(DurableCatalogTest, MultikeyPathsForBtreeIndexInitializedToVectorOfEmptyS
     {
         MultikeyPaths multikeyPaths;
         ASSERT(!catalog->isIndexMultikey(opCtx.get(), getCatalogId(), indexName, &multikeyPaths));
-        assertMultikeyPathsAreEqual(multikeyPaths, {std::set<size_t>{}, std::set<size_t>{}});
+        assertMultikeyPathsAreEqual(multikeyPaths, {MultikeyComponents{}, MultikeyComponents{}});
     }
 }
 
@@ -179,12 +184,12 @@ TEST_F(DurableCatalogTest, CanSetIndividualPathComponentOfBtreeIndexAsMultikey) 
     auto opCtx = newOperationContext();
     DurableCatalog* catalog = getCatalog();
     ASSERT(catalog->setIndexIsMultikey(
-        opCtx.get(), getCatalogId(), indexName, {std::set<size_t>{}, {0U}}));
+        opCtx.get(), getCatalogId(), indexName, {MultikeyComponents{}, {0U}}));
 
     {
         MultikeyPaths multikeyPaths;
         ASSERT(catalog->isIndexMultikey(opCtx.get(), getCatalogId(), indexName, &multikeyPaths));
-        assertMultikeyPathsAreEqual(multikeyPaths, {std::set<size_t>{}, {0U}});
+        assertMultikeyPathsAreEqual(multikeyPaths, {MultikeyComponents{}, {0U}});
     }
 }
 
@@ -193,16 +198,16 @@ TEST_F(DurableCatalogTest, MultikeyPathsAccumulateOnDifferentFields) {
     auto opCtx = newOperationContext();
     DurableCatalog* catalog = getCatalog();
     ASSERT(catalog->setIndexIsMultikey(
-        opCtx.get(), getCatalogId(), indexName, {std::set<size_t>{}, {0U}}));
+        opCtx.get(), getCatalogId(), indexName, {MultikeyComponents{}, {0U}}));
 
     {
         MultikeyPaths multikeyPaths;
         ASSERT(catalog->isIndexMultikey(opCtx.get(), getCatalogId(), indexName, &multikeyPaths));
-        assertMultikeyPathsAreEqual(multikeyPaths, {std::set<size_t>{}, {0U}});
+        assertMultikeyPathsAreEqual(multikeyPaths, {MultikeyComponents{}, {0U}});
     }
 
     ASSERT(catalog->setIndexIsMultikey(
-        opCtx.get(), getCatalogId(), indexName, {{0U}, std::set<size_t>{}}));
+        opCtx.get(), getCatalogId(), indexName, {{0U}, MultikeyComponents{}}));
 
     {
         MultikeyPaths multikeyPaths;
@@ -267,23 +272,23 @@ TEST_F(DurableCatalogTest, CanSetMultipleFieldsAndComponentsAsMultikey) {
     }
 }
 
-DEATH_TEST_F(DurableCatalogTest,
-             CannotOmitPathLevelMultikeyInfoWithBtreeIndex,
-             "Invariant failure !multikeyPaths.empty()") {
+DEATH_TEST_REGEX_F(DurableCatalogTest,
+                   CannotOmitPathLevelMultikeyInfoWithBtreeIndex,
+                   R"#(Invariant failure.*!multikeyPaths.empty\(\))#") {
     std::string indexName = createIndex(BSON("a" << 1 << "b" << 1));
     auto opCtx = newOperationContext();
     DurableCatalog* catalog = getCatalog();
     catalog->setIndexIsMultikey(opCtx.get(), getCatalogId(), indexName, MultikeyPaths{});
 }
 
-DEATH_TEST_F(DurableCatalogTest,
-             AtLeastOnePathComponentMustCauseIndexToBeMultikey,
-             "Invariant failure somePathIsMultikey") {
+DEATH_TEST_REGEX_F(DurableCatalogTest,
+                   AtLeastOnePathComponentMustCauseIndexToBeMultikey,
+                   R"#(Invariant failure.*somePathIsMultikey)#") {
     std::string indexName = createIndex(BSON("a" << 1 << "b" << 1));
     auto opCtx = newOperationContext();
     DurableCatalog* catalog = getCatalog();
     catalog->setIndexIsMultikey(
-        opCtx.get(), getCatalogId(), indexName, {std::set<size_t>{}, std::set<size_t>{}});
+        opCtx.get(), getCatalogId(), indexName, {MultikeyComponents{}, MultikeyComponents{}});
 }
 
 TEST_F(DurableCatalogTest, PathLevelMultikeyTrackingIsSupportedBy2dsphereIndexes) {
@@ -294,7 +299,7 @@ TEST_F(DurableCatalogTest, PathLevelMultikeyTrackingIsSupportedBy2dsphereIndexes
     {
         MultikeyPaths multikeyPaths;
         ASSERT(!catalog->isIndexMultikey(opCtx.get(), getCatalogId(), indexName, &multikeyPaths));
-        assertMultikeyPathsAreEqual(multikeyPaths, {std::set<size_t>{}, std::set<size_t>{}});
+        assertMultikeyPathsAreEqual(multikeyPaths, {MultikeyComponents{}, MultikeyComponents{}});
     }
 }
 
@@ -379,9 +384,9 @@ TEST_F(DurableCatalogTest, TwoPhaseIndexBuild) {
     ASSERT_FALSE(catalog->getIndexBuildUUID(opCtx.get(), getCatalogId(), indexName));
 }
 
-DEATH_TEST_F(DurableCatalogTest,
-             CannotSetIndividualPathComponentsOfTextIndexAsMultikey,
-             "Invariant failure multikeyPaths.empty()") {
+DEATH_TEST_REGEX_F(DurableCatalogTest,
+                   CannotSetIndividualPathComponentsOfTextIndexAsMultikey,
+                   R"#(Invariant failure.*multikeyPaths.empty\(\))#") {
     std::string indexType = IndexNames::TEXT;
     std::string indexName = createIndex(BSON("a" << indexType << "b" << 1), indexType);
     auto opCtx = newOperationContext();

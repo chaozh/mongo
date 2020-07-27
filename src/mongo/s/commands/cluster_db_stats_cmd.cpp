@@ -65,7 +65,6 @@ void aggregateResults(int scale,
         fileSize += b["fileSize"].numberLong();
     }
 
-    // TODO SERVER-26110: Add aggregated 'collections' and 'views' metrics.
     output.appendNumber("objects", objects);
 
     // avgObjSize on mongod is not scaled based on the argument to db.stats(), so we use
@@ -86,6 +85,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     bool adminOnly() const override {
@@ -128,7 +131,7 @@ public:
                 opCtx, this, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)),
             ReadPreferenceSetting::get(opCtx),
             Shard::RetryPolicy::kIdempotent);
-        if (!appendRawResponses(opCtx, &errmsg, &output, shardResponses)) {
+        if (!appendRawResponses(opCtx, &errmsg, &output, shardResponses).responseOK) {
             return false;
         }
 

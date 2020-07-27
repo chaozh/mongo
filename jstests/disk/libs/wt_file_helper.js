@@ -73,6 +73,15 @@ let assertRepairFailsWithFailpoint = function(dbpath, port, failpoint) {
 };
 
 /**
+ * Asserts that running MongoDB with --repair on the provided dbpath fails.
+ */
+let assertRepairFails = function(dbpath, port) {
+    jsTestLog("The node should complete repairing the node but fails.");
+
+    assert.neq(0, runMongoProgram("mongod", "--repair", "--port", port, "--dbpath", dbpath));
+};
+
+/**
  * Assert that starting MongoDB with --replSet on an existing data path exits with a specific
  * error.
  */
@@ -83,7 +92,7 @@ let assertErrorOnStartupWhenStartingAsReplSet = function(dbpath, port, rsName) {
     let node = MongoRunner.runMongod(
         {dbpath: dbpath, port: port, replSet: rsName, noCleanData: true, waitForConnect: false});
     assert.soon(function() {
-        return rawMongoProgramOutput().indexOf("Fatal Assertion 50923") >= 0;
+        return rawMongoProgramOutput().search(/Fatal assertion.*50923/) >= 0;
     });
     MongoRunner.stopMongod(node, null, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
 };
@@ -99,7 +108,7 @@ let assertErrorOnStartupAfterIncompleteRepair = function(dbpath, port) {
     let node = MongoRunner.runMongod(
         {dbpath: dbpath, port: port, noCleanData: true, waitForConnect: false});
     assert.soon(function() {
-        return rawMongoProgramOutput().indexOf("Fatal Assertion 50922") >= 0;
+        return rawMongoProgramOutput().search(/Fatal assertion.*50922/) >= 0;
     });
     MongoRunner.stopMongod(node, null, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
 };
@@ -156,7 +165,7 @@ let assertStartInReplSet = function(replSet, originalNode, cleanData, expectResy
  * Assert certain error messages are thrown on startup when files are missing or corrupt.
  */
 let assertErrorOnStartupWhenFilesAreCorruptOrMissing = function(
-    dbpath, dbName, collName, deleteOrCorruptFunc, errmsg) {
+    dbpath, dbName, collName, deleteOrCorruptFunc, errmsgRegExp) {
     // Start a MongoDB instance, create the collection file.
     const mongod = MongoRunner.runMongod({dbpath: dbpath, cleanData: true});
     const testColl = mongod.getDB(dbName)[collName];
@@ -170,14 +179,14 @@ let assertErrorOnStartupWhenFilesAreCorruptOrMissing = function(
     clearRawMongoProgramOutput();
     assert.eq(MongoRunner.EXIT_ABRUPT,
               runMongoProgram("mongod", "--port", mongod.port, "--dbpath", dbpath));
-    assert.gte(rawMongoProgramOutput().indexOf(errmsg), 0);
+    assert.gte(rawMongoProgramOutput().search(errmsgRegExp), 0);
 };
 
 /**
  * Assert certain error messages are thrown on a specific request when files are missing or corrupt.
  */
 let assertErrorOnRequestWhenFilesAreCorruptOrMissing = function(
-    dbpath, dbName, collName, deleteOrCorruptFunc, requestFunc, errmsg) {
+    dbpath, dbName, collName, deleteOrCorruptFunc, requestFunc, errmsgRegExp) {
     // Start a MongoDB instance, create the collection file.
     mongod = MongoRunner.runMongod({dbpath: dbpath, cleanData: true});
     testColl = mongod.getDB(dbName)[collName];
@@ -196,6 +205,24 @@ let assertErrorOnRequestWhenFilesAreCorruptOrMissing = function(
     requestFunc(testColl);
 
     // Get an expected error message.
-    assert.gte(rawMongoProgramOutput().indexOf(errmsg), 0);
+    assert.gte(rawMongoProgramOutput().search(errmsgRegExp), 0);
     MongoRunner.stopMongod(mongod, 9, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
+};
+
+/**
+ * Runs the WiredTiger tool with the provided arguments.
+ */
+let runWiredTigerTool = function(...args) {
+    const cmd = ['wt'].concat(args);
+    assert.eq(run.apply(undefined, cmd), 0, "error executing: " + cmd.join(' '));
+};
+
+/**
+ * Stops the given mongod, runs the truncate command on the given uri using the WiredTiger tool, and
+ * starts mongod again on the same path.
+ */
+let truncateUriAndRestartMongod = function(uri, conn) {
+    MongoRunner.stopMongod(conn, null, {skipValidation: true});
+    runWiredTigerTool("-h", conn.dbpath, "truncate", uri);
+    return startMongodOnExistingPath(conn.dbpath, {});
 };

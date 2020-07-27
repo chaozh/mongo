@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonmisc.h"
@@ -36,7 +36,6 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -48,7 +47,7 @@ protected:
     ActiveShardCollectionRegistry _registry;
 };
 
-ShardsvrShardCollection createShardsvrShardCollectionRequest(
+ShardsvrShardCollectionRequest createShardsvrShardCollectionRequest(
     const NamespaceString& nss,
     BSONObj key,
     bool unique,
@@ -56,7 +55,7 @@ ShardsvrShardCollection createShardsvrShardCollectionRequest(
     boost::optional<std::vector<mongo::BSONObj>> initialSplitPoints,
     boost::optional<mongo::BSONObj> collation,
     bool UUIDfromPrimaryShard) {
-    ShardsvrShardCollection shardsvrShardCollectionRequest;
+    ShardsvrShardCollectionRequest shardsvrShardCollectionRequest;
     shardsvrShardCollectionRequest.set_shardsvrShardCollection(nss);
     shardsvrShardCollectionRequest.setKey(key);
     shardsvrShardCollectionRequest.setUnique(unique);

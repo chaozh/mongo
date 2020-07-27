@@ -306,6 +306,32 @@ assert = (function() {
         }
     };
 
+    assert.containsPrefix = function(prefix, arr, msg) {
+        var wasIn = false;
+        if (typeof (prefix) !== "string") {
+            throw new Error("The first argument to containsPrefix must be a string.");
+        }
+        if (!Array.isArray(arr)) {
+            throw new Error("The second argument to containsPrefix must be an array.");
+        }
+
+        for (let i = 0; i < arr.length; i++) {
+            if (typeof (arr[i]) !== "string") {
+                continue;
+            }
+
+            wasIn = arr[i].startsWith(prefix);
+            if (wasIn) {
+                break;
+            }
+        }
+
+        if (!wasIn) {
+            doassert(_buildAssertionMessage(
+                msg, tojson(prefix) + " was not a prefix in " + tojson(arr)));
+        }
+    };
+
     /*
      * Calls a function 'func' at repeated intervals until either func() returns true
      * or more than 'timeout' milliseconds have elapsed. Throws an exception with
@@ -323,9 +349,15 @@ assert = (function() {
         }
 
         var start = new Date();
-        timeout = timeout || 5 * 60 * 1000;
+
+        if (TestData && TestData.inEvergreen) {
+            timeout = timeout || 10 * 60 * 1000;
+        } else {
+            timeout = timeout || 90 * 1000;
+        }
+
         interval = interval || 200;
-        var last;
+
         while (1) {
             if (typeof (func) == "string") {
                 if (eval(func))
@@ -340,10 +372,10 @@ assert = (function() {
                 msg = _buildAssertionMessage(msg, msgPrefix);
                 if (runHangAnalyzer) {
                     msg = msg +
-                        "The hang analyzer is automatically called in assert.soon functions. " +
-                        "If you are *expecting* assert.soon to possibly fail, call assert.soon " +
-                        "with {runHangAnalyzer: false} as the fifth argument " +
-                        "(you can fill unused arguments with `undefined`).";
+                        " The hang analyzer is automatically called in assert.soon functions." +
+                        " If you are *expecting* assert.soon to possibly fail, call assert.soon" +
+                        " with {runHangAnalyzer: false} as the fifth argument" +
+                        " (you can fill unused arguments with `undefined`).";
                     print(msg + " Running hang analyzer from assert.soon.");
                     MongoRunner.runHangAnalyzer();
                 }
@@ -387,7 +419,7 @@ assert = (function() {
         // Used up all attempts
         msg = _buildAssertionMessage(msg);
         if (runHangAnalyzer) {
-            msg = msg + "The hang analyzer is automatically called in assert.retry functions. " +
+            msg = msg + " The hang analyzer is automatically called in assert.retry functions. " +
                 "If you are *expecting* assert.soon to possibly fail, call assert.retry " +
                 "with {runHangAnalyzer: false} as the fifth argument " +
                 "(you can fill unused arguments with `undefined`).";
@@ -449,7 +481,8 @@ assert = (function() {
                 "assert.time failed timeout " + timeout + "ms took " + diff + "ms : " + f + ", msg";
             msg = _buildAssertionMessage(msg, msgPrefix);
             if (runHangAnalyzer) {
-                msg = msg + "The hang analyzer is automatically called in assert.time functions. " +
+                msg = msg +
+                    " The hang analyzer is automatically called in assert.time functions. " +
                     "If you are *expecting* assert.soon to possibly fail, call assert.time " +
                     "with {runHangAnalyzer: false} as the fourth argument " +
                     "(you can fill unused arguments with `undefined`).";
@@ -583,6 +616,51 @@ assert = (function() {
         }
     }
 
+    function _runHangAnalyzerIfWriteConcernTimedOut(res) {
+        const timeoutMsg = "waiting for replication timed out";
+        let isWriteConcernTimeout = false;
+        if (_isWriteResultType(res)) {
+            if (res.hasWriteConcernError() && res.getWriteConcernError().errmsg === timeoutMsg) {
+                isWriteConcernTimeout = true;
+            }
+        } else if ((res.hasOwnProperty("errmsg") && res.errmsg === timeoutMsg) ||
+                   (res.hasOwnProperty("writeConcernError") &&
+                    res.writeConcernError.errmsg === timeoutMsg)) {
+            isWriteConcernTimeout = true;
+        }
+        if (isWriteConcernTimeout) {
+            print("Running hang analyzer for writeConcern timeout " + tojson(res));
+            MongoRunner.runHangAnalyzer();
+            return true;
+        }
+        return false;
+    }
+
+    function _runHangAnalyzerIfNonTransientLockTimeoutError(res) {
+        // Concurrency suites see a lot of LockTimeouts when running concurrent transactions.
+        // However, they will also abort transactions and continue running rather than fail the
+        // test, so we don't want to run the hang analyzer when the error has a
+        // TransientTransactionError error label.
+        const isTransientTxnError = res.hasOwnProperty("errorLabels") &&
+            res.errorLabels.includes("TransientTransactionError");
+        const isLockTimeout = res.hasOwnProperty("code") && ErrorCodes.LockTimeout === res.code;
+        if (isLockTimeout && !isTransientTxnError) {
+            print("Running hang analyzer for lock timeout " + tojson(res));
+            MongoRunner.runHangAnalyzer();
+            return true;
+        }
+        return false;
+    }
+
+    function _runHangAnalyzerForSpecificFailureTypes(res) {
+        // If the hang analyzer is run, then we shouldn't try to run it again.
+        if (_runHangAnalyzerIfWriteConcernTimedOut(res)) {
+            return;
+        }
+
+        _runHangAnalyzerIfNonTransientLockTimeoutError(res);
+    }
+
     function _assertCommandWorked(res, msg, {ignoreWriteErrors, ignoreWriteConcernErrors}) {
         _validateAssertionMessage(msg);
         _validateCommandResponse(res, "commandWorked");
@@ -609,6 +687,7 @@ assert = (function() {
                     ignoreWriteErrors: ignoreWriteErrors,
                     ignoreWriteConcernErrors: ignoreWriteConcernErrors
                 })) {
+                _runHangAnalyzerForSpecificFailureTypes(res);
                 doassert(makeFailMsg(), res);
             }
         } else if (res.hasOwnProperty("acknowledged")) {
@@ -675,6 +754,7 @@ assert = (function() {
                 }
 
                 if (!foundCode) {
+                    _runHangAnalyzerForSpecificFailureTypes(res);
                     doassert(makeFailCodeMsg(), res);
                 }
             }
@@ -750,6 +830,7 @@ assert = (function() {
         }
 
         if (errMsg) {
+            _runHangAnalyzerForSpecificFailureTypes(res);
             doassert(_buildAssertionMessage(msg, errMsg), res);
         }
 
@@ -811,6 +892,7 @@ assert = (function() {
         }
 
         if (errMsg) {
+            _runHangAnalyzerForSpecificFailureTypes(res);
             doassert(_buildAssertionMessage(msg, errMsg));
         }
 

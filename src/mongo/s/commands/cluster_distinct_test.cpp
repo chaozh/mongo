@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/commands/cluster_command_test_fixture.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {

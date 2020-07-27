@@ -44,6 +44,7 @@
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/exec/upsert_stage.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 
 namespace mongo {
 
@@ -51,26 +52,29 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::collection
     OperationContext* opCtx,
     StringData ns,
     Collection* collection,
-    PlanExecutor::YieldPolicy yieldPolicy,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
     const Direction direction) {
     std::unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
 
+    auto expCtx = make_intrusive<ExpressionContext>(
+        opCtx, std::unique_ptr<CollatorInterface>(nullptr), NamespaceString(ns));
+
     if (nullptr == collection) {
-        auto eof = std::make_unique<EOFStage>(opCtx);
+        auto eof = std::make_unique<EOFStage>(expCtx.get());
         // Takes ownership of 'ws' and 'eof'.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            opCtx, std::move(ws), std::move(eof), nullptr, yieldPolicy, NamespaceString(ns));
+        auto statusWithPlanExecutor = plan_executor_factory::make(
+            expCtx, std::move(ws), std::move(eof), nullptr, yieldPolicy, NamespaceString(ns));
         invariant(statusWithPlanExecutor.isOK());
         return std::move(statusWithPlanExecutor.getValue());
     }
 
     invariant(ns == collection->ns().ns());
 
-    auto cs = _collectionScan(opCtx, ws.get(), collection, direction);
+    auto cs = _collectionScan(expCtx, ws.get(), collection, direction);
 
     // Takes ownership of 'ws' and 'cs'.
     auto statusWithPlanExecutor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(cs), collection, yieldPolicy);
+        plan_executor_factory::make(expCtx, std::move(ws), std::move(cs), collection, yieldPolicy);
     invariant(statusWithPlanExecutor.isOK());
     return std::move(statusWithPlanExecutor.getValue());
 }
@@ -79,18 +83,21 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     OperationContext* opCtx,
     Collection* collection,
     std::unique_ptr<DeleteStageParams> params,
-    PlanExecutor::YieldPolicy yieldPolicy,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
     Direction direction) {
     invariant(collection);
     auto ws = std::make_unique<WorkingSet>();
 
-    auto root = _collectionScan(opCtx, ws.get(), collection, direction);
+    auto expCtx = make_intrusive<ExpressionContext>(
+        opCtx, std::unique_ptr<CollatorInterface>(nullptr), collection->ns());
+
+    auto root = _collectionScan(expCtx, ws.get(), collection, direction);
 
     root = std::make_unique<DeleteStage>(
-        opCtx, std::move(params), ws.get(), collection, root.release());
+        expCtx.get(), std::move(params), ws.get(), collection, root.release());
 
-    auto executor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(
+        expCtx, std::move(ws), std::move(root), collection, yieldPolicy);
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
@@ -103,12 +110,15 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::indexScan(
     const BSONObj& startKey,
     const BSONObj& endKey,
     BoundInclusion boundInclusion,
-    PlanExecutor::YieldPolicy yieldPolicy,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
     Direction direction,
     int options) {
     auto ws = std::make_unique<WorkingSet>();
 
-    std::unique_ptr<PlanStage> root = _indexScan(opCtx,
+    auto expCtx = make_intrusive<ExpressionContext>(
+        opCtx, std::unique_ptr<CollatorInterface>(nullptr), collection->ns());
+
+    std::unique_ptr<PlanStage> root = _indexScan(expCtx,
                                                  ws.get(),
                                                  collection,
                                                  descriptor,
@@ -118,8 +128,8 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::indexScan(
                                                  direction,
                                                  options);
 
-    auto executor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(
+        expCtx, std::move(ws), std::move(root), collection, yieldPolicy);
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
@@ -132,12 +142,15 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
     const BSONObj& startKey,
     const BSONObj& endKey,
     BoundInclusion boundInclusion,
-    PlanExecutor::YieldPolicy yieldPolicy,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
     Direction direction) {
     invariant(collection);
     auto ws = std::make_unique<WorkingSet>();
 
-    std::unique_ptr<PlanStage> root = _indexScan(opCtx,
+    auto expCtx = make_intrusive<ExpressionContext>(
+        opCtx, std::unique_ptr<CollatorInterface>(nullptr), collection->ns());
+
+    std::unique_ptr<PlanStage> root = _indexScan(expCtx,
                                                  ws.get(),
                                                  collection,
                                                  descriptor,
@@ -148,10 +161,10 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::deleteWith
                                                  InternalPlanner::IXSCAN_FETCH);
 
     root = std::make_unique<DeleteStage>(
-        opCtx, std::move(params), ws.get(), collection, root.release());
+        expCtx.get(), std::move(params), ws.get(), collection, root.release());
 
-    auto executor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(
+        expCtx, std::move(ws), std::move(root), collection, yieldPolicy);
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
@@ -162,32 +175,38 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> InternalPlanner::updateWith
     const UpdateStageParams& params,
     const IndexDescriptor* descriptor,
     const BSONObj& key,
-    PlanExecutor::YieldPolicy yieldPolicy) {
+    PlanYieldPolicy::YieldPolicy yieldPolicy) {
     invariant(collection);
     auto ws = std::make_unique<WorkingSet>();
 
-    auto idHackStage = std::make_unique<IDHackStage>(opCtx, key, ws.get(), descriptor);
+    auto expCtx = make_intrusive<ExpressionContext>(
+        opCtx, std::unique_ptr<CollatorInterface>(nullptr), collection->ns());
+
+    auto idHackStage =
+        std::make_unique<IDHackStage>(expCtx.get(), key, ws.get(), collection, descriptor);
 
     const bool isUpsert = params.request->isUpsert();
     auto root = (isUpsert ? std::make_unique<UpsertStage>(
-                                opCtx, params, ws.get(), collection, idHackStage.release())
+                                expCtx.get(), params, ws.get(), collection, idHackStage.release())
                           : std::make_unique<UpdateStage>(
-                                opCtx, params, ws.get(), collection, idHackStage.release()));
+                                expCtx.get(), params, ws.get(), collection, idHackStage.release()));
 
-    auto executor =
-        PlanExecutor::make(opCtx, std::move(ws), std::move(root), collection, yieldPolicy);
+    auto executor = plan_executor_factory::make(
+        expCtx, std::move(ws), std::move(root), collection, yieldPolicy);
     invariant(executor.getStatus());
     return std::move(executor.getValue());
 }
 
-std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(OperationContext* opCtx,
-                                                            WorkingSet* ws,
-                                                            const Collection* collection,
-                                                            Direction direction) {
+std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    WorkingSet* ws,
+    const Collection* collection,
+    Direction direction) {
     invariant(collection);
 
     CollectionScanParams params;
-    params.shouldWaitForOplogVisibility = shouldWaitForOplogVisibility(opCtx, collection, false);
+    params.shouldWaitForOplogVisibility =
+        shouldWaitForOplogVisibility(expCtx->opCtx, collection, false);
 
     if (FORWARD == direction) {
         params.direction = CollectionScanParams::FORWARD;
@@ -195,34 +214,35 @@ std::unique_ptr<PlanStage> InternalPlanner::_collectionScan(OperationContext* op
         params.direction = CollectionScanParams::BACKWARD;
     }
 
-    return std::make_unique<CollectionScan>(opCtx, collection, params, ws, nullptr);
+    return std::make_unique<CollectionScan>(expCtx.get(), collection, params, ws, nullptr);
 }
 
-std::unique_ptr<PlanStage> InternalPlanner::_indexScan(OperationContext* opCtx,
-                                                       WorkingSet* ws,
-                                                       const Collection* collection,
-                                                       const IndexDescriptor* descriptor,
-                                                       const BSONObj& startKey,
-                                                       const BSONObj& endKey,
-                                                       BoundInclusion boundInclusion,
-                                                       Direction direction,
-                                                       int options) {
+std::unique_ptr<PlanStage> InternalPlanner::_indexScan(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    WorkingSet* ws,
+    const Collection* collection,
+    const IndexDescriptor* descriptor,
+    const BSONObj& startKey,
+    const BSONObj& endKey,
+    BoundInclusion boundInclusion,
+    Direction direction,
+    int options) {
     invariant(collection);
     invariant(descriptor);
 
-    IndexScanParams params(opCtx, descriptor);
+    IndexScanParams params(expCtx->opCtx, descriptor);
     params.direction = direction;
     params.bounds.isSimpleRange = true;
     params.bounds.startKey = startKey;
     params.bounds.endKey = endKey;
     params.bounds.boundInclusion = boundInclusion;
-    params.shouldDedup = descriptor->isMultikey();
+    params.shouldDedup = descriptor->getEntry()->isMultikey();
 
     std::unique_ptr<PlanStage> root =
-        std::make_unique<IndexScan>(opCtx, std::move(params), ws, nullptr);
+        std::make_unique<IndexScan>(expCtx.get(), collection, std::move(params), ws, nullptr);
 
     if (InternalPlanner::IXSCAN_FETCH & options) {
-        root = std::make_unique<FetchStage>(opCtx, ws, std::move(root), nullptr, collection);
+        root = std::make_unique<FetchStage>(expCtx.get(), ws, std::move(root), nullptr, collection);
     }
 
     return root;

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +36,6 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database.h"
@@ -56,14 +55,15 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/uuid.h"
 
@@ -78,6 +78,11 @@ MONGO_FAIL_POINT_DEFINE(createIndexesWriteConflict);
 // collection is created.
 MONGO_FAIL_POINT_DEFINE(hangBeforeCreateIndexesCollectionCreate);
 MONGO_FAIL_POINT_DEFINE(hangBeforeIndexBuildAbortOnInterrupt);
+MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildAbort);
+
+// This failpoint hangs between logging the index build UUID and starting the index build
+// through the IndexBuildsCoordinator.
+MONGO_FAIL_POINT_DEFINE(hangCreateIndexesBeforeStartingIndexBuild);
 
 constexpr auto kIndexesFieldName = "indexes"_sd;
 constexpr auto kCommandName = "createIndexes"_sd;
@@ -161,6 +166,8 @@ StatusWith<std::vector<BSONObj>> parseAndValidateIndexSpecs(
                     // entry with a '*' as an index name means "drop all indexes in this
                     // collection".  We disallow creation of such indexes to avoid this conflict.
                     return {ErrorCodes::BadValue, "The index name '*' is not valid."};
+                } else if (ns.isSystem() && !indexSpec[IndexDescriptor::kHiddenFieldName].eoo()) {
+                    return {ErrorCodes::BadValue, "Can't hide index on system collection"};
                 }
 
                 indexSpecs.push_back(std::move(indexSpec));
@@ -205,7 +212,9 @@ void appendFinalIndexFieldsToResult(int numIndexesBefore,
         result.append(kNoteFieldName, "index already exists");
     }
 
-    commitQuorum->append("commitQuorum", &result);
+    // commitQuorum will be populated only when two phase index build is enabled.
+    if (commitQuorum)
+        commitQuorum->appendToBuilder(kCommitQuorumFieldName, &result);
 }
 
 
@@ -273,23 +282,33 @@ Status validateTTLOptions(OperationContext* opCtx, const BSONObj& cmdObj) {
  * commit quorum, which consists of all the data-bearing nodes.
  */
 boost::optional<CommitQuorumOptions> parseAndGetCommitQuorum(OperationContext* opCtx,
+                                                             IndexBuildProtocol protocol,
                                                              const BSONObj& cmdObj) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto commitQuorumEnabled = (enableIndexBuildCommitQuorum) ? true : false;
 
     if (cmdObj.hasField(kCommitQuorumFieldName)) {
         uassert(ErrorCodes::BadValue,
                 str::stream() << "Standalones can't specify commitQuorum",
                 replCoord->isReplEnabled());
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "commitQuorum is supported only for two phase index builds with "
+                                 "commit quorum support enabled ",
+                (IndexBuildProtocol::kTwoPhase == protocol && commitQuorumEnabled));
         CommitQuorumOptions commitQuorum;
         uassertStatusOK(commitQuorum.parse(cmdObj.getField(kCommitQuorumFieldName)));
+        uassertStatusOK(replCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum));
         return commitQuorum;
-    } else {
-        // Retrieve the default commit quorum if one wasn't passed in, which consists of all
-        // data-bearing nodes.
-        int numDataBearingMembers =
-            replCoord->isReplEnabled() ? replCoord->getConfig().getNumDataBearingMembers() : 1;
-        return CommitQuorumOptions(numDataBearingMembers);
     }
+
+    if (IndexBuildProtocol::kTwoPhase == protocol) {
+        // Setting CommitQuorum to 0 will make the index build to opt out of voting proces.
+        return (replCoord->isReplEnabled() && commitQuorumEnabled)
+            ? CommitQuorumOptions(CommitQuorumOptions::kVotingMembers)
+            : CommitQuorumOptions(CommitQuorumOptions::kDisabled);
+    }
+
+    return boost::none;
 }
 
 /**
@@ -300,29 +319,11 @@ boost::optional<CommitQuorumOptions> parseAndGetCommitQuorum(OperationContext* o
 std::vector<BSONObj> resolveDefaultsAndRemoveExistingIndexes(OperationContext* opCtx,
                                                              const Collection* collection,
                                                              std::vector<BSONObj> indexSpecs) {
-    auto swDefaults = collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, indexSpecs);
-    uassertStatusOK(swDefaults.getStatus());
+    // Normalize the specs' collations, wildcard projections, and partial filters as applicable.
+    auto normalSpecs = IndexBuildsCoordinator::normalizeIndexSpecs(opCtx, collection, indexSpecs);
 
-    auto indexCatalog = collection->getIndexCatalog();
-
-    return indexCatalog->removeExistingIndexes(
-        opCtx, swDefaults.getValue(), false /*removeIndexBuildsToo*/);
-}
-
-void checkUniqueIndexConstraints(OperationContext* opCtx,
-                                 const NamespaceString& nss,
-                                 const BSONObj& newIdxKey) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
-
-    const auto metadata = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
-    if (!metadata->isSharded())
-        return;
-
-    const ShardKeyPattern shardKeyPattern(metadata->getKeyPattern());
-    uassert(ErrorCodes::CannotCreateIndex,
-            str::stream() << "cannot create unique index over " << newIdxKey
-                          << " with shard key pattern " << shardKeyPattern.toBSON(),
-            shardKeyPattern.isUniqueIndexCompatible(newIdxKey));
+    return collection->getIndexCatalog()->removeExistingIndexes(
+        opCtx, normalSpecs, false /*removeIndexBuildsToo*/);
 }
 
 /**
@@ -335,22 +336,12 @@ void fillCommandResultWithIndexesAlreadyExistInfo(int numIndexes, BSONObjBuilder
 };
 
 /**
- * Before potentially taking an exclusive database or collection lock, check if all indexes
- * already exist while holding an intent lock.
- *
  * Returns true, after filling in the command result, if the index creation can return early.
  */
 bool indexesAlreadyExist(OperationContext* opCtx,
-                         const NamespaceString& ns,
+                         const Collection* collection,
                          const std::vector<BSONObj>& specs,
                          BSONObjBuilder* result) {
-    AutoGetCollection autoColl(opCtx, ns, MODE_IX);
-
-    auto collection = autoColl.getCollection();
-    if (!collection) {
-        return false;
-    }
-
     auto specsCopy = resolveDefaultsAndRemoveExistingIndexes(opCtx, collection, specs);
     if (specsCopy.size() > 0) {
         return false;
@@ -365,17 +356,33 @@ bool indexesAlreadyExist(OperationContext* opCtx,
 /**
  * Checks database sharding state. Throws exception on error.
  */
-void checkDatabaseShardingState(OperationContext* opCtx, StringData dbName) {
-    auto dss = DatabaseShardingState::get(opCtx, dbName);
+void checkDatabaseShardingState(OperationContext* opCtx, const NamespaceString& ns) {
+    auto dss = DatabaseShardingState::get(opCtx, ns.db());
     auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
     dss->checkDbVersion(opCtx, dssLock);
-}
 
-/**
- * Checks collection sharding state. Throws exception on error.
- */
-void checkCollectionShardingState(OperationContext* opCtx, const NamespaceString& ns) {
-    CollectionShardingState::get(opCtx, ns)->checkShardVersionOrThrow(opCtx, true);
+    Lock::CollectionLock collLock(opCtx, ns, MODE_IS);
+    try {
+        const auto collDesc =
+            CollectionShardingState::get(opCtx, ns)->getCollectionDescription(opCtx);
+        if (!collDesc.isSharded()) {
+            auto mpsm = dss->getMovePrimarySourceManager(dssLock);
+
+            if (mpsm) {
+                LOGV2(
+                    4909200, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = ns.toString());
+
+                uasserted(ErrorCodes::MovePrimaryInProgress,
+                          "movePrimary is in progress for namespace " + ns.toString());
+            }
+        }
+    } catch (const DBException& ex) {
+        if (ex.toStatus() != ErrorCodes::MovePrimaryInProgress) {
+            LOGV2(4909201, "Error when getting colleciton description", "what"_attr = ex.what());
+            return;
+        }
+        throw;
+    }
 }
 
 /**
@@ -413,8 +420,9 @@ BSONObj runCreateIndexesOnNewCollection(OperationContext* opCtx,
         if (MONGO_unlikely(hangBeforeCreateIndexesCollectionCreate.shouldFail())) {
             // Simulate a scenario where a conflicting collection creation occurs
             // mid-index build.
-            log() << "Hanging create collection due to failpoint "
-                     "'hangBeforeCreateIndexesCollectionCreate'";
+            LOGV2(20437,
+                  "Hanging create collection due to failpoint "
+                  "'hangBeforeCreateIndexesCollectionCreate'");
             hangBeforeCreateIndexesCollectionCreate.pauseWhileSet();
         }
 
@@ -468,12 +476,8 @@ BSONObj runCreateIndexesOnNewCollection(OperationContext* opCtx,
 bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                                      const std::string& dbname,
                                      const BSONObj& cmdObj,
-                                     std::string& errmsg,
                                      BSONObjBuilder& result) {
     const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-
-    // Disallows drops and renames on this namespace.
-    BackgroundOperation backgroundOp(ns.ns());
 
     uassertStatusOK(userAllowedWriteNS(ns));
 
@@ -483,9 +487,19 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             str::stream() << "not allowed to create index on " << ns.ns(),
             ns != NamespaceString::kSessionTransactionsTableNamespace);
 
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot write to system collection " << ns.toString()
+                          << " within a transaction.",
+            !opCtx->inMultiDocumentTransaction() || !ns.isSystem());
+
     auto specs = uassertStatusOK(
         parseAndValidateIndexSpecs(opCtx, ns, cmdObj, serverGlobalParams.featureCompatibility));
-    boost::optional<CommitQuorumOptions> commitQuorum = parseAndGetCommitQuorum(opCtx, cmdObj);
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
+    // Two phase index builds are designed to improve the availability of indexes in a replica set.
+    auto protocol = !replCoord->isOplogDisabledFor(opCtx, ns) ? IndexBuildProtocol::kTwoPhase
+                                                              : IndexBuildProtocol::kSinglePhase;
+    auto commitQuorum = parseAndGetCommitQuorum(opCtx, protocol, cmdObj);
 
     Status validateTTL = validateTTLOptions(opCtx, cmdObj);
     uassertStatusOK(validateTTL);
@@ -496,19 +510,25 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
     // 3) Check if we can create the index without handing control to the IndexBuildsCoordinator.
     OptionalCollectionUUID collectionUUID;
     {
-        Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
-        checkDatabaseShardingState(opCtx, ns.db());
+        Lock::DBLock dbLock(opCtx, ns.db(), MODE_IS);
+        checkDatabaseShardingState(opCtx, ns);
         if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
             uasserted(ErrorCodes::NotMaster,
                       str::stream() << "Not primary while creating indexes in " << ns.ns());
         }
 
         bool indexExists = writeConflictRetry(opCtx, "createCollectionWithIndexes", ns.ns(), [&] {
-            if (indexesAlreadyExist(opCtx, ns, specs, &result)) {
+            AutoGetCollection autoColl(opCtx, ns, MODE_IS);
+            auto collection = autoColl.getCollection();
+
+            // Before potentially taking an exclusive collection lock, check if all indexes already
+            // exist while holding an intent lock.
+            if (collection && indexesAlreadyExist(opCtx, collection, specs, &result)) {
+                repl::ReplClientInfo::forClient(opCtx->getClient())
+                    .setLastOpToSystemLastOpTime(opCtx);
                 return true;
             }
 
-            auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns);
             if (collection &&
                 !UncommittedCollections::get(opCtx).isUncommittedCollection(opCtx, ns)) {
                 // The collection exists and was not created in the same multi-document transaction
@@ -545,66 +565,55 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
     // Use AutoStatsTracker to update Top.
     boost::optional<AutoStatsTracker> statsTracker;
-    const boost::optional<int> dbProfilingLevel = boost::none;
     statsTracker.emplace(opCtx,
                          ns,
                          Top::LockType::WriteLocked,
                          AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                         dbProfilingLevel);
+                         CollectionCatalog::get(opCtx).getDatabaseProfileLevel(ns.db()));
 
-    auto indexBuildsCoord = IndexBuildsCoordinator::get(opCtx);
     auto buildUUID = UUID::gen();
-    auto protocol = IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()
-        ? IndexBuildProtocol::kTwoPhase
-        : IndexBuildProtocol::kSinglePhase;
-    log() << "Registering index build: " << buildUUID;
     ReplIndexBuildState::IndexCatalogStats stats;
     IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions = {commitQuorum};
+
+    LOGV2(20438,
+          "Index build: registering",
+          "buildUUID"_attr = buildUUID,
+          "namespace"_attr = ns,
+          "collectionUUID"_attr = *collectionUUID,
+          "indexes"_attr = specs.size(),
+          "firstIndex"_attr = specs[0][IndexDescriptor::kIndexNameFieldName]);
+    hangCreateIndexesBeforeStartingIndexBuild.pauseWhileSet(opCtx);
 
     try {
         auto buildIndexFuture = uassertStatusOK(indexBuildsCoord->startIndexBuild(
             opCtx, dbname, *collectionUUID, specs, buildUUID, protocol, indexBuildOptions));
 
         auto deadline = opCtx->getDeadline();
-        // Date_t::max() means no deadline.
-        if (deadline == Date_t::max()) {
-            log() << "Waiting for index build to complete: " << buildUUID;
-        } else {
-            log() << "Waiting for index build to complete: " << buildUUID
-                  << " (deadline: " << deadline << ")";
-        }
+        LOGV2(20440,
+              "Index build: waiting for index build to complete",
+              "buildUUID"_attr = buildUUID,
+              "deadline"_attr = deadline);
 
         // Throws on error.
         try {
             stats = buildIndexFuture.get(opCtx);
         } catch (const ExceptionForCat<ErrorCategory::Interruption>& interruptionEx) {
-            log() << "Index build interrupted: " << buildUUID << ": " << interruptionEx;
+            LOGV2(20441,
+                  "Index build: received interrupt signal",
+                  "buildUUID"_attr = buildUUID,
+                  "signal"_attr = interruptionEx);
 
             hangBeforeIndexBuildAbortOnInterrupt.pauseWhileSet();
 
-            boost::optional<Lock::GlobalLock> globalLock;
             if (IndexBuildProtocol::kTwoPhase == protocol) {
                 // If this node is no longer a primary, the index build will continue to run in the
                 // background and will complete when this node receives a commitIndexBuild oplog
                 // entry from the new primary.
                 if (ErrorCodes::InterruptedDueToReplStateChange == interruptionEx.code()) {
-                    log() << "Index build continuing in background: " << buildUUID;
+                    LOGV2(20442,
+                          "Index build: ignoring interrupt and continuing in background",
+                          "buildUUID"_attr = buildUUID);
                     throw;
-                }
-
-                // If we are using two-phase index builds and are no longer primary after receiving
-                // an interrupt, we cannot replicate an abortIndexBuild oplog entry. Rely on the new
-                // primary to finish the index build. Acquire the global lock to check the
-                // replication state and to prevent any state transitions from happening while
-                // aborting the index build.
-                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-                globalLock.emplace(opCtx, MODE_IS);
-                if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
-                    uassertStatusOK(
-                        {ErrorCodes::NotMaster,
-                         str::stream()
-                             << "Unable to abort index build because we are no longer primary: "
-                             << buildUUID});
                 }
             }
 
@@ -612,56 +621,66 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             // for the createIndexes command or that the IndexBuildsCoordinator task was interrupted
             // independently of this command invocation. We'll defensively abort the index build
             // with the assumption that if the index build was already in the midst of tearing down,
-            // this be a no-op.
-            // Use a null abort timestamp because the index build will generate its own timestamp
-            // on cleanup.
-            indexBuildsCoord->abortIndexBuildByBuildUUIDNoWait(
-                opCtx,
-                buildUUID,
-                Timestamp(),
-                str::stream() << "Index build interrupted: " << buildUUID << ": "
-                              << interruptionEx.toString());
-            log() << "Index build aborted: " << buildUUID;
+            // this will be a no-op.
+            {
+                // The current OperationContext may be interrupted, which would prevent us from
+                // taking locks. Use a new OperationContext to abort the index build.
+                auto newClient = opCtx->getServiceContext()->makeClient("abort-index-build");
+                AlternativeClientRegion acr(newClient);
+                const auto abortCtx = cc().makeOperationContext();
 
+                std::string abortReason(str::stream() << "Index build aborted: " << buildUUID
+                                                      << ": " << interruptionEx.toString());
+                indexBuildsCoord->abortIndexBuildByBuildUUID(
+                    abortCtx.get(), buildUUID, IndexBuildAction::kPrimaryAbort, abortReason);
+                LOGV2(20443,
+                      "Index build: aborted due to interruption",
+                      "buildUUID"_attr = buildUUID);
+            }
             throw;
         } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
-            log() << "Index build interrupted due to change in replication state: " << buildUUID
-                  << ": " << ex;
+            LOGV2(20444,
+                  "Index build: received interrupt signal due to change in replication state",
+                  "buildUUID"_attr = buildUUID,
+                  "ex"_attr = ex);
 
-            // The index build will continue to run in the background and will complete when this
-            // node receives a commitIndexBuild oplog entry from the new primary.
-
-            if (indexBuildsCoord->supportsTwoPhaseIndexBuild()) {
-                log() << "Index build continuing in background: " << buildUUID;
+            // If this node is no longer a primary, the index build will continue to run in the
+            // background and will complete when this node receives a commitIndexBuild oplog
+            // entry from the new primary.
+            if (IndexBuildProtocol::kTwoPhase == protocol) {
+                LOGV2(20445,
+                      "Index build: ignoring interrupt and continuing in background",
+                      "buildUUID"_attr = buildUUID);
                 throw;
             }
 
-            // Use a null abort timestamp because the index build will generate a ghost timestamp
-            // for the single-phase build on cleanup.
-            indexBuildsCoord->abortIndexBuildByBuildUUIDNoWait(
-                opCtx,
-                buildUUID,
-                Timestamp(),
-                str::stream() << "Index build interrupted due to change in replication state: "
-                              << buildUUID << ": " << ex.toString());
-            log() << "Index build aborted due to NotMaster error: " << buildUUID;
-
+            std::string abortReason(str::stream() << "Index build aborted: " << buildUUID << ": "
+                                                  << ex.toString());
+            indexBuildsCoord->abortIndexBuildByBuildUUID(
+                opCtx, buildUUID, IndexBuildAction::kPrimaryAbort, abortReason);
+            LOGV2(
+                20446, "Index build: aborted due to NotMaster error", "buildUUID"_attr = buildUUID);
             throw;
         }
 
-        log() << "Index build completed: " << buildUUID;
+        LOGV2(20447, "Index build: completed", "buildUUID"_attr = buildUUID);
     } catch (DBException& ex) {
         // If the collection is dropped after the initial checks in this function (before the
         // AutoStatsTracker is created), the IndexBuildsCoordinator (either startIndexBuild() or
         // the the task running the index build) may return NamespaceNotFound. This is not
         // considered an error and the command should return success.
         if (ErrorCodes::NamespaceNotFound == ex.code()) {
-            log() << "Index build failed: " << buildUUID << ": collection dropped: " << ns;
+            LOGV2(20448,
+                  "Index build: failed because collection dropped",
+                  "buildUUID"_attr = buildUUID,
+                  "namespace"_attr = ns,
+                  "collectionUUID"_attr = *collectionUUID,
+                  "exception"_attr = ex);
             return true;
         }
 
         // All other errors should be forwarded to the caller with index build information included.
-        log() << "Index build failed: " << buildUUID << ": " << ex.toStatus();
+        LOGV2(20449, "Index build: failed", "buildUUID"_attr = buildUUID, "error"_attr = ex);
         ex.addContext(str::stream() << "Index build failed: " << buildUUID << ": Collection " << ns
                                     << " ( " << *collectionUUID << " )");
 
@@ -723,8 +742,9 @@ public:
         bool shouldLogMessageOnAlreadyBuildingError = true;
         while (true) {
             try {
-                return runCreateIndexesWithCoordinator(opCtx, dbname, cmdObj, errmsg, result);
+                return runCreateIndexesWithCoordinator(opCtx, dbname, cmdObj, result);
             } catch (const DBException& ex) {
+                hangAfterIndexBuildAbort.pauseWhileSet();
                 // We can only wait for an existing index build to finish if we are able to release
                 // our locks, in order to allow the existing index build to proceed. We cannot
                 // release locks in transactions, so we bypass the below logic in transactions.
@@ -734,12 +754,17 @@ public:
                 }
                 if (shouldLogMessageOnAlreadyBuildingError) {
                     auto bsonElem = cmdObj.getField(kIndexesFieldName);
-                    log()
-                        << "Received a request to create indexes: '" << bsonElem
-                        << "', but found that at least one of the indexes is already being built, '"
-                        << ex.toStatus()
-                        << "'. This request will wait for the pre-existing index build to finish "
-                           "before proceeding.";
+                    LOGV2(20450,
+                          "Received a request to create indexes: '{indexesFieldName}', but found "
+                          "that at least one of the indexes is already being built, '{error}'. "
+                          "This request will wait for the pre-existing index build to finish "
+                          "before proceeding",
+                          "Received a request to create indexes, "
+                          "but found that at least one of the indexes is already being built."
+                          "This request will wait for the pre-existing index build to finish "
+                          "before proceeding",
+                          "indexesFieldName"_attr = bsonElem,
+                          "error"_attr = ex);
                     shouldLogMessageOnAlreadyBuildingError = false;
                 }
                 // Unset the response fields so we do not write duplicate fields.
@@ -751,7 +776,7 @@ public:
                 // This is a bit racy since we are not holding a lock across discovering an
                 // in-progress build and starting to listen for completion. It is good enough,
                 // however: we can only wait longer than needed, not less.
-                BackgroundOperation::waitUntilAnIndexBuildFinishes(opCtx, nss.ns());
+                IndexBuildsCoordinator::get(opCtx)->waitUntilAnIndexBuildFinishes(opCtx);
             }
         }
     }

@@ -67,6 +67,7 @@
 #include "mongo/scripting/mozjs/timestamp.h"
 #include "mongo/scripting/mozjs/uri.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace mozjs {
@@ -88,7 +89,7 @@ class MozJSImplScope final : public Scope {
     MozJSImplScope& operator=(const MozJSImplScope&) = delete;
 
 public:
-    explicit MozJSImplScope(MozJSScriptEngine* engine);
+    explicit MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
     ~MozJSImplScope();
 
     void init(const BSONObj* data) override;
@@ -377,9 +378,8 @@ private:
      */
     struct MozRuntime {
     public:
-        MozRuntime(const MozJSScriptEngine* engine);
+        MozRuntime(const MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB);
 
-        std::thread _thread;  // NOLINT
         std::unique_ptr<JSRuntime, std::function<void(JSRuntime*)>> _runtime;
         std::unique_ptr<JSContext, std::function<void(JSContext*)>> _context;
     };
@@ -412,13 +412,15 @@ private:
     WrapType<GlobalInfo> _globalProto;
     JS::HandleObject _global;
     std::vector<JS::PersistentRootedValue> _funcs;
+    StringMap<ScriptingFunction> _funcCodeToHandleMap;
     InternedStringTable _internedStrings;
     Status _killStatus;
     mutable Mutex _mutex = MONGO_MAKE_LATCH("MozJSImplScope::_mutex");
     stdx::condition_variable _sleepCondition;
     std::string _error;
-    unsigned int _opId;        // op id for this scope
-    OperationContext* _opCtx;  // Op context for DbEval
+    unsigned int _opId;               // op id for this scope
+    OperationContext* _opCtx;         // Op context for DbEval
+    stdx::thread::id _opCtxThreadId;  // Id of the thread that owns '_opCtx'
     std::size_t _inOp;
     std::atomic<bool> _pendingGC;  // NOLINT
     ConnectState _connectState;

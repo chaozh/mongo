@@ -26,82 +26,138 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/client/sdam/topology_manager.h"
 
+#include <string>
+
 #include "mongo/client/sdam/topology_state_machine.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/topology_version_gen.h"
 
 namespace mongo::sdam {
-
 namespace {
 
-// Compare topologyVersions. If the isMaster response has topologyVersion < lastServerDescription's
-// toplogyVersion, we will ignore this reply because the lastServerDescription is fresher.
+/* Compare topologyVersions to determine if the isMaster response's topologyVersion is stale
+ * according to the following rules:
+ * 1. If the response's topologyVersion is unset or the lastServerDescription's topologyVersion is
+ * null, the client MUST assume the response is more recent.
+ * 2. If the response’s topologyVersion.processId != to lastServerDescription's, the client MUST
+ * assume the response is more recent.
+ * 3. If the response’s topologyVersion.processId == to lastServerDescription's and response's
+ * topologyVersion.counter < lastServerDescription's topologyVersion.counter, the client MUST ignore
+ * this reply because the lastServerDescription is fresher.
+ */
 bool isStaleTopologyVersion(boost::optional<TopologyVersion> lastTopologyVersion,
                             boost::optional<TopologyVersion> newTopologyVersion) {
     if (lastTopologyVersion && newTopologyVersion &&
-        (lastTopologyVersion.get() > newTopologyVersion.get())) {
+        ((lastTopologyVersion->getProcessId() == newTopologyVersion->getProcessId()) &&
+         (lastTopologyVersion->getCounter() > newTopologyVersion->getCounter()))) {
         return true;
     }
 
     return false;
 }
-
 }  // namespace
 
-TopologyManager::TopologyManager(SdamConfiguration config, ClockSource* clockSource)
+
+TopologyManager::TopologyManager(SdamConfiguration config,
+                                 ClockSource* clockSource,
+                                 TopologyEventsPublisherPtr eventsPublisher)
     : _config(std::move(config)),
       _clockSource(clockSource),
-      _topologyDescription(std::make_unique<TopologyDescription>(_config)),
-      _topologyStateMachine(std::make_unique<TopologyStateMachine>(_config)) {}
+      _topologyDescription(std::make_shared<TopologyDescription>(_config)),
+      _topologyStateMachine(std::make_unique<TopologyStateMachine>(_config)),
+      _topologyEventsPublisher(eventsPublisher) {}
 
-void TopologyManager::onServerDescription(const IsMasterOutcome& isMasterOutcome) {
+bool TopologyManager::onServerDescription(const IsMasterOutcome& isMasterOutcome) {
     stdx::lock_guard<mongo::Mutex> lock(_mutex);
 
     boost::optional<IsMasterRTT> lastRTT;
     boost::optional<TopologyVersion> lastTopologyVersion;
-    boost::optional<int> lastPoolResetCounter;
 
     const auto& lastServerDescription =
         _topologyDescription->findServerByAddress(isMasterOutcome.getServer());
     if (lastServerDescription) {
         lastRTT = (*lastServerDescription)->getRtt();
         lastTopologyVersion = (*lastServerDescription)->getTopologyVersion();
-        lastPoolResetCounter = (*lastServerDescription)->getPoolResetCounter();
     }
 
     boost::optional<TopologyVersion> newTopologyVersion = isMasterOutcome.getTopologyVersion();
-    boost::optional<int> poolResetCounter = boost::none;
-    if (isMasterOutcome.isSuccess()) {
-        if (isStaleTopologyVersion(lastTopologyVersion, newTopologyVersion)) {
-            log() << "Ignoring this isMaster response because our topologyVersion: "
-                  << lastTopologyVersion->toBSON()
-                  << "is fresher than the provided topologyVersion: "
-                  << newTopologyVersion->toBSON();
-            return;
-        }
-
-        // Maintain the poolResetCounter.
-        poolResetCounter = lastPoolResetCounter;
-    } else {
-        // Bump the poolResetCounter on error if we have one established already.
-        if (lastServerDescription) {
-            poolResetCounter = ++lastPoolResetCounter.get();
-        }
+    if (isStaleTopologyVersion(lastTopologyVersion, newTopologyVersion)) {
+        LOGV2(
+            23930,
+            "Ignoring this isMaster response because our topologyVersion: {lastTopologyVersion} is "
+            "fresher than the provided topologyVersion: {newTopologyVersion}",
+            "Ignoring this isMaster response because our last topologyVersion is fresher than the "
+            "new topologyVersion provided",
+            "lastTopologyVersion"_attr = lastTopologyVersion->toBSON(),
+            "newTopologyVersion"_attr = newTopologyVersion->toBSON());
+        return false;
     }
 
     auto newServerDescription = std::make_shared<ServerDescription>(
-        _clockSource, isMasterOutcome, lastRTT, newTopologyVersion, poolResetCounter);
+        _clockSource, isMasterOutcome, lastRTT, newTopologyVersion);
 
-    auto newTopologyDescription = std::make_unique<TopologyDescription>(*_topologyDescription);
-    _topologyStateMachine->onServerDescription(*newTopologyDescription, newServerDescription);
-    _topologyDescription = std::move(newTopologyDescription);
+    auto oldTopologyDescription = _topologyDescription;
+    _topologyDescription = std::make_shared<TopologyDescription>(*oldTopologyDescription);
+
+    // if we are equal to the old description, just install the new description without
+    // performing any actions on the state machine.
+    auto isEqualToOldServerDescription =
+        (lastServerDescription && (*lastServerDescription->get()) == *newServerDescription);
+    if (isEqualToOldServerDescription) {
+        _topologyDescription->installServerDescription(newServerDescription);
+    } else {
+        _topologyStateMachine->onServerDescription(*_topologyDescription, newServerDescription);
+    }
+
+    _publishTopologyDescriptionChanged(oldTopologyDescription, _topologyDescription);
+    return true;
 }
 
 const std::shared_ptr<TopologyDescription> TopologyManager::getTopologyDescription() const {
     stdx::lock_guard<mongo::Mutex> lock(_mutex);
     return _topologyDescription;
+}
+
+void TopologyManager::onServerRTTUpdated(HostAndPort hostAndPort, IsMasterRTT rtt) {
+    {
+        stdx::lock_guard<mongo::Mutex> lock(_mutex);
+
+        auto oldServerDescription = _topologyDescription->findServerByAddress(hostAndPort);
+        if (oldServerDescription) {
+            auto newServerDescription = (*oldServerDescription)->cloneWithRTT(rtt);
+
+            auto oldTopologyDescription = _topologyDescription;
+            _topologyDescription = std::make_shared<TopologyDescription>(*_topologyDescription);
+            _topologyDescription->installServerDescription(newServerDescription);
+
+            _publishTopologyDescriptionChanged(oldTopologyDescription, _topologyDescription);
+
+            return;
+        }
+    }
+    // otherwise, the server was removed from the topology. Nothing to do.
+    LOGV2(4333201,
+          "Not updating RTT. Server {server} does not exist in {replicaSet}",
+          "Not updating RTT. The server does not exist in the replica set",
+          "server"_attr = hostAndPort,
+          "replicaSet"_attr = getTopologyDescription()->getSetName());
+}
+
+SemiFuture<std::vector<HostAndPort>> TopologyManager::executeWithLock(
+    std::function<SemiFuture<std::vector<HostAndPort>>(const TopologyDescriptionPtr&)> func) {
+    stdx::lock_guard<mongo::Mutex> lock(_mutex);
+    return func(_topologyDescription);
+}
+
+void TopologyManager::_publishTopologyDescriptionChanged(
+    const TopologyDescriptionPtr& oldTopologyDescription,
+    const TopologyDescriptionPtr& newTopologyDescription) const {
+    if (_topologyEventsPublisher)
+        _topologyEventsPublisher->onTopologyDescriptionChangedEvent(oldTopologyDescription,
+                                                                    newTopologyDescription);
 }
 };  // namespace mongo::sdam

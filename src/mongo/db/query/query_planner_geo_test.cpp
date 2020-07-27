@@ -685,8 +685,8 @@ TEST_F(QueryPlannerTest, CompoundGeoNoGeoPredicate) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {creationDate: 1}, limit: 0, node: {sortKeyGen: "
-        "{node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {creationDate: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}");
     assertSolutionExists(
         "{fetch: {node: {ixscan: {pattern: {creationDate: 1, 'foo.bar': '2dsphere'}}}}}");
 }
@@ -702,11 +702,11 @@ TEST_F(QueryPlannerTest, CompoundGeoNoGeoPredicateMultikey) {
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {creationDate: 1}, limit: 0, node: {sortKeyGen: "
-        "{node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {creationDate: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {creationDate: 1}, limit: 0, node: {sortKeyGen: {node: {fetch: {node: "
-        "{ixscan: {pattern: {creationDate: 1, 'foo.bar': '2dsphere'}}}}}}}}}");
+        "{sort: {pattern: {creationDate: 1}, limit: 0, type: 'simple', node: {fetch: {node: "
+        "{ixscan: {pattern: {creationDate: 1, 'foo.bar': '2dsphere'}}}}}}}");
 }
 
 // Test that a 2dsphere index can satisfy a whole index scan solution if the query has a GEO
@@ -754,8 +754,8 @@ TEST_F(QueryPlannerTest, CantUseNonCompoundGeoIndexToProvideSort) {
 
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: "
-        "{node: {cscan: {dir: 1, filter: {}}}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1, filter: {}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantUseNonCompoundGeoIndexToProvideSortWithIndexablePred) {
@@ -768,11 +768,11 @@ TEST_F(QueryPlannerTest, CantUseNonCompoundGeoIndexToProvideSortWithIndexablePre
 
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: {node: "
-        "{fetch: {node: {ixscan: {pattern: {x: '2dsphere'}}}}}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, type: 'simple', node: "
+        "{fetch: {node: {ixscan: {pattern: {x: '2dsphere'}}}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: {node: "
-        "{cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantUseCompoundGeoIndexToProvideSortIfNoGeoPred) {
@@ -782,8 +782,8 @@ TEST_F(QueryPlannerTest, CantUseCompoundGeoIndexToProvideSortIfNoGeoPred) {
 
     ASSERT_EQUALS(getNumSolutions(), 1U);
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: "
-        "{node: {cscan: {dir: 1, filter: {}}}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1, filter: {}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CanUseCompoundGeoIndexToProvideSortWithGeoPred) {
@@ -799,8 +799,8 @@ TEST_F(QueryPlannerTest, CanUseCompoundGeoIndexToProvideSortWithGeoPred) {
         "{fetch: {node: "
         "{ixscan: {pattern: {x: 1, y: '2dsphere'}}}}}");
     assertSolutionExists(
-        "{sort: {pattern: {x: 1}, limit: 0, node: {sortKeyGen: {node: "
-        "{cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {x: 1}, limit: 0, type: 'simple', node: "
+        "{cscan: {dir: 1}}}}");
 }
 
 //
@@ -885,7 +885,7 @@ TEST_F(QueryPlannerTest, Negation2DSphereGeoNearMultikey) {
 using QueryPlannerGeo2dsphereTest = QueryPlannerTest;
 
 TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsWhenFirstFieldIsNotMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -900,7 +900,7 @@ TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsWhenFirstFieldIsNotMultike
 
 TEST_F(QueryPlannerGeo2dsphereTest,
        CanIntersectBoundsOnFirstFieldWhenItAndSharedPrefixAreNotMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {1U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {1U}, MultikeyComponents{}};
     addIndex(BSON("a.b" << 1 << "a.c" << 1 << "a.geo"
                         << "2dsphere"),
              multikeyPaths);
@@ -914,7 +914,7 @@ TEST_F(QueryPlannerGeo2dsphereTest,
 }
 
 TEST_F(QueryPlannerGeo2dsphereTest, CannotIntersectBoundsWhenFirstFieldIsMultikey) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -928,7 +928,7 @@ TEST_F(QueryPlannerGeo2dsphereTest, CannotIntersectBoundsWhenFirstFieldIsMultike
 }
 
 TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsWhenFirstFieldIsMultikeyButHasElemMatch) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -943,7 +943,7 @@ TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsWhenFirstFieldIsMultikeyBu
 
 TEST_F(QueryPlannerGeo2dsphereTest,
        CannotComplementBoundsOnFirstFieldWhenItIsMultikeyAndHasNotEqualExpr) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -954,7 +954,7 @@ TEST_F(QueryPlannerGeo2dsphereTest,
 
 TEST_F(QueryPlannerGeo2dsphereTest,
        CanIntersectBoundsWhenFirstFieldIsMultikeyAndHasNotInsideElemMatch) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -1001,7 +1001,7 @@ TEST_F(QueryPlannerGeo2dsphereTest,
 }
 
 TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsWhenSecondFieldIsNotMultikey) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -1016,7 +1016,7 @@ TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsWhenSecondFieldIsNotMultik
 
 TEST_F(QueryPlannerGeo2dsphereTest,
        CanIntersectBoundsOnSecondFieldWhenItAndSharedPrefixAreNotMultikey) {
-    MultikeyPaths multikeyPaths{{1U}, std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{1U}, MultikeyComponents{}, MultikeyComponents{}};
     addIndex(BSON("a.b" << 1 << "a.c" << 1 << "a.geo"
                         << "2dsphere"),
              multikeyPaths);
@@ -1030,7 +1030,7 @@ TEST_F(QueryPlannerGeo2dsphereTest,
 }
 
 TEST_F(QueryPlannerGeo2dsphereTest, CannotIntersectBoundsWhenSecondFieldIsMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -1044,7 +1044,7 @@ TEST_F(QueryPlannerGeo2dsphereTest, CannotIntersectBoundsWhenSecondFieldIsMultik
 }
 
 TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsWhenSecondFieldIsMultikeyButHasElemMatch) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -1059,7 +1059,7 @@ TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsWhenSecondFieldIsMultikeyB
 
 TEST_F(QueryPlannerGeo2dsphereTest,
        CannotComplementBoundsOnSecondFieldWhenItIsMultikeyAndHasNotEqualExpr) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -1074,7 +1074,7 @@ TEST_F(QueryPlannerGeo2dsphereTest,
 
 TEST_F(QueryPlannerGeo2dsphereTest,
        CanIntersectBoundsWhenSecondFieldIsMultikeyAndHasNotInsideElemMatch) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1 << "geo"
                       << "2dsphere"),
              multikeyPaths);
@@ -1264,7 +1264,7 @@ TEST_F(QueryPlannerGeo2dsphereTest,
 }
 
 TEST_F(QueryPlannerGeo2dsphereTest, CanIntersectBoundsOn2dsphereFieldWhenItIsNotMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}};
     addIndex(BSON("geo"
                   << "2dsphere"),
              multikeyPaths);

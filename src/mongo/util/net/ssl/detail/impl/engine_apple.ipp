@@ -30,7 +30,7 @@
 
 #pragma once
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "asio/detail/config.hpp"
 
@@ -40,7 +40,7 @@
 
 #include <arpa/inet.h>
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/net/ssl/apple.hpp"
 #include "mongo/util/net/ssl/detail/engine.hpp"
 #include "mongo/util/net/ssl/detail/stream_core.hpp"
@@ -131,9 +131,6 @@ engine::engine(context::native_handle_type context, const std::string& remoteHos
         }
         _protoMin = context->protoMin;
         _protoMax = context->protoMax;
-        if (context->allowInvalidHostnames) {
-            _remoteHostName.clear();
-        }
     } else {
         apple::Context def;
         _protoMin = def.protoMin;
@@ -149,7 +146,7 @@ bool engine::_initSSL(stream_base::handshake_type type, asio::error_code& ec) {
     const auto side = (type == stream_base::client) ? ::kSSLClientSide : ::kSSLServerSide;
     _ssl.reset(::SSLCreateContext(nullptr, side, ::kSSLStreamType));
     if (!_ssl) {
-        mongo::error() << "Failed allocating SSLContext";
+        LOGV2_ERROR(24140, "Failed allocating SSLContext");
         ec = errorCode(::errSSLInternal);
         return false;
     }
@@ -245,7 +242,7 @@ engine::want engine::shutdown(asio::error_code& ec) {
             ec = errorCode(status);
         }
     } else {
-        mongo::error() << "SSL connection already shut down";
+        LOGV2_ERROR(24141, "SSL connection already shut down");
         ec = errorCode(::errSSLInternal);
     }
     return want::want_nothing;

@@ -35,20 +35,25 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
 const StringData CommitQuorumOptions::kCommitQuorumField = "commitQuorum"_sd;
 const char CommitQuorumOptions::kMajority[] = "majority";
+const char CommitQuorumOptions::kVotingMembers[] = "votingMembers";
 
 const BSONObj CommitQuorumOptions::Majority(BSON(kCommitQuorumField
                                                  << CommitQuorumOptions::kMajority));
+const BSONObj CommitQuorumOptions::VotingMembers(BSON(kCommitQuorumField
+                                                      << CommitQuorumOptions::kVotingMembers));
 
 CommitQuorumOptions::CommitQuorumOptions(int numNodesOpts) {
     reset();
     numNodes = numNodesOpts;
-    invariant(numNodes >= 0);
+    invariant(numNodes >= 0 &&
+              numNodes <= static_cast<decltype(numNodes)>(repl::ReplSetConfig::kMaxMembers));
 }
 
 CommitQuorumOptions::CommitQuorumOptions(const std::string& modeOpts) {
@@ -61,9 +66,22 @@ Status CommitQuorumOptions::parse(const BSONElement& commitQuorumElement) {
     reset();
 
     if (commitQuorumElement.isNumber()) {
-        numNodes = commitQuorumElement.numberInt();
+        auto cNumNodes = commitQuorumElement.safeNumberLong();
+        if (cNumNodes < 0 ||
+            cNumNodes > static_cast<decltype(cNumNodes)>(repl::ReplSetConfig::kMaxMembers)) {
+            return Status(
+                ErrorCodes::FailedToParse,
+                str::stream()
+                    << "commitQuorum has to be a non-negative number and not greater than "
+                    << repl::ReplSetConfig::kMaxMembers);
+        }
+        numNodes = static_cast<decltype(numNodes)>(cNumNodes);
     } else if (commitQuorumElement.type() == String) {
         mode = commitQuorumElement.valuestrsafe();
+        if (mode.empty()) {
+            return Status(ErrorCodes::FailedToParse,
+                          str::stream() << "commitQuorum can't be an empty string");
+        }
     } else {
         return Status(ErrorCodes::FailedToParse, "commitQuorum has to be a number or a string");
     }
@@ -80,15 +98,15 @@ CommitQuorumOptions CommitQuorumOptions::deserializerForIDL(
 
 BSONObj CommitQuorumOptions::toBSON() const {
     BSONObjBuilder builder;
-    append(kCommitQuorumField, &builder);
+    appendToBuilder(kCommitQuorumField, &builder);
     return builder.obj();
 }
 
-void CommitQuorumOptions::append(StringData fieldName, BSONObjBuilder* builder) const {
+void CommitQuorumOptions::appendToBuilder(StringData fieldName, BSONObjBuilder* builder) const {
     if (mode.empty()) {
-        builder->append(kCommitQuorumField, numNodes);
+        builder->append(fieldName, numNodes);
     } else {
-        builder->append(kCommitQuorumField, mode);
+        builder->append(fieldName, mode);
     }
 }
 

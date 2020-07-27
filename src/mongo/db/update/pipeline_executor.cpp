@@ -31,11 +31,14 @@
 
 #include "mongo/db/update/pipeline_executor.h"
 
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/pipeline/document_source_queue.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/update/document_diff_calculator.h"
 #include "mongo/db/update/object_replace_executor.h"
 #include "mongo/db/update/storage_validation.h"
+#include "mongo/db/update/update_oplog_entry_serialization.h"
 
 namespace mongo {
 
@@ -59,7 +62,7 @@ PipelineExecutor::PipelineExecutor(const boost::intrusive_ptr<ExpressionContext>
     if (constants) {
         for (auto&& constElem : *constants) {
             const auto constName = constElem.fieldNameStringData();
-            Variables::uassertValidNameForUserRead(constName);
+            Variables::validateNameForUserRead(constName);
 
             auto varId = _expCtx->variablesParseState.defineVariable(constName);
             _expCtx->variables.setConstantValue(varId, Value(constElem));
@@ -67,7 +70,7 @@ PipelineExecutor::PipelineExecutor(const boost::intrusive_ptr<ExpressionContext>
     }
 
     _expCtx->setResolvedNamespaces(resolvedNamespaces);
-    _pipeline = uassertStatusOK(Pipeline::parse(pipeline, _expCtx));
+    _pipeline = Pipeline::parse(pipeline, _expCtx);
 
     // Validate the update pipeline.
     for (auto&& stage : _pipeline->getSources()) {
@@ -86,13 +89,39 @@ PipelineExecutor::PipelineExecutor(const boost::intrusive_ptr<ExpressionContext>
 }
 
 UpdateExecutor::ApplyResult PipelineExecutor::applyUpdate(ApplyParams applyParams) const {
-    DocumentSourceQueue* queueStage = static_cast<DocumentSourceQueue*>(_pipeline->peekFront());
-    queueStage->emplace_back(Document{applyParams.element.getDocument().getObject()});
-    auto transformedDoc = _pipeline->getNext()->toBson();
-    auto transformedDocHasIdField = transformedDoc.hasField(kIdFieldName);
+    const auto originalDoc = applyParams.element.getDocument().getObject();
 
-    return ObjectReplaceExecutor::applyReplacementUpdate(
+    DocumentSourceQueue* queueStage = static_cast<DocumentSourceQueue*>(_pipeline->peekFront());
+    queueStage->emplace_back(Document{originalDoc});
+
+    const auto transformedDoc = _pipeline->getNext()->toBson();
+    const auto transformedDocHasIdField = transformedDoc.hasField(kIdFieldName);
+
+    // Replace the pre-image document in applyParams with the post image we got from running the
+    // post image.
+    auto ret = ObjectReplaceExecutor::applyReplacementUpdate(
         applyParams, transformedDoc, transformedDocHasIdField);
+    // The oplog entry should not have been populated yet.
+    invariant(ret.oplogEntry.isEmpty());
+
+    if (applyParams.logMode != ApplyParams::LogMode::kDoNotGenerateOplogEntry && !ret.noop) {
+        if (applyParams.logMode == ApplyParams::LogMode::kGenerateOplogEntry) {
+            // We're allowed to generate $v: 2 log entries.
+            const auto diff = doc_diff::computeDiff(originalDoc, transformedDoc);
+            if (diff) {
+                ret.oplogEntry = update_oplog_entry::makeDeltaOplogEntry(*diff);
+                return ret;
+            }
+        }
+
+        // Either we can't use diffing or diffing failed so fall back to full replacement. Set the
+        // replacement to the value set by the object replace executor, in case it changed _id or
+        // anything like that.
+        ret.oplogEntry = update_oplog_entry::makeReplacementOplogEntry(
+            applyParams.element.getDocument().getObject());
+    }
+
+    return ret;
 }
 
 Value PipelineExecutor::serialize() const {

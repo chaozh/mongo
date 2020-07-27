@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -39,8 +39,8 @@
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/projection_parser.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo::projection_executor {
 namespace {
@@ -64,8 +64,11 @@ public:
             _allowFastPath = false;
             base->run();
         } catch (...) {
-            log() << "exception while testing with allowFastPath=" << _allowFastPath
-                  << " and allowFallBackToDefault=" << AllowFallBackToDefault;
+            LOGV2(20597,
+                  "exception while testing with allowFastPath={allowFastPath} and "
+                  "allowFallBackToDefault={AllowFallBackToDefault}",
+                  "allowFastPath"_attr = _allowFastPath,
+                  "AllowFallBackToDefault"_attr = AllowFallBackToDefault);
             throw;
         }
     }
@@ -167,6 +170,14 @@ TEST_F(ProjectionExecutorTestWithFallBackToDefault, CanProjectExpression) {
                        executor->applyTransformation(Document{fromjson("{a: 1, b: 2}")}));
 }
 
+TEST_F(ProjectionExecutorTestWithFallBackToDefault, CanProjectExpressionWithCommonParent) {
+    auto proj = parseWithDefaultPolicies(
+        fromjson("{'a.b.c': 1, 'b.c.d': 1, 'a.p.c' : {$add: ['$a.b.e', '$a.p']}, 'a.b.e': 1}"));
+    auto executor = createProjectionExecutor(proj);
+    ASSERT_DOCUMENT_EQ(Document{fromjson("{a: {b: {e: 4}, p: {c: 6}}}")},
+                       executor->applyTransformation(Document{fromjson("{a: {b: {e: 4}, p: 2}}")}));
+}
+
 TEST_F(ProjectionExecutorTestWithFallBackToDefault, CanProjectExclusionWithIdPath) {
     auto projWithoutId = parseWithDefaultPolicies(fromjson("{a: 0, _id: 0}"));
     auto executor = createProjectionExecutor(projWithoutId);
@@ -228,8 +239,9 @@ TEST_F(ProjectionExecutorTestWithFallBackToDefault, CanProjectFindElemMatch) {
 }
 
 TEST_F(ProjectionExecutorTestWithFallBackToDefault, ElemMatchRespectsCollator) {
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    getExpCtx()->setCollator(&collator);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    getExpCtx()->setCollator(std::move(collator));
 
     auto proj = parseWithFindFeaturesEnabled(fromjson("{a: {$elemMatch: {$gte: 'abc'}}}"));
     auto executor = createProjectionExecutor(proj);

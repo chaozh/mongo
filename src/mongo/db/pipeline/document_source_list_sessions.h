@@ -29,10 +29,13 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "mongo/bson/bsonelement.h"
 #include "mongo/db/pipeline/document_source_list_local_sessions.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -47,6 +50,13 @@ namespace mongo {
  */
 class DocumentSourceListSessions final : public DocumentSourceMatch {
 public:
+    DocumentSourceListSessions(const DocumentSourceListSessions& other)
+        : DocumentSourceMatch(other) {}
+
+    virtual boost::intrusive_ptr<DocumentSourceMatch> clone() const {
+        return make_intrusive<std::decay_t<decltype(*this)>>(*this);
+    }
+
     static constexpr StringData kStageName = "$listSessions"_sd;
 
     class LiteParsed final : public LiteParsedDocumentSource {
@@ -54,10 +64,12 @@ public:
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec) {
             return std::make_unique<LiteParsed>(
+                spec.fieldName(),
                 listSessionsParseSpec(DocumentSourceListSessions::kStageName, spec));
         }
 
-        explicit LiteParsed(const ListSessionsSpec& spec) : _spec(spec) {}
+        explicit LiteParsed(std::string parseTimeName, const ListSessionsSpec& spec)
+            : LiteParsedDocumentSource(std::move(parseTimeName)), _spec(spec) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
@@ -93,7 +105,8 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kNotAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(

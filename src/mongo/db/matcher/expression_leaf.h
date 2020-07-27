@@ -50,17 +50,22 @@ class CollatorInterface;
 
 class LeafMatchExpression : public PathMatchExpression {
 public:
-    LeafMatchExpression(MatchType matchType, StringData path)
+    LeafMatchExpression(MatchType matchType,
+                        StringData path,
+                        clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : LeafMatchExpression(matchType,
                               path,
                               ElementPath::LeafArrayBehavior::kTraverse,
-                              ElementPath::NonLeafArrayBehavior::kTraverse) {}
+                              ElementPath::NonLeafArrayBehavior::kTraverse,
+                              std::move(annotation)) {}
 
     LeafMatchExpression(MatchType matchType,
                         StringData path,
                         ElementPath::LeafArrayBehavior leafArrBehavior,
-                        ElementPath::NonLeafArrayBehavior nonLeafArrBehavior)
-        : PathMatchExpression(matchType, path, leafArrBehavior, nonLeafArrBehavior) {}
+                        ElementPath::NonLeafArrayBehavior nonLeafArrBehavior,
+                        clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : PathMatchExpression(
+              matchType, path, leafArrBehavior, nonLeafArrBehavior, std::move(annotation)) {}
 
     virtual ~LeafMatchExpression() = default;
 
@@ -102,7 +107,8 @@ public:
                                   StringData path,
                                   const BSONElement& rhs,
                                   ElementPath::LeafArrayBehavior,
-                                  ElementPath::NonLeafArrayBehavior);
+                                  ElementPath::NonLeafArrayBehavior,
+                                  clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     virtual ~ComparisonMatchExpressionBase() = default;
 
@@ -173,7 +179,10 @@ public:
         }
     }
 
-    ComparisonMatchExpression(MatchType type, StringData path, const BSONElement& rhs);
+    ComparisonMatchExpression(MatchType type,
+                              StringData path,
+                              const BSONElement& rhs,
+                              clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     virtual ~ComparisonMatchExpression() = default;
 
@@ -184,8 +193,10 @@ class EqualityMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$eq"_sd;
 
-    EqualityMatchExpression(StringData path, const BSONElement& rhs)
-        : ComparisonMatchExpression(EQ, path, rhs) {}
+    EqualityMatchExpression(StringData path,
+                            const BSONElement& rhs,
+                            clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ComparisonMatchExpression(EQ, path, rhs, std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
@@ -193,12 +204,20 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            std::make_unique<EqualityMatchExpression>(path(), _rhs);
+            std::make_unique<EqualityMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
         e->setCollator(_collator);
         return std::move(e);
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 
@@ -206,8 +225,10 @@ class LTEMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$lte"_sd;
 
-    LTEMatchExpression(StringData path, const BSONElement& rhs)
-        : ComparisonMatchExpression(LTE, path, rhs) {}
+    LTEMatchExpression(StringData path,
+                       const BSONElement& rhs,
+                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ComparisonMatchExpression(LTE, path, rhs, std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
@@ -215,12 +236,20 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            std::make_unique<LTEMatchExpression>(path(), _rhs);
+            std::make_unique<LTEMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
         e->setCollator(_collator);
         return std::move(e);
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 
@@ -228,8 +257,10 @@ class LTMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$lt"_sd;
 
-    LTMatchExpression(StringData path, const BSONElement& rhs)
-        : ComparisonMatchExpression(LT, path, rhs) {}
+    LTMatchExpression(StringData path,
+                      const BSONElement& rhs,
+                      clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ComparisonMatchExpression(LT, path, rhs, std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
@@ -237,12 +268,20 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            std::make_unique<LTMatchExpression>(path(), _rhs);
+            std::make_unique<LTMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
         e->setCollator(_collator);
         return std::move(e);
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 
@@ -250,8 +289,10 @@ class GTMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$gt"_sd;
 
-    GTMatchExpression(StringData path, const BSONElement& rhs)
-        : ComparisonMatchExpression(GT, path, rhs) {}
+    GTMatchExpression(StringData path,
+                      const BSONElement& rhs,
+                      clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ComparisonMatchExpression(GT, path, rhs, std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
@@ -259,12 +300,20 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            std::make_unique<GTMatchExpression>(path(), _rhs);
+            std::make_unique<GTMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
         e->setCollator(_collator);
         return std::move(e);
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 
@@ -272,8 +321,10 @@ class GTEMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$gte"_sd;
 
-    GTEMatchExpression(StringData path, const BSONElement& rhs)
-        : ComparisonMatchExpression(GTE, path, rhs) {}
+    GTEMatchExpression(StringData path,
+                       const BSONElement& rhs,
+                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : ComparisonMatchExpression(GTE, path, rhs, std::move(annotation)) {}
 
     StringData name() const final {
         return kName;
@@ -281,18 +332,29 @@ public:
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<ComparisonMatchExpression> e =
-            std::make_unique<GTEMatchExpression>(path(), _rhs);
+            std::make_unique<GTEMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
             e->setTag(getTag()->clone());
         }
         e->setCollator(_collator);
         return std::move(e);
     }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class RegexMatchExpression : public LeafMatchExpression {
 public:
     static const std::set<char> kValidRegexFlags;
+
+    static std::unique_ptr<pcrecpp::RE> makeRegex(const std::string& regex,
+                                                  const std::string& flags);
 
     RegexMatchExpression(StringData path, const BSONElement& e);
     RegexMatchExpression(StringData path, StringData regex, StringData options);
@@ -325,6 +387,14 @@ public:
     }
     const std::string& getFlags() const {
         return _flags;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:
@@ -367,6 +437,14 @@ public:
         return _remainder;
     }
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
         return [](std::unique_ptr<MatchExpression> expression) { return expression; };
@@ -396,6 +474,14 @@ public:
 
     virtual bool equivalent(const MatchExpression* other) const;
 
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
+
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
         return [](std::unique_ptr<MatchExpression> expression) { return expression; };
@@ -407,7 +493,7 @@ private:
  */
 class InMatchExpression : public LeafMatchExpression {
 public:
-    explicit InMatchExpression(StringData path);
+    explicit InMatchExpression(StringData path, clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const;
 
@@ -448,6 +534,14 @@ public:
 
     bool hasEmptyArray() const {
         return _hasEmptyArray;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:
@@ -571,6 +665,14 @@ public:
         }
         return std::move(bitTestMatchExpression);
     }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class BitsAllClearMatchExpression : public BitTestMatchExpression {
@@ -591,6 +693,14 @@ public:
             bitTestMatchExpression->setTag(getTag()->clone());
         }
         return std::move(bitTestMatchExpression);
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 
@@ -613,6 +723,14 @@ public:
         }
         return std::move(bitTestMatchExpression);
     }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class BitsAnyClearMatchExpression : public BitTestMatchExpression {
@@ -633,6 +751,14 @@ public:
             bitTestMatchExpression->setTag(getTag()->clone());
         }
         return std::move(bitTestMatchExpression);
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 };
 

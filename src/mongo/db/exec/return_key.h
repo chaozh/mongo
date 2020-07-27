@@ -46,15 +46,13 @@ class ReturnKeyStage : public PlanStage {
 public:
     static constexpr StringData kStageName = "RETURN_KEY"_sd;
 
-    ReturnKeyStage(OperationContext* opCtx,
+    ReturnKeyStage(ExpressionContext* expCtx,
                    std::vector<FieldPath> sortKeyMetaFields,
                    WorkingSet* ws,
-                   SortKeyFormat sortKeyFormat,
                    std::unique_ptr<PlanStage> child)
-        : PlanStage(opCtx, std::move(child), kStageName.rawData()),
+        : PlanStage(expCtx, std::move(child), kStageName.rawData()),
           _ws(*ws),
-          _sortKeyMetaFields(std::move(sortKeyMetaFields)),
-          _sortKeyFormat(sortKeyFormat) {}
+          _sortKeyMetaFields(std::move(sortKeyMetaFields)) {}
 
     StageType stageType() const final {
         return STAGE_RETURN_KEY;
@@ -73,7 +71,7 @@ public:
     }
 
 private:
-    Status _extractIndexKey(WorkingSetMember* member);
+    void _extractIndexKey(WorkingSetMember* member);
 
     WorkingSet& _ws;
     ReturnKeyStats _specificStats;
@@ -81,7 +79,5 @@ private:
     // The field names associated with any sortKey meta-projection(s). Empty if there is no sortKey
     // meta-projection.
     std::vector<FieldPath> _sortKeyMetaFields;
-
-    const SortKeyFormat _sortKeyFormat;
 };
 }  // namespace mongo

@@ -62,9 +62,10 @@ public:
     static constexpr StringData kAllowDiskUseName = "allowDiskUse"_sd;
     static constexpr StringData kHintName = "hint"_sd;
     static constexpr StringData kExchangeName = "exchange"_sd;
-    static constexpr StringData kRuntimeConstants = "runtimeConstants"_sd;
-    static constexpr StringData kUse44SortKeys = "use44SortKeys"_sd;
-    static constexpr StringData kUseNewUpsert = "useNewUpsert"_sd;
+    static constexpr StringData kRuntimeConstantsName = "runtimeConstants"_sd;
+    static constexpr StringData kUse44SortKeysName = "use44SortKeys"_sd;
+    static constexpr StringData kIsMapReduceCommandName = "isMapReduceCommand"_sd;
+    static constexpr StringData kLetName = "let"_sd;
 
     static constexpr long long kDefaultBatchSize = 101;
 
@@ -218,12 +219,12 @@ public:
         return _runtimeConstants;
     }
 
-    bool getUse44SortKeys() const {
-        return _use44SortKeys;
+    const auto& getLetParameters() const {
+        return _letParameters;
     }
 
-    bool getUseNewUpsert() const {
-        return _useNewUpsert;
+    bool getIsMapReduceCommand() const {
+        return _isMapReduceCommand;
     }
 
     //
@@ -290,12 +291,12 @@ public:
         _runtimeConstants = std::move(runtimeConstants);
     }
 
-    void setUse44SortKeys(bool use44SortKeys) {
-        _use44SortKeys = use44SortKeys;
+    void setLetParameters(BSONObj letParameters) {
+        _letParameters = letParameters.getOwned();
     }
 
-    void setUseNewUpsert(bool useNewUpsert) {
-        _useNewUpsert = useNewUpsert;
+    void setIsMapReduceCommand(bool isMapReduce) {
+        _isMapReduceCommand = isMapReduce;
     }
 
 private:
@@ -348,12 +349,11 @@ private:
     // $$NOW).
     boost::optional<RuntimeConstants> _runtimeConstants;
 
-    // All aggregation requests from mongos-4.4 set this flag, indicating that shard results should
-    // use the updated sort key format when returning change stream results.
-    bool _use44SortKeys = false;
+    // A document containing user-specified let parameter constants; i.e. values that do not change
+    // once computed.
+    BSONObj _letParameters;
 
-    // Indicates whether the aggregation may use the new 'upsertSupplied' mechanism when running
-    // $merge stages. All 4.4 mongoS and some versions of 4.2 set this flag.
-    bool _useNewUpsert = false;
+    // True when an aggregation was invoked by the MapReduce command.
+    bool _isMapReduceCommand = false;
 };
 }  // namespace mongo

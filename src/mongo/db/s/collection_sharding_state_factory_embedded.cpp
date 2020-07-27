@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,7 +37,7 @@
 namespace mongo {
 namespace {
 
-class UnshardedCollection : public ScopedCollectionMetadata::Impl {
+class UnshardedCollection : public ScopedCollectionDescription::Impl {
 public:
     UnshardedCollection() = default;
 
@@ -51,35 +51,21 @@ private:
 
 const auto kUnshardedCollection = std::make_shared<UnshardedCollection>();
 
-class CollectionShardingStateStandalone final : public CollectionShardingState {
+class CollectionShardingStateEmbedded final : public CollectionShardingState {
 public:
-    ScopedCollectionFilter getOwnershipFilter(OperationContext*, bool) override {
+    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) override {
         return {kUnshardedCollection};
     }
-
-    ScopedCollectionMetadata getCurrentMetadata() override {
+    ScopedCollectionFilter getOwnershipFilter(OperationContext*,
+                                              OrphanCleanupPolicy orphanCleanupPolicy) override {
         return {kUnshardedCollection};
     }
+    void checkShardVersionOrThrow(OperationContext*) override {}
 
-    boost::optional<ScopedCollectionMetadata> getCurrentMetadataIfKnown() override {
-        return boost::none;
-    }
-    boost::optional<ChunkVersion> getCurrentShardVersionIfKnown() override {
-        return boost::none;
-    }
+    void appendShardVersion(BSONObjBuilder* builder) override {}
 
-    void checkShardVersionOrThrow(OperationContext*, bool) override {}
-
-    Status checkShardVersionNoThrow(OperationContext*, bool) noexcept override {
-        return Status::OK();
-    }
-
-    void enterCriticalSectionCatchUpPhase(OperationContext*) override{};
-    void enterCriticalSectionCommitPhase(OperationContext*) override{};
-    void exitCriticalSection(OperationContext*) override{};
-    std::shared_ptr<Notification<void>> getCriticalSectionSignal(
-        ShardingMigrationCriticalSection::Operation) const override {
-        return nullptr;
+    size_t numberOfRangesScheduledForDeletion() const override {
+        return 0;
     }
 };
 
@@ -91,7 +77,7 @@ public:
     void join() override {}
 
     std::unique_ptr<CollectionShardingState> make(const NamespaceString&) override {
-        return std::make_unique<CollectionShardingStateStandalone>();
+        return std::make_unique<CollectionShardingStateEmbedded>();
     }
 };
 

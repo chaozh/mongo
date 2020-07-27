@@ -43,6 +43,8 @@ namespace mongo {
 
 namespace {
 
+const NamespaceString kTestNss = NamespaceString("db.dummy");
+
 class QueryStageEnsureSortedTest : public unittest::Test {
 public:
     /**
@@ -57,11 +59,15 @@ public:
     void testWork(const char* patternStr,
                   const char* inputStr,
                   const char* expectedStr,
-                  CollatorInterface* collator = nullptr) {
+                  std::unique_ptr<CollatorInterface> collator = nullptr) {
         auto opCtx = _serviceContext.makeOperationContext();
 
+        // Create a mock ExpressionContext.
+        boost::intrusive_ptr<ExpressionContext> expCtx(
+            make_intrusive<ExpressionContext>(opCtx.get(), std::move(collator), kTestNss));
+
         WorkingSet ws;
-        auto queuedDataStage = std::make_unique<QueuedDataStage>(opCtx.get(), &ws);
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
         BSONObj inputObj = fromjson(inputStr);
         BSONElement inputElt = inputObj["input"];
         ASSERT(inputElt.isABSONObj());
@@ -78,16 +84,11 @@ public:
             queuedDataStage->pushBack(id);
         }
 
-        // Create a mock ExpressionContext.
-        boost::intrusive_ptr<ExpressionContext> pExpCtx(
-            new ExpressionContext(opCtx.get(), collator));
-        pExpCtx->setCollator(collator);
-
         // Initialization.
         BSONObj pattern = fromjson(patternStr);
         auto sortKeyGen = std::make_unique<SortKeyGeneratorStage>(
-            pExpCtx, std::move(queuedDataStage), &ws, pattern);
-        EnsureSortedStage ess(opCtx.get(), pattern, &ws, std::move(sortKeyGen));
+            expCtx.get(), std::move(queuedDataStage), &ws, pattern);
+        EnsureSortedStage ess(expCtx.get(), pattern, &ws, std::move(sortKeyGen));
         WorkingSetID id = WorkingSet::INVALID_ID;
         PlanStage::StageState state = PlanStage::NEED_TIME;
 
@@ -97,7 +98,6 @@ public:
         BSONArrayBuilder arr(bob.subarrayStart("output"));
         while (state != PlanStage::IS_EOF) {
             state = ess.work(&id);
-            ASSERT_NE(state, PlanStage::FAILURE);
             if (state == PlanStage::ADVANCED) {
                 WorkingSetMember* member = ws.get(id);
                 auto obj = member->doc.value().toBson();
@@ -121,13 +121,14 @@ TEST_F(QueryStageEnsureSortedTest, EnsureSortedEmptyWorkingSet) {
     auto opCtx = _serviceContext.makeOperationContext();
 
     // Create a mock ExpressionContext.
-    boost::intrusive_ptr<ExpressionContext> pExpCtx(new ExpressionContext(opCtx.get(), nullptr));
+    boost::intrusive_ptr<ExpressionContext> pExpCtx(
+        new ExpressionContext(opCtx.get(), nullptr, kTestNss));
 
     WorkingSet ws;
-    auto queuedDataStage = std::make_unique<QueuedDataStage>(opCtx.get(), &ws);
+    auto queuedDataStage = std::make_unique<QueuedDataStage>(pExpCtx.get(), &ws);
     auto sortKeyGen = std::make_unique<SortKeyGeneratorStage>(
         pExpCtx, std::move(queuedDataStage), &ws, BSONObj());
-    EnsureSortedStage ess(opCtx.get(), BSONObj(), &ws, std::move(sortKeyGen));
+    EnsureSortedStage ess(pExpCtx.get(), BSONObj(), &ws, std::move(sortKeyGen));
 
     WorkingSetID id = WorkingSet::INVALID_ID;
     PlanStage::StageState state = PlanStage::NEED_TIME;
@@ -181,8 +182,12 @@ TEST_F(QueryStageEnsureSortedTest, EnsureSortedStringsNullCollator) {
 }
 
 TEST_F(QueryStageEnsureSortedTest, EnsureSortedStringsCollator) {
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    testWork("{a: 1}", "{input: [{a: 'abc'}, {a: 'cba'}]}", "{output: [{a: 'abc'}]}", &collator);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
+    testWork("{a: 1}",
+             "{input: [{a: 'abc'}, {a: 'cba'}]}",
+             "{output: [{a: 'abc'}]}",
+             std::move(collator));
 }
 
 }  // namespace

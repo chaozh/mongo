@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -37,12 +37,11 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/sync_source_selector.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -173,9 +172,7 @@ std::unique_ptr<Fetcher> SyncSourceResolver::_makeFirstOplogEntryFetcher(
                     << "projection"
                     << BSON(OplogEntryBase::kTimestampFieldName
                             << 1 << OplogEntryBase::kTermFieldName << 1)
-                    << "readConcern"
-                    << BSON("level"
-                            << "local")),
+                    << ReadConcernArgs::kReadConcernFieldName << ReadConcernArgs::kImplicitDefault),
         [=](const StatusWith<Fetcher::QueryResponse>& response,
             Fetcher::NextAction*,
             BSONObjBuilder*) {
@@ -189,18 +186,17 @@ std::unique_ptr<Fetcher> SyncSourceResolver::_makeFirstOplogEntryFetcher(
 std::unique_ptr<Fetcher> SyncSourceResolver::_makeRequiredOpTimeFetcher(HostAndPort candidate,
                                                                         OpTime earliestOpTimeSeen,
                                                                         int rbid) {
-    // This query is structured so that it is executed on the sync source using the oplog
-    // start hack (oplogReplay=true and $gt/$gte predicate over "ts").
+    // This query is structured so that it is executed on the sync source using the "oplog start
+    // hack". The sync source should recognize that it can optimize an oplog query with a $gt/$gte
+    // predicate over "ts".
     return std::make_unique<Fetcher>(
         _taskExecutor,
         candidate,
         kLocalOplogNss.db().toString(),
-        BSON("find" << kLocalOplogNss.coll() << "oplogReplay" << true << "filter"
+        BSON("find" << kLocalOplogNss.coll() << "filter"
                     << BSON("ts" << BSON("$gte" << _requiredOpTime.getTimestamp() << "$lte"
                                                 << _requiredOpTime.getTimestamp()))
-                    << "readConcern"
-                    << BSON("level"
-                            << "local")),
+                    << ReadConcernArgs::kReadConcernFieldName << ReadConcernArgs::kImplicitDefault),
         [=](const StatusWith<Fetcher::QueryResponse>& response,
             Fetcher::NextAction*,
             BSONObjBuilder*) {
@@ -224,8 +220,12 @@ Status SyncSourceResolver::_scheduleFetcher(std::unique_ptr<Fetcher> fetcher) {
         _shuttingDownFetcher = std::move(_fetcher);
         _fetcher = std::move(fetcher);
     } else {
-        error() << "Error scheduling fetcher to evaluate host as sync source, host:"
-                << fetcher->getSource() << ", error: " << status;
+        LOGV2_ERROR(21776,
+                    "Error scheduling fetcher to evaluate host as sync source, "
+                    "host:{host}, error: {error}",
+                    "Error scheduling fetcher to evaluate host as sync source",
+                    "host"_attr = fetcher->getSource(),
+                    "error"_attr = status);
     }
     return status;
 }
@@ -235,8 +235,13 @@ OpTime SyncSourceResolver::_parseRemoteEarliestOpTime(const HostAndPort& candida
     if (queryResponse.documents.empty()) {
         // Remote oplog is empty.
         const auto until = _taskExecutor->now() + kOplogEmptyBlacklistDuration;
-        log() << "Blacklisting " << candidate << " due to empty oplog for "
-              << kOplogEmptyBlacklistDuration << " until: " << until;
+        LOGV2(21766,
+              "Blacklisting {candidate} due to empty oplog for {blacklistDuration} "
+              "until: {blacklistUntil}",
+              "Blacklisting candidate due to empty oplog",
+              "candidate"_attr = candidate,
+              "blacklistDuration"_attr = kOplogEmptyBlacklistDuration,
+              "blacklistUntil"_attr = until);
         _syncSourceSelector->blacklistSyncSource(candidate, until);
         return OpTime();
     }
@@ -245,8 +250,13 @@ OpTime SyncSourceResolver::_parseRemoteEarliestOpTime(const HostAndPort& candida
     if (firstObjFound.isEmpty()) {
         // First document in remote oplog is empty.
         const auto until = _taskExecutor->now() + kFirstOplogEntryEmptyBlacklistDuration;
-        log() << "Blacklisting " << candidate << " due to empty first document for "
-              << kFirstOplogEntryEmptyBlacklistDuration << " until: " << until;
+        LOGV2(21767,
+              "Blacklisting {candidate} due to empty first document for "
+              "{blacklistDuration} until: {blacklistUntil}",
+              "Blacklisting candidate due to empty first document",
+              "candidate"_attr = candidate,
+              "blacklistDuration"_attr = kFirstOplogEntryEmptyBlacklistDuration,
+              "blacklistUntil"_attr = until);
         _syncSourceSelector->blacklistSyncSource(candidate, until);
         return OpTime();
     }
@@ -254,10 +264,16 @@ OpTime SyncSourceResolver::_parseRemoteEarliestOpTime(const HostAndPort& candida
     const auto remoteEarliestOpTime = OpTime::parseFromOplogEntry(firstObjFound);
     if (!remoteEarliestOpTime.isOK()) {
         const auto until = _taskExecutor->now() + kFirstOplogEntryNullTimestampBlacklistDuration;
-        log() << "Blacklisting " << candidate << " due to error parsing OpTime from the oldest"
-              << " oplog entry for " << kFirstOplogEntryNullTimestampBlacklistDuration
-              << " until: " << until << ". Error: " << remoteEarliestOpTime.getStatus()
-              << ", Entry: " << redact(firstObjFound);
+        LOGV2(21768,
+              "Blacklisting {candidate} due to error parsing OpTime from the oldest oplog entry "
+              "for {blacklistDuration} until: {blacklistUntil}. Error: "
+              "{error}, Entry: {oldestOplogEntry}",
+              "Blacklisting candidate due to error parsing OpTime from the oldest oplog entry",
+              "candidate"_attr = candidate,
+              "blacklistDuration"_attr = kFirstOplogEntryNullTimestampBlacklistDuration,
+              "blacklistUntil"_attr = until,
+              "error"_attr = remoteEarliestOpTime.getStatus(),
+              "oldestOplogEntry"_attr = redact(firstObjFound));
         _syncSourceSelector->blacklistSyncSource(candidate, until);
         return OpTime();
     }
@@ -265,8 +281,13 @@ OpTime SyncSourceResolver::_parseRemoteEarliestOpTime(const HostAndPort& candida
     if (remoteEarliestOpTime.getValue().isNull()) {
         // First document in remote oplog is empty.
         const auto until = _taskExecutor->now() + kFirstOplogEntryNullTimestampBlacklistDuration;
-        log() << "Blacklisting " << candidate << " due to null timestamp in first document for "
-              << kFirstOplogEntryNullTimestampBlacklistDuration << " until: " << until;
+        LOGV2(21769,
+              "Blacklisting {candidate} due to null timestamp in first document for "
+              "{blacklistDuration} until: {blacklistUntil}",
+              "Blacklisting candidate due to null timestamp in first document",
+              "candidate"_attr = candidate,
+              "blacklistDuration"_attr = kFirstOplogEntryNullTimestampBlacklistDuration,
+              "blacklistUntil"_attr = until);
         _syncSourceSelector->blacklistSyncSource(candidate, until);
         return OpTime();
     }
@@ -295,8 +316,14 @@ void SyncSourceResolver::_firstOplogEntryFetcherCallback(
     if (!queryResult.isOK()) {
         // We got an error.
         const auto until = _taskExecutor->now() + kFetcherErrorBlacklistDuration;
-        log() << "Blacklisting " << candidate << " due to error: '" << queryResult.getStatus()
-              << "' for " << kFetcherErrorBlacklistDuration << " until: " << until;
+        LOGV2(21770,
+              "Blacklisting {candidate} due to error: '{error}' for "
+              "{blacklistDuration} until: {blacklistUntil}",
+              "Blacklisting candidate due to error",
+              "candidate"_attr = candidate,
+              "error"_attr = queryResult.getStatus(),
+              "blacklistDuration"_attr = kFetcherErrorBlacklistDuration,
+              "blacklistUntil"_attr = until);
         _syncSourceSelector->blacklistSyncSource(candidate, until);
 
         _chooseAndProbeNextSyncSource(earliestOpTimeSeen).transitional_ignore();
@@ -314,13 +341,20 @@ void SyncSourceResolver::_firstOplogEntryFetcherCallback(
     if (_lastOpTimeFetched.getTimestamp() < remoteEarliestOpTime.getTimestamp()) {
         // We're too stale to use this sync source.
         const auto blacklistDuration = kTooStaleBlacklistDuration;
-        const auto until = _taskExecutor->now() + Minutes(1);
+        const auto until = _taskExecutor->now() + blacklistDuration;
 
-        log() << "We are too stale to use " << candidate << " as a sync source. "
-              << "Blacklisting this sync source"
-              << " because our last fetched timestamp: " << _lastOpTimeFetched.getTimestamp()
-              << " is before their earliest timestamp: " << remoteEarliestOpTime.getTimestamp()
-              << " for " << blacklistDuration << " until: " << until;
+        LOGV2(21771,
+              "We are too stale to use {candidate} as a sync source. Blacklisting this sync source "
+              "because our last fetched timestamp: {lastOpTimeFetchedTimestamp} is before "
+              "their earliest timestamp: {remoteEarliestOpTimeTimestamp} for "
+              "{blacklistDuration} until: {blacklistUntil}",
+              "We are too stale to use candidate as a sync source. Blacklisting this sync source "
+              "because our last fetched timestamp is before their earliest timestamp",
+              "candidate"_attr = candidate,
+              "lastOpTimeFetchedTimestamp"_attr = _lastOpTimeFetched.getTimestamp(),
+              "remoteEarliestOpTimeTimestamp"_attr = remoteEarliestOpTime.getTimestamp(),
+              "blacklistDuration"_attr = blacklistDuration,
+              "blacklistUntil"_attr = until);
 
         _syncSourceSelector->blacklistSyncSource(candidate, until);
 
@@ -334,6 +368,13 @@ void SyncSourceResolver::_firstOplogEntryFetcherCallback(
         }
 
         _chooseAndProbeNextSyncSource(earliestOpTimeSeen).transitional_ignore();
+        return;
+    }
+
+    // If we should not proceed with the rollback-via-refetch checks, we can safely return the
+    // candidate with an uninitialized rbid.
+    if (_requiredOpTime.isNull()) {
+        _finishCallback(candidate, ReplicationProcess::kUninitializedRollbackId).ignore();
         return;
     }
 
@@ -386,25 +427,25 @@ void SyncSourceResolver::_rbidRequestCallback(
         rbid = rbidReply.response.data["rbid"].Int();
     } catch (const DBException& ex) {
         const auto until = _taskExecutor->now() + kFetcherErrorBlacklistDuration;
-        log() << "Blacklisting " << candidate << " due to error: '" << ex << "' for "
-              << kFetcherErrorBlacklistDuration << " until: " << until;
+        LOGV2(21772,
+              "Blacklisting {candidate} due to error: '{error}' for {blacklistDuration} "
+              "until: {blacklistUntil}",
+              "Blacklisting candidate due to error",
+              "candidate"_attr = candidate,
+              "error"_attr = ex,
+              "blacklistDuration"_attr = kFetcherErrorBlacklistDuration,
+              "blacklistUntil"_attr = until);
         _syncSourceSelector->blacklistSyncSource(candidate, until);
         _chooseAndProbeNextSyncSource(earliestOpTimeSeen).transitional_ignore();
         return;
     }
 
-    if (!_requiredOpTime.isNull()) {
-        // Schedule fetcher to look for '_requiredOpTime' in the remote oplog.
-        // Unittest requires that this kind of failure be handled specially.
-        auto status =
-            _scheduleFetcher(_makeRequiredOpTimeFetcher(candidate, earliestOpTimeSeen, rbid));
-        if (!status.isOK()) {
-            _finishCallback(status).transitional_ignore();
-        }
-        return;
+    // Schedule fetcher to look for '_requiredOpTime' in the remote oplog.
+    // Unittest requires that this kind of failure be handled specially.
+    auto status = _scheduleFetcher(_makeRequiredOpTimeFetcher(candidate, earliestOpTimeSeen, rbid));
+    if (!status.isOK()) {
+        _finishCallback(status).ignore();
     }
-
-    _finishCallback(candidate, rbid).ignore();
 }
 
 Status SyncSourceResolver::_compareRequiredOpTimeWithQueryResponse(
@@ -456,9 +497,16 @@ void SyncSourceResolver::_requiredOpTimeFetcherCallback(
     if (!queryResult.isOK()) {
         // We got an error.
         const auto until = _taskExecutor->now() + kFetcherErrorBlacklistDuration;
-        log() << "Blacklisting " << candidate << " due to required optime fetcher error: '"
-              << queryResult.getStatus() << "' for " << kFetcherErrorBlacklistDuration
-              << " until: " << until << ". required optime: " << _requiredOpTime;
+        LOGV2(21773,
+              "Blacklisting {candidate} due to required optime fetcher error: "
+              "'{error}' for {blacklistDuration} until: {blacklistUntil}. "
+              "required optime: {requiredOpTime}",
+              "Blacklisting candidate due to required optime fetcher error",
+              "candidate"_attr = candidate,
+              "error"_attr = queryResult.getStatus(),
+              "blacklistDuration"_attr = kFetcherErrorBlacklistDuration,
+              "blacklistUntil"_attr = until,
+              "requiredOpTime"_attr = _requiredOpTime);
         _syncSourceSelector->blacklistSyncSource(candidate, until);
 
         _chooseAndProbeNextSyncSource(earliestOpTimeSeen).transitional_ignore();
@@ -469,13 +517,20 @@ void SyncSourceResolver::_requiredOpTimeFetcherCallback(
     auto status = _compareRequiredOpTimeWithQueryResponse(queryResponse);
     if (!status.isOK()) {
         const auto until = _taskExecutor->now() + kNoRequiredOpTimeBlacklistDuration;
-        warning() << "We cannot use " << candidate.toString()
-                  << " as a sync source because it does not contain the necessary "
-                     "operations for us to reach a consistent state: "
-                  << status << " last fetched optime: " << _lastOpTimeFetched
-                  << ". required optime: " << _requiredOpTime
-                  << ". Blacklisting this sync source for " << kNoRequiredOpTimeBlacklistDuration
-                  << " until: " << until;
+        LOGV2_WARNING(
+            21774,
+            "We cannot use {candidate} as a sync source because it does not contain the necessary "
+            "operations for us to reach a consistent state: {error} last fetched optime: "
+            "{lastOpTimeFetched}. required optime: {requiredOpTime}. Blacklisting this sync source "
+            "for {blacklistDuration} until: {blacklistUntil}",
+            "We cannot use candidate as a sync source because it does not contain the necessary "
+            "operations for us to reach a consistent state. Blacklisting this sync source",
+            "candidate"_attr = candidate.toString(),
+            "error"_attr = status,
+            "lastOpTimeFetched"_attr = _lastOpTimeFetched,
+            "requiredOpTime"_attr = _requiredOpTime,
+            "blacklistDuration"_attr = kNoRequiredOpTimeBlacklistDuration,
+            "blacklistUntil"_attr = until);
         _syncSourceSelector->blacklistSyncSource(candidate, until);
 
         _chooseAndProbeNextSyncSource(earliestOpTimeSeen).transitional_ignore();
@@ -498,7 +553,7 @@ Status SyncSourceResolver::_chooseAndProbeNextSyncSource(OpTime earliestOpTimeSe
         }
 
         SyncSourceResolverResponse response;
-        response.syncSourceStatus = {ErrorCodes::OplogStartMissing, "too stale to catch up"};
+        response.syncSourceStatus = {ErrorCodes::TooStaleToSyncFromSource, "too stale to catch up"};
         response.earliestOpTimeSeen = earliestOpTimeSeen;
         return _finishCallback(response);
     }
@@ -515,9 +570,7 @@ Status SyncSourceResolver::_chooseAndProbeNextSyncSource(OpTime earliestOpTimeSe
 Status SyncSourceResolver::_finishCallback(HostAndPort hostAndPort, int rbid) {
     SyncSourceResolverResponse response;
     response.syncSourceStatus = std::move(hostAndPort);
-    if (rbid != ReplicationProcess::kUninitializedRollbackId) {
-        response.rbid = rbid;
-    }
+    response.rbid = rbid;
     return _finishCallback(response);
 }
 
@@ -532,8 +585,10 @@ Status SyncSourceResolver::_finishCallback(const SyncSourceResolverResponse& res
     try {
         _onCompletion(response);
     } catch (...) {
-        warning() << "sync source resolver finish callback threw exception: "
-                  << exceptionToStatus();
+        LOGV2_WARNING(21775,
+                      "sync source resolver finish callback threw exception: {error}",
+                      "Sync source resolver finish callback threw exception",
+                      "error"_attr = exceptionToStatus());
     }
 
     stdx::lock_guard<Latch> lock(_mutex);

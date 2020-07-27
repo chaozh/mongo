@@ -27,21 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/shutdown.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_util.h"
 #include "mongo/logv2/ramlog.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
@@ -121,7 +121,7 @@ public:
         bSys.append("cpuAddrSize", static_cast<int>(p.getAddrSize()));
         bSys.append("memSizeMB", static_cast<long long>(p.getSystemMemSizeMB()));
         bSys.append("memLimitMB", static_cast<long long>(p.getMemSizeMB()));
-        bSys.append("numCores", static_cast<int>(p.getNumCores()));
+        bSys.append("numCores", static_cast<int>(p.getNumAvailableCores()));
         bSys.append("cpuArch", p.getArch());
         bSys.append("numaEnabled", p.hasNumaEnabled());
         bOs.append("type", p.getOsType());
@@ -136,9 +136,6 @@ public:
     }
 
 } hostInfoCmd;
-
-MONGO_FAIL_POINT_DEFINE(crashOnShutdown);
-int* volatile illegalAddress;  // NOLINT - used for fail point only
 
 class CmdGetCmdLineOpts : public BasicCommand {
 public:
@@ -196,10 +193,11 @@ public:
                      const std::string& ns,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate, logV2Enabled());
+        bool didRotate = logv2::rotateLogs(serverGlobalParams.logRenameOnRotate);
         if (didRotate)
             logProcessDetailsForLogRotate(opCtx->getServiceContext());
         return didRotate;
+        return true;
     }
 
 } logRotateCmd;
@@ -233,10 +231,7 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        if (logV2Enabled()) {
-            return errmsgRunImpl<logv2::RamLog>(opCtx, dbname, cmdObj, errmsg, result);
-        }
-        return errmsgRunImpl<RamLog>(opCtx, dbname, cmdObj, errmsg, result);
+        return errmsgRunImpl<logv2::RamLog>(opCtx, dbname, cmdObj, errmsg, result);
     }
 
     template <typename RamLogType>
@@ -322,11 +317,8 @@ public:
             invariant(ramlog);
             ramlog->clear();
         };
-        if (logV2Enabled()) {
-            clearRamlog(logv2::RamLog::getIfExists(logName));
-        } else {
-            clearRamlog(RamLog::getIfExists(logName));
-        }
+        clearRamlog(logv2::RamLog::getIfExists(logName));
+
         return true;
     }
 };
@@ -334,42 +326,5 @@ public:
 MONGO_REGISTER_TEST_COMMAND(ClearLogCmd);
 
 }  // namespace
-
-void CmdShutdown::addRequiredPrivileges(const std::string& dbname,
-                                        const BSONObj& cmdObj,
-                                        std::vector<Privilege>* out) const {
-    ActionSet actions;
-    actions.addAction(ActionType::shutdown);
-    out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-}
-
-void CmdShutdown::shutdownHelper(const BSONObj& cmdObj) {
-    ShutdownTaskArgs shutdownArgs;
-    shutdownArgs.isUserInitiated = true;
-
-    crashOnShutdown.execute([&](const BSONObj& data) {
-        if (data["how"].str() == "fault") {
-            ++*illegalAddress;
-        }
-        ::abort();
-    });
-
-    log() << "terminating, shutdown command received " << cmdObj;
-
-#if defined(_WIN32)
-    // Signal the ServiceMain thread to shutdown.
-    if (ntservice::shouldStartService()) {
-        shutdownNoTerminate(shutdownArgs);
-
-        // Client expects us to abruptly close the socket as part of exiting
-        // so this function is not allowed to return.
-        // The ServiceMain thread will quit for us so just sleep until it does.
-        while (true)
-            sleepsecs(60);  // Loop forever
-        return;
-    }
-#endif
-    shutdown(EXIT_CLEAN, shutdownArgs);  // this never returns
-}
 
 }  // namespace mongo

@@ -43,33 +43,27 @@ namespace {
 
 const std::string kCheckEmptyFieldName = "checkEmpty";
 const std::string kConfigVersionFieldName = "configVersion";
+const std::string kConfigTermFieldName = "configTerm";
 const std::string kHeartbeatVersionFieldName = "hbv";
 const std::string kSenderHostFieldName = "from";
 const std::string kSenderIdFieldName = "fromId";
 const std::string kSetNameFieldName = "replSetHeartbeat";
 const std::string kTermFieldName = "term";
-
-const std::string kLegalHeartbeatFieldNames[] = {kCheckEmptyFieldName,
-                                                 kConfigVersionFieldName,
-                                                 kHeartbeatVersionFieldName,
-                                                 kSenderHostFieldName,
-                                                 kSenderIdFieldName,
-                                                 kSetNameFieldName,
-                                                 kTermFieldName};
-
+const std::string kPrimaryIdFieldName = "primaryId";
 }  // namespace
 
 Status ReplSetHeartbeatArgsV1::initialize(const BSONObj& argsObj) {
-    Status status = bsonCheckOnlyHasFieldsForCommand(
-        "ReplSetHeartbeatArgs", argsObj, kLegalHeartbeatFieldNames);
-    if (!status.isOK())
-        return status;
-
-    status = bsonExtractBooleanFieldWithDefault(argsObj, kCheckEmptyFieldName, false, &_checkEmpty);
+    Status status =
+        bsonExtractBooleanFieldWithDefault(argsObj, kCheckEmptyFieldName, false, &_checkEmpty);
     if (!status.isOK())
         return status;
 
     status = bsonExtractIntegerField(argsObj, kConfigVersionFieldName, &_configVersion);
+    if (!status.isOK())
+        return status;
+
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kConfigTermFieldName, OpTime::kUninitializedTerm, &_configTerm);
     if (!status.isOK())
         return status;
 
@@ -103,6 +97,13 @@ Status ReplSetHeartbeatArgsV1::initialize(const BSONObj& argsObj) {
         _hasSender = true;
     }
 
+    // If sender is in an older version, the request object may not have the 'primaryId' field, but
+    // we still parse and allow it whenever it is present.
+    status = bsonExtractIntegerFieldWithDefault(
+        argsObj, kPrimaryIdFieldName, kEmptyPrimaryId, &_primaryId);
+    if (!status.isOK())
+        return status;
+
     status = bsonExtractIntegerField(argsObj, kTermFieldName, &_term);
     if (!status.isOK())
         return status;
@@ -122,6 +123,10 @@ void ReplSetHeartbeatArgsV1::setConfigVersion(long long newVal) {
     _configVersion = newVal;
 }
 
+void ReplSetHeartbeatArgsV1::setConfigTerm(long long newVal) {
+    _configTerm = newVal;
+}
+
 void ReplSetHeartbeatArgsV1::setHeartbeatVersion(long long newVal) {
     _heartbeatVersion = newVal;
     _hasHeartbeatVersion = true;
@@ -136,8 +141,8 @@ void ReplSetHeartbeatArgsV1::setSenderId(long long newVal) {
     _senderId = newVal;
 }
 
-void ReplSetHeartbeatArgsV1::setSetName(const std::string& newVal) {
-    _setName = newVal;
+void ReplSetHeartbeatArgsV1::setSetName(StringData newVal) {
+    _setName = newVal.toString();
 }
 
 void ReplSetHeartbeatArgsV1::setTerm(long long newVal) {
@@ -146,6 +151,10 @@ void ReplSetHeartbeatArgsV1::setTerm(long long newVal) {
 
 void ReplSetHeartbeatArgsV1::setCheckEmpty() {
     _checkEmpty = true;
+}
+
+void ReplSetHeartbeatArgsV1::setPrimaryId(long long primaryId) {
+    _primaryId = primaryId;
 }
 
 BSONObj ReplSetHeartbeatArgsV1::toBSON() const {
@@ -161,12 +170,20 @@ void ReplSetHeartbeatArgsV1::addToBSON(BSONObjBuilder* builder) const {
         builder->append(kCheckEmptyFieldName, _checkEmpty);
     }
     builder->appendIntOrLL(kConfigVersionFieldName, _configVersion);
+    builder->appendIntOrLL(kConfigTermFieldName, _configTerm);
     if (_hasHeartbeatVersion) {
         builder->appendIntOrLL(kHeartbeatVersionFieldName, _hasHeartbeatVersion);
     }
     builder->append(kSenderHostFieldName, _hasSender ? _senderHost.toString() : "");
     builder->appendIntOrLL(kSenderIdFieldName, _senderId);
     builder->appendIntOrLL(kTermFieldName, _term);
+
+    // TODO SERVER-49382: Remove this FCV check after we branch for 4.7.
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion451)) {
+        builder->append(kPrimaryIdFieldName, _primaryId);
+    }
 }
 
 }  // namespace repl

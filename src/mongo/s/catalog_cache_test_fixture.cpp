@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/catalog_cache_test_fixture.h"
@@ -83,27 +81,26 @@ CatalogCacheTestFixture::scheduleRoutingInfoUnforcedRefresh(const NamespaceStrin
     });
 }
 
-void CatalogCacheTestFixture::setupNShards(int numShards) {
-    setupShards([&]() {
-        std::vector<ShardType> shards;
-        for (int i = 0; i < numShards; i++) {
-            ShardId name(str::stream() << i);
-            HostAndPort host(str::stream() << "Host" << i << ":12345");
+std::vector<ShardType> CatalogCacheTestFixture::setupNShards(int numShards) {
+    std::vector<ShardType> shards;
+    for (int i = 0; i < numShards; i++) {
+        ShardId name(str::stream() << i);
+        HostAndPort host(str::stream() << "Host" << i << ":12345");
 
-            ShardType shard;
-            shard.setName(name.toString());
-            shard.setHost(host.toString());
-            shards.emplace_back(std::move(shard));
+        ShardType shard;
+        shard.setName(name.toString());
+        shard.setHost(host.toString());
+        shards.emplace_back(std::move(shard));
 
-            std::unique_ptr<RemoteCommandTargeterMock> targeter(
-                std::make_unique<RemoteCommandTargeterMock>());
-            targeter->setConnectionStringReturnValue(ConnectionString(host));
-            targeter->setFindHostReturnValue(host);
-            targeterFactory()->addTargeterToReturn(ConnectionString(host), std::move(targeter));
-        }
+        std::unique_ptr<RemoteCommandTargeterMock> targeter(
+            std::make_unique<RemoteCommandTargeterMock>());
+        targeter->setConnectionStringReturnValue(ConnectionString(host));
+        targeter->setFindHostReturnValue(host);
+        targeterFactory()->addTargeterToReturn(ConnectionString(host), std::move(targeter));
+    }
 
-        return shards;
-    }());
+    setupShards(shards);
+    return shards;
 }
 
 std::shared_ptr<ChunkManager> CatalogCacheTestFixture::makeChunkManager(
@@ -161,7 +158,6 @@ std::shared_ptr<ChunkManager> CatalogCacheTestFixture::makeChunkManager(
 
     expectFindSendBSONObjVector(kConfigHostAndPort, {databaseBSON});
     expectFindSendBSONObjVector(kConfigHostAndPort, {collectionBSON});
-    expectFindSendBSONObjVector(kConfigHostAndPort, {collectionBSON});
     expectFindSendBSONObjVector(kConfigHostAndPort, initialChunks);
 
     auto routingInfo = future.default_timed_get();
@@ -214,8 +210,9 @@ CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChun
     auto future = scheduleRoutingInfoForcedRefresh(nss);
 
     // Mock the expected config server queries.
-    expectGetDatabase(nss);
-    expectGetCollection(nss, epoch, shardKeyPattern);
+    if (!nss.isAdminDB() && !nss.isConfigDB()) {
+        expectGetDatabase(nss);
+    }
     expectGetCollection(nss, epoch, shardKeyPattern);
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         ChunkVersion version(1, 0, epoch);

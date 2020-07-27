@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -40,10 +40,10 @@
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
@@ -137,7 +137,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
     boost::filesystem::path p(filename);
 #endif
     if (!exists(p)) {
-        error() << "file [" << filename << "] doesn't exist";
+        LOGV2_ERROR(22779, "file [{filename}] doesn't exist", "filename"_attr = filename);
         return false;
     }
 
@@ -156,7 +156,9 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
         }
 
         if (empty) {
-            error() << "directory [" << filename << "] doesn't have any *.js files";
+            LOGV2_ERROR(22780,
+                        "directory [{filename}] doesn't have any *.js files",
+                        "filename"_attr = filename);
             return false;
         }
 
@@ -171,7 +173,7 @@ bool Scope::execFile(const string& filename, bool printResult, bool reportError,
 
     fileofs fo = f.len();
     if (fo > kMaxJsFileLength) {
-        warning() << "attempted to execute javascript file larger than 2GB";
+        LOGV2_WARNING(22778, "attempted to execute javascript file larger than 2GB");
         return false;
     }
     unsigned len = static_cast<unsigned>(fo);
@@ -222,7 +224,6 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
     if (_loadedVersion == lastVersion)
         return;
 
-    _loadedVersion = lastVersion;
     NamespaceString coll(_localDBName, "system.js");
 
     auto directDBClient = DBDirectClientFactory::get(opCtx).create(opCtx);
@@ -237,8 +238,15 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
         BSONElement n = o["_id"];
         BSONElement v = o["value"];
 
-        uassert(10209, str::stream() << "name has to be a string: " << n, n.type() == String);
-        uassert(10210, "value has to be set", v.type() != EOO);
+        uassert(
+            10209, str::stream() << "name has to be a string: " << n, n.type() == BSONType::String);
+        uassert(10210, "value has to be set", v.type() != BSONType::EOO);
+
+        uassert(4546000,
+                str::stream() << "BSON type 'CodeWithScope' not supported in system.js scripts. As "
+                                 "an alternative use 'Code'. Script _id value: '"
+                              << n.String() << "'",
+                v.type() != BSONType::CodeWScope);
 
         if (MONGO_unlikely(mr_killop_test_fp.shouldFail())) {
 
@@ -258,8 +266,10 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
                 throw;
             }
 
-            error() << "unable to load stored JavaScript function " << n.valuestr()
-                    << "(): " << redact(setElemEx);
+            LOGV2_ERROR(22781,
+                        "unable to load stored JavaScript function {n_valuestr}(): {setElemEx}",
+                        "n_valuestr"_attr = n.valuestr(),
+                        "setElemEx"_attr = redact(setElemEx));
         }
     }
 
@@ -273,6 +283,10 @@ void Scope::loadStored(OperationContext* opCtx, bool ignoreNotConnected) {
             ++i;
         }
     }
+
+    // Only update _loadedVersion if loading system.js completed successfully.
+    // If any one operation failed or was interrupted we will start over next time.
+    _loadedVersion = lastVersion;
 }
 
 ScriptingFunction Scope::createFunction(const char* code) {
@@ -339,7 +353,7 @@ public:
 
         if (scope->hasOutOfMemoryException()) {
             // make some room
-            log() << "Clearing all idle JS contexts due to out of memory";
+            LOGV2_INFO(22777, "Clearing all idle JS contexts due to out of memory");
             _pools.clear();
             return;
         }
@@ -563,7 +577,7 @@ unique_ptr<Scope> ScriptEngine::getPooledScope(OperationContext* opCtx,
     return p;
 }
 
-void (*ScriptEngine::_connectCallback)(DBClientBase&) = nullptr;
+void (*ScriptEngine::_connectCallback)(DBClientBase&, StringData) = nullptr;
 
 ScriptEngine* getGlobalScriptEngine() {
     if (hasGlobalServiceContext())

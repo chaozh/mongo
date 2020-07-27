@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +36,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -61,7 +61,7 @@ TaskExecutorCursor::~TaskExecutorCursor() {
             _executor->cancel(*_cbHandle);
         }
 
-        if (_cursorId > 0) {
+        if (_cursorId >= kMinLegalCursorId) {
             // We deliberately ignore failures to kill the cursor.  This "best effort" is acceptable
             // because some timeout mechanism on the remote host can be expected to reap it later.
             //
@@ -69,7 +69,7 @@ TaskExecutorCursor::~TaskExecutorCursor() {
             // timeout if an lsid is used.
             _executor
                 ->scheduleRemoteCommand(
-                    _createRequest(nullptr, KillCursorsRequest(_ns, {_cursorId}).toBSON()),
+                    _createRequest(nullptr, KillCursorsRequest(_ns, {_cursorId}).toBSON(BSONObj{})),
                     [](const auto&) {})
                 .isOK();
         }
@@ -78,7 +78,7 @@ TaskExecutorCursor::~TaskExecutorCursor() {
 }
 
 boost::optional<BSONObj> TaskExecutorCursor::getNext(OperationContext* opCtx) {
-    if (_batchIter == _batch.end()) {
+    while (_batchIter == _batch.end() && _cursorId != kClosedCursorId) {
         _getNextBatch(opCtx);
     }
 
@@ -130,9 +130,8 @@ void TaskExecutorCursor::_runRemoteCommand(const RemoteCommandRequest& rcr) {
 }
 
 void TaskExecutorCursor::_getNextBatch(OperationContext* opCtx) {
-    if (_cursorId == 0) {
-        return;
-    }
+    invariant(_cbHandle, "_getNextBatch() requires an async request to have already been sent.");
+    invariant(_cursorId != kClosedCursorId);
 
     auto clock = opCtx->getServiceContext()->getPreciseClockSource();
     auto dateStart = clock->now();
@@ -143,10 +142,10 @@ void TaskExecutorCursor::_getNextBatch(OperationContext* opCtx) {
     _millisecondsWaiting += std::max(Milliseconds(0), dateEnd - dateStart);
     uassertStatusOK(out);
 
-    // If we had a cursor id, set it to 0 so that we don't attempt to kill the cursor if there was
-    // an error
-    if (_cursorId > 0) {
-        _cursorId = 0;
+    // If we had a cursor id, set it to kClosedCursorId so that we don't attempt to kill the cursor
+    // if there was an error.
+    if (_cursorId >= kMinLegalCursorId) {
+        _cursorId = kClosedCursorId;
     }
 
     // if we've received a response from our last request (initial or getmore), our remote operation
@@ -156,7 +155,7 @@ void TaskExecutorCursor::_getNextBatch(OperationContext* opCtx) {
     auto cr = uassertStatusOK(CursorResponse::parseFromBSON(out.getValue()));
 
     // If this was our first batch
-    if (_cursorId == -1) {
+    if (_cursorId == kUnitializedCursorId) {
         _ns = cr.getNSS();
         _rcr.dbname = _ns.db().toString();
     }

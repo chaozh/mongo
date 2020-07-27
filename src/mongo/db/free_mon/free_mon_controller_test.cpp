@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -62,12 +62,13 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/log.h"
+#include "mongo/util/hex.h"
 
 
 namespace mongo {
@@ -75,8 +76,7 @@ namespace {
 
 auto makeRandom() {
     auto seed = SecureRandom().nextInt64();
-    unittest::log() << "PseudoRandom(" << std::showbase << std::hex << seed << std::dec
-                    << std::noshowbase << ")";
+    LOGV2(24189, "PseudoRandom()", "seed"_attr = seed);
     return PseudoRandom(seed);
 }
 
@@ -245,13 +245,13 @@ public:
 
     Future<FreeMonRegistrationResponse> sendRegistrationAsync(
         const FreeMonRegistrationRequest& req) final {
-        log() << "Sending Registration ...";
+        LOGV2(20611, "Sending Registration ...");
 
         _registers.addAndFetch(1);
 
         auto pf = makePromiseFuture<FreeMonRegistrationResponse>();
         if (_options.doSync) {
-            pf.promise.setFrom(doRegister(req));
+            pf.promise.setFromStatusWith(doRegister(req));
         } else {
             auto swSchedule = _threadPool->scheduleWork(
                 [sharedPromise = std::move(pf.promise), req, this](
@@ -291,13 +291,13 @@ public:
 
 
     Future<FreeMonMetricsResponse> sendMetricsAsync(const FreeMonMetricsRequest& req) final {
-        log() << "Sending Metrics ...";
+        LOGV2(20612, "Sending Metrics ...");
 
         _metrics.addAndFetch(1);
 
         auto pf = makePromiseFuture<FreeMonMetricsResponse>();
         if (_options.doSync) {
-            pf.promise.setFrom(doMetrics(req));
+            pf.promise.setFromStatusWith(doMetrics(req));
         } else {
             auto swSchedule = _threadPool->scheduleWork(
                 [sharedPromise = std::move(pf.promise), req, this](
@@ -429,6 +429,9 @@ void FreeMonControllerTest::setUp() {
     // Transition to PRIMARY so that the server can accept writes.
     ASSERT_OK(_getReplCoord()->setFollowerMode(repl::MemberState::RS_PRIMARY));
 
+    repl::setOplogCollectionName(service);
+    repl::createOplog(_opCtx.get());
+
     // Create collection with one document.
     CollectionOptions collectionOptions;
     collectionOptions.uuid = UUID::gen();
@@ -508,8 +511,8 @@ TEST(FreeMonRetryTest, TestRegistration) {
     // If jitter is large as possible, we'd expect trueMin increments before false.
     const auto trueMin = characterizeJitter(Seconds{9}, Seconds{119});
 
-    // unittest::log() << "trueMin:" << trueMin;
-    // unittest::log() << "trueMax:" << trueMax;
+    // LOGV2(20613, "trueMin:{trueMin}", "trueMin"_attr = trueMin);
+    // LOGV2(20614, "trueMax:{trueMax}", "trueMax"_attr = trueMax);
 
     for (int j = 0; j < 30; j++) {
         // std::cout << "j: " << j << "\n";

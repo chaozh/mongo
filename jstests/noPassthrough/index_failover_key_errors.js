@@ -27,12 +27,6 @@ const primary = rst.getPrimary();
 const testDB = primary.getDB('test');
 const coll = testDB.getCollection('test');
 
-if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    jsTestLog('Two phase index builds not enabled, skipping test.');
-    rst.stopSet();
-    return;
-}
-
 // Insert a document that cannot be indexed because it causes a CannotIndexParallelArrays error
 // code.
 const badDoc = {
@@ -71,7 +65,7 @@ const stepDown = startParallelShell(() => {
 // the index build will continue in the background.
 const exitCode = createIdx({checkExitSuccess: false});
 assert.neq(0, exitCode, 'expected shell to exit abnormally due to index build being terminated');
-checkLog.contains(primary, 'Index build interrupted: ');
+checkLog.containsJson(primary, 20441);
 
 // Wait for stepdown to complete.
 stepDown();

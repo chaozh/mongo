@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,10 +36,8 @@
 #include "mongo/db/commands/rwc_defaults_commands_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/read_write_concern_defaults.h"
-#include "mongo/db/rw_concern_default_gen.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -72,7 +70,7 @@ public:
         // Quickly pick up the new defaults by setting them in the cache.
         auto newDefaults = RWConcernDefault::parse(
             IDLParserErrorContext("ClusterSetDefaultRWConcern"), cmdResponse.response);
-        ReadWriteConcernDefaults::get(opCtx).setDefault(std::move(newDefaults));
+        ReadWriteConcernDefaults::get(opCtx).setDefault(opCtx, std::move(newDefaults));
 
         CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
         return true;
@@ -113,20 +111,23 @@ class ClusterGetDefaultRWConcernCommand final
     : public TypedCommand<ClusterGetDefaultRWConcernCommand> {
 public:
     using Request = GetDefaultRWConcern;
-    using Response = RWConcernDefault;
 
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
 
-        Response typedRun(OperationContext* opCtx) {
-            if (request().getInMemory() && *request().getInMemory()) {
-                auto rwc =
-                    ReadWriteConcernDefaults::get(opCtx->getServiceContext()).getDefault(opCtx);
-                rwc.setInMemory(true);
-                return rwc;
+        GetDefaultRWConcernResponse typedRun(OperationContext* opCtx) {
+            auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx->getServiceContext());
+            if (request().getInMemory().value_or(false)) {
+                const auto rwcDefault = rwcDefaults.getDefault(opCtx);
+                GetDefaultRWConcernResponse response;
+                response.setRWConcernDefault(rwcDefault);
+                response.setLocalUpdateWallClockTime(rwcDefault.localUpdateWallClockTime());
+                response.setInMemory(true);
+                return response;
             }
 
+            // If not asking for the in-memory defaults, fetch them from the config server
             GetDefaultRWConcern configsvrRequest;
             configsvrRequest.setDbName(request().getDbName());
 
@@ -140,8 +141,8 @@ public:
 
             uassertStatusOK(cmdResponse.commandStatus);
 
-            return Response::parse(IDLParserErrorContext("ClusterGetDefaultRWConcernResponse"),
-                                   cmdResponse.response);
+            return GetDefaultRWConcernResponse::parse(
+                IDLParserErrorContext("ClusterGetDefaultRWConcernResponse"), cmdResponse.response);
         }
 
     private:

@@ -43,7 +43,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -83,20 +83,21 @@ public:
     int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
         AutoGetCollectionForReadCommand ctx(&_opCtx, NamespaceString(ns()));
 
-        const CollatorInterface* collator = nullptr;
-        const boost::intrusive_ptr<ExpressionContext> expCtx(
-            new ExpressionContext(&_opCtx, collator));
         StatusWithMatchExpression statusWithMatcher =
-            MatchExpressionParser::parse(filterObj, expCtx);
+            MatchExpressionParser::parse(filterObj, _expCtx);
         verify(statusWithMatcher.isOK());
         unique_ptr<MatchExpression> filterExpr = std::move(statusWithMatcher.getValue());
 
         unique_ptr<WorkingSet> ws = std::make_unique<WorkingSet>();
-        unique_ptr<IndexScan> ix =
-            std::make_unique<IndexScan>(&_opCtx, params, ws.get(), filterExpr.get());
+        unique_ptr<IndexScan> ix = std::make_unique<IndexScan>(
+            _expCtx.get(), ctx.getCollection(), params, ws.get(), filterExpr.get());
 
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(ix), ctx.getCollection(), PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(ix),
+                                        ctx.getCollection(),
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -149,6 +150,9 @@ public:
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        new ExpressionContext(&_opCtx, nullptr, NamespaceString(ns()));
 
 private:
     DBDirectClient _client;

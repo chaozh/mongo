@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -36,12 +36,14 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/resize_oplog_gen.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
@@ -63,7 +65,7 @@ public:
     }
 
     std::string help() const override {
-        return "resize oplog size in MB";
+        return "Resize oplog using size (in MBs) and optionally, retention (in terms of hours)";
     }
 
     Status checkAuthForCommand(Client* client,
@@ -87,27 +89,31 @@ public:
         Collection* coll = autoColl.getCollection();
         uassert(ErrorCodes::NamespaceNotFound, "oplog does not exist", coll);
         uassert(ErrorCodes::IllegalOperation, "oplog isn't capped", coll->isCapped());
-        uassert(ErrorCodes::InvalidOptions,
-                "invalid size field, size should be a number",
-                jsobj["size"].isNumber());
 
-        long long sizeMb = jsobj["size"].numberLong();
-        uassert(ErrorCodes::InvalidOptions, "oplog size should be 990MB at least", sizeMb >= 990L);
-
-        const long long kMB = 1024 * 1024;
-        const long long kPB = kMB * 1024 * 1024 * 1024;
-        uassert(ErrorCodes::InvalidOptions,
-                "oplog size in MB cannot exceed maximum of 1PB",
-                sizeMb <= kPB / kMB);
-        long long size = sizeMb * kMB;
+        auto params =
+            ReplSetResizeOplogRequest::parse(IDLParserErrorContext("replSetResizeOplog"), jsobj);
 
         return writeConflictRetry(opCtx, "replSetResizeOplog", coll->ns().ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
-            Status status = coll->getRecordStore()->updateCappedSize(opCtx, size);
-            uassertStatusOK(status);
-            DurableCatalog::get(opCtx)->updateCappedSize(opCtx, coll->getCatalogId(), size);
+
+            if (auto sizeMB = params.getSize()) {
+                const long long sizeBytes = *sizeMB * 1024 * 1024;
+                uassertStatusOK(coll->getRecordStore()->updateCappedSize(opCtx, sizeBytes));
+                DurableCatalog::get(opCtx)->updateCappedSize(
+                    opCtx, coll->getCatalogId(), sizeBytes);
+            }
+
+            if (auto minRetentionHoursOpt = params.getMinRetentionHours()) {
+                storageGlobalParams.oplogMinRetentionHours.store(*minRetentionHoursOpt);
+            }
             wunit.commit();
-            LOG(0) << "replSetResizeOplog success, currentSize:" << size;
+
+            LOGV2(20497,
+                  "replSetResizeOplog success",
+                  "size"_attr = DurableCatalog::get(opCtx)
+                                    ->getCollectionOptions(opCtx, coll->getCatalogId())
+                                    .cappedSize,
+                  "minRetentionHours"_attr = storageGlobalParams.oplogMinRetentionHours.load());
             return true;
         });
     }

@@ -32,9 +32,10 @@
 #include <functional>
 
 #include "mongo/transport/session.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 
-Status launchServiceWorkerThread(std::function<void()> task);
+Status launchServiceWorkerThread(unique_function<void()> task) noexcept;
 
 }  // namespace mongo

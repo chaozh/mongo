@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -36,9 +36,10 @@
 #include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -78,7 +79,12 @@ CollectionCatalog::iterator::iterator(StringData dbName,
     stdx::lock_guard<Latch> lock(_catalog->_catalogLock);
     _mapIter = _catalog->_orderedCollections.lower_bound(std::make_pair(_dbName, minUuid));
 
-    if (_mapIter != _catalog->_orderedCollections.end() && _mapIter->first.first == _dbName) {
+    // Start with the first collection that is visible outside of its transaction.
+    while (!_exhausted() && !_mapIter->second->isCommitted()) {
+        _mapIter++;
+    }
+
+    if (!_exhausted()) {
         _uuid = _mapIter->first.second;
     }
 }
@@ -106,6 +112,11 @@ CollectionCatalog::iterator CollectionCatalog::iterator::operator++() {
 
     if (!_repositionIfNeeded()) {
         _mapIter++;  // If the position was not updated, increment iterator to next element.
+    }
+
+    // Skip any collections that are not yet visible outside of their respective transactions.
+    while (!_exhausted() && !_mapIter->second->isCommitted()) {
+        _mapIter++;
     }
 
     if (_exhausted()) {
@@ -147,7 +158,13 @@ bool CollectionCatalog::iterator::_repositionIfNeeded() {
 
     _genNum = _catalog->_generationNumber;
     // If the map has been modified, find the entry the iterator was on, or the one right after it.
+    // The entry the iterator was on must have been for a collection visible outside of its
+    // transaction.
     _mapIter = _catalog->_orderedCollections.lower_bound(std::make_pair(_dbName, *_uuid));
+
+    while (!_exhausted() && !_mapIter->second->isCommitted()) {
+        _mapIter++;
+    }
 
     if (_exhausted()) {
         return true;
@@ -233,6 +250,11 @@ void CollectionCatalog::onOpenCatalog(OperationContext* opCtx) {
     stdx::lock_guard<Latch> lock(_catalogLock);
     invariant(_shadowCatalog);
     _shadowCatalog.reset();
+    ++_epoch;
+}
+
+uint64_t CollectionCatalog::getEpoch() const {
+    return _epoch;
 }
 
 Collection* CollectionCatalog::lookupCollectionByUUID(OperationContext* opCtx,
@@ -242,7 +264,20 @@ Collection* CollectionCatalog::lookupCollectionByUUID(OperationContext* opCtx,
     }
 
     stdx::lock_guard<Latch> lock(_catalogLock);
-    return _lookupCollectionByUUID(lock, uuid);
+    auto coll = _lookupCollectionByUUID(lock, uuid);
+    return (coll && coll->isCommitted()) ? coll : nullptr;
+}
+
+void CollectionCatalog::makeCollectionVisible(CollectionUUID uuid) {
+    stdx::lock_guard<Latch> lock(_catalogLock);
+    auto coll = _lookupCollectionByUUID(lock, uuid);
+    coll->setCommitted(true);
+}
+
+bool CollectionCatalog::isCollectionAwaitingVisibility(CollectionUUID uuid) const {
+    stdx::lock_guard<Latch> lock(_catalogLock);
+    auto coll = _lookupCollectionByUUID(lock, uuid);
+    return coll && !coll->isCommitted();
 }
 
 Collection* CollectionCatalog::_lookupCollectionByUUID(WithLock, CollectionUUID uuid) const {
@@ -258,7 +293,8 @@ Collection* CollectionCatalog::lookupCollectionByNamespace(OperationContext* opC
 
     stdx::lock_guard<Latch> lock(_catalogLock);
     auto it = _collections.find(nss);
-    return it == _collections.end() ? nullptr : it->second;
+    auto coll = (it == _collections.end() ? nullptr : it->second);
+    return (coll && coll->isCommitted()) ? coll : nullptr;
 }
 
 boost::optional<NamespaceString> CollectionCatalog::lookupNSSByUUID(OperationContext* opCtx,
@@ -270,9 +306,9 @@ boost::optional<NamespaceString> CollectionCatalog::lookupNSSByUUID(OperationCon
     stdx::lock_guard<Latch> lock(_catalogLock);
     auto foundIt = _catalog.find(uuid);
     if (foundIt != _catalog.end()) {
-        NamespaceString ns = foundIt->second->ns();
-        invariant(!ns.isEmpty());
-        return ns;
+        boost::optional<NamespaceString> ns = foundIt->second->ns();
+        invariant(!ns.get().isEmpty());
+        return _collections.find(ns.get())->second->isCommitted() ? ns : boost::none;
     }
 
     // Only in the case that the catalog is closed and a UUID is currently unknown, resolve it
@@ -295,7 +331,8 @@ boost::optional<CollectionUUID> CollectionCatalog::lookupUUIDByNSS(
     stdx::lock_guard<Latch> lock(_catalogLock);
     auto it = _collections.find(nss);
     if (it != _collections.end()) {
-        return it->second->uuid();
+        boost::optional<CollectionUUID> uuid = it->second->uuid();
+        return it->second->isCommitted() ? uuid : boost::none;
     }
     return boost::none;
 }
@@ -345,7 +382,9 @@ std::vector<CollectionUUID> CollectionCatalog::getAllCollectionUUIDsFromDb(
 
     std::vector<CollectionUUID> ret;
     while (it != _orderedCollections.end() && it->first.first == dbName) {
-        ret.push_back(it->first.second);
+        if (it->second->isCommitted()) {
+            ret.push_back(it->first.second);
+        }
         ++it;
     }
     return ret;
@@ -362,7 +401,9 @@ std::vector<NamespaceString> CollectionCatalog::getAllCollectionNamesFromDb(
     for (auto it = _orderedCollections.lower_bound(std::make_pair(dbName.toString(), minUuid));
          it != _orderedCollections.end() && it->first.first == dbName;
          ++it) {
-        ret.push_back(it->second->ns());
+        if (it->second->isCommitted()) {
+            ret.push_back(it->second->ns());
+        }
     }
     return ret;
 }
@@ -374,22 +415,58 @@ std::vector<std::string> CollectionCatalog::getAllDbNames() const {
     auto iter = _orderedCollections.upper_bound(std::make_pair("", maxUuid));
     while (iter != _orderedCollections.end()) {
         auto dbName = iter->first.first;
-        ret.push_back(dbName);
+        if (iter->second->isCommitted()) {
+            ret.push_back(dbName);
+        } else {
+            // If the first collection found for `dbName` is not yet committed, increment the
+            // iterator to find the next visible collection (possibly under a different `dbName`).
+            iter++;
+            continue;
+        }
+        // Move on to the next database after `dbName`.
         iter = _orderedCollections.upper_bound(std::make_pair(dbName, maxUuid));
     }
     return ret;
+}
+
+void CollectionCatalog::setDatabaseProfileLevel(StringData dbName, int newProfileLevel) {
+    stdx::lock_guard<Latch> lock(_profileLevelsLock);
+    _databaseProfileLevels[dbName] = newProfileLevel;
+}
+
+int CollectionCatalog::getDatabaseProfileLevel(StringData dbName) const {
+    stdx::lock_guard<Latch> lock(_profileLevelsLock);
+    auto it = _databaseProfileLevels.find(dbName);
+    if (it != _databaseProfileLevels.end()) {
+        return it->second;
+    }
+
+    return serverGlobalParams.defaultProfile;
+}
+
+void CollectionCatalog::clearDatabaseProfileLevel(StringData dbName) {
+    stdx::lock_guard<Latch> lock(_profileLevelsLock);
+    _databaseProfileLevels.erase(dbName);
 }
 
 void CollectionCatalog::registerCollection(CollectionUUID uuid, std::unique_ptr<Collection>* coll) {
     auto ns = (*coll)->ns();
     stdx::lock_guard<Latch> lock(_catalogLock);
     if (_collections.find(ns) != _collections.end()) {
-        log() << "Conflicted creating a collection. ns: " << (*coll)->ns() << " ("
-              << (*coll)->uuid() << ").";
+        LOGV2(20279,
+              "Conflicted creating a collection. ns: {coll_ns} ({coll_uuid}).",
+              "Conflicted creating a collection",
+              "namespace"_attr = (*coll)->ns(),
+              "uuid"_attr = (*coll)->uuid());
         throw WriteConflictException();
     }
 
-    LOG(1) << "Registering collection " << ns << " with UUID " << uuid;
+    LOGV2_DEBUG(20280,
+                1,
+                "Registering collection {ns} with UUID {uuid}",
+                "Registering collection",
+                "namespace"_attr = ns,
+                "uuid"_attr = uuid);
 
     auto dbName = ns.db().toString();
     auto dbIdPair = std::make_pair(dbName, uuid);
@@ -419,7 +496,7 @@ std::unique_ptr<Collection> CollectionCatalog::deregisterCollection(CollectionUU
     auto dbName = ns.db().toString();
     auto dbIdPair = std::make_pair(dbName, uuid);
 
-    LOG(1) << "Deregistering collection " << ns << " with UUID " << uuid;
+    LOGV2_DEBUG(20281, 1, "Deregistering collection", "namespace"_attr = ns, "uuid"_attr = uuid);
 
     // Make sure collection object exists.
     invariant(_collections.find(ns) != _collections.end());
@@ -447,14 +524,15 @@ std::unique_ptr<RecoveryUnit::Change> CollectionCatalog::makeFinishDropCollectio
 void CollectionCatalog::deregisterAllCollections() {
     stdx::lock_guard<Latch> lock(_catalogLock);
 
-    LOG(0) << "Deregistering all the collections";
+    LOGV2(20282, "Deregistering all the collections");
     for (auto& entry : _catalog) {
         auto uuid = entry.first;
         auto ns = entry.second->ns();
         auto dbName = ns.db().toString();
         auto dbIdPair = std::make_pair(dbName, uuid);
 
-        LOG(1) << "Deregistering collection " << ns << " with UUID " << uuid;
+        LOGV2_DEBUG(
+            20283, 1, "Deregistering collection", "namespace"_attr = ns, "uuid"_attr = uuid);
 
         entry.second.reset();
     }

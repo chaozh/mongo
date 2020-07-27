@@ -2,7 +2,11 @@
 // Tests that documents in a sharded collection with missing shard key fields are treated as if they
 // contain an explicit null value for any missing fields.
 //
-// @tags: [requires_find_command, uses_transactions, uses_multi_shard_transactions, requires_fcv_44]
+// @tags: [
+//   requires_find_command,
+//   uses_multi_shard_transactions,
+//   uses_transactions,
+// ]
 
 (function() {
 'use strict';
@@ -151,20 +155,15 @@ assert.commandWorked(mongos.getCollection(kNsName).insert({a: -100, b: 1, c: 1, 
 assert.commandWorked(mongos.getCollection(kNsName).insert({a: 0, b: 1, c: 2, d: 1}));
 assert.commandWorked(mongos.getCollection(kNsName).insert({a: 100, b: 1, c: 3, d: 1}));
 
-// Update via a query that's missing the shard key, in order to force the targeting logic to fall
-// back to the replacement document.
+// Verify we cannot update a shard key value via a query that's missing the shard key, despite being
+// able to target using the replacement document.
 
 // Need to start a session to change the shard key.
 const session = st.s.startSession({retryWrites: true});
 const sessionDB = session.getDatabase(kDbName);
 const sessionColl = sessionDB[kCollName];
 
-assert.commandWorked(sessionColl.update({d: 1}, {b: 1, c: 4, d: 1}));
-docsArr = sessionColl.find({c: 4, d: 1}, {_id: 0}).toArray();
-assert.eq(1, docsArr.length);
-assert.eq({b: 1, c: 4, d: 1}, docsArr[0]);
-assert(isOwnedByPrimaryShard({b: 1, c: 4, d: 1}));
-assert(!isOwnedBySecondaryShard({b: 1, c: 4, d: 1}));
+assert.commandFailedWithCode(sessionColl.update({d: 1}, {b: 1, c: 4, d: 1}), 31025);
 
 // Verify that an upsert targets shards without treating missing shard key fields as null values.
 // This implies that upsert still requires the entire shard key to be specified in the query.

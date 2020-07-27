@@ -37,7 +37,7 @@
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_graph_lookup.h"
 #include "mongo/db/pipeline/document_source_mock.h"
-#include "mongo/db/pipeline/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -62,31 +62,12 @@ public:
     MockMongoInterface(std::deque<DocumentSource::GetNextResult> results)
         : _results(std::move(results)) {}
 
-    std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const MakePipelineOptions opts) final {
-        auto pipeline = uassertStatusOK(Pipeline::parse(rawPipeline, expCtx));
-
-        if (opts.optimize) {
-            pipeline->optimizePipeline();
-        }
-
-        if (opts.attachCursorSource) {
-            pipeline = attachCursorSourceToPipeline(
-                expCtx, pipeline.release(), false /* allowTargetingShards */);
-        }
-
-        return pipeline;
-    }
-
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        Pipeline* ownedPipeline,
-        bool allowTargetingShards) final {
-        std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
-                                                            PipelineDeleter(expCtx->opCtx));
-        pipeline->addInitialSource(DocumentSourceMock::createForTest(_results));
+        Pipeline* ownedPipeline, bool allowTargetingShards) final {
+        std::unique_ptr<Pipeline, PipelineDeleter> pipeline(
+            ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->opCtx));
+        pipeline->addInitialSource(
+            DocumentSourceMock::createForTest(_results, pipeline->getContext()));
         return pipeline;
     }
 
@@ -98,7 +79,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
        ShouldErrorWhenDoingInitialMatchIfDocumentInFromCollectionIsMissingId) {
     auto expCtx = getExpCtx();
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}}};
-    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{Document{{"to", 0}}};
 
@@ -112,7 +93,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
                                           "results",
                                           "from",
                                           "to",
-                                          ExpressionFieldPath::create(expCtx, "_id"),
+                                          ExpressionFieldPath::create(expCtx.get(), "_id"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -126,7 +107,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
     auto expCtx = getExpCtx();
 
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}}};
-    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{
         Document{{"_id", "a"_sd}, {"to", 0}, {"from", 1}}, Document{{"to", 1}}};
@@ -141,7 +122,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
                                           "results",
                                           "from",
                                           "to",
-                                          ExpressionFieldPath::create(expCtx, "_id"),
+                                          ExpressionFieldPath::create(expCtx.get(), "_id"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -156,7 +137,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
     auto expCtx = getExpCtx();
 
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}}};
-    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{Document{{"to", 0}}};
 
@@ -171,7 +152,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
                                           "results",
                                           "from",
                                           "to",
-                                          ExpressionFieldPath::create(expCtx, "_id"),
+                                          ExpressionFieldPath::create(expCtx.get(), "_id"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -195,7 +176,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
     auto expCtx = getExpCtx();
 
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}}};
-    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     Document to0from1{{"_id", "a"_sd}, {"to", 0}, {"from", 1}};
     Document to0from2{{"_id", "a"_sd}, {"to", 0}, {"from", 2}};
@@ -214,7 +195,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
                                           "results",
                                           "from",
                                           "to",
-                                          ExpressionFieldPath::create(expCtx, "_id"),
+                                          ExpressionFieldPath::create(expCtx.get(), "_id"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -225,7 +206,7 @@ TEST_F(DocumentSourceGraphLookUpTest,
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(2U, next.getDocument().size());
+    ASSERT_EQ(2ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");
@@ -262,7 +243,8 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePauses) {
         DocumentSourceMock::createForTest({Document{{"startPoint", 0}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"startPoint", 0}},
-                                           DocumentSource::GetNextResult::makePauseExecution()});
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{
         Document{{"_id", "a"_sd}, {"to", 0}, {"from", 1}}, Document{{"_id", "b"_sd}, {"to", 1}}};
@@ -277,7 +259,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePauses) {
                                           "results",
                                           "from",
                                           "to",
-                                          ExpressionFieldPath::create(expCtx, "startPoint"),
+                                          ExpressionFieldPath::create(expCtx.get(), "startPoint"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -329,7 +311,8 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePausesWhileUnwinding) {
         DocumentSourceMock::createForTest({Document{{"startPoint", 0}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"startPoint", 0}},
-                                           DocumentSource::GetNextResult::makePauseExecution()});
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          expCtx);
 
     std::deque<DocumentSource::GetNextResult> fromContents{
         Document{{"_id", "a"_sd}, {"to", 0}, {"from", 1}}, Document{{"_id", "b"_sd}, {"to", 1}}};
@@ -352,7 +335,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldPropagatePausesWhileUnwinding) {
                                           "results",
                                           "from",
                                           "to",
-                                          ExpressionFieldPath::create(expCtx, "startPoint"),
+                                          ExpressionFieldPath::create(expCtx.get(), "startPoint"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -411,7 +394,7 @@ TEST_F(DocumentSourceGraphLookUpTest, GraphLookupShouldReportAsFieldIsModified) 
                                           "results",
                                           "from",
                                           "to",
-                                          ExpressionFieldPath::create(expCtx, "startPoint"),
+                                          ExpressionFieldPath::create(expCtx.get(), "startPoint"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -438,7 +421,7 @@ TEST_F(DocumentSourceGraphLookUpTest, GraphLookupShouldReportFieldsModifiedByAbs
                                           "results",
                                           "from",
                                           "to",
-                                          ExpressionFieldPath::create(expCtx, "startPoint"),
+                                          ExpressionFieldPath::create(expCtx.get(), "startPoint"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -454,7 +437,8 @@ TEST_F(DocumentSourceGraphLookUpTest, GraphLookupShouldReportFieldsModifiedByAbs
 TEST_F(DocumentSourceGraphLookUpTest, GraphLookupWithComparisonExpressionForStartWith) {
     auto expCtx = getExpCtx();
 
-    auto inputMock = DocumentSourceMock::createForTest(Document({{"_id", 0}, {"a", 1}, {"b", 2}}));
+    auto inputMock =
+        DocumentSourceMock::createForTest(Document({{"_id", 0}, {"a", 1}, {"b", 2}}), expCtx);
 
     NamespaceString fromNs("test", "foreign");
     expCtx->setResolvedNamespaces(StringMap<ExpressionContext::ResolvedNamespace>{
@@ -469,10 +453,10 @@ TEST_F(DocumentSourceGraphLookUpTest, GraphLookupWithComparisonExpressionForStar
         "results",
         "from",
         "to",
-        ExpressionCompare::create(expCtx,
+        ExpressionCompare::create(expCtx.get(),
                                   ExpressionCompare::GT,
-                                  ExpressionFieldPath::create(expCtx, "a"),
-                                  ExpressionFieldPath::create(expCtx, "b")),
+                                  ExpressionFieldPath::create(expCtx.get(), "a"),
+                                  ExpressionFieldPath::create(expCtx.get(), "b")),
         boost::none,
         boost::none,
         boost::none,
@@ -498,7 +482,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldExpandArraysAtEndOfConnectFromField)
     auto expCtx = getExpCtx();
 
     std::deque<DocumentSource::GetNextResult> inputs{Document{{"_id", 0}, {"startVal", 0}}};
-    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     /* Make the following graph:
      *   ,> 1 .
@@ -532,7 +516,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldExpandArraysAtEndOfConnectFromField)
                                           "results",
                                           "to",
                                           "_id",
-                                          ExpressionFieldPath::create(expCtx, "startVal"),
+                                          ExpressionFieldPath::create(expCtx.get(), "startVal"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -543,7 +527,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldExpandArraysAtEndOfConnectFromField)
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(3U, next.getDocument().size());
+    ASSERT_EQ(3ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");
@@ -566,7 +550,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldNotExpandArraysWithinArraysAtEndOfCo
 
     std::deque<DocumentSource::GetNextResult> inputs{
         Document{{"_id", 0}, {"startVal", makeTupleValue(0, 0)}}};
-    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs));
+    auto inputMock = DocumentSourceMock::createForTest(std::move(inputs), expCtx);
 
     // Make the following graph:
     //
@@ -605,7 +589,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldNotExpandArraysWithinArraysAtEndOfCo
                                           "results",
                                           "connectedTo",
                                           "coordinate",
-                                          ExpressionFieldPath::create(expCtx, "startVal"),
+                                          ExpressionFieldPath::create(expCtx.get(), "startVal"),
                                           boost::none,
                                           boost::none,
                                           boost::none,
@@ -616,7 +600,7 @@ TEST_F(DocumentSourceGraphLookUpTest, ShouldNotExpandArraysWithinArraysAtEndOfCo
     auto next = graphLookupStage->getNext();
     ASSERT_TRUE(next.isAdvanced());
 
-    ASSERT_EQ(3U, next.getDocument().size());
+    ASSERT_EQ(3ULL, next.getDocument().computeSize());
     ASSERT_VALUE_EQ(Value(0), next.getDocument().getField("_id"));
 
     auto resultsValue = next.getDocument().getField("results");

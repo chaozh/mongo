@@ -72,7 +72,7 @@ public:
             mockInputs.emplace_back(std::move(input));
         }
 
-        auto source = DocumentSourceMock::createForTest(std::move(mockInputs));
+        auto source = DocumentSourceMock::createForTest(std::move(mockInputs), getExpCtx());
         bucketAutoStage->setSource(source.get());
 
         vector<Document> results;
@@ -324,7 +324,8 @@ TEST_F(BucketAutoTests, ShouldPropagatePauses) {
                                            Document{{"x", 3}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"x", 4}},
-                                           DocumentSource::GetNextResult::makePauseExecution()});
+                                           DocumentSource::GetNextResult::makePauseExecution()},
+                                          getExpCtx());
     bucketAutoStage->setSource(source.get());
 
     // The $bucketAuto stage needs to consume all inputs before returning any output, so we should
@@ -356,7 +357,7 @@ TEST_F(BucketAutoTests, ShouldBeAbleToCorrectlySpillToDisk) {
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$a", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
 
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
@@ -366,7 +367,8 @@ TEST_F(BucketAutoTests, ShouldBeAbleToCorrectlySpillToDisk) {
     auto mock = DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
                                                    Document{{"a", 1}, {"largeStr", largeStr}},
                                                    Document{{"a", 2}, {"largeStr", largeStr}},
-                                                   Document{{"a", 3}, {"largeStr", largeStr}}});
+                                                   Document{{"a", 3}, {"largeStr", largeStr}}},
+                                                  expCtx);
     bucketAutoStage->setSource(mock.get());
 
     auto next = bucketAutoStage->getNext();
@@ -392,7 +394,7 @@ TEST_F(BucketAutoTests, ShouldBeAbleToPauseLoadingWhileSpilled) {
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$a", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
 
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
@@ -406,7 +408,8 @@ TEST_F(BucketAutoTests, ShouldBeAbleToPauseLoadingWhileSpilled) {
                                            Document{{"a", 1}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"a", 2}, {"largeStr", largeStr}},
-                                           Document{{"a", 3}, {"largeStr", largeStr}}});
+                                           Document{{"a", 3}, {"largeStr", largeStr}}},
+                                          expCtx);
     bucketAutoStage->setSource(mock.get());
 
     // There were 2 pauses, so we should expect 2 paused results before any results can be
@@ -515,7 +518,7 @@ TEST_F(BucketAutoTests, ShouldBeAbleToReParseSerializedStage) {
     ASSERT_EQUALS(serialization.size(), 1UL);
     ASSERT_EQUALS(serialization[0].getType(), BSONType::Object);
 
-    ASSERT_EQUALS(serialization[0].getDocument().size(), 1UL);
+    ASSERT_EQUALS(serialization[0].getDocument().computeSize(), 1ULL);
     ASSERT_EQUALS(serialization[0].getDocument()["$bucketAuto"].getType(), BSONType::Object);
 
     auto serializedBson = serialization[0].getDocument().toBson();
@@ -548,7 +551,7 @@ TEST_F(BucketAutoTests, FailsWithInvalidNumberOfBuckets) {
     const int numBuckets = 0;
     ASSERT_THROWS_CODE(
         DocumentSourceBucketAuto::create(
-            getExpCtx(), ExpressionConstant::create(getExpCtx(), Value(0)), numBuckets),
+            getExpCtx(), ExpressionConstant::create(getExpCtxRaw(), Value(0)), numBuckets),
         AssertionException,
         40243);
 }
@@ -633,7 +636,7 @@ void assertCannotSpillToDisk(const boost::intrusive_ptr<ExpressionContext>& expC
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$a", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
 
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
@@ -641,10 +644,13 @@ void assertCannotSpillToDisk(const boost::intrusive_ptr<ExpressionContext>& expC
 
     string largeStr(maxMemoryUsageBytes, 'x');
     auto mock = DocumentSourceMock::createForTest(
-        {Document{{"a", 0}, {"largeStr", largeStr}}, Document{{"a", 1}, {"largeStr", largeStr}}});
+        {Document{{"a", 0}, {"largeStr", largeStr}}, Document{{"a", 1}, {"largeStr", largeStr}}},
+        expCtx);
     bucketAutoStage->setSource(mock.get());
 
-    ASSERT_THROWS_CODE(bucketAutoStage->getNext(), AssertionException, 16819);
+    ASSERT_THROWS_CODE(bucketAutoStage->getNext(),
+                       AssertionException,
+                       ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(BucketAutoTests, ShouldFailIfBufferingTooManyDocuments) {
@@ -669,7 +675,7 @@ TEST_F(BucketAutoTests, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     const size_t maxMemoryUsageBytes = 1000;
 
     VariablesParseState vps = expCtx->variablesParseState;
-    auto groupByExpression = ExpressionFieldPath::parse(expCtx, "$a", vps);
+    auto groupByExpression = ExpressionFieldPath::parse(expCtx.get(), "$a", vps);
 
     const int numBuckets = 2;
     auto bucketAutoStage = DocumentSourceBucketAuto::create(
@@ -680,14 +686,17 @@ TEST_F(BucketAutoTests, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
         DocumentSourceMock::createForTest({Document{{"a", 0}, {"largeStr", largeStr}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
                                            Document{{"a", 1}, {"largeStr", largeStr}},
-                                           Document{{"a", 2}, {"largeStr", largeStr}}});
+                                           Document{{"a", 2}, {"largeStr", largeStr}}},
+                                          expCtx);
     bucketAutoStage->setSource(mock.get());
 
     // The first getNext() should pause.
     ASSERT_TRUE(bucketAutoStage->getNext().isPaused());
 
     // The next should realize it's used too much memory.
-    ASSERT_THROWS_CODE(bucketAutoStage->getNext(), AssertionException, 16819);
+    ASSERT_THROWS_CODE(bucketAutoStage->getNext(),
+                       AssertionException,
+                       ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed);
 }
 
 TEST_F(BucketAutoTests, ShouldRoundUpMaximumBoundariesWithGranularitySpecified) {

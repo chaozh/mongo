@@ -27,7 +27,10 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 #include <math.h>
+#include <sstream>
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +44,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
 
 namespace DocumentTests {
 
@@ -77,20 +81,20 @@ void assertRoundTrips(const Document& document1) {
 
 TEST(DocumentConstruction, Default) {
     Document document;
-    ASSERT_EQUALS(0U, document.size());
+    ASSERT_EQUALS(0ULL, document.computeSize());
     assertRoundTrips(document);
 }
 
 TEST(DocumentConstruction, FromEmptyBson) {
     Document document = fromBson(BSONObj());
-    ASSERT_EQUALS(0U, document.size());
+    ASSERT_EQUALS(0ULL, document.computeSize());
     assertRoundTrips(document);
 }
 
 TEST(DocumentConstruction, FromNonEmptyBson) {
     Document document = fromBson(BSON("a" << 1 << "b"
                                           << "q"));
-    ASSERT_EQUALS(2U, document.size());
+    ASSERT_EQUALS(2ULL, document.computeSize());
     ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
     ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
     ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
@@ -99,7 +103,7 @@ TEST(DocumentConstruction, FromNonEmptyBson) {
 
 TEST(DocumentConstruction, FromInitializerList) {
     auto document = Document{{"a", 1}, {"b", "q"_sd}};
-    ASSERT_EQUALS(2U, document.size());
+    ASSERT_EQUALS(2ULL, document.computeSize());
     ASSERT_EQUALS("a", getNthField(document, 0).first.toString());
     ASSERT_EQUALS(1, getNthField(document, 0).second.getInt());
     ASSERT_EQUALS("b", getNthField(document, 1).first.toString());
@@ -108,7 +112,7 @@ TEST(DocumentConstruction, FromInitializerList) {
 
 TEST(DocumentConstruction, FromEmptyDocumentClone) {
     Document document;
-    ASSERT_EQUALS(0U, document.size());
+    ASSERT_EQUALS(0ULL, document.computeSize());
     // Prior to SERVER-26462, cloning an empty document would cause a segmentation fault.
     Document documentClone = document.clone();
     ASSERT_DOCUMENT_EQ(document, documentClone);
@@ -172,22 +176,201 @@ TEST(DocumentSerialization, CannotSerializeDocumentThatExceedsDepthLimit) {
     throwaway.abandon();
 }
 
+TEST(DocumentGetFieldNonCaching, UncachedTopLevelFields) {
+    BSONObj bson = BSON("scalar" << 1 << "array" << BSON_ARRAY(1 << 2 << 3) << "scalar2" << true);
+    Document document = fromBson(bson);
+
+    // Should be able to get all top level fields without caching.
+    for (auto&& elt : bson) {
+        auto valueVariant = document.getNestedFieldNonCaching(elt.fieldNameStringData());
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariant));
+        ASSERT_TRUE(stdx::get<BSONElement>(valueVariant).binaryEqual(elt));
+
+        // Get the field again to be sure it wasn't cached during the access above.
+        auto valueVariantAfterAccess = document.getNestedFieldNonCaching(elt.fieldNameStringData());
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariantAfterAccess));
+    }
+
+    // Try to get a top level field which doesn't exist.
+    auto nonExistentFieldVariant = document.getNestedFieldNonCaching("doesnotexist");
+    ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(nonExistentFieldVariant));
+
+    assertRoundTrips(document);
+}
+
+TEST(DocumentGetFieldNonCaching, CachedTopLevelFields) {
+    BSONObj bson = BSON("scalar" << 1 << "array" << BSON_ARRAY(1 << 2 << 3) << "scalar2" << true);
+    Document document = fromBson(bson);
+
+    // Force 'scalar2' to be cached.
+    ASSERT_FALSE(document["scalar2"].missing());
+
+    // Attempt to access scalar2 with the non caching accessor. It should be cached already.
+    {
+        auto valueVariant = document.getNestedFieldNonCaching("scalar2");
+        ASSERT_TRUE(stdx::holds_alternative<Value>(valueVariant));
+        ASSERT_EQ(stdx::get<Value>(valueVariant).getBool(), true);
+    }
+
+    // Attempt to access 'array' with the non caching accessor. It should not be cached.
+    {
+        auto valueVariant = document.getNestedFieldNonCaching("array");
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(valueVariant));
+        auto elt = stdx::get<BSONElement>(valueVariant);
+        ASSERT_TRUE(bson["array"].binaryEqual(elt));
+    }
+
+    // Force 'array' to be cached.
+    ASSERT_FALSE(document["array"].missing());
+
+    // Check that 'array' is cached and that we can read it with the non caching accessor.
+    {
+        auto valueVariant = document.getNestedFieldNonCaching("array");
+        ASSERT_TRUE(stdx::holds_alternative<Value>(valueVariant));
+        ASSERT_EQ(stdx::get<Value>(valueVariant).getArrayLength(), 3);
+    }
+}
+
+TEST(DocumentGetFieldNonCaching, NonArrayDottedPaths) {
+    BSONObj bson = BSON("address" << BSON("zip" << 123 << "street"
+                                                << "foo"));
+    Document document = fromBson(bson);
+
+    // With no fields cached.
+    {
+        // Get a nested field without caching.
+        auto zipVariant = document.getNestedFieldNonCaching("address.zip");
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(zipVariant));
+        ASSERT_EQ(stdx::get<BSONElement>(zipVariant).numberInt(), 123);
+
+        // Check that it was not cached.
+        auto zipVariantAfterAccess = document.getNestedFieldNonCaching("address.zip");
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(zipVariantAfterAccess));
+
+        // Check that the top level field isn't cached after accessing one of its children.
+        auto addressVariant = document.getNestedFieldNonCaching("address");
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(addressVariant));
+
+        // Get a dotted field which does not exist.
+        auto nonExistentVariant = document.getNestedFieldNonCaching("address.doesnotexist");
+        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(nonExistentVariant));
+
+        // Check that the top level field isn't cached after a failed attempt to access one of its
+        // children.
+        addressVariant = document.getNestedFieldNonCaching("address");
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(addressVariant));
+
+        // Get a dotted field which extends past a scalar.
+        auto pathPastScalarVariant = document.getNestedFieldNonCaching("address.zip.doesnotexist");
+        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(pathPastScalarVariant));
+    }
+
+    // Now force 'address.street' to be cached.
+    ASSERT_FALSE(document.getNestedField("address.street").missing());
+
+    // Check that we get the right value when accessing it with the non caching accessor.
+    {
+        // The top level field should be cached.
+        auto topLevelVariant = document.getNestedFieldNonCaching("address");
+        ASSERT_TRUE(stdx::holds_alternative<Value>(topLevelVariant));
+
+        auto variant = document.getNestedFieldNonCaching("address.street");
+        ASSERT_TRUE(stdx::holds_alternative<Value>(variant));
+        ASSERT_EQ(stdx::get<Value>(variant).getString(), "foo");
+    }
+
+    // Check that the other subfield, 'zip' is not cached.
+    {
+        auto variant = document.getNestedFieldNonCaching("address.zip");
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
+    }
+
+    // Check that attempting to get a subfield of 'address.street' returns monostate.
+    {
+        auto variant = document.getNestedFieldNonCaching("address.street.doesnotexist");
+        ASSERT_TRUE(stdx::holds_alternative<stdx::monostate>(variant));
+    }
+}
+
+TEST(DocumentGetFieldNonCaching, NonArrayLongDottedPath) {
+    BSONObj bson = BSON("a" << BSON("b" << BSON("c" << BSON("d" << BSON("e" << 1)))));
+    Document document = fromBson(bson);
+
+    // Not cached.
+    {
+        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
+        ASSERT_EQ(stdx::get<BSONElement>(variant).numberInt(), 1);
+    }
+
+    // Force part of the path to get cached.
+    ASSERT_FALSE(document.getNestedField("a.b.c").missing());
+
+    // The function should be able to traverse a path which is part Value and part BSONElement.
+    {
+        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
+        ASSERT_TRUE(stdx::holds_alternative<BSONElement>(variant));
+        ASSERT_EQ(stdx::get<BSONElement>(variant).numberInt(), 1);
+    }
+
+    // Force the entire path to be cached.
+    ASSERT_FALSE(document.getNestedField("a.b.c.d.e").missing());
+
+    {
+        auto variant = document.getNestedFieldNonCaching("a.b.c.d.e");
+        ASSERT_TRUE(stdx::holds_alternative<Value>(variant));
+        ASSERT_EQ(stdx::get<Value>(variant).getInt(), 1);
+    }
+}
+
+TEST(DocumentGetFieldNonCaching, TraverseArray) {
+    BSONObj bson =
+        BSON("topLevelArray" << BSON_ARRAY(BSON("foo" << 1) << BSON("foo" << 2) << BSON("foo" << 3))
+                             << "subObj" << BSON("subArray" << BSON_ARRAY(1 << 2)));
+    Document document = fromBson(bson);
+
+    auto checkArrayTagIsReturned = [&document]() {
+        auto topLevelArrayVariant = document.getNestedFieldNonCaching("topLevelArray.foo");
+        ASSERT_TRUE(stdx::holds_alternative<Document::TraversesArrayTag>(topLevelArrayVariant));
+
+        // Attempting to traverse an uncached nested array results in TraversesArrayTag being
+        // returned.
+        auto subArrayVariant = document.getNestedFieldNonCaching("subObj.subArray.foobar");
+        ASSERT_TRUE(stdx::holds_alternative<Document::TraversesArrayTag>(subArrayVariant));
+    };
+
+    // Check with no fields cached.
+    checkArrayTagIsReturned();
+
+    // Force the top level array to be cached.
+    ASSERT_FALSE(document["topLevelArray"].missing());
+
+    // Check with one field cached.
+    checkArrayTagIsReturned();
+
+    // Force the array that's in a sub object to be cached.
+    ASSERT_FALSE(document.getNestedField("subObj.subArray").missing());
+
+    // Check it works with both fields (and the full sub object) cached.
+    checkArrayTagIsReturned();
+}
+
 /** Add Document fields. */
 class AddField {
 public:
     void run() {
         MutableDocument md;
         md.addField("foo", Value(1));
-        ASSERT_EQUALS(1U, md.peek().size());
+        ASSERT_EQUALS(1ULL, md.peek().computeSize());
         ASSERT_EQUALS(1, md.peek()["foo"].getInt());
         md.addField("bar", Value(99));
-        ASSERT_EQUALS(2U, md.peek().size());
+        ASSERT_EQUALS(2ULL, md.peek().computeSize());
         ASSERT_EQUALS(99, md.peek()["bar"].getInt());
         // No assertion is triggered by a duplicate field name.
         md.addField("a", Value(5));
 
         Document final = md.freeze();
-        ASSERT_EQUALS(3U, final.size());
+        ASSERT_EQUALS(3ULL, final.computeSize());
         assertRoundTrips(final);
     }
 };
@@ -223,21 +406,21 @@ public:
 
         // Set the first field.
         md.setField("a", Value("foo"_sd));
-        ASSERT_EQUALS(3U, md.peek().size());
+        ASSERT_EQUALS(3ULL, md.peek().computeSize());
         ASSERT_EQUALS("foo", md.peek()["a"].getString());
         ASSERT_EQUALS("foo", getNthField(md.peek(), 0).second.getString());
         assertRoundTrips(md.peek());
         // Set the second field.
         md["b"] = Value("bar"_sd);
-        ASSERT_EQUALS(3U, md.peek().size());
+        ASSERT_EQUALS(3ULL, md.peek().computeSize());
         ASSERT_EQUALS("bar", md.peek()["b"].getString());
         ASSERT_EQUALS("bar", getNthField(md.peek(), 1).second.getString());
         assertRoundTrips(md.peek());
 
         // Remove the second field.
         md.setField("b", Value());
-        log() << md.peek().toString();
-        ASSERT_EQUALS(2U, md.peek().size());
+        LOGV2(20585, "{md_peek}", "md_peek"_attr = md.peek().toString());
+        ASSERT_EQUALS(2ULL, md.peek().computeSize());
         ASSERT(md.peek()["b"].missing());
         ASSERT_EQUALS("a", getNthField(md.peek(), 0).first.toString());
         ASSERT_EQUALS("c", getNthField(md.peek(), 1).first.toString());
@@ -246,7 +429,7 @@ public:
 
         // Remove the first field.
         md["a"] = Value();
-        ASSERT_EQUALS(1U, md.peek().size());
+        ASSERT_EQUALS(1ULL, md.peek().computeSize());
         ASSERT(md.peek()["a"].missing());
         ASSERT_EQUALS("c", getNthField(md.peek(), 0).first.toString());
         ASSERT_EQUALS(99, md.peek()["c"].getInt());
@@ -255,7 +438,7 @@ public:
         // Remove the final field. Verify document is empty.
         md.remove("c");
         ASSERT(md.peek().empty());
-        ASSERT_EQUALS(0U, md.peek().size());
+        ASSERT_EQUALS(0ULL, md.peek().computeSize());
         ASSERT_DOCUMENT_EQ(md.peek(), Document());
         ASSERT(!FieldIterator(md.peek()).more());
         ASSERT(md.peek()["c"].missing());
@@ -595,7 +778,7 @@ TEST(MetaFields, IndexKeyMetadataSerializesCorrectly) {
     ASSERT_TRUE(doc.metadata().hasIndexKey());
     ASSERT_BSONOBJ_EQ(doc.metadata().getIndexKey(), BSON("b" << 1));
 
-    auto serialized = doc.toBsonWithMetaData(SortKeyFormat::k42SortKey);
+    auto serialized = doc.toBsonWithMetaData();
     ASSERT_BSONOBJ_EQ(serialized, BSON("a" << 1 << "$indexKey" << BSON("b" << 1)));
 }
 
@@ -709,7 +892,7 @@ TEST(MetaFields, ToAndFromBson) {
     docBuilder.metadata().setSearchHighlights(DOC_ARRAY("abc"_sd
                                                         << "def"_sd));
     Document doc = docBuilder.freeze();
-    BSONObj obj = doc.toBsonWithMetaData(SortKeyFormat::k42SortKey);
+    BSONObj obj = doc.toBsonWithMetaData();
     ASSERT_EQ(10.0, obj[Document::metaFieldTextScore].Double());
     ASSERT_EQ(20, obj[Document::metaFieldRandVal].numberLong());
     ASSERT_EQ(30.0, obj[Document::metaFieldSearchScore].Double());
@@ -1915,7 +2098,7 @@ private:
         assertComparison(expectedResult, fromBson(a), fromBson(b));
     }
     void assertComparison(int expectedResult, const Value& a, const Value& b) {
-        mongo::unittest::log() << "testing " << a.toString() << " and " << b.toString();
+        LOGV2(20586, "testing {a} and {b}", "a"_attr = a.toString(), "b"_attr = b.toString());
 
         // reflexivity
         ASSERT_EQUALS(0, cmp(a, a));
@@ -2063,6 +2246,12 @@ TEST(ValueIntegral, CorrectlyIdentifiesInvalid64BitIntegralValues) {
     ASSERT_FALSE(Value(kDoubleMin).integral64Bit());
     ASSERT_FALSE(Value(kDoubleMaxAsDecimal).integral64Bit());
     ASSERT_FALSE(Value(kDoubleMinAsDecimal).integral64Bit());
+}
+
+TEST(ValueOutput, StreamOutputForIllegalDateProducesErrorToken) {
+    auto sout = std::ostringstream{};
+    sout << mongo::Value{Date_t::min()};
+    ASSERT_EQ("illegal date", sout.str());
 }
 
 }  // namespace Value

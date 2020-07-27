@@ -1,8 +1,11 @@
 // Cannot implicitly shard accessed collections because of collection existing when none
 // expected.
 // FCV4.4 is required for creating a collection with a long name.
-// @tags: [assumes_no_implicit_collection_creation_after_drop, requires_capped,
-//         assumes_against_mongod_not_mongos, requires_fcv_44]
+// @tags: [
+//   assumes_against_mongod_not_mongos,
+//   assumes_no_implicit_collection_creation_after_drop,
+//   requires_capped,
+// ]
 
 // Tests for the "create" command.
 (function() {
@@ -19,9 +22,9 @@ assert.commandFailedWithCode(db.createCollection("\0ab"), ErrorCodes.InvalidName
 assert.commandFailedWithCode(db.createCollection("a\0b"), ErrorCodes.InvalidNamespace);
 assert.commandFailedWithCode(db.createCollection("ab\0"), ErrorCodes.InvalidNamespace);
 
-// The collection name length limit was removed in 4.4, try creating a collection with a longer
+// The collection name length limit was upped in 4.4, try creating a collection with a longer
 // name than previously allowed.
-const longCollName = 'a'.repeat(8192);
+const longCollName = 'a'.repeat(200);
 db[longCollName].drop();
 assert.commandWorked(db.createCollection(longCollName));
 

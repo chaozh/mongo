@@ -23,7 +23,7 @@ assert.commandWorked(coll.insert({a: 1}));
 assert.commandWorked(coll.insert({a: 2}));
 
 // Add a secondary node but make it hang before copying databases.
-var secondary = replSet.add();
+var secondary = replSet.add({rsConfig: {votes: 0, priority: 0}});
 secondary.setSlaveOk();
 
 var failPointBeforeCopying = configureFailPoint(secondary, 'initialSyncHangBeforeCopyingDatabases');
@@ -58,7 +58,11 @@ failPointBeforeFinish.wait();
 res = assert.commandWorked(secondary.adminCommand({replSetGetStatus: 1}));
 assert(res.initialSyncStatus,
        () => "Response should have an 'initialSyncStatus' field: " + tojson(res));
-assert.eq(res.initialSyncStatus.appliedOps, 3);
+
+// It is possible that we update the config document after going through a reconfig. So make sure
+// we account for this.
+assert.gte(res.initialSyncStatus.appliedOps, 3);
+
 assert.eq(res.initialSyncStatus.failedInitialSyncAttempts, 0);
 assert.eq(res.initialSyncStatus.maxFailedInitialSyncAttempts, 10);
 assert.eq(res.initialSyncStatus.databases.databasesCloned, 3);

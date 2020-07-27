@@ -39,6 +39,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/client/fetcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/callback_completion_guard.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
@@ -80,8 +81,7 @@ struct InitialSyncerOptions {
     using GetMyLastOptimeFn = std::function<OpTime()>;
 
     /** Function to update optime of last operation applied on this node */
-    using SetMyLastOptimeFn = std::function<void(
-        const OpTimeAndWallTime&, ReplicationCoordinator::DataConsistency consistency)>;
+    using SetMyLastOptimeFn = std::function<void(const OpTimeAndWallTime&)>;
 
     /** Function to reset all optimes on this node (e.g. applied & durable). */
     using ResetOptimesFn = std::function<void()>;
@@ -159,7 +159,6 @@ public:
         executor::TaskExecutor* executor,
         OpTime lastFetched,
         HostAndPort source,
-        NamespaceString nss,
         ReplSetConfig config,
         std::unique_ptr<OplogFetcher::OplogFetcherRestartDecision> oplogFetcherRestartDecision,
         int requiredRBID,
@@ -184,22 +183,22 @@ public:
     };
 
     class OplogFetcherRestartDecisionInitialSyncer
-        : public AbstractOplogFetcher::OplogFetcherRestartDecision {
+        : public OplogFetcher::OplogFetcherRestartDecision {
 
     public:
         OplogFetcherRestartDecisionInitialSyncer(InitialSyncSharedData* sharedData,
                                                  std::size_t maxFetcherRestarts)
             : _sharedData(sharedData), _defaultDecision(maxFetcherRestarts){};
 
-        bool shouldContinue(AbstractOplogFetcher* fetcher, Status status) final;
+        bool shouldContinue(OplogFetcher* fetcher, Status status) final;
 
-        void fetchSuccessful(AbstractOplogFetcher* fetcher) final;
+        void fetchSuccessful(OplogFetcher* fetcher) final;
 
     private:
         InitialSyncSharedData* _sharedData;
 
         // We delegate to the default strategy when it's a non-network error.
-        AbstractOplogFetcher::OplogFetcherRestartDecisionDefault _defaultDecision;
+        OplogFetcher::OplogFetcherRestartDecisionDefault _defaultDecision;
 
         // The operation, if any, currently being retried because of a network error.
         InitialSyncSharedData::RetryableOperation _retryingOperation;
@@ -256,6 +255,11 @@ public:
      * returns an empty BSON object.
      */
     BSONObj getInitialSyncProgress() const;
+
+    /**
+     * Cancels the current initial sync attempt if the initial syncer is active.
+     */
+    void cancelCurrentAttempt();
 
     /**
      *
@@ -454,7 +458,7 @@ private:
      */
     void _startInitialSyncAttemptCallback(const executor::TaskExecutor::CallbackArgs& callbackArgs,
                                           std::uint32_t initialSyncAttempt,
-                                          std::uint32_t initialSyncMaxAttempts);
+                                          std::uint32_t initialSyncMaxAttempts) noexcept;
 
     /**
      * Callback to obtain sync source from sync source selector.
@@ -465,7 +469,7 @@ private:
     void _chooseSyncSourceCallback(const executor::TaskExecutor::CallbackArgs& callbackArgs,
                                    std::uint32_t chooseSyncSourceAttempt,
                                    std::uint32_t chooseSyncSourceMaxAttempts,
-                                   std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+                                   std::shared_ptr<OnCompletionGuard> onCompletionGuard) noexcept;
 
     /**
      * This function does the following:
@@ -551,8 +555,9 @@ private:
     /**
      * Callback to obtain next batch of operations to apply.
      */
-    void _getNextApplierBatchCallback(const executor::TaskExecutor::CallbackArgs& callbackArgs,
-                                      std::shared_ptr<OnCompletionGuard> onCompletionGuard);
+    void _getNextApplierBatchCallback(
+        const executor::TaskExecutor::CallbackArgs& callbackArgs,
+        std::shared_ptr<OnCompletionGuard> onCompletionGuard) noexcept;
 
     /**
      * Callback for MultiApplier completion.
@@ -592,8 +597,8 @@ private:
      * Returns a status even though it always returns OK, to conform the interface OplogFetcher
      * expects for the EnqueueDocumentsFn.
      */
-    Status _enqueueDocuments(Fetcher::Documents::const_iterator begin,
-                             Fetcher::Documents::const_iterator end,
+    Status _enqueueDocuments(OplogFetcher::Documents::const_iterator begin,
+                             OplogFetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
     void _appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const;

@@ -35,10 +35,12 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
+#include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/shard_server_op_observer.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
@@ -46,7 +48,6 @@
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
-#include "mongo/s/shard_server_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -69,9 +70,12 @@ protected:
         // When sharding initialization is triggered, initialize sharding state as a shard server.
         serverGlobalParams.clusterRole = ClusterRole::ShardServer;
 
-        CatalogCacheLoader::set(getServiceContext(),
-                                std::make_unique<ShardServerCatalogCacheLoader>(
-                                    std::make_unique<ConfigServerCatalogCacheLoader>()));
+        _catalogCacheExecutor = CatalogCache::makeDefaultThreadPool();
+        CatalogCacheLoader::set(
+            getServiceContext(),
+            std::make_unique<ShardServerCatalogCacheLoader>(
+                std::make_unique<ConfigServerCatalogCacheLoader>(catalogCacheExecutor()),
+                catalogCacheExecutor()));
 
         ShardingInitializationMongoD::get(getServiceContext())
             ->setGlobalInitMethodForTest([&](OperationContext* opCtx,
@@ -135,21 +139,30 @@ protected:
 class ScopedSetStandaloneMode {
 public:
     ScopedSetStandaloneMode(ServiceContext* serviceContext) : _serviceContext(serviceContext) {
+        CollectionShardingStateFactory::clear(serviceContext);
+
+        CollectionShardingStateFactory::set(
+            serviceContext,
+            std::make_unique<CollectionShardingStateFactoryStandalone>(serviceContext));
+
         serverGlobalParams.clusterRole = ClusterRole::None;
         _serviceContext->setOpObserver(std::make_unique<OpObserverRegistry>());
     }
 
     ~ScopedSetStandaloneMode() {
+        CollectionShardingStateFactory::clear(_serviceContext);
+
+        CollectionShardingStateFactory::set(
+            _serviceContext,
+            std::make_unique<CollectionShardingStateFactoryShard>(_serviceContext));
+
         serverGlobalParams.clusterRole = ClusterRole::ShardServer;
-        auto makeOpObserver = [&] {
+        _serviceContext->setOpObserver([&] {
             auto opObserver = std::make_unique<OpObserverRegistry>();
             opObserver->addObserver(std::make_unique<OpObserverShardingImpl>());
-            opObserver->addObserver(std::make_unique<ConfigServerOpObserver>());
             opObserver->addObserver(std::make_unique<ShardServerOpObserver>());
             return opObserver;
-        };
-
-        _serviceContext->setOpObserver(makeOpObserver());
+        }());
     }
 
 private:

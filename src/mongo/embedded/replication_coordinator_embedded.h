@@ -49,6 +49,10 @@ public:
 
     void enterTerminalShutdown() override;
 
+    bool enterQuiesceModeIfSecondary(Milliseconds quiesceTime) override;
+
+    bool inQuiesceMode() const override;
+
     void shutdown(OperationContext* opCtx) override;
 
     void markAsCleanShutdownIfPossible(OperationContext* opCtx) override;
@@ -71,8 +75,10 @@ public:
     bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) override;
     bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) override;
 
-    bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceString& ns) override;
-    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) override;
+    bool canAcceptWritesFor(OperationContext* opCtx,
+                            const NamespaceStringOrUUID& nsOrUUID) override;
+    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
+                                   const NamespaceStringOrUUID& nsOrUUID) override;
 
     Status checkCanServeReadsFor(OperationContext* opCtx,
                                  const NamespaceString& ns,
@@ -114,12 +120,15 @@ public:
     Status checkIfCommitQuorumCanBeSatisfied(
         const CommitQuorumOptions& commitQuorum) const override;
 
+    bool isCommitQuorumSatisfied(const CommitQuorumOptions& commitQuorum,
+                                 const std::vector<mongo::HostAndPort>& members) const override;
+
     void setMyLastAppliedOpTimeAndWallTime(
         const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
     void setMyLastDurableOpTimeAndWallTime(
         const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
-    void setMyLastAppliedOpTimeAndWallTimeForward(const repl::OpTimeAndWallTime& opTimeAndWallTime,
-                                                  DataConsistency consistency) override;
+    void setMyLastAppliedOpTimeAndWallTimeForward(
+        const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
     void setMyLastDurableOpTimeAndWallTimeForward(
         const repl::OpTimeAndWallTime& opTimeAndWallTime) override;
 
@@ -134,6 +143,9 @@ public:
     repl::OpTime getMyLastDurableOpTime() const override;
     repl::OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const override;
 
+    Status waitUntilMajorityOpTime(OperationContext* opCtx,
+                                   repl::OpTime targetOpTime,
+                                   boost::optional<Date_t> deadline) override;
     Status waitUntilOpTimeForReadUntil(OperationContext*,
                                        const repl::ReadConcernArgs&,
                                        boost::optional<Date_t>) override;
@@ -149,7 +161,7 @@ public:
 
     Status setFollowerMode(const repl::MemberState&) override;
 
-    Status setFollowerModeStrict(OperationContext* opCtx, const repl::MemberState&) override;
+    Status setFollowerModeRollback(OperationContext* opCtx) override;
 
     ApplierState getApplierState() override;
 
@@ -159,8 +171,6 @@ public:
 
     void signalUpstreamUpdater() override;
 
-    Status resyncData(OperationContext*, bool) override;
-
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
 
     Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle) override;
@@ -169,7 +179,9 @@ public:
 
     repl::ReplSetConfig getConfig() const override;
 
-    void processReplSetGetConfig(BSONObjBuilder*) override;
+    void processReplSetGetConfig(BSONObjBuilder*,
+                                 bool commitmentStatus = false,
+                                 bool includeNewlyAdded = false) override;
 
     void processReplSetMetadata(const rpc::ReplSetMetadata&) override;
 
@@ -188,26 +200,31 @@ public:
                                   const ReplSetReconfigArgs&,
                                   BSONObjBuilder*) override;
 
+    Status doReplSetReconfig(OperationContext* opCtx,
+                             GetNewConfigFn getNewConfig,
+                             bool force) override;
+
+    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) override;
+
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
 
     Status processReplSetUpdatePosition(const repl::UpdatePositionArgs&, long long*) override;
 
     std::vector<HostAndPort> getHostsWrittenTo(const repl::OpTime&, bool) override;
 
-    std::vector<HostAndPort> getOtherNodesInReplSet() const override;
-
     Status checkReplEnabledForCommand(BSONObjBuilder*) override;
-
 
     HostAndPort chooseNewSyncSource(const repl::OpTime&) override;
 
     void blacklistSyncSource(const HostAndPort&, Date_t) override;
 
-    void resetLastOpTimesFromOplog(OperationContext*, DataConsistency) override;
+    void resetLastOpTimesFromOplog(OperationContext*) override;
 
-    bool shouldChangeSyncSource(const HostAndPort&,
-                                const rpc::ReplSetMetadata&,
-                                boost::optional<rpc::OplogQueryMetadata>) override;
+    repl::ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort&,
+                                                        const rpc::ReplSetMetadata&,
+                                                        const rpc::OplogQueryMetadata&,
+                                                        const repl::OpTime&,
+                                                        const repl::OpTime&) override;
 
     repl::OpTime getLastCommittedOpTime() const override;
 
@@ -254,6 +271,8 @@ public:
 
     bool setContainsArbiter() const override;
 
+    bool replSetContainsNewlyAddedMembers() const override;
+
     void attemptToAdvanceStableTimestamp() override;
 
     void finishRecoveryIfEligible(OperationContext* opCtx) override;
@@ -265,15 +284,31 @@ public:
 
     TopologyVersion getTopologyVersion() const override;
 
-    void incrementTopologyVersion(OperationContext* opCtx) override;
+    void incrementTopologyVersion() override;
 
     std::shared_ptr<const repl::IsMasterResponse> awaitIsMasterResponse(
         OperationContext* opCtx,
         const repl::SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> previous,
-        boost::optional<Date_t> deadline) const override;
+        boost::optional<Date_t> deadline) override;
 
-    repl::OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
+    virtual SharedSemiFuture<std::shared_ptr<const repl::IsMasterResponse>>
+    getIsMasterResponseFuture(const repl::SplitHorizon::Parameters& horizonParams,
+                              boost::optional<TopologyVersion> clientTopologyVersion);
+
+    StatusWith<repl::OpTime> getLatestWriteOpTime(OperationContext* opCtx) const noexcept override;
+
+    HostAndPort getCurrentPrimaryHostAndPort() const override;
+
+    void cancelCbkHandle(executor::TaskExecutor::CallbackHandle activeHandle) override;
+
+    BSONObj runCmdOnPrimaryAndAwaitResponse(OperationContext* opCtx,
+                                            const std::string& dbName,
+                                            const BSONObj& cmdObj,
+                                            OnRemoteCmdScheduledFn onRemoteCmdScheduled,
+                                            OnRemoteCmdCompleteFn onRemoteCmdComplete) final;
+
+    virtual void restartHeartbeats_forTest() override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

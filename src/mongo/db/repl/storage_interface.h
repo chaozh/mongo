@@ -150,8 +150,7 @@ public:
      * Implementations are allowed to be "fuzzy" and delete documents when the actual size is
      * slightly above or below this, so callers should not rely on its exact value.
      */
-    virtual StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx,
-                                               const NamespaceString& nss) = 0;
+    virtual StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx) = 0;
 
     /**
      * Creates a collection.
@@ -313,6 +312,29 @@ public:
                                   const NamespaceString& nss,
                                   const BSONObj& filter) = 0;
 
+    /**
+     * Searches for an oplog entry with a timestamp <= 'timestamp'. Returns boost::none if no
+     * matches are found.
+     */
+    virtual boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
+        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) = 0;
+
+    /**
+     * Calls findOplogEntryLessThanOrEqualToTimestamp with endless WriteConflictException retries.
+     * Other errors get thrown. Concurrent oplog reads with the validate cmd on the same collection
+     * may throw WCEs. Obeys opCtx interrupts.
+     *
+     * Call this function instead of findOplogEntryLessThanOrEqualToTimestamp if the caller cannot
+     * fail, say for correctness.
+     */
+    virtual boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) = 0;
+
+    /**
+     * Fetches the latest oplog entry's timestamp. Bypasses the oplog visibility rules.
+     */
+    virtual Timestamp getLatestOplogTimestamp(OperationContext* opCtx) = 0;
+
     using CollectionSize = uint64_t;
     using CollectionCount = uint64_t;
 
@@ -360,8 +382,10 @@ public:
      * "local.replset.minvalid" which should be reverted to the last stable timestamp.
      *
      * The 'stable' timestamp is set by calling StorageInterface::setStableTimestamp.
+     *
+     * Returns the stable timestamp to which it reverted the data.
      */
-    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) = 0;
+    virtual Timestamp recoverToStableTimestamp(OperationContext* opCtx) = 0;
 
     /**
      * Returns whether the storage engine supports "recover to stable timestamp".

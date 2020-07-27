@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -39,15 +39,19 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/fail_point.h"
 
 namespace mongo {
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(throwClientDisconnectInSignLogicalTimeForExternalClients);
+
 const auto getLogicalClockValidator =
     ServiceContext::declareDecoration<std::unique_ptr<LogicalTimeValidator>>();
 
@@ -126,7 +130,7 @@ SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
     auto keyStatusWith = keyManager->getKeyForSigning(nullptr, newTime);
     auto keyStatus = keyStatusWith.getStatus();
 
-    while (keyStatus == ErrorCodes::KeyNotFound && LogicalClock::get(opCtx)->isEnabled()) {
+    while (keyStatus == ErrorCodes::KeyNotFound && VectorClock::get(opCtx)->isEnabled()) {
         keyManager->refreshNow(opCtx);
 
         keyStatusWith = keyManager->getKeyForSigning(nullptr, newTime);
@@ -135,6 +139,16 @@ SignedLogicalTime LogicalTimeValidator::signLogicalTime(OperationContext* opCtx,
         if (keyStatus == ErrorCodes::KeyNotFound) {
             sleepFor(kRefreshIntervalIfErrored);
         }
+    }
+
+    if (MONGO_unlikely(
+            throwClientDisconnectInSignLogicalTimeForExternalClients.shouldFail() &&
+            opCtx->getClient()->session() &&
+            !(opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient))) {
+        // KeysCollectionManager::refreshNow() can throw an exception if the client has
+        // already disconnected. We simulate such behavior using this failpoint.
+        keyStatus = {ErrorCodes::ClientDisconnect,
+                     "throwClientDisconnectInSignLogicalTimeForExternalClients failpoint enabled"};
     }
 
     uassertStatusOK(keyStatus);
@@ -195,7 +209,7 @@ bool LogicalTimeValidator::shouldGossipLogicalTime() {
 }
 
 void LogicalTimeValidator::resetKeyManagerCache() {
-    log() << "Resetting key manager cache";
+    LOGV2(20716, "Resetting key manager cache");
     invariant(_keyManager);
     _keyManager->clearCache();
     stdx::lock_guard<Latch> lk(_mutex);
@@ -205,7 +219,7 @@ void LogicalTimeValidator::resetKeyManagerCache() {
 
 void LogicalTimeValidator::stopKeyManager() {
     if (_keyManager) {
-        log() << "Stopping key manager";
+        LOGV2(20717, "Stopping key manager");
         _keyManager->stopMonitoring();
         _keyManager->clearCache();
 
@@ -213,7 +227,7 @@ void LogicalTimeValidator::stopKeyManager() {
         _lastSeenValidTime = SignedLogicalTime();
         _timeProofService.resetCache();
     } else {
-        log() << "Stopping key manager: no key manager exists.";
+        LOGV2(20718, "Stopping key manager: no key manager exists.");
     }
 }
 

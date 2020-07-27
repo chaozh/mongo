@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -41,14 +41,14 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/logger/redaction.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -68,12 +68,6 @@ Status _createView(OperationContext* opCtx,
 
         Database* db = autoDb.getDb();
 
-        AutoStatsTracker statsTracker(opCtx,
-                                      nss,
-                                      Top::LockType::NotLocked,
-                                      AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                      db->getProfilingLevel());
-
         if (opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
             return Status(ErrorCodes::NotMaster,
@@ -91,6 +85,20 @@ Status _createView(OperationContext* opCtx,
         wuow.commit();
 
         WriteUnitOfWork wunit(opCtx);
+
+        AutoStatsTracker statsTracker(
+            opCtx,
+            nss,
+            Top::LockType::NotLocked,
+            AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+            CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nss.db()));
+
+        // If the view creation rolls back, ensure that the Top entry created for the view is
+        // deleted.
+        opCtx->recoveryUnit()->onRollback([nss, serviceContext = opCtx->getServiceContext()]() {
+            Top::get(serviceContext).collectionDropped(nss);
+        });
+
         Status status = db->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
         if (!status.isOK()) {
             return status;
@@ -120,12 +128,6 @@ Status _createCollection(OperationContext* opCtx,
                           str::stream() << "A view already exists. NS: " << nss);
         }
 
-        AutoStatsTracker statsTracker(opCtx,
-                                      nss,
-                                      Top::LockType::NotLocked,
-                                      AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                      autoDb.getDb()->getProfilingLevel());
-
         if (opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
             return Status(ErrorCodes::NotMaster,
@@ -133,6 +135,20 @@ Status _createCollection(OperationContext* opCtx,
         }
 
         WriteUnitOfWork wunit(opCtx);
+
+        AutoStatsTracker statsTracker(
+            opCtx,
+            nss,
+            Top::LockType::NotLocked,
+            AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+            CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nss.db()));
+
+        // If the collection creation rolls back, ensure that the Top entry created for the
+        // collection is deleted.
+        opCtx->recoveryUnit()->onRollback([nss, serviceContext = opCtx->getServiceContext()]() {
+            Top::get(serviceContext).collectionDropped(nss);
+        });
+
         Status status = autoDb.getDb()->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
         if (!status.isOK()) {
             return status;
@@ -158,7 +174,7 @@ Status createCollection(OperationContext* opCtx,
     BSONElement firstElt = it.next();
     invariant(firstElt.fieldNameStringData() == "create");
 
-    Status status = userAllowedCreateNS(nss.db(), nss.coll());
+    Status status = userAllowedCreateNS(nss);
     if (!status.isOK()) {
         return status;
     }
@@ -196,6 +212,10 @@ Status createCollection(OperationContext* opCtx,
                 !opCtx->inMultiDocumentTransaction());
         return _createView(opCtx, nss, collectionOptions, idIndex);
     } else {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot create system collection " << nss.toString()
+                              << " within a transaction.",
+                !opCtx->inMultiDocumentTransaction() || !nss.isSystem());
         return _createCollection(opCtx, nss, collectionOptions, idIndex);
     }
 }
@@ -253,9 +273,14 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                     return Result(Status::OK());
 
                 if (currentName && currentName->isDropPendingNamespace()) {
-                    log() << "CMD: create " << newCollName
-                          << " - existing collection with conflicting UUID " << uuid
-                          << " is in a drop-pending state: " << *currentName;
+                    LOGV2(20308,
+                          "CMD: create {newCollection} - existing collection with conflicting UUID "
+                          "{conflictingUUID} is in a drop-pending state: {existingCollection}",
+                          "CMD: create -- existing collection with conflicting UUID "
+                          "is in a drop-pending state",
+                          "newCollection"_attr = newCollName,
+                          "conflictingUUID"_attr = uuid,
+                          "existingCollection"_attr = *currentName);
                     return Result(Status(ErrorCodes::NamespaceExists,
                                          str::stream()
                                              << "existing collection " << currentName->toString()
@@ -297,9 +322,14 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                     }
 
                     // It is ok to log this because this doesn't happen very frequently.
-                    log() << "CMD: create " << newCollName
-                          << " - renaming existing collection with conflicting UUID " << uuid
-                          << " to temporary collection " << tmpName;
+                    LOGV2(20309,
+                          "CMD: create {newCollection} - renaming existing collection with "
+                          "conflicting UUID {conflictingUUID} to temporary collection {tempName}",
+                          "CMD: create -- renaming existing collection with "
+                          "conflicting UUID to temporary collection",
+                          "newCollection"_attr = newCollName,
+                          "conflictingUUID"_attr = uuid,
+                          "tempName"_attr = tmpName);
                     Status status = db->renameCollection(opCtx, newCollName, tmpName, stayTemp);
                     if (!status.isOK())
                         return Result(status);
@@ -310,6 +340,14 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                                                    /*dropTargetUUID*/ {},
                                                    /*numRecords*/ 0U,
                                                    stayTemp);
+
+                    // Abort any remaining index builds on the temporary collection.
+                    IndexBuildsCoordinator::get(opCtx)->abortCollectionIndexBuilds(
+                        opCtx,
+                        tmpName,
+                        futureColl->uuid(),
+                        "Aborting index builds on temporary collection");
+
                     // The existing collection has been successfully moved out of the way.
                     needsRenaming = false;
                 }

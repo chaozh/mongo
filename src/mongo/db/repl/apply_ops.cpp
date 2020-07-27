@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/apply_ops.h"
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -55,9 +54,9 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -231,7 +230,8 @@ Status _applyOps(OperationContext* opCtx,
                             return Status::OK();
                         }
 
-                        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+                        AutoGetCollection autoColl(
+                            opCtx, nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
                         if (!autoColl.getCollection()) {
                             // For idempotency reasons, return success on delete operations.
                             if (*opType == 'd') {
@@ -266,7 +266,10 @@ Status _applyOps(OperationContext* opCtx,
 
         ab.append(status.isOK());
         if (!status.isOK()) {
-            log() << "applyOps error applying: " << status;
+            LOGV2(21064,
+                  "applyOps error applying: {error}",
+                  "applyOps error applying",
+                  "error"_attr = status);
             errors++;
         }
 
@@ -321,7 +324,8 @@ Status _checkPrecondition(OperationContext* opCtx,
 
         // applyOps does not allow any extensions, such as $text, $where, $geoNear, $near,
         // $nearSphere, or $expr.
-        boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
+        boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(opCtx, CollatorInterface::cloneCollator(collator), nss));
         Matcher matcher(preCondition["res"].Obj(), std::move(expCtx));
         if (!matcher.matches(realres)) {
             result->append("got", realres);

@@ -113,7 +113,7 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) final {}
+                   boost::optional<IndexCollModInfo> indexInfo) final {}
 
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) final {}
 
@@ -161,7 +161,8 @@ public:
                        OptionalCollectionUUID uuid) final {}
 
     void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       const std::vector<repl::ReplOperation>& statements) final {}
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) final {}
 
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
@@ -171,12 +172,16 @@ public:
 
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) final {}
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) final {}
 
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) final {}
 
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) final {}
 };
 
 }  // namespace mongo

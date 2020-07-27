@@ -29,8 +29,7 @@
 
 #pragma once
 
-#include "mongo/s/sharding_mongod_test_fixture.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/s/sharding_mongod_test_fixture.h"
 
 namespace mongo {
 
@@ -38,6 +37,7 @@ class ClockSourceMock;
 class DBDirectClient;
 class LogicalClock;
 class LogicalTime;
+class VectorClockMutable;
 
 /**
  * A test fixture that installs a LogicalClock instance with a TimeProofService onto a service
@@ -58,7 +58,9 @@ protected:
 
     void tearDown() override;
 
-    LogicalClock* resetClock();
+    VectorClockMutable* resetClock();
+
+    void advanceClusterTime(LogicalTime newTime);
 
     LogicalClock* getClock() const;
 

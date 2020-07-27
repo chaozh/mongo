@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -70,6 +70,7 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/sort_pattern.h"
@@ -87,7 +88,6 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/s/write_ops/cluster_write.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -105,7 +105,12 @@ namespace {
  * percentage of the collection.
  */
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorExecutor(
-    Collection* coll, OperationContext* opCtx, long long sampleSize, long long numRecords) {
+    Collection* coll,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    long long sampleSize,
+    long long numRecords) {
+    OperationContext* opCtx = expCtx->opCtx;
+
     // Verify that we are already under a collection lock. We avoid taking locks ourselves in this
     // function because double-locking forces any PlanExecutor we create to adopt a NO_YIELD policy.
     invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_IS));
@@ -124,13 +129,16 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
 
     // Build a MultiIteratorStage and pass it the random-sampling RecordCursor.
     auto ws = std::make_unique<WorkingSet>();
-    std::unique_ptr<PlanStage> root = std::make_unique<MultiIteratorStage>(opCtx, ws.get(), coll);
+    std::unique_ptr<PlanStage> root =
+        std::make_unique<MultiIteratorStage>(expCtx.get(), ws.get(), coll);
     static_cast<MultiIteratorStage*>(root.get())->addIterator(std::move(rsRandCursor));
 
     // If the incoming operation is sharded, use the CSS to infer the filtering metadata for the
     // collection, otherwise treat it as unsharded
     auto collectionFilter =
-        CollectionShardingState::get(opCtx, coll->ns())->getOwnershipFilter(opCtx, coll);
+        CollectionShardingState::get(opCtx, coll->ns())
+            ->getOwnershipFilter(
+                opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
 
     // Because 'numRecords' includes orphan documents, our initial decision to optimize the $sample
     // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
@@ -146,15 +154,15 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
         const auto minWorkAdvancedRatio = std::max(
             sampleSize / (numRecords * kMaxSampleRatioForRandCursor), kMaxSampleRatioForRandCursor);
         // The trial plan is SHARDING_FILTER-MULTI_ITERATOR.
-        auto randomCursorPlan =
-            std::make_unique<ShardFilterStage>(opCtx, collectionFilter, ws.get(), std::move(root));
+        auto randomCursorPlan = std::make_unique<ShardFilterStage>(
+            expCtx.get(), collectionFilter, ws.get(), std::move(root));
         // The backup plan is SHARDING_FILTER-COLLSCAN.
         std::unique_ptr<PlanStage> collScanPlan = std::make_unique<CollectionScan>(
-            opCtx, coll, CollectionScanParams{}, ws.get(), nullptr);
+            expCtx.get(), coll, CollectionScanParams{}, ws.get(), nullptr);
         collScanPlan = std::make_unique<ShardFilterStage>(
-            opCtx, collectionFilter, ws.get(), std::move(collScanPlan));
+            expCtx.get(), collectionFilter, ws.get(), std::move(collScanPlan));
         // Place a TRIAL stage at the root of the plan tree, and pass it the trial and backup plans.
-        root = std::make_unique<TrialStage>(opCtx,
+        root = std::make_unique<TrialStage>(expCtx.get(),
                                             ws.get(),
                                             std::move(randomCursorPlan),
                                             std::move(collScanPlan),
@@ -162,8 +170,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
                                             minWorkAdvancedRatio);
     }
 
-    return PlanExecutor::make(
-        opCtx, std::move(ws), std::move(root), coll, PlanExecutor::YIELD_AUTO);
+    return plan_executor_factory::make(
+        expCtx, std::move(ws), std::move(root), coll, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExecutor(
@@ -230,11 +238,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         // 2) We not want a plan that will return separate values for each array element. For
         // example, if we have a document {a: [1,2]} and group by "a" a DISTINCT_SCAN on an "a"
         // index would produce one result for '1' and another for '2', which would be incorrect.
-        auto distinctExecutor =
-            getExecutorDistinct(expCtx->opCtx,
-                                collection,
-                                plannerOpts | QueryPlannerParams::STRICT_DISTINCT_ONLY,
-                                &parsedDistinct);
+        auto distinctExecutor = getExecutorDistinct(
+            collection, plannerOpts | QueryPlannerParams::STRICT_DISTINCT_ONLY, &parsedDistinct);
         if (!distinctExecutor.isOK()) {
             return distinctExecutor.getStatus().withContext(
                 "Unable to use distinct scan to optimize $group stage");
@@ -320,7 +325,7 @@ PipelineD::buildInnerQueryExecutor(Collection* collection,
             const long long sampleSize = sampleStage->getSampleSize();
             const long long numRecords = collection->getRecordStore()->numRecords(expCtx->opCtx);
             auto exec = uassertStatusOK(
-                createRandomCursorExecutor(collection, expCtx->opCtx, sampleSize, numRecords));
+                createRandomCursorExecutor(collection, expCtx, sampleSize, numRecords));
             if (exec) {
                 // For sharded collections, the root of the plan tree is a TrialStage that may have
                 // chosen either a random-sampling cursor trial plan or a COLLSCAN backup plan. We
@@ -343,15 +348,16 @@ PipelineD::buildInnerQueryExecutor(Collection* collection,
                 // DocumentSourceCursor. This is a design flaw in DocumentSourceCursor.
 
                 auto deps = pipeline->getDependencies(DepsTracker::kAllMetadata);
-                const bool shouldProduceEmptyDocs = deps.hasNoRequirements();
+                const auto cursorType = deps.hasNoRequirements()
+                    ? DocumentSourceCursor::CursorType::kEmptyDocuments
+                    : DocumentSourceCursor::CursorType::kRegular;
                 auto attachExecutorCallback =
-                    [shouldProduceEmptyDocs](
-                        Collection* collection,
-                        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-                        Pipeline* pipeline) {
+                    [cursorType](Collection* collection,
+                                 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                                 Pipeline* pipeline) {
                         auto cursor = DocumentSourceCursor::create(
-                            collection, std::move(exec), pipeline->getContext());
-                        addCursorSource(pipeline, std::move(cursor), shouldProduceEmptyDocs);
+                            collection, std::move(exec), pipeline->getContext(), cursorType);
+                        pipeline->addInitialSource(std::move(cursor));
                     };
                 return std::make_pair(std::move(attachExecutorCallback), std::move(exec));
             }
@@ -485,6 +491,10 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
                                           const NamespaceString& nss,
                                           const AggregationRequest* aggRequest,
                                           Pipeline* pipeline) {
+    // Make a last effort to optimize pipeline stages before potentially detaching them to be pushed
+    // down into the query executor.
+    pipeline->optimizePipeline();
+
     Pipeline::SourceContainer& sources = pipeline->_sources;
     auto expCtx = pipeline->getContext();
 
@@ -546,19 +556,22 @@ PipelineD::buildInnerQueryExecutorGeneric(Collection* collection,
                                                 Pipeline::kAllowedMatcherFeatures,
                                                 &shouldProduceEmptyDocs));
 
+    const auto cursorType = shouldProduceEmptyDocs
+        ? DocumentSourceCursor::CursorType::kEmptyDocuments
+        : DocumentSourceCursor::CursorType::kRegular;
 
     // If this is a change stream pipeline, make sure that we tell DSCursor to track the oplog time.
     const bool trackOplogTS =
         (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage());
 
-    auto attachExecutorCallback = [shouldProduceEmptyDocs, trackOplogTS](
-                                      Collection* collection,
-                                      std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
-                                      Pipeline* pipeline) {
-        auto cursor = DocumentSourceCursor::create(
-            collection, std::move(exec), pipeline->getContext(), trackOplogTS);
-        addCursorSource(pipeline, std::move(cursor), shouldProduceEmptyDocs);
-    };
+    auto attachExecutorCallback =
+        [cursorType, trackOplogTS](Collection* collection,
+                                   std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+                                   Pipeline* pipeline) {
+            auto cursor = DocumentSourceCursor::create(
+                collection, std::move(exec), pipeline->getContext(), cursorType, trackOplogTS);
+            pipeline->addInitialSource(std::move(cursor));
+        };
     return std::make_pair(std::move(attachExecutorCallback), std::move(exec));
 }
 
@@ -603,8 +616,7 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
                         Pipeline::kGeoNearMatcherFeatures,
                         &shouldProduceEmptyDocs));
 
-    auto attachExecutorCallback = [shouldProduceEmptyDocs,
-                                   distanceField = geoNearStage->getDistanceField(),
+    auto attachExecutorCallback = [distanceField = geoNearStage->getDistanceField(),
                                    locationField = geoNearStage->getLocationField(),
                                    distanceMultiplier =
                                        geoNearStage->getDistanceMultiplier().value_or(1.0)](
@@ -617,7 +629,7 @@ PipelineD::buildInnerQueryExecutorGeoNear(Collection* collection,
                                                           distanceField,
                                                           locationField,
                                                           distanceMultiplier);
-        addCursorSource(pipeline, std::move(cursor), shouldProduceEmptyDocs);
+        pipeline->addInitialSource(std::move(cursor));
     };
     // Remove the initial $geoNear; it will be replaced by $geoNearCursor.
     sources.pop_front();
@@ -669,12 +681,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // $match or $sort pushed down into the query layer will not be reflected here.
     auto deps = pipeline->getDependencies(unavailableMetadata);
     *hasNoRequirements = deps.hasNoRequirements();
-
-    // If we're pushing down a sort, and a merge will be required later, then we need the query
-    // system to produce sortKey metadata.
-    if (!sortObj.isEmpty() && expCtx->needsMerge) {
-        deps.setNeedsMetadata(DocumentMetadataFields::kSortKey, true);
-    }
 
     BSONObj projObj;
     if (*hasNoRequirements) {
@@ -743,18 +749,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                 aggRequest,
                                 plannerOpts,
                                 matcherFeatures);
-}
-
-void PipelineD::addCursorSource(Pipeline* pipeline,
-                                boost::intrusive_ptr<DocumentSourceCursor> cursor,
-                                bool shouldProduceEmptyDocs) {
-    // Add the cursor to the pipeline first so that it's correctly disposed of as part of the
-    // pipeline if an exception is thrown during this method.
-    pipeline->addInitialSource(cursor);
-
-    if (shouldProduceEmptyDocs) {
-        cursor->shouldProduceEmptyDocs();
-    }
 }
 
 Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {

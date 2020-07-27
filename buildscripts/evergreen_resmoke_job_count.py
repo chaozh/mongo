@@ -2,12 +2,16 @@
 """Determine the number of resmoke jobs to run."""
 
 import argparse
+import logging
 import platform
 import re
 import sys
 
 import psutil
+import structlog
 import yaml
+
+LOGGER = structlog.get_logger(__name__)
 
 CPU_COUNT = psutil.cpu_count()
 PLATFORM_MACHINE = platform.machine()
@@ -39,8 +43,14 @@ PLATFORM_TASK_FACTOR_OVERRIDES = {"win32": TASKS_FACTORS, "cygwin": TASKS_FACTOR
 
 # Apply factor for a task everywhere it is run.
 GLOBAL_TASK_FACTOR_OVERRIDES = {
-    r"logical_session_cache.*_refresh_jscore_passthrough.*": 0.5,
+    r"causally_consistent_hedged_reads_jscore_passthrough.*": 0.25,
+    r"logical_session_cache.*_refresh_jscore_passthrough.*": 0.25,
     r"multi_shard_.*multi_stmt_txn_.*jscore_passthrough.*": 0.125,
+    r"replica_sets_reconfig_jscore_passthrough.*": 0.25,
+    r"replica_sets_reconfig_jscore_stepdown_passthrough.*": 0.25,
+    r"replica_sets_reconfig_kill_primary_jscore_passthrough.*": 0.25,
+    r"sharded_causally_consistent_jscore_passthrough.*": 0.75,
+    r"sharded_collections_jscore_passthrough.*": 0.75,
 }
 
 
@@ -124,6 +134,12 @@ def main():
                                            " unspecified no file is generated."))
 
     options = parser.parse_args()
+
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    structlog.configure(logger_factory=structlog.stdlib.LoggerFactory())
+
+    LOGGER.info("Finding job count", task=options.task, variant=options.variant,
+                platform=PLATFORM_MACHINE, sys=SYS_PLATFORM, cpu_count=CPU_COUNT)
 
     jobs = determine_jobs(options.task, options.variant, options.jobs_max, options.jobs_factor)
     if jobs < CPU_COUNT:

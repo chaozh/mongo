@@ -6,15 +6,18 @@
  * solution to this problem is to synchronize index build commits.
  *
  * @tags: [
- *     uses_transactions,
- *     uses_prepare_transaction,
+ *   uses_prepare_transaction,
+ *   uses_transactions,
  * ]
  */
 (function() {
 "use strict";
 load("jstests/core/txns/libs/prepare_helpers.js");
 
-const replTest = new ReplSetTest({nodes: 2});
+// This test create indexes with fail point enabled on secondary which prevents secondary from
+// voting. So, disabling index build commit quorum.
+const replTest =
+    new ReplSetTest({nodes: 2, nodeOptions: {setParameter: "enableIndexBuildCommitQuorum=false"}});
 replTest.startSet();
 replTest.initiate();
 

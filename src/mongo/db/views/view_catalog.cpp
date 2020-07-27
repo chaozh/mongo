@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -49,14 +49,14 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/pipeline/stub_mongo_process_interface.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_graph.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -94,7 +94,11 @@ Status ViewCatalog::reload(OperationContext* opCtx, ViewCatalogLookupBehavior lo
 Status ViewCatalog::_reload(WithLock,
                             OperationContext* opCtx,
                             ViewCatalogLookupBehavior lookupBehavior) {
-    LOG(1) << "reloading view catalog for database " << _durable->getName();
+    LOGV2_DEBUG(22546,
+                1,
+                "Reloading view catalog for database {db}",
+                "Reloading view catalog for database",
+                "db"_attr = _durable->getName());
 
     _viewMap.clear();
     _valid = false;
@@ -137,8 +141,11 @@ Status ViewCatalog::_reload(WithLock,
         }
     } catch (const DBException& ex) {
         auto status = ex.toStatus();
-        LOG(0) << "could not load view catalog for database " << _durable->getName() << ": "
-               << status;
+        LOGV2(22547,
+              "Could not load view catalog for database {db}: {error}",
+              "Could not load view catalog for database",
+              "db"_attr = _durable->getName(),
+              "error"_attr = status);
         return status;
     }
 
@@ -321,44 +328,53 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
                               std::move(resolvedNamespaces),
                               boost::none);
 
-    // Save this to a variable to avoid reading the atomic variable multiple times.
-    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
-
-    // If the feature compatibility version is not 4.4, and we are validating features as master,
-    // ban the use of new agg features introduced in 4.4 to prevent them from being persisted in the
-    // catalog.
+    // If the feature compatibility version is not kLatest, and we are validating features as
+    // master, ban the use of new agg features introduced in kLatest to prevent them from being
+    // persisted in the catalog.
+    // (Generic FCV reference): This FCV check should exist across LTS binary versions.
+    ServerGlobalParams::FeatureCompatibility::Version fcv;
     if (serverGlobalParams.validateFeaturesAsMaster.load() &&
-        currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-        expCtx->maxFeatureCompatibilityVersion = currentFCV;
+        serverGlobalParams.featureCompatibility.isLessThan(
+            ServerGlobalParams::FeatureCompatibility::kLatest, &fcv)) {
+        expCtx->maxFeatureCompatibilityVersion = fcv;
     }
 
     // The pipeline parser needs to know that we're parsing a pipeline for a view definition
     // to apply some additional checks.
     expCtx->isParsingViewDefinition = true;
 
-    auto pipelineStatus = Pipeline::parse(viewDef.pipeline(), std::move(expCtx));
-    if (!pipelineStatus.isOK()) {
-        return pipelineStatus.getStatus();
-    }
+    try {
+        auto pipeline =
+            Pipeline::parse(viewDef.pipeline(), std::move(expCtx), [&](const Pipeline& pipeline) {
+                // Validate that the view pipeline does not contain any ineligible stages.
+                const auto& sources = pipeline.getSources();
+                const auto firstPersistentStage =
+                    std::find_if(sources.begin(), sources.end(), [](const auto& source) {
+                        return source->constraints().writesPersistentData();
+                    });
 
-    // Validate that the view pipeline does not contain any ineligible stages.
-    const auto& sources = pipelineStatus.getValue()->getSources();
-    if (!sources.empty()) {
-        const auto firstPersistentStage =
-            std::find_if(sources.begin(), sources.end(), [](const auto& source) {
-                return source->constraints().writesPersistentData();
+                uassert(ErrorCodes::OptionNotSupportedOnView,
+                        str::stream()
+                            << "The aggregation stage "
+                            << firstPersistentStage->get()->getSourceName() << " in location "
+                            << std::distance(sources.begin(), firstPersistentStage)
+                            << " of the pipeline cannot be used in the view definition of "
+                            << viewDef.name().ns() << " because it writes to disk",
+                        firstPersistentStage == sources.end());
+
+                uassert(ErrorCodes::OptionNotSupportedOnView,
+                        "$changeStream cannot be used in a view definition",
+                        sources.empty() || !sources.front()->constraints().isChangeStreamStage());
+
+                std::for_each(sources.begin(), sources.end(), [](auto& stage) {
+                    uassert(ErrorCodes::InvalidNamespace,
+                            str::stream() << "'" << stage->getSourceName()
+                                          << "' cannot be used in a view definition",
+                            !stage->constraints().isIndependentOfAnyCollection);
+                });
             });
-        if (sources.front()->constraints().isChangeStreamStage()) {
-            return {ErrorCodes::OptionNotSupportedOnView,
-                    "$changeStream cannot be used in a view definition"};
-        } else if (firstPersistentStage != sources.end()) {
-            mongo::StringBuilder errorMessage;
-            errorMessage << "The aggregation stage " << firstPersistentStage->get()->getSourceName()
-                         << " in location " << std::distance(sources.begin(), firstPersistentStage)
-                         << " of the pipeline cannot be used in the view definition of "
-                         << viewDef.name().ns() << " because it writes to disk";
-            return {ErrorCodes::OptionNotSupportedOnView, errorMessage.str()};
-        }
+    } catch (const DBException& ex) {
+        return ex.toStatus();
     }
 
     return std::move(involvedNamespaces);
@@ -424,7 +440,9 @@ Status ViewCatalog::modifyView(OperationContext* opCtx,
                                const NamespaceString& viewName,
                                const NamespaceString& viewOn,
                                const BSONArray& pipeline) {
-    invariant(opCtx->lockState()->isDbLockedForMode(viewName.db(), MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_X));
+    invariant(opCtx->lockState()->isCollectionLockedForMode(
+        NamespaceString(viewName.db(), NamespaceString::kSystemDotViewsCollectionName), MODE_X));
 
     stdx::lock_guard<Latch> lk(_mutex);
 

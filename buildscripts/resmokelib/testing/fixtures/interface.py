@@ -7,12 +7,12 @@ from enum import Enum
 import pymongo
 import pymongo.errors
 
-from ... import config
-from ... import errors
-from ... import logging
-from ... import multiversionconstants as multiversion
-from ... import utils
-from ...utils import registry
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import logging
+from buildscripts.resmokelib import multiversionconstants as multiversion
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.utils import registry
 
 _FIXTURES = {}  # type: ignore
 
@@ -45,9 +45,9 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):
     # is defined for all subclasses of Fixture.
     REGISTERED_NAME = "Fixture"
 
-    _LAST_STABLE_FCV = multiversion.LAST_STABLE_FCV
+    _LAST_LTS_FCV = multiversion.LAST_LTS_FCV
     _LATEST_FCV = multiversion.LATEST_FCV
-    _LAST_STABLE_BIN_VERSION = multiversion.LAST_STABLE_BIN_VERSION
+    _LAST_LTS_BIN_VERSION = multiversion.LAST_LTS_BIN_VERSION
 
     def __init__(self, logger, job_num, dbpath_prefix=None):
         """Initialize the fixture with a logger instance."""

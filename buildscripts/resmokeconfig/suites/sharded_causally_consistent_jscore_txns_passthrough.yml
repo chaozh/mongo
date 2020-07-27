@@ -30,11 +30,8 @@ selector:
   # attached to statements in a transaction beyond the first one.
   - jstests/core/txns/non_transactional_operations_on_session_with_transaction.js
 
-  # TODO(SERVER-45368) re-enable once collection creation is permitted in cross-shard transactions.
-  - jstests/core/txns/create_collection.js
-  - jstests/core/txns/create_collection_parallel.js
-  - jstests/core/txns/create_indexes.js
-  - jstests/core/txns/create_indexes_parallel.js
+    # TODO SERVER-46187: maxTimeMS doesn't work correctly for insert on mongos.
+  - jstests/core/txns/write_conflicts_with_non_txns.js
 
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos

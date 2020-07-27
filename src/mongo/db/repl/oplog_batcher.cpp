@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/db/repl/oplog_batcher.h"
 
@@ -35,7 +35,7 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace repl {
@@ -109,11 +109,16 @@ bool isUnpreparedCommit(const OplogEntry& entry) {
  *
  * Commands, in most cases, must be processed one at a time. The exceptions to this rule are
  * unprepared applyOps and unprepared commitTransaction for transactions that only contain CRUD
- * operations. These two cases expand to CRUD operations, which can be safely batched with other
- * CRUD operations. All other command oplog entries, including unprepared applyOps/commitTransaction
- * for transactions that contain commands, must be processed in their own batch.
+ * operations and commands found within large transactions (>16MB). The prior two cases expand to
+ * CRUD operations, which can be safely batched with other CRUD operations. All other command oplog
+ * entries, including unprepared applyOps/commitTransaction for transactions that contain commands,
+ * must be processed in their own batch.
  * Note that 'unprepared applyOps' could mean a partial transaction oplog entry, an implicit commit
  * applyOps oplog entry, or an atomic applyOps oplog entry outside of a transaction.
+ *
+ * Command operations inside large transactions do not need to be processed individually as long as
+ * the final oplog entry in the transaction is processed individually, since the operations are not
+ * actually run until the commit operation is reached.
  *
  * Oplog entries on 'system.views' should also be processed one at a time. View catalog immediately
  * reflects changes for each oplog entry so we can see inconsistent view catalog if multiple oplog
@@ -121,22 +126,23 @@ bool isUnpreparedCommit(const OplogEntry& entry) {
  *
  * Process updates to 'admin.system.version' individually as well so the secondary's FCV when
  * processing each operation matches the primary's when committing that operation.
+ *
+ * The ends of large transactions (> 16MB) should also be processed immediately on its own in order
+ * to avoid scenarios where parts of the transaction is batched with other operations not in the
+ * transaction.
  */
 bool mustProcessIndividually(const OplogEntry& entry) {
     if (entry.isCommand()) {
-        if (entry.getCommandType() != OplogEntry::CommandType::kApplyOps || entry.shouldPrepare() ||
-            entry.isTransactionWithCommand()) {
-            return true;
-        } else {
-            // This branch covers unprepared CRUD applyOps and unprepared CRUD commits.
-            return false;
-        }
-    } else if (entry.getNss().isSystemDotViews()) {
-        return true;
-    } else if (entry.getNss().isServerConfigurationCollection()) {
-        return true;
+        // If none of the following cases is true, we'll return false to
+        // cover unprepared CRUD applyOps and unprepared CRUD commits.
+        return (entry.getCommandType() != OplogEntry::CommandType::kApplyOps) ||
+            entry.shouldPrepare() || entry.isSingleOplogEntryTransactionWithCommand() ||
+            entry.isEndOfLargeTransaction();
     }
-    return false;
+
+    const auto nss = entry.getNss();
+    return nss.isSystemDotViews() || nss.isServerConfigurationCollection() ||
+        nss.isPrivilegeCollection();
 }
 
 /**
@@ -170,11 +176,17 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
 
         // Check for oplog version change.
         if (entry.getVersion() != OplogEntry::kOplogVersion) {
-            std::string message = str::stream()
-                << "expected oplog version " << OplogEntry::kOplogVersion << " but found version "
-                << entry.getVersion() << " in oplog entry: " << redact(entry.toBSON());
-            severe() << message;
-            return {ErrorCodes::BadValue, message};
+            static constexpr char message[] = "Unexpected oplog version";
+            LOGV2_FATAL_CONTINUE(21240,
+                                 message,
+                                 "expectedVersion"_attr = OplogEntry::kOplogVersion,
+                                 "foundVersion"_attr = entry.getVersion(),
+                                 "oplogEntry"_attr = redact(entry.toBSON()));
+            return {ErrorCodes::BadValue,
+                    str::stream() << message << ", expected oplog version "
+                                  << OplogEntry::kOplogVersion << ", found version "
+                                  << entry.getVersion()
+                                  << ", oplog entry: " << redact(entry.toBSON())};
         }
 
         if (batchLimits.slaveDelayLatestTimestamp) {
@@ -319,7 +331,10 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
             // Check the oplog buffer after the applier state to ensure the producer is stopped.
             if (isDraining && _oplogBuffer->isEmpty()) {
                 ops.setTermWhenExhausted(termWhenBufferIsEmpty);
-                log() << "Oplog buffer has been drained in term " << termWhenBufferIsEmpty;
+                LOGV2(21239,
+                      "Oplog buffer has been drained in term {term}",
+                      "Oplog buffer has been drained",
+                      "term"_attr = termWhenBufferIsEmpty);
             } else {
                 // Don't emit empty batches.
                 continue;
@@ -345,13 +360,12 @@ std::size_t getBatchLimitOplogBytes(OperationContext* opCtx, StorageInterface* s
     // We can't change the timestamp source within a write unit of work.
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
     // We're only reading oplog metadata, so the timestamp is not important.  If we read with the
-    // default (which is kLastApplied on secondaries), we may end up with a reader that is at
-    // kLastApplied.  If we then roll back, then when we reconstruct prepared transactions during
+    // default (which is lastApplied on secondaries), we may end up with a reader that is at
+    // lastApplied.  If we then roll back, then when we reconstruct prepared transactions during
     // rollback recovery we will be preparing transactions before the read timestamp, which triggers
     // an assertion in WiredTiger.
     ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
-    auto oplogMaxSizeResult =
-        storageInterface->getOplogMaxSize(opCtx, NamespaceString::kRsOplogNamespace);
+    auto oplogMaxSizeResult = storageInterface->getOplogMaxSize(opCtx);
     auto oplogMaxSize = fassert(40301, oplogMaxSizeResult);
     return std::min(oplogMaxSize / 10, std::size_t(replBatchLimitBytes.load()));
 }

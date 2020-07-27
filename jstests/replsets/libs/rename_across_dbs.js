@@ -58,6 +58,7 @@ var RenameAcrossDatabasesTest = function(options) {
         for (let i = 1; i < nodes.length; ++i) {
             replTest.add(nodes[i]);
         }
+        replTest.waitForAllNewlyAddedRemovals();
 
         const conns = replTest.nodes;
         const hosts = replTest.nodeList();
@@ -85,8 +86,7 @@ var RenameAcrossDatabasesTest = function(options) {
             version: nextVersion,
         };
 
-        const force = true;  // TODO (SERVER-45575): Update this to be a non-force reconfig.
-        reconfig(replTest, replSetConfig, force);
+        reconfig(replTest, replSetConfig);
 
         replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
         replTest.awaitReplication();

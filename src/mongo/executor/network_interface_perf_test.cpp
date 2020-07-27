@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -43,10 +43,10 @@
 #include "mongo/executor/network_interface_asio.h"
 #include "mongo/executor/network_interface_asio_test_utils.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/timer.h"
@@ -107,7 +107,10 @@ TEST(NetworkInterfaceASIO, SerialPerf) {
 
     int duration = timeNetworkTestMillis(numOperations, &netAsio);
     int result = numOperations * 1000 / duration;
-    log() << "THROUGHPUT asio ping ops/s: " << result;
+    LOGV2(22591,
+          "THROUGHPUT asio ping ops/s: {throughput}",
+          "THROUGHPUT asio ping ops/s",
+          "throughput"_attr = result);
 }
 
 }  // namespace

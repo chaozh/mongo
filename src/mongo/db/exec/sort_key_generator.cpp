@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -43,19 +43,18 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/collation/collator_interface.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
 const char* SortKeyGeneratorStage::kStageType = "SORT_KEY_GENERATOR";
 
-SortKeyGeneratorStage::SortKeyGeneratorStage(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+SortKeyGeneratorStage::SortKeyGeneratorStage(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                              std::unique_ptr<PlanStage> child,
                                              WorkingSet* ws,
                                              const BSONObj& sortSpecObj)
-    : PlanStage(kStageType, pExpCtx->opCtx),
+    : PlanStage(kStageType, expCtx.get()),
       _ws(ws),
-      _sortKeyGen({{sortSpecObj, pExpCtx}, pExpCtx->getCollator()}) {
+      _sortKeyGen({{sortSpecObj, expCtx}, expCtx->getCollator()}) {
     _children.emplace_back(std::move(child));
 }
 
@@ -68,16 +67,10 @@ PlanStage::StageState SortKeyGeneratorStage::doWork(WorkingSetID* out) {
     if (stageState == PlanStage::ADVANCED) {
         WorkingSetMember* member = _ws->get(*out);
 
-        try {
-            auto sortKey = _sortKeyGen.computeSortKey(*member);
+        auto sortKey = _sortKeyGen.computeSortKey(*member);
 
-            // Add the sort key to the WSM as metadata.
-            member->metadata().setSortKey(std::move(sortKey), _sortKeyGen.isSingleElementKey());
-        } catch (const DBException& computeSortKeyException) {
-            *out = WorkingSetCommon::allocateStatusMember(_ws, computeSortKeyException.toStatus());
-            return PlanStage::FAILURE;
-        }
-
+        // Add the sort key to the WSM as metadata.
+        member->metadata().setSortKey(std::move(sortKey), _sortKeyGen.isSingleElementKey());
         return PlanStage::ADVANCED;
     }
 

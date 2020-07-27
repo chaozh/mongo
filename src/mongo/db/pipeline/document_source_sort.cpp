@@ -86,10 +86,11 @@ DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
         invariant(populationResult.isEOF());
     }
 
-    auto result = _sortExecutor->getNext();
-    if (!result)
+    if (!_sortExecutor->hasNext()) {
         return GetNextResult::makeEOF();
-    return GetNextResult(std::move(*result));
+    }
+
+    return GetNextResult{_sortExecutor->getNext().second};
 }
 
 void DocumentSourceSort::serializeToArray(
@@ -168,6 +169,23 @@ Pipeline::SourceContainer::iterator DocumentSourceSort::doOptimizeAt(
         _sortExecutor->setLimit(*limit);
     }
 
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
+    if (auto nextSort = dynamic_cast<DocumentSourceSort*>((*std::next(itr)).get())) {
+        // If subsequent $sort stage exists, optimize by erasing the initial one.
+        // Since $sort is not guaranteed to be stable, we can blindly remove the first $sort.
+        auto thisLim = _sortExecutor->getLimit();
+        auto otherLim = nextSort->_sortExecutor->getLimit();
+        // When coalescing subsequent $sort stages, retain the existing/lower limit.
+        if (thisLim && (!otherLim || otherLim > thisLim)) {
+            nextSort->_sortExecutor->setLimit(thisLim);
+        }
+        Pipeline::SourceContainer::iterator ret = std::next(itr);
+        container->erase(itr);
+        return ret;
+    }
     return std::next(itr);
 }
 

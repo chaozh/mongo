@@ -30,6 +30,7 @@ mock_web.waitRegisters(2);
 
 WaitForRegistration(rst.getPrimary());
 WaitForRegistration(rst.getSecondary());
+ValidateFreeMonReplicaSet(rst);
 
 const last_register = mock_web.query("last_register");
 print(tojson(last_register));
@@ -39,7 +40,7 @@ assert.eq(last_register.payload.buildInfo.bits, 64);
 assert.eq(last_register.payload.buildInfo.ok, 1);
 assert.eq(last_register.payload.storageEngine.readOnly, false);
 assert.eq(last_register.payload.isMaster.ok, 1);
-assert.eq(last_register.payload.replSetGetConfig.config.version, 2);
+assert.gte(last_register.payload.replSetGetConfig.config.version, 2);
 
 function isUUID(val) {
     // Mock webserver gives us back unpacked BinData/UUID in the form:

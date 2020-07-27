@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +38,8 @@
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -50,11 +50,11 @@ using std::vector;
 // static
 const char* ShardFilterStage::kStageType = "SHARDING_FILTER";
 
-ShardFilterStage::ShardFilterStage(OperationContext* opCtx,
+ShardFilterStage::ShardFilterStage(ExpressionContext* expCtx,
                                    ScopedCollectionFilter collectionFilter,
                                    WorkingSet* ws,
                                    std::unique_ptr<PlanStage> child)
-    : PlanStage(kStageType, opCtx), _ws(ws), _shardFilterer(std::move(collectionFilter)) {
+    : PlanStage(kStageType, expCtx), _ws(ws), _shardFilterer(std::move(collectionFilter)) {
     _children.emplace_back(std::move(child));
 }
 
@@ -87,10 +87,13 @@ PlanStage::StageState ShardFilterStage::doWork(WorkingSetID* out) {
 
                     // Skip this working set member with a warning - no shard key should not be
                     // possible unless manually inserting data into a shard
-                    warning() << "no shard key found in document "
-                              << redact(member->doc.value().toBson()) << " for shard key pattern "
-                              << _shardFilterer.getKeyPattern() << ", "
-                              << "document may have been inserted manually into shard";
+                    LOGV2_WARNING(
+                        23787,
+                        "no shard key found in document {member_doc_value_toBson} for shard key "
+                        "pattern {shardFilterer_getKeyPattern}, document may have been inserted "
+                        "manually into shard",
+                        "member_doc_value_toBson"_attr = redact(member->doc.value().toBson()),
+                        "shardFilterer_getKeyPattern"_attr = _shardFilterer.getKeyPattern());
                 } else {
                     invariant(res == ShardFilterer::DocumentBelongsResult::kDoesNotBelong);
                 }

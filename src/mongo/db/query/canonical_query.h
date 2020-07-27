@@ -149,8 +149,12 @@ public:
         return _proj.get_ptr();
     }
 
+    const boost::optional<SortPattern>& getSortPattern() const {
+        return _sortPattern;
+    }
+
     const CollatorInterface* getCollator() const {
-        return _collator.get();
+        return _expCtx->getCollator();
     }
 
     /**
@@ -187,12 +191,6 @@ public:
     std::string toStringShort() const;
 
     /**
-     * Traverses expression tree post-order.
-     * Sorts children at each non-leaf node by (MatchType, path(), children, number of children)
-     */
-    static void sortTree(MatchExpression* tree);
-
-    /**
      * Returns a count of 'type' nodes in expression tree.
      */
     static size_t countNodes(const MatchExpression* root, MatchExpression::MatchType type);
@@ -210,8 +208,11 @@ public:
         return _canHaveNoopMatchNodes;
     }
 
-    const boost::intrusive_ptr<ExpressionContext>& getExpCtx() const {
+    auto& getExpCtx() const {
         return _expCtx;
+    }
+    auto getExpCtxRaw() const {
+        return _expCtx.get();
     }
 
 private:
@@ -223,7 +224,6 @@ private:
                 std::unique_ptr<QueryRequest> qr,
                 bool canHaveNoopMatchNodes,
                 std::unique_ptr<MatchExpression> root,
-                std::unique_ptr<CollatorInterface> collator,
                 const ProjectionPolicies& projectionPolicies);
 
     // Initializes '_sortPattern', adding any metadata dependencies implied by the sort.
@@ -245,8 +245,6 @@ private:
 
     // Keeps track of what metadata has been explicitly requested.
     QueryMetadataBitSet _metadataDeps;
-
-    std::unique_ptr<CollatorInterface> _collator;
 
     bool _canHaveNoopMatchNodes = false;
 };

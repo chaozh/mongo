@@ -13,10 +13,18 @@ var waitForState;
 var reInitiateWithoutThrowingOnAbortedMember;
 var awaitRSClientHosts;
 var getLastOpTime;
+var getFirstOplogEntry;
 var setLogVerbosity;
 var stopReplicationAndEnforceNewPrimaryToCatchUp;
 var setFailPoint;
 var clearFailPoint;
+var isConfigCommitted;
+var assertSameConfigContent;
+var getConfigWithNewlyAdded;
+var isMemberNewlyAdded;
+var replConfigHasNewlyAddedMembers;
+var waitForNewlyAddedRemovalForNodeToBeCommitted;
+var assertVoteCount;
 
 (function() {
 "use strict";
@@ -191,34 +199,221 @@ waitForAllMembers = function(master, timeout) {
     print("All members are now in state PRIMARY, SECONDARY, or ARBITER");
 };
 
-reconfig = function(rs, config, force) {
-    "use strict";
-    var admin = rs.getPrimary().getDB("admin");
-    var e;
-    var master;
-    try {
-        var reconfigCommand = {replSetReconfig: rs._updateConfigIfNotDurable(config), force: force};
-        var res = admin.runCommand(reconfigCommand);
+/**
+ * Run a 'replSetReconfig' command with one retry on NodeNotFound and multiple retries on
+ * ConfigurationInProgress, CurrentConfigNotCommittedYet, and
+ * NewReplicaSetConfigurationIncompatible.
+ */
+function reconfigWithRetry(primary, config, force) {
+    const admin = primary.getDB("admin");
+    force = force || false;
+    let reconfigCommand = {
+        replSetReconfig: config,
+        force: force,
+        maxTimeMS: ReplSetTest.kDefaultTimeoutMS
+    };
 
-        // Retry reconfig if quorum check failed because not enough voting nodes responded.
+    assert.soon(function() {
+        const newVersion =
+            assert.commandWorked(admin.runCommand({replSetGetConfig: 1})).config.version + 1;
+        reconfigCommand.replSetReconfig.version = newVersion;
+        const res = admin.runCommand(reconfigCommand);
+
+        // Retry reconfig if quorum check failed because not enough voting nodes responded. One
+        // reason for this is if the connections used for heartbeats get closed on the destination
+        // node.
         if (!res.ok && res.code === ErrorCodes.NodeNotFound) {
             print("Replset reconfig failed because quorum check failed. Retry reconfig once. " +
                   "Error: " + tojson(res));
             res = admin.runCommand(reconfigCommand);
         }
 
-        assert.commandWorked(res);
-    } catch (e) {
-        if (!isNetworkError(e)) {
-            throw e;
+        // Always retry on these errors, even if we already retried on NodeNotFound.
+        if (!res.ok &&
+            (res.code === ErrorCodes.ConfigurationInProgress ||
+             res.code === ErrorCodes.CurrentConfigNotCommittedYet)) {
+            print("Replset reconfig failed since another configuration is in progress. Retry.");
+            // Retry.
+            return false;
         }
-        print("Calling replSetReconfig failed. " + tojson(e));
+
+        // Always retry on NewReplicaSetConfigurationIncompatible, if the current config version is
+        // higher than the requested one.
+        if (!res.ok && res.code === ErrorCodes.NewReplicaSetConfigurationIncompatible) {
+            const curVersion =
+                assert.commandWorked(admin.runCommand({replSetGetConfig: 1})).config.version;
+            if (curVersion >= newVersion) {
+                print("Replset reconfig failed since the config version was too low. Retry. " +
+                      "Error: " + tojson(res));
+                // Retry.
+                return false;
+            }
+        }
+
+        assert.commandWorked(res);
+        return true;
+    });
+}
+
+/**
+ * Executes an arbitrary reconfig as a sequence of non 'force' reconfigs.
+ *
+ * If this function fails for any reason, the replica set config may be left in an intermediate
+ * state i.e. neither in the original or target config.
+ *
+ * @param rst - a ReplSetTest instance.
+ * @param targetConfig - the final, desired replica set config. After this function returns, the
+ * given replica set should be in 'targetConfig', except with a higher version.
+ */
+function autoReconfig(rst, targetConfig) {
+    //
+    // The goal of this function is to transform the source config (the current config on the
+    // primary) into the 'targetConfig' via a sequence of non 'force' reconfigurations. Non force
+    // reconfigs are only permitted to add or remove a single voting node, so we need to represent
+    // some given, arbitrary reconfig as a sequence of single node add/remove operations. We execute
+    // the overall transformation in the following steps:
+    //
+    // (1) Remove members present in the source but not in the target.
+    // (2) Update members present in both the source and target whose vote is removed.
+    // (3) Update members present in both the source and target whose vote is added or unmodified.
+    // (4) Add members present in the target but not in the source.
+    //
+    // After executing the above steps the config member set should be equal to the target config
+    // member set. We then execute one last reconfig that attempts to install the given
+    // targetConfig directly. This serves to update any top level properties of the config and it
+    // also ensures that the order of the final config member list matches the order in the given
+    // target config.
+    //
+    // Note that the order of the steps above is important to avoid passing through invalid configs
+    // during the config transformation sequence. There are certain constraints imposed on replica
+    // set configs e.g. there must be at least 1 electable node and less than a certain number of
+    // maximum voting nodes. We know that the source and target configs are valid with respect to
+    // these constraints, but we must ensure that any sequence of reconfigs executed by this
+    // function never moves us to an intermediate config that violates one of these constraints.
+    // Since the primary, an electable node, can never be removed from the config, it is safe to do
+    // the removal of all voting nodes first, since we will be guaranteed to never go below the
+    // minimum number of electable nodes. Doing removals first similarly ensures that when adding
+    // nodes, we will never exceed an upper bound constraint, since we have already removed all
+    // necessary voting nodes.
+    //
+    // Note also that this procedure may not perform the desired config transformation in the
+    // minimal number of steps. For example, if the overall transformation removes 2 non-voting
+    // nodes from a config we could do this with a single reconfig, but the procedure implemented
+    // here will do it as a sequence of 2 reconfigs. We are not so worried about making this
+    // procedure optimal since each reconfig should be relatively quick and most reconfigs shouldn't
+    // take more than a few steps.
+    //
+
+    let primary = rst.getPrimary();
+    const sourceConfig = rst.getReplSetConfigFromNode();
+    let config = Object.assign({}, sourceConfig);
+
+    // Look up the index of a given member in the given array by its member id.
+    const memberIndex = (cfg, id) => cfg.members.findIndex(m => m._id === id);
+    const memberInConfig = (cfg, id) => cfg.members.find(m => m._id === id);
+    const getMember = (cfg, id) => cfg.members[memberIndex(cfg, id)];
+    const getVotes = (cfg, id) =>
+        getMember(cfg, id).hasOwnProperty("votes") ? getMember(cfg, id).votes : 1;
+
+    print(`autoReconfig: source config: ${tojson(sourceConfig)}, target config: ${
+        tojson(targetConfig)}`);
+
+    // All the members in the target that aren't in the source.
+    let membersToAdd = targetConfig.members.filter(m => !memberInConfig(sourceConfig, m._id));
+    // All the members in the source that aren't in the target.
+    let membersToRemove = sourceConfig.members.filter(m => !memberInConfig(targetConfig, m._id));
+    // All the members that appear in both the source and target and have changed.
+    let membersToUpdate = targetConfig.members.filter(
+        (m) => memberInConfig(sourceConfig, m._id) &&
+            bsonWoCompare(m, memberInConfig(sourceConfig, m._id)) !== 0);
+
+    // Sort the members to ensure that we do updates that remove a node's vote first.
+    let membersToUpdateRemoveVote = membersToUpdate.filter(
+        (m) => (getVotes(targetConfig, m._id) < getVotes(sourceConfig, m._id)));
+    let membersToUpdateAddVote = membersToUpdate.filter(
+        (m) => (getVotes(targetConfig, m._id) >= getVotes(sourceConfig, m._id)));
+    membersToUpdate = membersToUpdateRemoveVote.concat(membersToUpdateAddVote);
+
+    print(`autoReconfig: Starting with membersToRemove: ${
+        tojsononeline(membersToRemove)}, membersToUpdate: ${
+        tojsononeline(membersToUpdate)}, membersToAdd: ${tojsononeline(membersToAdd)}`);
+
+    // Remove members.
+    membersToRemove.forEach(toRemove => {
+        config.members = config.members.filter(m => m._id !== toRemove._id);
+        config.version++;
+        print(`autoReconfig: remove member id ${toRemove._id}, reconfiguring to member set: ${
+            tojsononeline(config.members)}`);
+        reconfigWithRetry(primary, config);
+    });
+
+    // Update members.
+    membersToUpdate.forEach(toUpdate => {
+        let configIndex = memberIndex(config, toUpdate._id);
+        config.members[configIndex] = toUpdate;
+        config.version++;
+        print(`autoReconfig: update member id ${toUpdate._id}, reconfiguring to member set: ${
+            tojsononeline(config.members)}`);
+        reconfigWithRetry(primary, config);
+    });
+
+    // Add members.
+    membersToAdd.forEach(toAdd => {
+        config.members.push(toAdd);
+        config.version++;
+        print(`autoReconfig: add member id ${toAdd._id}, reconfiguring to member set: ${
+            tojsononeline(config.members)}`);
+        reconfigWithRetry(primary, config);
+    });
+
+    // Verify that the final set of members is correct.
+    assert.sameMembers(targetConfig.members.map(m => m._id),
+                       rst.getReplSetConfigFromNode().members.map(m => m._id),
+                       "final config does not have the expected member set.");
+
+    // Do a final reconfig to update any other top level config fields. This also ensures the
+    // correct member order in the final config since the add/remove procedure above will result in
+    // a members array that has the correct set of members but the members may not be in the same
+    // order as the specified target config.
+    print("autoReconfig: doing final reconfig to reach target config.");
+    targetConfig.version = rst.getReplSetConfigFromNode().version + 1;
+    reconfigWithRetry(primary, targetConfig);
+}
+
+/**
+ * Executes a replica set reconfiguration on the given ReplSetTest instance.
+ *
+ * If this function fails for any reason while doing a non force reconfig, the replica set config
+ * may be left in an intermediate state i.e. neither in the original or target config.
+ *
+ * @param rst - a ReplSetTest instance.
+ * @param config - the desired target config. After this function returns, the
+ * given replica set should be in 'config', except with a higher version.
+ * @param force - should this be a 'force' reconfig or not.
+ * @param doNotWaitForMembers - if set, we will skip waiting for all members to be in primary,
+ *     secondary, or arbiter states
+ */
+reconfig = function(rst, config, force, doNotWaitForMembers) {
+    "use strict";
+    var primary = rst.getPrimary();
+    config = rst._updateConfigIfNotDurable(config);
+
+    // If this is a non 'force' reconfig, execute the reconfig as a series of reconfigs. Safe
+    // reconfigs only allow addition/removal of a single voting node at a time, so arbitrary
+    // reconfigs must be carried out in multiple steps. Using safe reconfigs guarantees that we
+    // don't violate correctness properties of the replication protocol.
+    if (!force) {
+        autoReconfig(rst, config);
+    } else {
+        // Force reconfigs can always be executed in one step.
+        reconfigWithRetry(primary, config, force);
     }
 
-    var master = rs.getPrimary().getDB("admin");
-    waitForAllMembers(master);
-
-    return master;
+    var primaryAdminDB = rst.getPrimary().getDB("admin");
+    if (!doNotWaitForMembers) {
+        waitForAllMembers(primaryAdminDB);
+    }
+    return primaryAdminDB;
 };
 
 awaitOpTime = function(catchingUpNode, latestOpTimeNode) {
@@ -444,6 +639,29 @@ getLastOpTime = function(conn) {
 };
 
 /**
+ * Returns the oldest oplog entry.
+ */
+getFirstOplogEntry = function(conn) {
+    let firstEntry;
+    // The query plan may yield between the cursor establishment and iterating to retrieve the first
+    // result. During this yield it's possible for the oplog to "roll over" or shrink. This is rare,
+    // but if these both happen the cursor will be unable to resume after yielding and return a
+    // "CappedPositionLost" error. This can be safely retried.
+    assert.soon(() => {
+        try {
+            firstEntry = conn.getDB('local').oplog.rs.find().sort({$natural: 1}).limit(1)[0];
+            return true;
+        } catch (e) {
+            if (e.code == ErrorCodes.CappedPositionLost) {
+                return false;
+            }
+            throw e;
+        }
+    });
+    return firstEntry;
+};
+
+/**
  * Set log verbosity on all given nodes.
  * e.g. setLogVerbosity(replTest.nodes, { "replication": {"verbosity": 3} });
  */
@@ -509,5 +727,102 @@ setFailPoint = function(node, failpoint, data = {}) {
 clearFailPoint = function(node, failpoint) {
     jsTestLog("Clearing fail point " + failpoint);
     assert.commandWorked(node.adminCommand({configureFailPoint: failpoint, mode: "off"}));
+};
+
+/**
+ * Returns the replSetGetConfig field 'commitmentStatus', which is true or false.
+ */
+isConfigCommitted = function(node) {
+    let adminDB = node.getDB('admin');
+    return assert.commandWorked(adminDB.runCommand({replSetGetConfig: 1, commitmentStatus: true}))
+        .commitmentStatus;
+};
+
+/**
+ * Asserts that replica set config A is the same as replica set config B ignoring the 'version' and
+ * 'term' field.
+ */
+assertSameConfigContent = function(configA, configB) {
+    // Save original versions and terms.
+    const [versionA, termA] = [configA.version, configA.term];
+    const [versionB, termB] = [configB.version, configB.term];
+
+    configA.version = configA.term = 0;
+    configB.version = configB.term = 0;
+    assert.eq(configA, configB);
+
+    // Reset values so we don't modify the original objects.
+    configA.version = versionA;
+    configA.term = termA;
+    configB.version = versionB;
+    configB.term = termB;
+};
+
+/**
+ * Returns the result of 'replSetGetConfig' with the test-parameter specified that indicates to
+ * include 'newlyAdded' fields.
+ */
+getConfigWithNewlyAdded = function(node) {
+    return assert.commandWorked(
+        node.adminCommand({replSetGetConfig: 1, $_internalIncludeNewlyAdded: true}));
+};
+
+/**
+ * @param memberIndex is optional. If not provided, then it will return true even if
+ * a single member in the replSet config has "newlyAdded" field.
+ */
+isMemberNewlyAdded = function(node, memberIndex) {
+    const config = getConfigWithNewlyAdded(node).config;
+
+    const allMembers = (memberIndex === undefined);
+    assert(allMembers || (memberIndex >= 0 && memberIndex < config.members.length),
+           "memberIndex should be between 0 and " + (config.members.length - 1) +
+               ", but memberIndex is " + memberIndex);
+
+    var hasNewlyAdded = (index) => {
+        const memberConfig = config.members[index];
+        if (memberConfig.hasOwnProperty("newlyAdded")) {
+            assert(memberConfig["newlyAdded"] === true, config);
+            return true;
+        }
+        return false;
+    };
+
+    if (allMembers) {
+        for (let i = 0; i < config.members.length; i++) {
+            if (hasNewlyAdded(i))
+                return true;
+        }
+        return false;
+    }
+
+    return hasNewlyAdded(memberIndex);
+};
+
+// Returns true if at least one member in the repl set config contains "newlyAdded" field.
+replConfigHasNewlyAddedMembers = function(conn) {
+    return isMemberNewlyAdded(conn);
+};
+
+waitForNewlyAddedRemovalForNodeToBeCommitted = function(node, memberIndex, force = false) {
+    jsTestLog("Waiting for member " + memberIndex + " to no longer be 'newlyAdded'");
+    assert.soonNoExcept(function() {
+        return !isMemberNewlyAdded(node, memberIndex, force) && isConfigCommitted(node);
+    }, getConfigWithNewlyAdded(node).config);
+};
+
+assertVoteCount = function(node, {
+    votingMembersCount,
+    majorityVoteCount,
+    writableVotingMembersCount,
+    writeMajorityCount,
+    totalMembersCount
+}) {
+    const status = assert.commandWorked(node.adminCommand({replSetGetStatus: 1}));
+    assert.eq(status["votingMembersCount"], votingMembersCount, status);
+    assert.eq(status["majorityVoteCount"], majorityVoteCount, status);
+    assert.eq(status["writableVotingMembersCount"], writableVotingMembersCount, status);
+    assert.eq(status["writeMajorityCount"], writeMajorityCount, status);
+    assert.eq(status["members"].length, totalMembersCount, status);
 };
 }());

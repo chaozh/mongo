@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -43,15 +43,14 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/split_chunk_request_type.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -72,7 +71,7 @@ bool checkIfSingleDoc(OperationContext* opCtx,
                                            newmin,
                                            newmax,
                                            BoundInclusion::kIncludeStartKeyOnly,
-                                           PlanExecutor::NO_YIELD);
+                                           PlanYieldPolicy::YieldPolicy::NO_YIELD);
     // check if exactly one document found
     PlanExecutor::ExecState state;
     BSONObj obj;
@@ -98,14 +97,13 @@ bool checkMetadataForSuccessfulSplitChunk(OperationContext* opCtx,
                                           const OID& epoch,
                                           const ChunkRange& chunkRange,
                                           const std::vector<BSONObj>& splitKeys) {
-    const auto metadataAfterSplit = [&] {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
-    }();
+    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+    const auto metadataAfterSplit =
+        CollectionShardingRuntime::get(opCtx, nss)->getCurrentMetadataIfKnown();
 
     uassert(ErrorCodes::StaleEpoch,
             str::stream() << "Collection " << nss.ns() << " changed since split start",
-            metadataAfterSplit->getCollVersion().epoch() == epoch);
+            metadataAfterSplit && metadataAfterSplit->getShardVersion().epoch() == epoch);
 
     auto newChunkBounds(splitKeys);
     auto startKey = chunkRange.getMin();
@@ -134,8 +132,9 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
                                                    const std::vector<BSONObj>& splitKeys,
                                                    const std::string& shardName,
                                                    const OID& expectedCollectionEpoch) {
-    const std::string whyMessage(str::stream() << "splitting chunk " << chunkRange.toString()
-                                               << " in " << nss.toString());
+    const std::string whyMessage(str::stream()
+                                 << "splitting chunk " << redact(chunkRange.toString()) << " in "
+                                 << nss.toString());
     auto scopedDistLock = Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
         opCtx, nss.ns(), whyMessage, DistLockManager::kDefaultLockTimeout);
     if (!scopedDistLock.isOK()) {
@@ -197,7 +196,7 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
     // succeeds, thus the automatic retry fails with a precondition violation, for example.
     //
     if (!commandStatus.isOK() || !writeConcernStatus.isOK()) {
-        forceShardFilteringMetadataRefresh(opCtx, nss);
+        onShardVersionMismatch(opCtx, nss, boost::none);
 
         if (checkMetadataForSuccessfulSplitChunk(
                 opCtx, nss, expectedCollectionEpoch, chunkRange, splitKeys)) {
@@ -213,8 +212,10 @@ StatusWith<boost::optional<ChunkRange>> splitChunk(OperationContext* opCtx,
 
     Collection* const collection = autoColl.getCollection();
     if (!collection) {
-        warning() << "will not perform top-chunk checking since " << nss.toString()
-                  << " does not exist after splitting";
+        LOGV2_WARNING(
+            23778,
+            "will not perform top-chunk checking since {nss} does not exist after splitting",
+            "nss"_attr = nss.toString());
         return boost::optional<ChunkRange>(boost::none);
     }
 

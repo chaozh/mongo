@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,17 +38,15 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/authenticate.h"
 #include "mongo/db/client.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/client/version_manager.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
 using std::string;
 
-ShardingConnectionHook::ShardingConnectionHook(bool shardedConnections,
-                                               std::unique_ptr<rpc::EgressMetadataHook> egressHook)
-    : _shardedConnections(shardedConnections), _egressHook(std::move(egressHook)) {}
+ShardingConnectionHook::ShardingConnectionHook(std::unique_ptr<rpc::EgressMetadataHook> egressHook)
+    : _egressHook(std::move(egressHook)) {}
 
 void ShardingConnectionHook::onCreate(DBClientBase* conn) {
     if (conn->type() == ConnectionString::INVALID) {
@@ -58,21 +56,17 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
     // Authenticate as the first thing we do
     // NOTE: Replica set authentication allows authentication against *any* online host
     if (auth::isInternalAuthSet()) {
-        LOG(2) << "calling onCreate auth for " << conn->toString();
+        LOGV2_DEBUG(22722,
+                    2,
+                    "Calling onCreate auth for {connectionString}",
+                    "Calling onCreate auth",
+                    "connectionString"_attr = conn->toString());
 
         uassertStatusOKWithContext(conn->authenticateInternalUser(),
                                    str::stream() << "can't authenticate to server "
                                                  << conn->getServerAddress());
     }
 
-    // Delegate the metadata hook logic to the egress hook; use lambdas to pass the arguments in
-    // the order expected by the egress hook.
-    if (_shardedConnections) {
-        conn->setReplyMetadataReader(
-            [this](OperationContext* opCtx, const BSONObj& metadataObj, StringData target) {
-                return _egressHook->readReplyMetadata(opCtx, target, metadataObj);
-            });
-    }
     conn->setRequestMetadataWriter([this](OperationContext* opCtx, BSONObjBuilder* metadataBob) {
         return _egressHook->writeRequestMetadata(opCtx, metadataBob);
     });
@@ -105,12 +99,6 @@ void ShardingConnectionHook::onCreate(DBClientBase* conn) {
                     configServerModeNumber <= maxKnownConfigServerMode);
 
         uassertStatusOK(status);
-    }
-}
-
-void ShardingConnectionHook::onDestroy(DBClientBase* conn) {
-    if (_shardedConnections && versionManager.isVersionableCB(conn)) {
-        versionManager.resetShardVersionCB(conn);
     }
 }
 

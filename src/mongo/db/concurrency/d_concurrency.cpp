@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -43,7 +43,6 @@
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/str.h"
 
@@ -150,7 +149,7 @@ Lock::GlobalLock::GlobalLock(OperationContext* opCtx,
 
     try {
         if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-            _pbwm.lock(opCtx, MODE_IS);
+            _pbwm.lock(opCtx, MODE_IS, deadline);
         }
         auto unlockPBWM = makeGuard([this] {
             if (_opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
@@ -202,12 +201,6 @@ Lock::DBLock::DBLock(OperationContext* opCtx, StringData db, LockMode mode, Date
       _globalLock(
           opCtx, isSharedLockMode(_mode) ? MODE_IS : MODE_IX, deadline, InterruptBehavior::kThrow) {
     massert(28539, "need a valid database name", !db.empty() && nsIsDbOnly(db));
-
-    // The check for the admin db is to ensure direct writes to auth collections
-    // are serialized (see SERVER-16092).
-    if ((_id == resourceIdAdminDB) && !isSharedLockMode(_mode)) {
-        _mode = MODE_X;
-    }
 
     _opCtx->lockState()->lock(_opCtx, _id, _mode, deadline);
     _result = LOCK_OK;
@@ -313,13 +306,9 @@ Lock::ParallelBatchWriterMode::ParallelBatchWriterMode(Locker* lockState)
     : _pbwm(lockState, resourceIdParallelBatchWriterMode, MODE_X),
       _shouldNotConflictBlock(lockState) {}
 
-void Lock::ResourceLock::lock(LockMode mode) {
-    lock(nullptr, mode);
-}
-
-void Lock::ResourceLock::lock(OperationContext* opCtx, LockMode mode) {
+void Lock::ResourceLock::lock(OperationContext* opCtx, LockMode mode, Date_t deadline) {
     invariant(_result == LOCK_INVALID);
-    _locker->lock(opCtx, _rid, mode);
+    _locker->lock(opCtx, _rid, mode, deadline);
     _result = LOCK_OK;
 }
 

@@ -52,7 +52,7 @@ public:
     ~MozJSScriptEngine() override;
 
     mongo::Scope* createScope() override;
-    mongo::Scope* createScopeForCurrentThread() override;
+    mongo::Scope* createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) override;
 
     void runTest() override {}
 
@@ -86,8 +86,6 @@ public:
     }
 
 private:
-    std::string printKnownOps_inlock();
-
     /**
      * This mutex protects _opToScopeMap
      */

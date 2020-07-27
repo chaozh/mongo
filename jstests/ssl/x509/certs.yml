@@ -24,7 +24,7 @@ certs:
     Most Certificates are issued by this CA.
   Subject: {CN: 'Kernel Test CA'}
   # ca-2019.pem is our "legacy" SHA-1 self-signed CA root.
-  append_cert: ['ca-2019.pem']
+  append_cert: ['jstests/libs/ca-2019.pem']
   Issuer: self
   extensions:
     basicConstraints:
@@ -335,6 +335,8 @@ certs:
   Issuer: self
   include_header: false
   output_path: 'jstests/libs/ocsp/'
+  keyfile: 'ca_ocsp.key'
+  crtfile: 'ca_ocsp.crt'
   extensions:
     basicConstraints:
       critical: true
@@ -356,7 +358,28 @@ certs:
     subjectAltName:
       DNS: localhost
       IP: 127.0.0.1
-    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status/'
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status'
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [serverAuth, clientAuth]
+
+- name: 'server_ocsp_revoked.pem'
+  description: >-
+    OCSP certificate for the mongodb server.
+  Subject:
+    CN: 'localhost'
+    C: US
+    ST: NY
+    L: OCSP-1
+  Issuer: 'ca_ocsp.pem'
+  include_header: false
+  output_path: 'jstests/libs/ocsp/'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectAltName:
+      DNS: localhost
+      IP: 127.0.0.1
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status'
     subjectKeyIdentifier: hash
     keyUsage: [digitalSignature, keyEncipherment]
     extendedKeyUsage: [serverAuth, clientAuth]
@@ -377,7 +400,7 @@ certs:
     subjectAltName:
       DNS: localhost
       IP: 127.0.0.1
-    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status/'
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status'
     mustStaple: true
     subjectKeyIdentifier: hash
     keyUsage: [digitalSignature, keyEncipherment]
@@ -399,12 +422,45 @@ certs:
     subjectAltName:
       DNS: localhost
       IP: 127.0.0.1
-    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status/'
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status'
     subjectKeyIdentifier: hash
     keyUsage: [digitalSignature, keyEncipherment]
     extendedKeyUsage: [clientAuth]
 
-- name: 'ocsp_responder.crt'
+# Intermediate OCSP tree
+- name: 'intermediate_ca_ocsp.pem'
+  description: CA issued by the primary OCSP CA, which then issues its own server OCSP cert.
+  Subject: {CN: 'Intermediate CA for OCSP'}
+  Issuer: 'ca_ocsp.pem'
+  include_header: false
+  append_cert: 'ca_ocsp.pem'
+  output_path: 'jstests/libs/ocsp/'
+  keyfile: 'intermediate_ca_ocsp.key'
+  crtfile: 'intermediate_ca_ocsp.crt'
+  extensions:
+    subjectKeyIdentifier: hash
+    basicConstraints:
+      critical: true
+      CA: true
+
+- name: 'server_intermediate_ca_ocsp.pem'
+  description: Server OCSP certificate signed by intermediate CA.
+  Subject: {CN: 'Server OCSP Via Intermediate'}
+  Issuer: 'intermediate_ca_ocsp.pem'
+  include_header: false
+  output_path: 'jstests/libs/ocsp/'
+  extensions:
+    basicConstraints: {CA: false}
+    subjectAltName:
+      DNS: localhost
+      IP: 127.0.0.1
+    authorityInfoAccess: 'OCSP;URI:http://localhost:8100/status'
+    subjectKeyIdentifier: hash
+    keyUsage: [digitalSignature, keyEncipherment]
+    extendedKeyUsage: [serverAuth, clientAuth]
+
+# OCSP Responder Certificate
+- name: 'ocsp_responder.pem'
   description: Certificate and key for the OCSP responder
   Subject:
     CN: 'localhost'
@@ -414,6 +470,7 @@ certs:
   Issuer: 'ca_ocsp.pem'
   include_header: false
   keyfile: 'ocsp_responder.key'
+  crtfile: 'ocsp_responder.crt'
   output_path: 'jstests/libs/ocsp/'
   extensions:
     basicConstraints: {CA: false}
@@ -558,7 +615,7 @@ certs:
   - 'trusted-ca.pem'
 
 ###
-# ECDSA tree
+# ECDSA trees
 ###
 
 # These three are all special cases handled internally by mkcert.py
@@ -566,11 +623,38 @@ certs:
 - name: 'ecdsa-ca.pem'
   description: Root of ECDSA tree.
   Issuer: self
+  tags: [ecdsa]
 
 - name: 'ecdsa-client.pem'
   description: Client certificate for ECDSA tree.
   Issuer: 'ecdsa-ca.pem'
+  tags: [ecdsa]
 
 - name: 'ecdsa-server.pem'
   description: Server certificate for ECDSA tree.
   Issuer: 'ecdsa-ca.pem'
+  tags: [ecdsa]
+
+###
+# ECDSA OCSP tree
+###
+
+- name: 'ecdsa-ca-ocsp.pem'
+  description: Root of ECDSA tree for OCSP testing
+  Issuer: self
+  tags: [ecdsa]
+
+- name: 'ecdsa-server-ocsp.pem'
+  description: ECDSA server certificate w/OCSP
+  Issuer: 'ecdsa-ca-ocsp.pem'
+  tags: [ecdsa, ocsp]
+
+- name: 'ecdsa-server-ocsp-mustStaple.pem'
+  description: ECDSA server certificate w/OCSP + must-staple
+  Issuer: 'ecdsa-ca-ocsp.pem'
+  tags: [ecdsa, ocsp, must-staple]
+
+- name: 'ecdsa-ocsp-responder.crt'
+  description: ECDSA certificate and key for OCSP responder
+  Issuer: 'ecdsa-ca-ocsp.pem'
+  tags: [ecdsa, ocsp, responder]

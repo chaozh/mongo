@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -43,7 +43,7 @@
 #include "mongo/db/repl/replication_coordinator_external_state.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace repl {
@@ -86,35 +86,32 @@ void DataReplicatorExternalStateImpl::processMetadata(const rpc::ReplSetMetadata
 
     _replicationCoordinator->processReplSetMetadata(replMetadata);
 
-    if ((oqMetadata.getPrimaryIndex() != rpc::OplogQueryMetadata::kNoPrimary) ||
-        (replMetadata.getPrimaryIndex() != rpc::ReplSetMetadata::kNoPrimary)) {
+    if (oqMetadata.hasPrimaryIndex()) {
         _replicationCoordinator->cancelAndRescheduleElectionTimeout();
     }
 }
 
-bool DataReplicatorExternalStateImpl::shouldStopFetching(
+ChangeSyncSourceAction DataReplicatorExternalStateImpl::shouldStopFetching(
     const HostAndPort& source,
     const rpc::ReplSetMetadata& replMetadata,
-    boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
+    const rpc::OplogQueryMetadata& oqMetadata,
+    const OpTime& previousOpTimeFetched,
+    const OpTime& lastOpTimeFetched) {
     // Re-evaluate quality of sync target.
-    if (_replicationCoordinator->shouldChangeSyncSource(source, replMetadata, oqMetadata)) {
-        // If OplogQueryMetadata was provided, its values were used to determine if we should
-        // change sync sources.
-        if (oqMetadata) {
-            log() << "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
-                     "sync source. Current source: "
-                  << source << ", OpTime " << oqMetadata->getLastOpApplied()
-                  << ", its sync source index:" << oqMetadata->getSyncSourceIndex();
-
-        } else {
-            log() << "Canceling oplog query due to ReplSetMetadata. We have to choose a new sync "
-                     "source. Current source: "
-                  << source << ", OpTime " << replMetadata.getLastOpVisible()
-                  << ", its sync source index:" << replMetadata.getSyncSourceIndex();
-        }
-        return true;
+    auto changeSyncSourceAction = _replicationCoordinator->shouldChangeSyncSource(
+        source, replMetadata, oqMetadata, previousOpTimeFetched, lastOpTimeFetched);
+    if (changeSyncSourceAction != ChangeSyncSourceAction::kContinueSyncing) {
+        LOGV2(21150,
+              "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
+              "sync source. Current source: {syncSource}, OpTime {lastAppliedOpTime}, "
+              "its sync source index:{syncSourceIndex}",
+              "Canceling oplog query due to OplogQueryMetadata. We have to choose a new "
+              "sync source",
+              "syncSource"_attr = source,
+              "lastAppliedOpTime"_attr = oqMetadata.getLastOpApplied(),
+              "syncSourceIndex"_attr = oqMetadata.getSyncSourceIndex());
     }
-    return false;
+    return changeSyncSourceAction;
 }
 
 std::unique_ptr<OplogBuffer> DataReplicatorExternalStateImpl::makeInitialSyncOplogBuffer(

@@ -213,10 +213,10 @@ public:
         return status;
     }
 
-    // optional
-    virtual int flushAllFiles(OperationContext* opCtx, bool sync) {
-        return 0;
-    }
+    /**
+     * See StorageEngine::flushAllFiles for details
+     */
+    virtual void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) {}
 
     /**
      * See StorageEngine::beginBackup for details
@@ -237,7 +237,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+    virtual StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
@@ -250,30 +250,6 @@ public:
     virtual StatusWith<std::vector<std::string>> extendBackupCursor(OperationContext* opCtx) {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
-    }
-
-    /**
-     * See StorageEngine::getCheckpointLock for details.
-     */
-    virtual std::unique_ptr<StorageEngine::CheckpointLock> getCheckpointLock(
-        OperationContext* opCtx) {
-        uasserted(ErrorCodes::CommandNotSupported,
-                  "The current storage engine does not support checkpoints");
-    }
-
-    virtual void addIndividuallyCheckpointedIndexToList(const std::string& ident) {
-        uasserted(ErrorCodes::CommandNotSupported,
-                  "The current storage engine does not support checkpoints");
-    }
-
-    virtual void clearIndividuallyCheckpointedIndexesList() {
-        uasserted(ErrorCodes::CommandNotSupported,
-                  "The current storage engine does not support checkpoints");
-    }
-
-    virtual bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const {
-        uasserted(ErrorCodes::CommandNotSupported,
-                  "The current storage engine does not support checkpoints");
     }
 
     /**
@@ -295,13 +271,6 @@ public:
      * This must not change over the lifetime of the engine.
      */
     virtual bool supportsDocLocking() const = 0;
-
-    /**
-     * This must not change over the lifetime of the engine.
-     */
-    virtual bool supportsDBLocking() const {
-        return true;
-    }
 
     /**
      * This must not change over the lifetime of the engine.
@@ -364,6 +333,13 @@ public:
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) {}
 
     /**
+     * See `StorageEngine::getInitialDataTimestamp`
+     */
+    virtual Timestamp getInitialDataTimestamp() {
+        return Timestamp();
+    }
+
+    /**
      * See `StorageEngine::setOldestTimestampFromStable`
      */
     virtual void setOldestTimestampFromStable() {}
@@ -378,18 +354,6 @@ public:
      * See `StorageEngine::setOldestTimestamp`
      */
     virtual void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) {}
-
-    /**
-     * See `StorageEngine::isCacheUnderPressure()`
-     */
-    virtual bool isCacheUnderPressure(OperationContext* opCtx) const {
-        return false;
-    }
-
-    /**
-     * See 'StorageEngine::setCachePressureForTest()'
-     */
-    virtual void setCachePressureForTest(int pressure) {}
 
     /**
      * See `StorageEngine::supportsRecoverToStableTimestamp`
@@ -458,11 +422,6 @@ public:
     virtual bool supportsOplogStones() const {
         return false;
     }
-
-    /**
-     * See `StorageEngine::triggerJournalFlush()`
-     */
-    virtual void triggerJournalFlush() const {};
 
     /**
      * Methods to access the storage engine's timestamps.

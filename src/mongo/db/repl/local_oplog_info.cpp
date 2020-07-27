@@ -27,18 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/local_oplog_info.h"
 
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/logical_time.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -96,7 +95,7 @@ void LocalOplogInfo::resetCollection() {
 
 void LocalOplogInfo::setNewTimestamp(ServiceContext* service, const Timestamp& newTime) {
     stdx::lock_guard<Latch> lk(_newOpMutex);
-    LogicalClock::get(service)->setClusterTimeFromTrustedSource(LogicalTime(newTime));
+    VectorClockMutable::get(service)->tickClusterTimeTo(LogicalTime(newTime));
 }
 
 std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, std::size_t count) {
@@ -123,7 +122,7 @@ std::vector<OplogSlot> LocalOplogInfo::getNextOpTimes(OperationContext* opCtx, s
     {
         stdx::lock_guard<Latch> lk(_newOpMutex);
 
-        ts = LogicalClock::get(opCtx)->reserveTicks(count).asTimestamp();
+        ts = VectorClockMutable::get(opCtx)->tickClusterTime(count).asTimestamp();
         const bool orderedCommit = false;
 
         // The local oplog collection pointer must already be established by this point.

@@ -110,7 +110,6 @@ env.Append(
 # propagates to consumers that Inject (depend on) unwind.
 env.RegisterConsumerModifications(
     CPPPATH=[unwind_platform.Dir("install/include")],
-    CPPDEFINES=['UNW_LOCAL_ONLY', 'MONGO_USE_LIBUNWIND'],
     LIBS=['lzma'])
 
 env.Append(
@@ -124,4 +123,9 @@ env.Append(
 
 env.Library(
     target='unwind',
-    source=env.File(unwind_sources, unwind_src_dir))
+    source=env.File(unwind_sources, unwind_src_dir),
+    # We don't want the shim_allocator hack to apply to this library, since
+    # otherwise we would create a loop, since tcmalloc might use us. That should
+    # be OK, unless libunwind had static initializers that invoked malloc.
+    DISABLE_ALLOCATOR_SHIM_INJECTION=True,
+)

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kASIO
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kASIO
 
 #include "mongo/platform/basic.h"
 
@@ -38,11 +38,11 @@
 #include "mongo/executor/network_interface_integration_fixture.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/integration_test.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace executor {
@@ -108,19 +108,73 @@ Future<RemoteCommandResponse> NetworkInterfaceIntegrationFixture::runCommand(
     RemoteCommandRequestOnAny rcroa{request};
 
     return net().startCommand(cbHandle, rcroa).then([](TaskExecutor::ResponseOnAnyStatus roa) {
-        return RemoteCommandResponse(roa);
+        auto res = RemoteCommandResponse(roa);
+        if (res.isOK()) {
+            LOGV2(4820500,
+                  "Got command result: {response}",
+                  "Got command result",
+                  "response"_attr = res.toString());
+        } else {
+            LOGV2(4820501, "Command failed: {error}", "Command failed", "error"_attr = res.status);
+        }
+        return res;
     });
+}
+
+Future<RemoteCommandOnAnyResponse> NetworkInterfaceIntegrationFixture::runCommandOnAny(
+    const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequestOnAny request) {
+    RemoteCommandRequestOnAny rcroa{request};
+
+    return net().startCommand(cbHandle, rcroa).then([](TaskExecutor::ResponseOnAnyStatus roa) {
+        if (roa.isOK()) {
+            LOGV2(4820502,
+                  "Got command result: {response}",
+                  "Got command result",
+                  "response"_attr = roa.toString());
+        } else {
+            LOGV2(4820503, "Command failed: {error}", "Command failed", "error"_attr = roa.status);
+        }
+        return roa;
+    });
+}
+
+Future<void> NetworkInterfaceIntegrationFixture::startExhaustCommand(
+    const TaskExecutor::CallbackHandle& cbHandle,
+    RemoteCommandRequest request,
+    std::function<void(const RemoteCommandResponse&)> exhaustUtilCB,
+    const BatonHandle& baton) {
+    RemoteCommandRequestOnAny rcroa{request};
+    auto pf = makePromiseFuture<void>();
+
+    auto status = net().startExhaustCommand(
+        cbHandle,
+        rcroa,
+        [p = std::move(pf.promise), exhaustUtilCB = std::move(exhaustUtilCB)](
+            const TaskExecutor::ResponseOnAnyStatus& rs) mutable {
+            exhaustUtilCB(rs);
+
+            if (!rs.status.isOK()) {
+                invariant(!rs.moreToCome);
+                p.setError(rs.status);
+                return;
+            }
+
+            if (!rs.moreToCome) {
+                p.emplaceValue();
+            }
+        },
+        baton);
+
+    if (!status.isOK()) {
+        return status;
+    }
+    return std::move(pf.future);
 }
 
 RemoteCommandResponse NetworkInterfaceIntegrationFixture::runCommandSync(
     RemoteCommandRequest& request) {
     auto deferred = runCommand(makeCallbackHandle(), request);
     auto& res = deferred.get();
-    if (res.isOK()) {
-        log() << "got command result: " << res.toString();
-    } else {
-        log() << "command failed: " << res.status;
-    }
     return res;
 }
 

@@ -64,6 +64,11 @@ function configuredForTxnOverride() {
     return TestData.networkErrorAndTxnOverrideConfig.wrapCRUDinTransactions;
 }
 
+function configuredForBackgroundReconfigs() {
+    assert(TestData.networkErrorAndTxnOverrideConfig, TestData);
+    return TestData.networkErrorAndTxnOverrideConfig.backgroundReconfigs;
+}
+
 // Commands assumed to not be blindly retryable.
 const kNonRetryableCommands = new Set([
     // Commands that take write concern and do not support txnNumbers.
@@ -87,12 +92,9 @@ const kNonRetryableCommands = new Set([
     "captrunc",
     "clone",
     "cloneCollectionAsCapped",
-    "collMod",
     "convertToCapped",
     "create",
     "createIndexes",
-    "createRole",
-    "createUser",
     "deleteIndexes",
     "drop",
     "dropAllRolesFromDatabase",
@@ -103,15 +105,7 @@ const kNonRetryableCommands = new Set([
     "dropUser",
     "emptycapped",
     "godinsert",
-    "grantPrivilegesToRole",
-    "grantRolesToRole",
-    "grantRolesToUser",
-    "mapreduce.shardedfinish",
-    "moveChunk",
     "renameCollection",
-    "revokePrivilegesFromRole",
-    "revokeRolesFromRole",
-    "revokeRolesFromUser",
     "updateRole",
     "updateUser",
 ]);
@@ -122,19 +116,36 @@ const kNonRetryableCommands = new Set([
 const kAcceptableNonRetryableCommands = new Set([
     "create",
     "createIndexes",
+    "createRole",
+    "createUser",
     "deleteIndexes",
     "drop",
     "dropDatabase",  // Already ignores NamespaceNotFound errors, so not handled below.
     "dropIndexes",
+    "moveChunk",
 ]);
+
+// The following read operations defined in the CRUD specification are retryable.
+// Note that estimatedDocumentCount() and countDocuments() use the count command.
+const kRetryableReadCommands = new Set(["find", "aggregate", "distinct", "count"]);
+
+// Returns true if the command name is that of a retryable read command.
+function isRetryableReadCmdName(cmdName) {
+    return kRetryableReadCommands.has(cmdName);
+}
 
 // Returns if the given failed response is a safe response to ignore when retrying the
 // given command type.
 function isAcceptableRetryFailedResponse(cmdName, res) {
     assert(!res.ok, res);
+    // These codes are uniquely returned from user_management_commands.cpp
+    const kErrorCodeRoleAlreadyExists = 51002;
+    const kErrorCodeUserAlreadyExists = 51003;
     return ((cmdName === "create" && res.code === ErrorCodes.NamespaceExists) ||
             (cmdName === "createIndexes" && res.code === ErrorCodes.IndexAlreadyExists) ||
             (cmdName === "drop" && res.code === ErrorCodes.NamespaceNotFound) ||
+            ((cmdName == "createUser") && (res.code === kErrorCodeUserAlreadyExists)) ||
+            ((cmdName == "createRole") && (res.code === kErrorCodeRoleAlreadyExists)) ||
             ((cmdName === "dropIndexes" || cmdName === "deleteIndexes") &&
              res.code === ErrorCodes.IndexNotFound));
 }
@@ -186,6 +197,20 @@ function canRetryNetworkErrorForCommand(cmdName, cmdObj) {
     return true;
 }
 
+// Returns if the given command should retry a read error when reconfigs are present.
+function canRetryReadErrorDuringBackgroundReconfig(cmdName) {
+    if (!configuredForBackgroundReconfigs()) {
+        return false;
+    }
+    return isRetryableReadCmdName(cmdName);
+}
+
+// When running the reconfig command on a node, it will drop its snapshot. Read commands issued
+// to this node before it updates its snapshot will fail with ReadConcernMajorityNotAvailableYet.
+function isRetryableReadCode(code) {
+    return code === ErrorCodes.ReadConcernMajorityNotAvailableYet;
+}
+
 // Several commands that use the plan executor swallow the actual error code from a failed plan
 // into their error message and instead return OperationFailed.
 //
@@ -203,6 +228,21 @@ function isRetryableShardCollectionResponse(res) {
         // shardCollection creates collections on each shard that will receive a chunk using
         // _cloneCollectionsOptionsFromPrimaryShard, which may fail with the following code if
         // interupted by a failover.
+        res.code === ErrorCodes.CallbackCanceled;
+}
+
+// Returns true if the given response could have come from moveChunk being interrupted by a
+// failover.
+function isRetryableMoveChunkResponse(res) {
+    return (res.code === ErrorCodes.OperationFailed &&
+            (RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg) ||
+             // The transaction number is bumped by the migration coordinator when its commit or
+             // abort decision is being made durable.
+             res.errmsg.includes("TransactionTooOld") ||
+             // The range deletion task may have been interrupted. This error can occur even when
+             // _waitForDelete=false.
+             res.errmsg.includes("operation was interrupted"))) ||
+        // This error may occur when the node is shutting down.
         res.code === ErrorCodes.CallbackCanceled;
 }
 
@@ -446,7 +486,8 @@ function appendReadAndWriteConcern(conn, dbName, cmdName, cmdObj) {
             let writeConcern = cmdObj.writeConcern;
             if (typeof writeConcern !== "object" || writeConcern === null ||
                 (writeConcern.hasOwnProperty("w") &&
-                 bsonWoCompare({_: writeConcern.w}, {_: kDefaultWriteConcernW}) !== 0)) {
+                 bsonWoCompare({_: writeConcern.w}, {_: kDefaultWriteConcernW}) !== 0 &&
+                 bsonWoCompare({_: writeConcern.w}, {_: 1}) !== 0)) {
                 throw new Error("Cowardly refusing to override write concern of command: " +
                                 tojson(cmdObj));
             }
@@ -571,6 +612,16 @@ function isCommandNonTxnGetMore(cmdName, cmdObj) {
     return cmdName === "getMore" && nonTxnAggCursorSet[cmdObj.getMore];
 }
 
+function isNamespaceSystemDotProfile(cmdObj) {
+    // No operations on system.profile are permitted inside transactions (see SERVER-46900).
+    for (let val of Object.values(cmdObj)) {
+        if (typeof val === 'string' && val.endsWith('system.profile')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function setupTransactionCommand(conn, dbName, cmdName, cmdObj, lsid) {
     // We want to overwrite whatever read and write concern is already set.
     delete cmdObj.readConcern;
@@ -580,8 +631,10 @@ function setupTransactionCommand(conn, dbName, cmdName, cmdObj, lsid) {
     // use transactions.
     const driverSession = conn.getDB(dbName).getSession();
     const commandSupportsTransaction = TransactionsUtil.commandSupportsTxn(dbName, cmdName, cmdObj);
-    if (commandSupportsTransaction && driverSession.getSessionId() !== null &&
-        !isCommandNonTxnGetMore(cmdName, cmdObj)) {
+    const isSystemDotProfile = isNamespaceSystemDotProfile(cmdObj);
+
+    if (commandSupportsTransaction && !isSystemDotProfile &&
+        driverSession.getSessionId() !== null && !isCommandNonTxnGetMore(cmdName, cmdObj)) {
         if (isNested()) {
             // Nested commands should never start a new transaction.
         } else if (ops.length === 0) {
@@ -600,7 +653,10 @@ function setupTransactionCommand(conn, dbName, cmdName, cmdObj, lsid) {
         continueTransaction(conn, dbName, cmdName, cmdObj);
 
     } else {
-        if (ops.length > 0 && !isNested()) {
+        if (ops.length > 0 && !isNested() && !isSystemDotProfile) {
+            // Operations on system.profile must be allowed to execute in parallel with open
+            // transactions, so operations on system.profile should not commit the current open
+            // transaction.
             logMsgFull('setupTransactionCommand',
                        `Committing transaction ${txnOptions.txnNumber} on session` +
                            ` ${tojsononeline(lsid)} to run a command that does not support` +
@@ -680,19 +736,6 @@ function retryWithTxnOverride(res, conn, dbName, cmdName, cmdObj, lsid, logError
     if (failedOnCRUDStatement) {
         assert.gt(ops.length, 0);
         abortTransaction(conn, lsid, txnOptions.txnNumber);
-
-        // If the command inserted data and is not supported in a transaction, we assume it
-        // failed because the collection did not exist. We will create the collection and retry
-        // the entire transaction. We should not receive this error in this override for any
-        // other reason.
-        // Tests that expect collections to not exist will have to be skipped.
-        if (kCmdsThatInsert.has(cmdName) &&
-            includesErrorCode(res, ErrorCodes.OperationNotSupportedInTransaction)) {
-            const collName = cmdObj[cmdName];
-            createCollectionExplicitly(conn, dbName, collName, lsid);
-
-            return retryEntireTransaction(conn, lsid);
-        }
 
         // Transaction statements cannot be retried, but retryable codes are expected to succeed
         // on full transaction retry.
@@ -830,6 +873,12 @@ function shouldRetryWithNetworkErrorOverride(
             return kContinue;
         }
 
+        // Check for the retryable error codes from an interrupted moveChunk.
+        if (cmdName === "moveChunk" && isRetryableMoveChunkResponse(res)) {
+            logError("Retrying interrupted moveChunk");
+            return kContinue;
+        }
+
         // In a sharded cluster, drop may bury the original error code in the error message if
         // interrupted.
         if (cmdName === "drop" && RetryableWritesUtil.errmsgContainsRetryableCodeName(res.errmsg)) {
@@ -859,6 +908,19 @@ function shouldRetryWithNetworkErrorOverride(
         }
     }
 
+    return res;
+}
+
+function shouldRetryForBackgroundReconfigOverride(res, cmdName, logError) {
+    assert(configuredForBackgroundReconfigs());
+    // Background reconfigs can interfere with read commands if they are using readConcern: majority
+    // and readPreference: primary. If we're running a read command and it fails with
+    // ReadConcernMajorityNotAvailableYet, retry because it should eventually succeed.
+    if (isRetryableReadCmdName(cmdName) && isRetryableReadCode(res.code)) {
+        logError("Retrying read command after 100ms because of background reconfigs");
+        sleep(100);
+        return kContinue;
+    }
     return res;
 }
 
@@ -947,6 +1009,7 @@ function runCommandOverrideBody(conn, dbName, cmdName, cmdObj, lsid, clientFunct
     }
 
     const canRetryNetworkError = canRetryNetworkErrorForCommand(cmdName, cmdObj);
+    const canRetryReadError = canRetryReadErrorDuringBackgroundReconfig(cmdName);
     let numNetworkErrorRetries = canRetryNetworkError ? kMaxNumRetries : 0;
     do {
         try {
@@ -974,6 +1037,16 @@ function runCommandOverrideBody(conn, dbName, cmdName, cmdObj, lsid, clientFunct
                     continue;
                 } else {
                     res = networkRetryRes;
+                }
+            }
+
+            if (canRetryReadError) {
+                const readRetryRes =
+                    shouldRetryForBackgroundReconfigOverride(res, cmdName, logError);
+                if (readRetryRes === kContinue) {
+                    continue;
+                } else {
+                    res = readRetryRes;
                 }
             }
 
@@ -1049,9 +1122,6 @@ function runCommandOverride(conn, dbName, cmdName, cmdObj, clientFunction, makeF
 }
 
 if (configuredForNetworkRetry()) {
-    OverrideHelpers.prependOverrideInParallelShell(
-        "jstests/libs/override_methods/network_error_and_txn_override.js");
-
     const connectOriginal = connect;
 
     connect = function(url, user, pass) {
@@ -1080,13 +1150,18 @@ if (configuredForNetworkRetry()) {
         throw new Error(
             "logout() isn't resilient to network errors. Please add requires_non_retryable_commands to your test");
     };
+
+    startParallelShell = function() {
+        throw new Error("Cowardly refusing to run test with network retries enabled when it uses " +
+                        "startParallelShell()");
+    };
 }
 
 if (configuredForTxnOverride()) {
     startParallelShell = function() {
         throw new Error(
-            "Cowardly refusing to run test with transaction override enabled when it uses" +
-            "startParalleShell()");
+            "Cowardly refusing to run test with transaction override enabled when it uses " +
+            "startParallelShell()");
     };
 }
 

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -108,7 +108,7 @@ public:
 
     void _sleepInPBWM(mongo::OperationContext* opCtx, long long millis) {
         Lock::ResourceLock pbwm(opCtx->lockState(), resourceIdParallelBatchWriterMode);
-        pbwm.lock(MODE_X);
+        pbwm.lock(nullptr, MODE_X);
         opCtx->sleepFor(Milliseconds(millis));
         pbwm.unlock();
     }
@@ -118,7 +118,7 @@ public:
              const std::string& ns,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        log() << "test only command sleep invoked";
+        LOGV2(20504, "Test-only command 'sleep' invoked");
         long long msToSleep = 0;
 
         if (cmdObj["secs"] || cmdObj["seconds"] || cmdObj["millis"]) {

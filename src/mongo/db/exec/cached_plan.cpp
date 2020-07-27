@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,17 +38,18 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/plan_cache_util.h"
 #include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/exec/trial_period_utils.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_cache.h"
-#include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/query/stage_builder.h"
-#include "mongo/util/log.h"
+#include "mongo/db/query/stage_builder_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
@@ -57,14 +58,14 @@ namespace mongo {
 // static
 const char* CachedPlanStage::kStageType = "CACHED_PLAN";
 
-CachedPlanStage::CachedPlanStage(OperationContext* opCtx,
+CachedPlanStage::CachedPlanStage(ExpressionContext* expCtx,
                                  Collection* collection,
                                  WorkingSet* ws,
                                  CanonicalQuery* cq,
                                  const QueryPlannerParams& params,
                                  size_t decisionWorks,
                                  std::unique_ptr<PlanStage> root)
-    : RequiresAllIndicesStage(kStageType, opCtx, collection),
+    : RequiresAllIndicesStage(kStageType, expCtx, collection),
       _ws(ws),
       _canonicalQuery(cq),
       _plannerParams(params),
@@ -76,7 +77,7 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // Adds the amount of time taken by pickBestPlan() to executionTimeMillis. There's lots of
     // execution work that happens here, so this is needed for the time accounting to
     // make sense.
-    ScopedTimer timer(getClock(), &_commonStats.executionTimeMillis);
+    auto optTimer = getOptTimer();
 
     // During plan selection, the list of indices we are using to plan must remain stable, so the
     // query will die during yield recovery if any index has been dropped. However, once plan
@@ -92,7 +93,7 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         static_cast<size_t>(internalQueryCacheEvictionRatio * _decisionWorks);
 
     // The trial period ends without replanning if the cached plan produces this many results.
-    size_t numResults = MultiPlanStage::getTrialPeriodNumToReturn(*_canonicalQuery);
+    size_t numResults = trial_period::getTrialPeriodNumToReturn(*_canonicalQuery);
 
     for (size_t i = 0; i < maxWorksBeforeReplan; ++i) {
         // Might need to yield between calls to work due to the timer elapsing.
@@ -102,7 +103,28 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         }
 
         WorkingSetID id = WorkingSet::INVALID_ID;
-        PlanStage::StageState state = child()->work(&id);
+        PlanStage::StageState state;
+        try {
+            state = child()->work(&id);
+        } catch (const ExceptionFor<ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed>& ex) {
+            // The plan failed by hitting the limit we impose on memory consumption. It's possible
+            // that a different plan is less resource-intensive, so we fall back to replanning the
+            // whole query. We neither evict the existing cache entry nor cache the result of
+            // replanning.
+            LOGV2_DEBUG(20579,
+                        1,
+                        "Execution of cached plan failed, falling back to replan. query: "
+                        "{query} planSummary: {planSummary} status: {status}",
+                        "Execution of cached plan failed, failling back to replan",
+                        "query"_attr = redact(_canonicalQuery->toStringShort()),
+                        "planSummary"_attr = Explain::getPlanSummary(child().get()),
+                        "status"_attr = redact(ex.toStatus()));
+
+            const bool shouldCache = false;
+            return replan(yieldPolicy,
+                          shouldCache,
+                          str::stream() << "cached plan returned: " << ex.toStatus());
+        }
 
         if (PlanStage::ADVANCED == state) {
             // Save result for later.
@@ -112,15 +134,11 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             _results.push(id);
 
             if (_results.size() >= numResults) {
-                // Once a plan returns enough results, stop working. Update cache with stats
-                // from this run and return.
-                updatePlanCache();
+                // Once a plan returns enough results, stop working. There is no need to replan.
                 return Status::OK();
             }
         } else if (PlanStage::IS_EOF == state) {
-            // Cached plan hit EOF quickly enough. No need to replan. Update cache with stats
-            // from this run and return.
-            updatePlanCache();
+            // Cached plan hit EOF quickly enough. No need to replan.
             return Status::OK();
         } else if (PlanStage::NEED_YIELD == state) {
             invariant(id == WorkingSet::INVALID_ID);
@@ -136,21 +154,6 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             if (!yieldStatus.isOK()) {
                 return yieldStatus;
             }
-        } else if (PlanStage::FAILURE == state) {
-            // On failure, fall back to replanning the whole query. We neither evict the
-            // existing cache entry nor cache the result of replanning.
-            BSONObj statusObj = WorkingSetCommon::getStatusMemberDocument(*_ws, id)->toBson();
-
-            LOG(1) << "Execution of cached plan failed, falling back to replan."
-                   << " query: " << redact(_canonicalQuery->toStringShort())
-                   << " planSummary: " << Explain::getPlanSummary(child().get())
-                   << " status: " << redact(statusObj);
-
-            const bool shouldCache = false;
-            return replan(yieldPolicy,
-                          shouldCache,
-                          str::stream() << "cached plan returned: "
-                                        << WorkingSetCommon::toStatusString(statusObj));
         } else {
             invariant(PlanStage::NEED_TIME == state);
         }
@@ -158,11 +161,16 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
 
     // If we're here, the trial period took more than 'maxWorksBeforeReplan' work cycles. This
     // plan is taking too long, so we replan from scratch.
-    LOG(1) << "Execution of cached plan required " << maxWorksBeforeReplan
-           << " works, but was originally cached with only " << _decisionWorks
-           << " works. Evicting cache entry and replanning query: "
-           << redact(_canonicalQuery->toStringShort())
-           << " plan summary before replan: " << Explain::getPlanSummary(child().get());
+    LOGV2_DEBUG(
+        20580,
+        1,
+        "Execution of cached plan required {maxWorksBeforeReplan} works, but was originally cached "
+        "with only {decisionWorks} works. Evicting cache entry and replanning query: "
+        "{canonicalQuery_Short} plan summary before replan: {Explain_getPlanSummary_child_get}",
+        "maxWorksBeforeReplan"_attr = maxWorksBeforeReplan,
+        "decisionWorks"_attr = _decisionWorks,
+        "canonicalQuery_Short"_attr = redact(_canonicalQuery->toStringShort()),
+        "Explain_getPlanSummary_child_get"_attr = Explain::getPlanSummary(child().get()));
 
     const bool shouldCache = true;
     return replan(
@@ -180,9 +188,9 @@ Status CachedPlanStage::tryYield(PlanYieldPolicy* yieldPolicy) {
     //   2) some stage requested a yield, or
     //   3) we need to yield and retry due to a WriteConflictException.
     // In all cases, the actual yielding happens here.
-    if (yieldPolicy->shouldYieldOrInterrupt()) {
+    if (yieldPolicy->shouldYieldOrInterrupt(expCtx()->opCtx)) {
         // Here's where we yield.
-        return yieldPolicy->yieldOrInterrupt();
+        return yieldPolicy->yieldOrInterrupt(expCtx()->opCtx);
     }
 
     return Status::OK();
@@ -216,26 +224,29 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, s
 
     if (1 == solutions.size()) {
         // Only one possible plan. Build the stages from the solution.
-        auto newRoot =
-            StageBuilder::build(getOpCtx(), collection(), *_canonicalQuery, *solutions[0], _ws);
+        auto&& newRoot = stage_builder::buildClassicExecutableTree(
+            expCtx()->opCtx, collection(), *_canonicalQuery, *solutions[0], _ws);
         _children.emplace_back(std::move(newRoot));
         _replannedQs = std::move(solutions.back());
         solutions.pop_back();
 
-        LOG(1)
-            << "Replanning of query resulted in single query solution, which will not be cached. "
-            << redact(_canonicalQuery->toStringShort())
-            << " plan summary after replan: " << Explain::getPlanSummary(child().get())
-            << " previous cache entry evicted: " << (shouldCache ? "yes" : "no");
+        LOGV2_DEBUG(
+            20581,
+            1,
+            "Replanning of query resulted in single query solution, which will not be cached. "
+            "{canonicalQuery_Short} plan summary after replan: {Explain_getPlanSummary_child_get} "
+            "previous cache entry evicted: {shouldCache_yes_no}",
+            "canonicalQuery_Short"_attr = redact(_canonicalQuery->toStringShort()),
+            "Explain_getPlanSummary_child_get"_attr = Explain::getPlanSummary(child().get()),
+            "shouldCache_yes_no"_attr = (shouldCache ? "yes" : "no"));
         return Status::OK();
     }
 
     // Many solutions. Create a MultiPlanStage to pick the best, update the cache,
     // and so on. The working set will be shared by all candidate plans.
-    auto cachingMode = shouldCache ? MultiPlanStage::CachingMode::AlwaysCache
-                                   : MultiPlanStage::CachingMode::NeverCache;
+    auto cachingMode = shouldCache ? PlanCachingMode::AlwaysCache : PlanCachingMode::NeverCache;
     _children.emplace_back(
-        new MultiPlanStage(getOpCtx(), collection(), _canonicalQuery, cachingMode));
+        new MultiPlanStage(expCtx(), collection(), _canonicalQuery, cachingMode));
     MultiPlanStage* multiPlanStage = static_cast<MultiPlanStage*>(child().get());
 
     for (size_t ix = 0; ix < solutions.size(); ++ix) {
@@ -243,8 +254,8 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, s
             solutions[ix]->cacheData->indexFilterApplied = _plannerParams.indexFiltersApplied;
         }
 
-        auto nextPlanRoot =
-            StageBuilder::build(getOpCtx(), collection(), *_canonicalQuery, *solutions[ix], _ws);
+        auto&& nextPlanRoot = stage_builder::buildClassicExecutableTree(
+            expCtx()->opCtx, collection(), *_canonicalQuery, *solutions[ix], _ws);
 
         multiPlanStage->addPlan(std::move(solutions[ix]), std::move(nextPlanRoot), _ws);
     }
@@ -255,9 +266,14 @@ Status CachedPlanStage::replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, s
         return pickBestPlanStatus;
     }
 
-    LOG(1) << "Replanning " << redact(_canonicalQuery->toStringShort())
-           << " resulted in plan with summary: " << Explain::getPlanSummary(child().get())
-           << ", which " << (shouldCache ? "has" : "has not") << " been written to the cache";
+    LOGV2_DEBUG(20582,
+                1,
+                "Replanning {canonicalQuery_Short} resulted in plan with summary: "
+                "{Explain_getPlanSummary_child_get}, which {shouldCache_has_has_not} been written "
+                "to the cache",
+                "canonicalQuery_Short"_attr = redact(_canonicalQuery->toStringShort()),
+                "Explain_getPlanSummary_child_get"_attr = Explain::getPlanSummary(child().get()),
+                "shouldCache_has_has_not"_attr = (shouldCache ? "has" : "has not"));
     return Status::OK();
 }
 
@@ -295,20 +311,4 @@ std::unique_ptr<PlanStageStats> CachedPlanStage::getStats() {
 const SpecificStats* CachedPlanStage::getSpecificStats() const {
     return &_specificStats;
 }
-
-void CachedPlanStage::updatePlanCache() {
-    const double score = PlanRanker::scoreTree(getStats()->children[0].get());
-
-    PlanCache* cache = CollectionQueryInfo::get(collection()).getPlanCache();
-    Status fbs = cache->feedback(*_canonicalQuery, score);
-    if (!fbs.isOK()) {
-        LOG(5) << _canonicalQuery->ns() << ": Failed to update cache with feedback: " << redact(fbs)
-               << " - "
-               << "(query: " << redact(_canonicalQuery->getQueryObj())
-               << "; sort: " << _canonicalQuery->getQueryRequest().getSort()
-               << "; projection: " << _canonicalQuery->getQueryRequest().getProj()
-               << ") is no longer in plan cache.";
-    }
-}
-
 }  // namespace mongo

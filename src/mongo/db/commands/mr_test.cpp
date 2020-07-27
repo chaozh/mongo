@@ -26,13 +26,6 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-
-/**
- * This file contains tests for mongo/db/commands/mr.h
- */
-
-#include "mongo/db/commands/mr.h"
-
 #include <functional>
 #include <memory>
 #include <string>
@@ -45,6 +38,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/map_reduce_gen.h"
+#include "mongo/db/commands/mr_common.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
@@ -64,11 +58,7 @@ namespace mongo {
 namespace {
 
 /**
- * Tests for mr::Config
- */
-
-/**
- * Helper function to verify field of mr::Config::OutputOptions.
+ * Helper function to verify field of map_reduce_common::OutputOptions.
  */
 template <typename T>
 void _compareOutputOptionField(const std::string& dbname,
@@ -139,32 +129,32 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
     // 'out' must be either string or object.
     ASSERT_THROWS(map_reduce_common::parseOutputOptions("mydb", fromjson("{out: 99}")),
                   AssertionException);
-    // 'out.nonAtomic' is not supported with normal, replace or inline.
+    // 'out.nonAtomic' false is not supported.
     ASSERT_THROWS(map_reduce_common::parseOutputOptions(
-                      "mydb", fromjson("{out: {normal: 'mycoll', nonAtomic: true}}")),
+                      "mydb", fromjson("{out: {normal: 'mycoll', nonAtomic: false}}")),
                   AssertionException);
     ASSERT_THROWS(map_reduce_common::parseOutputOptions(
-                      "mydb", fromjson("{out: {replace: 'mycoll', nonAtomic: true}}")),
+                      "mydb", fromjson("{out: {replace: 'mycoll', nonAtomic: false}}")),
                   AssertionException);
     ASSERT_THROWS(map_reduce_common::parseOutputOptions(
-                      "mydb", fromjson("{out: {inline: 'mycoll', nonAtomic: true}}")),
+                      "mydb", fromjson("{out: {inline: 'mycoll', nonAtomic: false}}")),
                   AssertionException);
+
     // Unknown output specifer.
     ASSERT_THROWS(map_reduce_common::parseOutputOptions(
                       "mydb", fromjson("{out: {no_such_out_type: 'mycoll'}}")),
                   AssertionException);
 
-
     // 'out' is string.
     _testConfigParseOutputOptions(
-        "mydb", "{out: 'mycoll'}", "", "mycoll", "mydb.mycoll", false, OutputType::Replace);
+        "mydb", "{out: 'mycoll'}", "", "mycoll", "mydb.mycoll", true, OutputType::Replace);
     // 'out' is object.
     _testConfigParseOutputOptions("mydb",
                                   "{out: {normal: 'mycoll'}}",
                                   "",
                                   "mycoll",
                                   "mydb.mycoll",
-                                  false,
+                                  true,
                                   OutputType::Replace);
     // 'out.db' overrides dbname parameter
     _testConfigParseOutputOptions("mydb1",
@@ -172,7 +162,7 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "mydb2",
                                   "mycoll",
                                   "mydb2.mycoll",
-                                  false,
+                                  true,
                                   OutputType::Replace);
     // 'out.nonAtomic' is supported with merge and reduce.
     _testConfigParseOutputOptions("mydb",
@@ -195,7 +185,7 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "mydb2",
                                   "",
                                   "",
-                                  false,
+                                  true,
                                   OutputType::InMemory);
 
     // Order should not matter in fields of 'out' object.
@@ -204,14 +194,14 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "mydb2",
                                   "mycoll",
                                   "mydb2.mycoll",
-                                  false,
+                                  true,
                                   OutputType::Replace);
     _testConfigParseOutputOptions("mydb1",
                                   "{out: {db: 'mydb2', replace: 'mycoll'}}",
                                   "mydb2",
                                   "mycoll",
                                   "mydb2.mycoll",
-                                  false,
+                                  true,
                                   OutputType::Replace);
     _testConfigParseOutputOptions("mydb1",
                                   "{out: {nonAtomic: true, merge: 'mycoll'}}",
@@ -232,47 +222,8 @@ TEST(ConfigOutputOptionsTest, parseOutputOptions) {
                                   "mydb2",
                                   "",
                                   "",
-                                  false,
+                                  true,
                                   OutputType::InMemory);
-}
-
-TEST(ConfigTest, ParseCollation) {
-    std::string dbname = "myDB";
-    BSONObj collation = BSON("locale"
-                             << "en_US");
-    BSONObjBuilder bob;
-    bob.append("mapReduce", "myCollection");
-    bob.appendCode("map", "function() { emit(0, 1); }");
-    bob.appendCode("reduce", "function(k, v) { return {count: 0}; }");
-    bob.append("out", "outCollection");
-    bob.append("collation", collation);
-    BSONObj cmdObj = bob.obj();
-    mr::Config config(dbname, cmdObj);
-    ASSERT_BSONOBJ_EQ(config.collation, collation);
-}
-
-TEST(ConfigTest, ParseNoCollation) {
-    std::string dbname = "myDB";
-    BSONObjBuilder bob;
-    bob.append("mapReduce", "myCollection");
-    bob.appendCode("map", "function() { emit(0, 1); }");
-    bob.appendCode("reduce", "function(k, v) { return {count: 0}; }");
-    bob.append("out", "outCollection");
-    BSONObj cmdObj = bob.obj();
-    mr::Config config(dbname, cmdObj);
-    ASSERT_BSONOBJ_EQ(config.collation, BSONObj());
-}
-
-TEST(ConfigTest, CollationNotAnObjectFailsToParse) {
-    std::string dbname = "myDB";
-    BSONObjBuilder bob;
-    bob.append("mapReduce", "myCollection");
-    bob.appendCode("map", "function() { emit(0, 1); }");
-    bob.appendCode("reduce", "function(k, v) { return {count: 0}; }");
-    bob.append("out", "outCollection");
-    bob.append("collation", "en_US");
-    BSONObj cmdObj = bob.obj();
-    ASSERT_THROWS(mr::Config(dbname, cmdObj), AssertionException);
 }
 
 /**
@@ -463,6 +414,8 @@ void MapReduceCommandTest::setUp() {
 
     // Transition to PRIMARY so that the server can accept writes.
     ASSERT_OK(_getReplCoord()->setFollowerMode(repl::MemberState::RS_PRIMARY));
+    repl::setOplogCollectionName(service);
+    repl::createOplog(_opCtx.get());
 
     // Create collection with one document.
     CollectionOptions collectionOptions;
@@ -577,7 +530,7 @@ TEST_F(MapReduceCommandTest, ReplacingExistingOutputCollectionPreservesIndexes) 
     auto indexSpec = BSON("v" << 2 << "key" << BSON("a" << 1) << "name"
                               << "a_1");
     {
-        AutoGetCollection autoColl(_opCtx.get(), outputNss, MODE_IX);
+        AutoGetCollection autoColl(_opCtx.get(), outputNss, MODE_X);
         auto coll = autoColl.getCollection();
         ASSERT(coll);
         auto indexCatalog = coll->getIndexCatalog();

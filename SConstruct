@@ -14,6 +14,8 @@ import sys
 import textwrap
 import uuid
 
+from pkg_resources import parse_version
+
 import SCons
 
 # This must be first, even before EnsureSConsVersion, if
@@ -26,6 +28,7 @@ import mongo
 import mongo.platform as mongo_platform
 import mongo.toolchain as mongo_toolchain
 import mongo.generators as mongo_generators
+import mongo.install_actions as install_actions
 
 EnsurePythonVersion(3, 6)
 EnsureSConsVersion(3, 1, 1)
@@ -102,16 +105,12 @@ SetOption('random', 1)
 #
 
 add_option('ninja',
-    choices=['true', 'false'],
-    default='false',
+    choices=['stable', 'next', 'disabled'],
+    default='disabled',
     nargs='?',
-    const='true',
+    const='stable',
     type='choice',
-    help='Enable the build.ninja generator tool',
-)
-
-add_option('prefix',
-    help='installation prefix (conficts with DESTDIR, PREFIX, and --install-mode=hygienic)',
+    help='Enable the build.ninja generator tool stable or canary version',
 )
 
 add_option('legacy-tarball',
@@ -131,16 +130,19 @@ add_option('lint-scope',
 )
 
 add_option('install-mode',
-    choices=['legacy', 'hygienic'],
-    default='legacy',
+    choices=['hygienic'],
+    default='hygienic',
     help='select type of installation',
     nargs=1,
     type='choice',
 )
 
-add_option('nostrip',
-    help='do not strip installed binaries',
-    nargs=0,
+add_option('install-action',
+    choices=([*install_actions.available_actions] + ['default']),
+    default='default',
+    help='select mechanism to use to install files (advanced option to reduce disk IO and utilization)',
+    nargs=1,
+    type='choice',
 )
 
 add_option('build-dir',
@@ -219,11 +221,6 @@ add_option('noshell',
     nargs=0,
 )
 
-add_option('safeshell',
-    help="don't let shell scripts run programs (still, don't run untrusted scripts)",
-    nargs=0,
-)
-
 add_option('dbg',
     choices=['on', 'off'],
     const='on',
@@ -237,7 +234,7 @@ add_option('separate-debug',
     choices=['on', 'off'],
     const='on',
     default='off',
-    help='Produce separate debug files (only effective in --install-mode=hygienic)',
+    help='Produce separate debug files',
     nargs='?',
     type='choice',
 )
@@ -272,11 +269,6 @@ add_option('sanitize-coverage',
 add_option('llvm-symbolizer',
     default='llvm-symbolizer',
     help='name of (or path to) the LLVM symbolizer',
-)
-
-add_option('durableDefaultOn',
-    help='have durable default to on',
-    nargs=0,
 )
 
 add_option('allocator',
@@ -318,6 +310,13 @@ add_option('enable-http-client',
 add_option('use-sasl-client',
     help='Support SASL authentication in the client library',
     nargs=0,
+)
+
+add_option('use-diagnostic-latches',
+    choices=['on', 'off'],
+    default='on',
+    help='Enable annotated Mutex types',
+    type='choice',
 )
 
 # Most of the "use-system-*" options follow a simple form.
@@ -398,12 +397,6 @@ add_option('osx-version-min',
 # https://docs.microsoft.com/en-us/cpp/porting/modifying-winver-and-win32-winnt?view=vs-2017
 # https://docs.microsoft.com/en-us/windows-server/get-started/windows-server-release-info
 win_version_min_choices = {
-    'win7'     : ('0601', '0000'),
-    'ws08r2'   : ('0601', '0000'),
-    'win8'     : ('0602', '0000'),
-    'ws2012'   : ('0602', '0000'),
-    'win81'    : ('0603', '0000'),
-    'ws2012r2' : ('0603', '0000'),
     'win10'    : ('0A00', '0000'),
     'ws2016'   : ('0A00', '1607'),
     'ws2019'   : ('0A00', '1809')
@@ -505,10 +498,10 @@ add_option('msvc-debugging-format',
 )
 
 add_option('use-libunwind',
-    choices=["on", "off"],
+    choices=["on", "off", "auto"],
     const="on",
-    default="off",
-    help="Enable libunwind for backtraces (experimental)",
+    default="auto",
+    help="Enable libunwind for backtraces",
     nargs="?",
     type='choice',
 )
@@ -530,6 +523,15 @@ add_option('enable-usdt-probes',
 	type='choice',
     nargs='?',
     const='on',
+)
+
+add_option('libdeps-linting',
+    choices=['on', 'off', 'print'],
+    const='on',
+    default='on',
+    help='Enable linting of libdeps. Default is on, optionally \'print\' will not stop the build.',
+    nargs='?',
+    type='choice',
 )
 
 try:
@@ -646,27 +648,6 @@ for vf in variables_files:
     else:
         print("IGNORING missing variable customization file {}".format(vf))
 
-# Attempt to prevent confusion between the different ways of
-# specifying file placement between hygienic and non-hygienic
-# modes. Re-interpret a value provided for the legacy '--prefix' flag
-# as setting `DESTDIR` instead. Note that we can't validate things
-# passed in via variables_files, so this is imperfect. However, it is
-# also temporary.
-if get_option('install-mode') == 'hygienic':
-    if has_option('prefix'):
-        print("Cannot use the '--prefix' option with '--install-mode=hygienic'. Use the DESTDIR and PREFIX Variables instead")
-        Exit(1)
-else:
-    if 'PREFIX' in ARGUMENTS:
-        print("Cannot use the 'PREFIX' Variable without '--install-mode=hygienic'")
-        Exit(1)
-    if 'DESTDIR' in ARGUMENTS:
-        print("Cannot use the 'DESTDIR' Variable without '--install-mode=hygienic', use the '--prefix' flag instead")
-        Exit(1)
-
-    if has_option('prefix'):
-        ARGUMENTS['DESTDIR'] = get_option('prefix')
-
 env_vars = Variables(
     files=variables_files,
     args=ARGUMENTS
@@ -731,11 +712,23 @@ env_vars.Add('CXXFLAGS',
     converter=variable_shlex_converter)
 
 env_vars.Add('DESTDIR',
-    help='Where hygienic builds will install files',
+    help='Where builds will install files',
     default='$BUILD_ROOT/install')
+
+env_vars.Add('DSYMUTIL',
+    help='Path to the dsymutil utility',
+)
 
 env_vars.Add('GITDIFFFLAGS',
     help='Sets flags for git diff',
+    default='')
+
+env_vars.Add('REVISION',
+    help='Base git revision',
+    default='')
+
+env_vars.Add('ENTERPRISE_REV',
+    help='Base git revision of enterprise modules',
     default='')
 
 # Note: This probably is only really meaningful when configured via a variables file. It will
@@ -764,7 +757,7 @@ env_vars.Add('ICERUN',
 
 env_vars.Add('ICECC_CREATE_ENV',
     help='Tell SCons where icecc-create-env tool is',
-    default='buildscripts/icecc_create_env')
+    default='icecc-create-env')
 
 env_vars.Add('ICECC_SCHEDULER',
     help='Tell ICECC where the sceduler daemon is running')
@@ -840,6 +833,25 @@ env_vars.Add('MSVC_VERSION',
     help='Sets the version of Visual C++ to use (e.g. 14.1 for VS2017, 14.2 for VS2019)',
     default="14.2")
 
+env_vars.Add('NINJA_PREFIX',
+    default="build",
+    help="""A prefix to add to the beginning of generated ninja
+files. Useful for when compiling multiple build ninja files for
+different configurations, for instance:
+
+    scons --sanitize=asan --ninja NINJA_PREFIX=asan asan.ninja
+    scons --sanitize=tsan --ninja NINJA_PREFIX=tsan tsan.ninja
+
+Will generate the files (respectively):
+
+    asan.ninja
+    tsan.ninja
+
+Defaults to build, best used with the generate-ninja alias so you don't have to
+reiterate the prefix in the target name and variable.
+""")
+
+
 env_vars.Add('NINJA_SUFFIX',
     help="""A suffix to add to the end of generated build.ninja
 files. Useful for when compiling multiple build ninja files for
@@ -863,9 +875,14 @@ env_vars.Add('OBJCOPY',
     help='Sets the path to objcopy',
     default=WhereIs('objcopy'))
 
+
+env_vars.Add('PKGDIR',
+    help='Directory in which to build packages and archives',
+    default='$BUILD_DIR/pkgs')
+
 env_vars.Add('PREFIX',
     help='Final installation location of files, will be made into a sub dir of $DESTDIR',
-    default='')
+    default='.')
 
 # Exposed to be able to cross compile Android/*nix from Windows without ending up with the .exe suffix.
 env_vars.Add('PROGSUFFIX',
@@ -893,6 +910,10 @@ env_vars.Add('SHELL',
 env_vars.Add('SHLINKFLAGS',
     help='Sets flags for the linker when building shared libraries',
     converter=variable_shlex_converter)
+
+env_vars.Add('STRIP',
+    help='Path to the strip utility (non-darwin platforms probably use OBJCOPY for this)',
+)
 
 env_vars.Add('TARGET_ARCH',
     help='Sets the architecture to build for',
@@ -1018,17 +1039,6 @@ usemozjs = (jsEngine.startswith('mozjs'))
 if not serverJs and not usemozjs:
     print("Warning: --server-js=off is not needed with --js-engine=none")
 
-use_libunwind = get_option("use-libunwind") == "on"
-if use_libunwind:
-    use_system_libunwind = use_system_version_of_library("libunwind")
-    use_vendored_libunwind = not use_system_libunwind
-else:
-    if use_system_version_of_library("libunwind"):
-        print("Error: --use-system-libunwind requires --use-libunwind")
-        Exit(1)
-
-    use_system_libunwind = use_vendored_libunwind = False
-
 # We defer building the env until we have determined whether we want certain values. Some values
 # in the env actually have semantics for 'None' that differ from being absent, so it is better
 # to build it up via a dict, and then construct the Environment in one shot with kwargs.
@@ -1041,22 +1051,19 @@ else:
 envDict = dict(BUILD_ROOT=buildDir,
                BUILD_DIR=make_variant_dir_generator(),
                DIST_ARCHIVE_SUFFIX='.tgz',
-               DIST_BINARIES=[],
                MODULE_BANNERS=[],
                MODULE_INJECTORS=dict(),
-               ARCHIVE_ADDITION_DIR_MAP={},
-               ARCHIVE_ADDITIONS=[],
                PYTHON="$( {} $)".format(sys.executable),
                SERVER_ARCHIVE='${SERVER_DIST_BASENAME}${DIST_ARCHIVE_SUFFIX}',
-               UNITTEST_ALIAS='unittests',
+               UNITTEST_ALIAS='install-unittests',
                # TODO: Move unittests.txt to $BUILD_DIR, but that requires
                # changes to MCI.
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
-               LIBFUZZER_TEST_ALIAS='libfuzzer_tests',
+               LIBFUZZER_TEST_ALIAS='install-fuzzertests',
                LIBFUZZER_TEST_LIST='$BUILD_ROOT/libfuzzer_tests.txt',
-               INTEGRATION_TEST_ALIAS='integration_tests',
+               INTEGRATION_TEST_ALIAS='install-integration-tests',
                INTEGRATION_TEST_LIST='$BUILD_ROOT/integration_tests.txt',
-               BENCHMARK_ALIAS='benchmarks',
+               BENCHMARK_ALIAS='install-benchmarks',
                BENCHMARK_LIST='$BUILD_ROOT/benchmarks.txt',
                CONFIGUREDIR='$BUILD_ROOT/scons/$VARIANT_DIR/sconf_temp',
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
@@ -1123,6 +1130,10 @@ if has_option('variables-help'):
 unknown_vars = env_vars.UnknownVariables()
 if unknown_vars:
     env.FatalError("Unknown variables specified: {0}", ", ".join(list(unknown_vars.keys())))
+
+if get_option('install-action') != 'default' and get_option('ninja') != "disabled":
+    env.FatalError("Cannot use non-default install actions when generating Ninja.")
+install_actions.setup(env, get_option('install-action'))
 
 def set_config_header_define(env, varname, varval = 1):
     env['CONFIG_HEADER_DEFINES'][varname] = varval
@@ -1368,24 +1379,47 @@ if has_option("cache"):
 
 # Normalize the link model. If it is auto, then for now both developer and release builds
 # use the "static" mode. Somday later, we probably want to make the developer build default
-# dynamic, but that will require the hygienic builds project.
+# dynamic.
 link_model = get_option('link-model')
 if link_model == "auto":
     link_model = "static"
 
+# libunwind configuration.
+# In which the following globals are set and normalized to bool:
+#     - use_libunwind
+#     - use_system_libunwind
+#     - use_vendored_libunwind
+use_libunwind = get_option("use-libunwind")
+use_system_libunwind = use_system_version_of_library("libunwind")
+
+# Assume system libunwind works if it's installed and selected.
+# Vendored libunwind, however, works only on linux-x86_64.
+can_use_libunwind = (use_system_libunwind or
+    env.TargetOSIs('linux') and env['TARGET_ARCH'] == 'x86_64')
+
+if use_libunwind == "off":
+    use_libunwind = False
+    use_system_libunwind = False
+elif use_libunwind == "on":
+    use_libunwind = True
+    if not can_use_libunwind:
+        env.ConfError("libunwind not supported on target platform")
+        Exit(1)
+elif use_libunwind == "auto":
+    use_libunwind = can_use_libunwind
+
+use_vendored_libunwind = use_libunwind and not use_system_libunwind
+if use_system_libunwind and not use_libunwind:
+    print("Error: --use-system-libunwind requires --use-libunwind")
+    Exit(1)
+if use_libunwind == True:
+    env.SetConfigHeaderDefine("MONGO_CONFIG_USE_LIBUNWIND")
+
+
 # Windows can't currently support anything other than 'object' or 'static', until
-# we have both hygienic builds and have annotated functions for export.
+# we have annotated functions for export.
 if env.TargetOSIs('windows') and link_model not in ['object', 'static', 'dynamic-sdk']:
     env.FatalError("Windows builds must use the 'object', 'dynamic-sdk', or 'static' link models")
-
-
-# The mongodbtoolchain currently doesn't produce working binaries if
-# you combine a dynamic build with a non-system allocator, but the
-# failure mode is non-obvious. For now, prevent people from wandering
-# inadvertantly into this trap. Remove this constraint when
-# https://jira.mongodb.org/browse/SERVER-27675 is resolved.
-if (link_model == 'dynamic') and ('mongodbtoolchain' in env['CXX']) and (env['MONGO_ALLOCATOR'] != 'system'):
-    env.FatalError('Cannot combine the MongoDB toolchain, a dynamic build, and a non-system allocator. Choose two.')
 
 # The 'object' mode for libdeps is enabled by setting _LIBDEPS to $_LIBDEPS_OBJS. The other two
 # modes operate in library mode, enabled by setting _LIBDEPS to $_LIBDEPS_LIBS.
@@ -1520,11 +1554,12 @@ if link_model.startswith("dynamic"):
 if optBuild:
     env.SetConfigHeaderDefine("MONGO_CONFIG_OPTIMIZED_BUILD")
 
+
 # Enable the fast decider if explicitly requested or if in 'auto' mode
 # and not in conflict with other options like the ninja option which
 # sets it's own decider
 if (
-        not get_option('ninja') == 'true' and
+        get_option('ninja') == 'disabled' and
         get_option('build-fast-and-loose') == 'on' or
         (
             get_option('build-fast-and-loose') == 'auto' and
@@ -1617,7 +1652,10 @@ if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
     # command but instead runs a function.
     env["BUILDERS"]["StaticLibrary"].action = SCons.Action.Action(write_uuid_to_file, "Generating placeholder library $TARGET")
 
-libdeps.setup_environment(env, emitting_shared=(link_model.startswith("dynamic")))
+libdeps.setup_environment(
+    env, 
+    emitting_shared=(link_model.startswith("dynamic")), 
+    linting=get_option('libdeps-linting'))
 
 # Both the abidw tool and the thin archive tool must be loaded after
 # libdeps, so that the scanners they inject can see the library
@@ -1815,13 +1853,29 @@ elif env.TargetOSIs('windows'):
     elif get_option('msvc-debugging-format') == "pdb":
         env['CCPDBFLAGS'] = '/Zi /Fd${TARGET}.pdb'
 
+
+    # The SCons built-in pdbGenerator always adds /DEBUG, but we would like
+    # control over that flag so that users can override with /DEBUG:fastlink
+    # for better local builds. So we overwrite the builtin.
+    def pdbGenerator(env, target, source, for_signature):
+        try:
+            return ['/PDB:%s' % target[0].attributes.pdb]
+        except (AttributeError, IndexError):
+            return None
+    env['_PDB'] = pdbGenerator
+
     # /DEBUG will tell the linker to create a .pdb file
     # which WinDbg and Visual Studio will use to resolve
     # symbols if you want to debug a release-mode image.
     # Note that this means we can't do parallel links in the build.
     #
     # Please also note that this has nothing to do with _DEBUG or optimization.
-    env.Append( LINKFLAGS=["/DEBUG"] )
+
+    # If the user set a /DEBUG flag explicitly, don't add
+    # another. Otherwise use the standard /DEBUG flag, since we always
+    # want PDBs.
+    if not any(flag.startswith('/DEBUG') for flag in env['LINKFLAGS']):
+        env.Append(LINKFLAGS=["/DEBUG"])
 
     # /MD:  use the multithreaded, DLL version of the run-time library (MSVCRT.lib/MSVCR###.DLL)
     # /MDd: Defines _DEBUG, _MT, _DLL, and uses MSVCRTD.lib/MSVCRD###.DLL
@@ -2091,14 +2145,14 @@ def doConfigure(myenv):
     # bare compilers, and we should re-check at the very end that TryCompile and TryLink still
     # work with the flags we have selected.
     if myenv.ToolchainIs('msvc'):
-        compiler_minimum_string = "Microsoft Visual Studio 2017 15.9"
+        compiler_minimum_string = "Microsoft Visual Studio 2019 16.4"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(_MSC_VER)
         #error
         #endif
 
-        #if _MSC_VER < 1916
+        #if _MSC_VER < 1924
         #error %s or newer is required to build MongoDB
         #endif
 
@@ -2123,7 +2177,7 @@ def doConfigure(myenv):
         }
         """ % compiler_minimum_string)
     elif myenv.ToolchainIs('clang'):
-        compiler_minimum_string = "clang 7.0 (or Apple XCode 10.0)"
+        compiler_minimum_string = "clang 7.0 (or Apple XCode 10.2)"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(__clang__)
@@ -2131,7 +2185,7 @@ def doConfigure(myenv):
         #endif
 
         #if defined(__apple_build_version__)
-        #if __apple_build_version__ < 10001044
+        #if __apple_build_version__ < 10010046
         #error %s or newer is required to build MongoDB
         #endif
         #elif (__clang_major__ < 7) || (__clang_major__ == 7 && __clang_minor__ < 0)
@@ -2485,11 +2539,9 @@ def doConfigure(myenv):
         To specify a target minimum for Darwin platforms, please explicitly add the appropriate options
         to CCFLAGS and LINKFLAGS on the command line:
 
-        macOS: scons CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11" ..
-        iOS  : scons CCFLAGS="-miphoneos-version-min=10.3" LINKFLAGS="-miphoneos-version-min=10.3" ...
-        tvOS : scons CCFLAGS="-mtvos-version-min=10.3" LINKFLAGS="-tvos-version-min=10.3" ...
+        macOS: scons CCFLAGS="-mmacosx-version-min=10.13" LINKFLAGS="-mmacosx-version-min=10.13" ..
 
-        Note that MongoDB requires macOS 10.10, iOS 10.2, or tvOS 10.2 or later.
+        Note that MongoDB requires macOS 10.13 or later.
         """
         myenv.ConfError(textwrap.dedent(message))
 
@@ -2557,6 +2609,7 @@ def doConfigure(myenv):
 
     conf.Finish()
 
+    # C11 memset_s - a secure memset
     def CheckMemset_s(context):
         test_body = """
         #define __STDC_WANT_LIB_EXT1__ 1
@@ -2580,6 +2633,10 @@ def doConfigure(myenv):
 
     if conf.CheckFunc('strnlen'):
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_STRNLEN")
+
+    # Gblic 2.25+, OpenBSD 5.5+ and FreeBSD 11.0+ offer explicit_bzero, a secure way to zero memory
+    if conf.CheckFunc('explicit_bzero'):
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_EXPLICIT_BZERO")
 
     conf.Finish()
 
@@ -2723,31 +2780,19 @@ def doConfigure(myenv):
 
         sanitizer_list = get_option('sanitize').split(',')
 
+        using_asan = 'address' in sanitizer_list
+        using_fsan = 'fuzzer' in sanitizer_list
         using_lsan = 'leak' in sanitizer_list
-        using_asan = 'address' in sanitizer_list or using_lsan
         using_tsan = 'thread' in sanitizer_list
         using_ubsan = 'undefined' in sanitizer_list
-        using_fsan = 'fuzzer' in sanitizer_list
 
-        if env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental'] and (using_lsan or using_asan):
+        if using_lsan:
+            env.FatalError("Please use --sanitize=address instead of --sanitize=leak")
+
+        if using_asan and env['MONGO_ALLOCATOR'] in ['tcmalloc', 'tcmalloc-experimental']:
             # There are multiply defined symbols between the sanitizer and
             # our vendorized tcmalloc.
-            env.FatalError("Cannot use --sanitize=leak or --sanitize=address with tcmalloc")
-
-        # If the user asked for leak sanitizer, turn on the detect_leaks
-        # ASAN_OPTION. If they asked for address sanitizer as well, drop
-        # 'leak', because -fsanitize=leak means no address.
-        #
-        # --sanitize=leak:           -fsanitize=leak, detect_leaks=1
-        # --sanitize=address,leak:   -fsanitize=address, detect_leaks=1
-        # --sanitize=address:        -fsanitize=address
-        #
-        if using_lsan:
-            if using_asan:
-                myenv['ENV']['ASAN_OPTIONS'] = "detect_leaks=1"
-            myenv['ENV']['LSAN_OPTIONS'] = "suppressions=%s" % myenv.File("#etc/lsan.suppressions").abspath
-            if 'address' in sanitizer_list:
-                sanitizer_list.remove('leak')
+            env.FatalError("Cannot use --sanitize=address with tcmalloc")
 
         if using_fsan:
             def CheckForFuzzerCompilerSupport(context):
@@ -2811,7 +2856,6 @@ def doConfigure(myenv):
 
         blackfiles_map = {
             "address" : myenv.File("#etc/asan.blacklist"),
-            "leak" : myenv.File("#etc/asan.blacklist"),
             "thread" : myenv.File("#etc/tsan.blacklist"),
             "undefined" : myenv.File("#etc/ubsan.blacklist"),
         }
@@ -2836,7 +2880,15 @@ def doConfigure(myenv):
         # generator to return at command line expansion time so that
         # we can change the signature if the file contents change.
         if blackfiles:
-            blacklist_options=["-fsanitize-blacklist=%s" % blackfile for blackfile in blackfiles]
+            # Unconditionally using the full path can affect SCons cached builds, so we only do
+            # this in cases where we know it's going to matter.
+            blackfile_paths = [
+                blackfile.get_abspath() if ('ICECC' in env and env['ICECC']) else blackfile.path
+                for blackfile in blackfiles
+            ]
+            # Make these files available to remote icecream builds if requested
+            blacklist_options=[f"-fsanitize-blacklist={file_path}" for file_path in blackfile_paths]
+            env.AppendUnique(ICECC_CREATE_ENV_ADDFILES=blackfile_paths)
             def SanitizerBlacklistGenerator(source, target, env, for_signature):
                 if for_signature:
                     return [f.get_csig() for f in blackfiles]
@@ -2860,8 +2912,8 @@ def doConfigure(myenv):
             myenv['ENV']['ASAN_SYMBOLIZER_PATH'] = llvm_symbolizer
             myenv['ENV']['LSAN_SYMBOLIZER_PATH'] = llvm_symbolizer
             tsan_options = "external_symbolizer_path=\"%s\" " % llvm_symbolizer
-        elif using_lsan:
-            myenv.FatalError("Using the leak sanitizer requires a valid symbolizer")
+        elif using_asan:
+            myenv.FatalError("Using the address sanitizer requires a valid symbolizer")
 
         if using_asan:
             # Unfortunately, abseil requires that we make these macros
@@ -2870,9 +2922,36 @@ def doConfigure(myenv):
             # compiler. We do this unconditionally because abseil is
             # basically pervasive via the 'base' library.
             myenv.AppendUnique(CPPDEFINES=['ADDRESS_SANITIZER'])
+            # If anything is changed, added, or removed in either asan_options or
+            # lsan_options, be sure to make the corresponding changes to the
+            # appropriate build variants in etc/evergreen.yml
+            asan_options = "check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1"
+            lsan_options = "detect_leaks=1:report_objects=1:suppressions=%s" % myenv.File("#etc/lsan.suppressions").abspath
+            env['ENV']['ASAN_OPTIONS'] = asan_options + ":" + lsan_options
 
         if using_tsan:
-            tsan_options += "suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
+
+            if use_libunwind:
+                # TODO: SERVER-48622
+                #
+                # See https://github.com/google/sanitizers/issues/943
+                # for why we disallow combining TSAN with
+                # libunwind. We could, atlernatively, have added logic
+                # to automate the decision about whether to enable
+                # libunwind based on whether TSAN is enabled, but that
+                # logic is already complex, and it feels better to
+                # make it explicit that using TSAN means you won't get
+                # the benefits of libunwind. Fixing this is:
+                env.FatalError("Cannot use libunwind with TSAN, please add --use-libunwind=off to your compile flags")
+
+            # If anything is changed, added, or removed in tsan_options, be sure
+            # to make the corresponding changes to the appropriate build
+            # variants in etc/evergreen.yml
+            # die_after_fork=0 is a temporary setting to allow tests to continue while we figure out why
+            # we're running afoul of it. If we remove it here, it also needs to be removed from the test
+            # variant in etc/evergreen.yml
+            # TODO: https://jira.mongodb.org/browse/SERVER-49121
+            tsan_options += "die_after_fork=0:suppressions=\"%s\" " % myenv.File("#etc/tsan.suppressions").abspath
             myenv['ENV']['TSAN_OPTIONS'] = tsan_options
             myenv.AppendUnique(CPPDEFINES=['THREAD_SANITIZER'])
 
@@ -2885,6 +2964,11 @@ def doConfigure(myenv):
             if not using_fsan and not AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover"):
                 AddToCCFLAGSIfSupported(myenv, "-fno-sanitize-recover=undefined")
             myenv.AppendUnique(CPPDEFINES=['UNDEFINED_BEHAVIOR_SANITIZER'])
+            # If anything is changed, added, or removed in ubsan_options, be
+            # sure to make the corresponding changes to the appropriate build
+            # variants in etc/evergreen.yml
+            ubsan_options = "print_stacktrace=1"
+            myenv['ENV']['UBSAN_OPTIONS'] = ubsan_options
 
     if myenv.ToolchainIs('msvc') and optBuild:
         # http://blogs.msdn.com/b/vcblog/archive/2013/09/11/introducing-gw-compiler-switch.aspx
@@ -2901,12 +2985,31 @@ def doConfigure(myenv):
         # because it is much faster. Don't use it if the user has already configured another linker
         # selection manually.
         if not any(flag.startswith('-fuse-ld=') for flag in env['LINKFLAGS']):
-            if AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld') or AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold'):
-                if link_model.startswith("dynamic"):
-                    AddToLINKFLAGSIfSupported(myenv, '-Wl,--gdb-index')
 
-            # Our build is already parallel.
-            AddToLINKFLAGSIfSupported(myenv, '-Wl,--no-threads')
+            # lld has problems with separate debug info on some platforms. See:
+            # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
+            # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
+            #
+            # lld also apparently has problems with symbol resolution
+            # in some esoteric configurations that apply for us when
+            # using --link-model=dynamic mode, so disable lld there
+            # too. See:
+            # - https://bugs.llvm.org/show_bug.cgi?id=46676
+            #
+            # We should revisit all of these issues the next time we upgrade our clang minimum.
+            if get_option('separate-debug') == 'off' and get_option('link-model') != 'dynamic':
+                if not AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld'):
+                    AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+            else:
+                AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+
+        # Usually, --gdb-index is too expensive in big static binaries, but for dynamic
+        # builds it works well.
+        if link_model.startswith("dynamic"):
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--gdb-index')
+
+        # Our build is already parallel.
+        AddToLINKFLAGSIfSupported(myenv, '-Wl,--no-threads')
 
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
@@ -3387,6 +3490,7 @@ def doConfigure(myenv):
             "BOOST_ENABLE_ASSERT_DEBUG_HANDLER",
             "BOOST_LOG_NO_SHORTHAND_NAMES",
             "BOOST_LOG_USE_NATIVE_SYSLOG",
+            "BOOST_LOG_WITHOUT_THREAD_ATTR",
             "ABSL_FORCE_ALIGNED_ACCESS",
         ]
     )
@@ -3423,6 +3527,9 @@ def doConfigure(myenv):
 
     if posix_monotonic_clock:
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_HAVE_POSIX_MONOTONIC_CLOCK")
+
+    if get_option('use-diagnostic-latches') == 'off':
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_USE_RAW_LATCHES")
 
     if (conf.CheckCXXHeader( "execinfo.h" ) and
         conf.CheckDeclaration('backtrace', includes='#include <execinfo.h>') and
@@ -3723,46 +3830,84 @@ def doConfigure(myenv):
 env = doConfigure( env )
 env["NINJA_SYNTAX"] = "#site_scons/third_party/ninja_syntax.py"
 
+
 # Now that we are done with configure checks, enable ccache and
-# icecream, if available. Per the rules declared in the icecream tool,
-# load the ccache tool first.
+# icecream if requested. If *both* icecream and ccache are requested,
+# ccache must be loaded first.
 env.Tool('ccache')
+
+if env.ToolchainIs("clang"):
+    env["ICECC_COMPILER_TYPE"] = "clang"
+elif env.ToolchainIs("gcc"):
+    env["ICECC_COMPILER_TYPE"] = "gcc"
+
 env.Tool('icecream')
 
-if get_option('ninja') == 'true':
-    ninja_builder = Tool("ninja")
-    ninja_builder.generate(env)
 
-    # Explicitly add all generated sources to the DAG so NinjaBuilder can
-    # generate rules for them. SCons if the files don't exist will not wire up
-    # the dependencies in the DAG because it cannot scan them. The Ninja builder
-    # does not care about the actual edge here as all generated sources will be
-    # pushed to the "bottom" of it's DAG via the order_only dependency on
-    # _generated_sources (an internal phony target)
-    if get_option('install-mode') == 'hygienic':
-        env.Alias("install-common-base", env.Alias("generated-sources"))
+# Defaults for SCons provided flags. SetOption only sets the option to our value
+# if the user did not provide it. So for any flag here if it's explicitly passed
+# the values below set with SetOption will be overwritten.
+#
+# Default j to the number of CPUs on the system. Note: in containers this
+# reports the number of CPUs for the host system. Perhaps in a future version of
+# psutil it will instead report the correct number when in a container.
+#
+# The presence of the variable ICECC means the icecream tool is
+# enabled and so the default j value should scale accordingly. In this
+# scenario multiply the cpu count by 8 to set a reasonable default since the
+# cluster can handle many more jobs than your local machine but is
+# still throttled by your cpu count in the sense that you can only
+# handle so many python threads sending out jobs.
+#
+# Capitalize on the weird way SCons handles arguments to determine if
+# the user configured it or not. If not, it is under our control. Try
+# to set some helpful defaults.
+initial_num_jobs = env.GetOption('num_jobs')
+altered_num_jobs = initial_num_jobs + 1
+env.SetOption('num_jobs', altered_num_jobs)
+if env.GetOption('num_jobs') == altered_num_jobs:
+    # psutil.cpu_count returns None when it can't determine the
+    # number. This always fails on BSD's for example. If the user
+    # didn't specify, and we can't determine for a parallel build, it
+    # is better to make the user restart and be explicit, rather than
+    # give them a very slow build.
+    cpu_count = psutil.cpu_count()
+    if cpu_count is None:
+        if get_option("ninja") != "disabled":
+            env.FatalError("Cannot auto-determine the appropriate size for the Ninja local_job pool. Please regenerate with an explicit -j argument to SCons")
+        else:
+            env.FatalError("Cannot auto-determine the appropriate build paralleism on this platform. Please build with an explicit -j argument to SCons")
+
+    if 'ICECC' in env and env['ICECC'] and get_option("ninja") == "disabled":
+        # If SCons is driving and we are using icecream, scale up the
+        # number of jobs. The icerun integration will prevent us from
+        # overloading the local system.
+        env.SetOption('num_jobs', 8 * cpu_count)
     else:
-        env.Alias("all", env.Alias("generated-sources"))
-        env.Alias("core", env.Alias("generated-sources"))
+        # Otherwise, either icecream isn't in play, so just use local
+        # concurrency for SCons builds, or we are generating for
+        # Ninja, in which case num_jobs controls the size of the local
+        # pool. Scale that up to the number of local CPUs.
+        env.SetOption('num_jobs', cpu_count)
 
-    if get_option("install-mode") == "hygienic":
-        ninja_build = env.Ninja(
-            target="build.ninja",
-            source=[
-                env.Alias("install-all-meta"),
-                env.Alias("test-execution-aliases"),
-            ],
-        )
+if get_option('ninja') != 'disabled':
+
+    if 'ICECREAM_VERSION' in env and not env.get('CCACHE', None):
+        if env['ICECREAM_VERSION'] < parse_version("1.2"):
+            env.FatalError("Use of ccache is mandatory with --ninja and icecream older than 1.2. You are running {}.".format(env['ICECREAM_VERSION']))
+
+    if get_option('ninja') == 'stable':
+        ninja_builder = Tool("ninja")
+        ninja_builder.generate(env)
     else:
-        ninja_build = env.Ninja(
-            target="build.ninja",
-            source=[
-                env.Alias("all"),
-                env.Alias("test-execution-aliases"),
-            ],
-        )
+        ninja_builder = Tool("ninja_next")
+        ninja_builder.generate(env)
 
-    env.Alias("generate-ninja", ninja_build)
+        ninjaConf = Configure(env, help=False, custom_tests = {
+            'CheckNinjaCompdbExpand': env.CheckNinjaCompdbExpand,
+        })
+        env['NINJA_COMPDB_EXPAND'] = ninjaConf.CheckNinjaCompdbExpand()
+        ninjaConf.Finish()
 
 
     # idlc.py has the ability to print it's implicit dependencies
@@ -3805,12 +3950,11 @@ if get_option('ninja') == 'true':
 
     env.NinjaRegisterFunctionHandler("write_uuid_to_file", fakelib_in_ninja)
 
-
     def ninja_test_list_builder(env, node):
-        test_files = env["MONGO_TEST_REGISTRY"][node.path]
-        files = "\\n".join(test_files)
+        test_files = [test_file.path for test_file in env["MONGO_TEST_REGISTRY"][node.path]]
+        files = ' '.join(test_files)
         return {
-            "outputs": node.get_path(),
+            "outputs": [node.get_path()],
             "rule": "TEST_LIST",
             "implicit": test_files,
             "variables": {
@@ -3818,172 +3962,248 @@ if get_option('ninja') == 'true':
             }
         }
 
+    if env["PLATFORM"] == "win32":
+        cmd = 'cmd.exe /c del "$out" && for %a in ($files) do (echo %a >> "$out")'
+    else:
+        cmd = 'rm -f "$out"; for i in $files; do echo "$$i" >> "$out"; done;'
+
     env.NinjaRule(
         rule="TEST_LIST",
         description="Compiling test list: $out",
-        command="{}echo '$files' > '$out'".format(
-            "cmd.exe /c " if env["PLATFORM"] == "win32" else "",
-        ),
+        command=cmd,
     )
     env.NinjaRegisterFunctionHandler("test_list_builder_action", ninja_test_list_builder)
 
 
-# TODO: Later, this should live somewhere more graceful.
-if get_option('install-mode') == 'hygienic':
+if get_option('separate-debug') == "on" or env.TargetOSIs("windows"):
 
-    if get_option('separate-debug') == "on":
-        env.Tool('separate_debug')
+    # The current ninja builder can't handle --separate-debug on non-Windows platforms
+    # like linux or macOS, because they depend on adding extra actions to the link step,
+    # which cannot be translated into the ninja bulider.
+    if not env.TargetOSIs("windows") and get_option('ninja') != 'disabled':
+        env.FatalError("Cannot use --separate-debug with Ninja on non-Windows platforms.")
 
-    env["AIB_TARBALL_SUFFIX"] = "tgz"
-    env.Tool('auto_install_binaries')
+    separate_debug = Tool('separate_debug')
+    if not separate_debug.exists(env):
+        env.FatalError('Cannot honor --separate-debug because the separate_debug.py Tool reported as nonexistent')
+    separate_debug(env)
 
-    env.DeclareRoles(
-        roles=[
+env["AUTO_ARCHIVE_TARBALL_SUFFIX"] = "tgz"
 
-            env.Role(
-                name="base",
-            ),
+env["AIB_META_COMPONENT"] = "all"
+env["AIB_BASE_COMPONENT"] = "common"
+env["AIB_DEFAULT_COMPONENT"] = "mongodb"
 
-            env.Role(
-                name="debug",
-            ),
+env.Tool('auto_install_binaries')
+env.Tool('auto_archive')
 
-            env.Role(
-                name="dev",
-                dependencies=[
-                    "runtime"
-                ],
-            ),
+env.DeclareRoles(
+    roles=[
 
-            env.Role(
-                name="meta",
-            ),
+        env.Role(
+            name="base",
+        ),
 
-            env.Role(
-                name="runtime",
-                dependencies=[
-                    # On windows, we want the runtime role to depend
-                    # on the debug role so that PDBs end in the
-                    # runtime package.
-                    "debug" if env.TargetOSIs('windows') else None,
-                ],
-                transitive=True,
-                silent=True,
-            ),
+        env.Role(
+            name="debug",
+        ),
+
+        env.Role(
+            name="dev",
+            dependencies=[
+                "runtime"
+            ],
+        ),
+
+        env.Role(
+            name="meta",
+        ),
+
+        env.Role(
+            name="runtime",
+            dependencies=[
+                # On windows, we want the runtime role to depend
+                # on the debug role so that PDBs end in the
+                # runtime package.
+                "debug" if env.TargetOSIs('windows') else None,
+            ],
+            silent=True,
+        ),
+    ],
+    base_role="base",
+    meta_role="meta",
+)
+
+def _aib_debugdir(source, target, env, for_signature):
+    for s in source:
+        origin = getattr(s.attributes, "debug_file_for", None)
+        oentry = env.Entry(origin)
+        osuf = oentry.get_suffix()
+        map_entry = env["AIB_SUFFIX_MAP"].get(osuf)
+        if map_entry:
+            return map_entry[0]
+    env.FatalError("Unable to find debuginfo file in _aib_debugdir: (source='{}')".format(str(source)))
+
+env["PREFIX_DEBUGDIR"] = _aib_debugdir
+
+env.AddSuffixMapping({
+    "$PROGSUFFIX": env.SuffixMap(
+        directory="$PREFIX_BINDIR",
+        default_role="runtime",
+    ),
+
+    "$SHLIBSUFFIX": env.SuffixMap(
+        directory="$PREFIX_BINDIR" \
+        if mongo_platform.get_running_os_name() == "windows" \
+        else "$PREFIX_LIBDIR",
+        default_role="runtime",
+    ),
+
+    ".debug": env.SuffixMap(
+        directory="$PREFIX_DEBUGDIR",
+        default_role="debug",
+    ),
+
+    ".dSYM": env.SuffixMap(
+        directory="$PREFIX_DEBUGDIR",
+        default_role="debug",
+    ),
+
+    ".pdb": env.SuffixMap(
+        directory="$PREFIX_DEBUGDIR",
+        default_role="debug",
+    ),
+})
+
+env.AddPackageNameAlias(
+    component="dist",
+    role="runtime",
+    name="mongodb-dist",
+)
+
+env.AddPackageNameAlias(
+    component="dist",
+    role="debug",
+    name="mongodb-dist-debugsymbols",
+)
+
+env.AddPackageNameAlias(
+    component="dist-test",
+    role="runtime",
+    name="mongodb-binaries",
+)
+
+env.AddPackageNameAlias(
+    component="dist-test",
+    role="debug",
+    name="mongo-debugsymbols",
+)
+
+env.AddPackageNameAlias(
+    component="dbtest",
+    role="runtime",
+    name="dbtest-binary",
+)
+
+env.AddPackageNameAlias(
+    component="dbtest",
+    role="debug",
+    name="dbtest-debugsymbols",
+)
+
+env.AddPackageNameAlias(
+    component="shell",
+    role="runtime",
+    name="mongodb-shell",
+)
+
+env.AddPackageNameAlias(
+    component="shell",
+    role="debug",
+    name="mongodb-shell-debugsymbols",
+)
+
+env.AddPackageNameAlias(
+    component="mongocryptd",
+    role="runtime",
+    name="mongodb-cryptd",
+)
+
+env.AddPackageNameAlias(
+    component="mongocryptd",
+    role="debug",
+    name="mongodb-cryptd-debugsymbols",
+)
+
+env.AddPackageNameAlias(
+    component="mh",
+    role="runtime",
+    # TODO: we should be able to move this to where the mqlrun binary is
+    # defined when AIB correctly uses environments instead of hooking into
+    # the first environment used.
+    name="mh-binaries",
+)
+
+env.AddPackageNameAlias(
+    component="mh",
+    role="debug",
+    # TODO: we should be able to move this to where the mqlrun binary is
+    # defined when AIB correctly uses environments instead of hooking into
+    # the first environment used.
+    name="mh-debugsymbols",
+)
+
+def rpath_generator(env, source, target, for_signature):
+    # If the PREFIX_LIBDIR has an absolute path, we will use that directly as
+    # RPATH because that indicates the final install destination of the libraries.
+    prefix_libdir = env.subst('$PREFIX_LIBDIR')
+    if  os.path.isabs(prefix_libdir):
+        return ['$PREFIX_LIBDIR']
+
+    # If the PREFIX_LIBDIR is not an absolute path, we will use a relative path
+    # from the bin to the lib dir.
+    lib_rel = os.path.relpath(prefix_libdir, env.subst('$PREFIX_BINDIR'))
+
+    if env['PLATFORM'] == 'posix':\
+        return [env.Literal(f"\\$$ORIGIN/{lib_rel}")]
+
+    if env['PLATFORM'] == 'darwin':
+        return [f"@loader_path/{lib_rel}",]
+
+env['RPATH_GENERATOR'] = rpath_generator
+
+if env['PLATFORM'] == 'posix':
+    env.AppendUnique(
+        RPATH='$RPATH_GENERATOR',
+        LINKFLAGS=[
+            # Most systems *require* -z,origin to make origin work, but android
+            # blows up at runtime if it finds DF_ORIGIN_1 in DT_FLAGS_1.
+            # https://android.googlesource.com/platform/bionic/+/cbc80ba9d839675a0c4891e2ab33f39ba51b04b2/linker/linker.h#68
+            # https://android.googlesource.com/platform/bionic/+/cbc80ba9d839675a0c4891e2ab33f39ba51b04b2/libc/include/elf.h#215
+            '-Wl,-z,origin' if not env.TargetOSIs('android') else [],
+            '-Wl,--enable-new-dtags',
         ],
-        base_role="base",
-        meta_role="meta",
+        SHLINKFLAGS=[
+            # -h works for both the sun linker and the gnu linker.
+            "-Wl,-h,${TARGET.file}",
+        ]
+    )
+elif env['PLATFORM'] == 'darwin':
+    # The darwin case uses a adhoc implementation of RPATH for SCons
+    # since SCons does not support RPATH directly for macOS:
+    #   https://github.com/SCons/scons/issues/2127
+    # so we setup RPATH and LINKFLAGS ourselves.
+    env['RPATHPREFIX'] = '-Wl,-rpath,'
+    env['RPATHSUFFIX'] = ''
+    env['RPATH'] = '$RPATH_GENERATOR'
+    env.AppendUnique(
+        LINKFLAGS="${_concat(RPATHPREFIX, RPATH, RPATHSUFFIX, __env__)}",
+        SHLINKFLAGS=[
+            "-Wl,-install_name,@rpath/${TARGET.file}",
+        ],
     )
 
-    env.AddSuffixMapping({
-        "$PROGSUFFIX": env.SuffixMap(
-            directory="$PREFIX_BINDIR",
-            default_roles=[
-                "runtime",
-            ]
-        ),
-
-        "$LIBSUFFIX": env.SuffixMap(
-            directory="$PREFIX_LIBDIR",
-            default_roles=[
-                "dev",
-            ]
-        ),
-
-        "$SHLIBSUFFIX": env.SuffixMap(
-            directory="$PREFIX_BINDIR" \
-            if mongo_platform.get_running_os_name() == "windows" \
-            else "$PREFIX_LIBDIR",
-            default_roles=[
-                "runtime",
-            ]
-        ),
-
-        ".debug": env.SuffixMap(
-            directory="$PREFIX_DEBUGDIR",
-            default_roles=[
-                "debug",
-            ]
-        ),
-
-        ".dSYM": env.SuffixMap(
-            directory="$PREFIX_DEBUGDIR",
-            default_roles=[
-                "debug"
-            ]
-        ),
-
-        ".pdb": env.SuffixMap(
-            directory="$PREFIX_DEBUGDIR",
-            default_roles=[
-                "debug"
-            ]
-        ),
-    })
-
-    env.AddPackageNameAlias(
-        component="dist",
-        role="runtime",
-        name="${SERVER_DIST_BASENAME}",
-    )
-
-    env.AddPackageNameAlias(
-        component="dist",
-        role="debug",
-        name="${SERVER_DIST_BASENAME}-debugsymbols",
-    )
-
-    env.AddPackageNameAlias(
-        component="mh",
-        role="runtime",
-        # TODO: we should be able to move this to where the mqlrun binary is
-        # defined when AIB correctly uses environments instead of hooking into
-        # the first environment used.
-        name="${MH_DIST_BASENAME}-binaries",
-    )
-
-    env.AddPackageNameAlias(
-        component="mh",
-        role="debug",
-        # TODO: we should be able to move this to where the mqlrun binary is
-        # defined when AIB correctly uses environments instead of hooking into
-        # the first environment used.
-        name="${MH_DIST_BASENAME}-debugsymbols",
-    )
-
-    if env['PLATFORM'] == 'posix':
-        env.AppendUnique(
-            RPATH=[
-                # In the future when we want to improve dynamic builds
-                # we should set this to $PREFIX ideally
-                 env.Literal('\\$$ORIGIN/../lib'),
-            ],
-            LINKFLAGS=[
-                # Most systems *require* -z,origin to make origin work, but android
-                # blows up at runtime if it finds DF_ORIGIN_1 in DT_FLAGS_1.
-                # https://android.googlesource.com/platform/bionic/+/cbc80ba9d839675a0c4891e2ab33f39ba51b04b2/linker/linker.h#68
-                # https://android.googlesource.com/platform/bionic/+/cbc80ba9d839675a0c4891e2ab33f39ba51b04b2/libc/include/elf.h#215
-                '-Wl,-z,origin' if not env.TargetOSIs('android') else [],
-                '-Wl,--enable-new-dtags',
-            ],
-            SHLINKFLAGS=[
-                # -h works for both the sun linker and the gnu linker.
-                "-Wl,-h,${TARGET.file}",
-            ]
-        )
-    elif env['PLATFORM'] == 'darwin':
-        env.AppendUnique(
-            LINKFLAGS=[
-                '-Wl,-rpath,@loader_path/../lib',
-                '-Wl,-rpath,@loader_path/../Frameworks'
-            ],
-            SHLINKFLAGS=[
-                "-Wl,-install_name,@rpath/${TARGET.file}",
-            ],
-        )
-elif get_option('separate-debug') == "on":
-    env.FatalError('Cannot use --separate-debug without --install-mode=hygienic')
-
+env.Default(env.Alias("install-default"))
 
 # If the flags in the environment are configured for -gsplit-dwarf,
 # inject the necessary emitter.
@@ -3993,7 +4213,7 @@ if split_dwarf.exists(env):
 
 # Load the compilation_db tool. We want to do this after configure so we don't end up with
 # compilation database entries for the configure tests, which is weird.
-if get_option('ninja') == 'false':
+if get_option('ninja') == 'disabled':
     env.Tool("compilation_db")
 
 # If we can, load the dagger tool for build dependency graph introspection.
@@ -4006,13 +4226,6 @@ if should_dagger:
 incremental_link = Tool('incremental_link')
 if incremental_link.exists(env):
     incremental_link(env)
-
-def checkErrorCodes():
-    import buildscripts.errorcodes as x
-    if x.check_error_codes() == False:
-        env.FatalError("next id to use: {0}", x.get_next_code())
-
-checkErrorCodes()
 
 # Resource Files are Windows specific
 def env_windows_resource_file(env, path):
@@ -4040,7 +4253,7 @@ if get_option('lint-scope') == 'changed':
             "buildscripts/pylinters.py",
             patch_file,
         ],
-        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+        action="REVISION=$REVISION ENTERPRISE_REV=$ENTERPRISE_REV $PYTHON ${SOURCES[0]} lint-git-diff"
     )
 
     clang_format = env.Command(
@@ -4049,7 +4262,7 @@ if get_option('lint-scope') == 'changed':
             "buildscripts/clang_format.py",
             patch_file,
         ],
-        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+        action="REVISION=$REVISION ENTERPRISE_REV=$ENTERPRISE_REV $PYTHON ${SOURCES[0]} lint-git-diff"
     )
 
     eslint = env.Command(
@@ -4058,7 +4271,7 @@ if get_option('lint-scope') == 'changed':
             "buildscripts/eslint.py",
             patch_file,
         ],
-        action="$PYTHON ${SOURCES[0]} lint-patch ${SOURCES[1]}"
+        action="REVISION=$REVISION ENTERPRISE_REV=$ENTERPRISE_REV $PYTHON ${SOURCES[0]} lint-git-diff"
     )
 
 else:
@@ -4082,10 +4295,8 @@ else:
         target="#lint-eslint",
         source=[
             "buildscripts/eslint.py",
-            "jstests/",
-            "src/mongo/",
         ],
-        action="$PYTHON ${SOURCES[0]} --dirmode lint ${SOURCES[1:]}",
+        action="$PYTHON ${SOURCES[0]} --dirmode lint jstests/ src/mongo",
     )
 
 lint_py = env.Command(
@@ -4094,11 +4305,16 @@ lint_py = env.Command(
     action="$PYTHON ${SOURCES[0]} lint",
 )
 
-env.Alias( "lint" , [ lint_py, eslint, clang_format, pylinters ] )
-env.Alias( "lint-fast" , [ eslint, clang_format, pylinters ] )
+lint_errorcodes = env.Command(
+    target="#lint-errorcodes",
+    source=["buildscripts/errorcodes.py"],
+    action="$PYTHON ${SOURCES[0]} --quiet",
+)
+
+env.Alias( "lint" , [ lint_py, eslint, clang_format, pylinters, lint_errorcodes ] )
+env.Alias( "lint-fast" , [ eslint, clang_format, pylinters, lint_errorcodes ] )
 env.AlwaysBuild( "lint" )
 env.AlwaysBuild( "lint-fast" )
-
 
 #  ----  INSTALL -------
 
@@ -4196,7 +4412,7 @@ def injectModule(env, module, **kwargs):
     return env
 env.AddMethod(injectModule, 'InjectModule')
 
-if get_option('ninja') == 'false':
+if get_option('ninja') == 'disabled':
     compileCommands = env.CompilationDatabase('compile_commands.json')
     compileDb = env.Alias("compiledb", compileCommands)
 
@@ -4206,52 +4422,31 @@ if 'MSVC_VERSION' in env and env['MSVC_VERSION']:
     msvc_version = "--version " + env['MSVC_VERSION'] + " "
 
 # Microsoft Visual Studio Project generation for code browsing
-if get_option("ninja") == "false":
+if get_option("ninja") == "disabled":
     vcxprojFile = env.Command(
         "mongodb.vcxproj",
         compileCommands,
         r"$PYTHON buildscripts\make_vcxproj.py " + msvc_version + "mongodb")
     vcxproj = env.Alias("vcxproj", vcxprojFile)
 
-distSrc = env.DistSrc("mongodb-src-${MONGO_VERSION}.tar")
+# TODO: maybe make these work like the other archive- aliases
+# even though they aren't piped through AIB?
+distSrc = env.DistSrc("distsrc.tar", NINJA_SKIP=True)
 env.NoCache(distSrc)
 env.Alias("distsrc-tar", distSrc)
 
 distSrcGzip = env.GZip(
-    target="mongodb-src-${MONGO_VERSION}.tgz",
-    source=[distSrc])
+    target="distsrc.tgz",
+    source=[distSrc],
+    NINJA_SKIP=True)
 env.NoCache(distSrcGzip)
 env.Alias("distsrc-tgz", distSrcGzip)
 
-distSrcZip = env.DistSrc("mongodb-src-${MONGO_VERSION}.zip")
+distSrcZip = env.DistSrc("distsrc.zip", NINJA_SKIP=True)
 env.NoCache(distSrcZip)
 env.Alias("distsrc-zip", distSrcZip)
 
 env.Alias("distsrc", "distsrc-tgz")
-
-# Defaults for SCons provided flags. SetOption only sets the option to our value
-# if the user did not provide it. So for any flag here if it's explicitly passed
-# the values below set with SetOption will be overwritten.
-#
-# Default j to the number of CPUs on the system. Note: in containers this
-# reports the number of CPUs for the host system. Perhaps in a future version of
-# psutil it will instead report the correct number when in a container.
-#
-# The presence of the variable ICECC means the icecream tool is
-# enabled and so the default j value should scale accordingly. In this
-# scenario multiply the cpu count by 8 to set a reasonable default since the
-# cluster can handle many more jobs than your local machine but is
-# still throttled by your cpu count in the sense that you can only
-# handle so many python threads sending out jobs.
-#
-# psutil.cpu_count returns None when it can't determine the number. This always
-# fails on BSD's for example.
-cpu_count = psutil.cpu_count()
-if cpu_count is not None and 'ICECC' in env and get_option("ninja") != "true":
-    env.SetOption('num_jobs', 8 * cpu_count)
-elif cpu_count is not None:
-    env.SetOption('num_jobs', cpu_count)
-
 
 # Do this as close to last as possible before reading SConscripts, so
 # that any tools that may have injected other things via emitters are included
@@ -4324,6 +4519,24 @@ if has_option("cache"):
         addNoCacheEmitter(env['BUILDERS']['SharedLibrary'])
         addNoCacheEmitter(env['BUILDERS']['LoadableModule'])
 
+
+# We need to be explicit about including $DESTDIR here, unlike most
+# other places. Normally, auto_install_binaries will take care of
+# injecting DESTDIR for us, but we aren't using that now.
+resmoke_install_dir = env.subst("$DESTDIR/$PREFIX_BINDIR")
+resmoke_install_dir = os.path.normpath(resmoke_install_dir).replace("\\", r"\\")
+
+# Much blood sweat and tears were shed getting to this point. Any version of
+# this that uses SCons builders and a scanner will either not regenerate when it
+# should, cause everything to rebuild, or conflict with ninja. Sometimes all
+# three. So we've decieded it's best to just write this file here every time
+# because it's the only solution that always works.
+with open("resmoke.ini", "w") as resmoke_config:
+    resmoke_config.write("""
+[resmoke]
+install_dir = {install_dir}
+""".format(install_dir=resmoke_install_dir))
+
 env.SConscript(
     dirs=[
         'src',
@@ -4347,19 +4560,11 @@ env.SConscript(
     ],
 )
 
-
-allTargets = ['core', 'tools', 'unittests', 'integration_tests', 'libfuzzer_tests', 'benchmarks']
-
-if not has_option('noshell') and usemozjs:
-    allTargets.extend(['dbtest'])
-
-env.Alias('all', allTargets)
-
 # run the Dagger tool if it's installed
 if should_dagger:
-    dependencyDb = env.Alias("dagger", env.Dagger('library_dependency_graph.json'))
-    # Require everything to be built before trying to extract build dependency information
-    env.Requires(dependencyDb, allTargets)
+    dagger = env.Dagger('library_dependency_graph.json')
+    env.Depends(dagger, env.Alias("install-all"))
+    dependencyDb = env.Alias("dagger", dagger)
 
 # Declare the cache prune target
 cachePrune = env.Command(
@@ -4372,22 +4577,12 @@ cachePrune = env.Command(
 )
 
 env.AlwaysBuild(cachePrune)
-env.Alias('cache-prune', cachePrune)
 
-if get_option('install-mode') == 'hygienic':
-    env.FinalizeInstallDependencies()
-    # TODO: Remove once hygienic is driving all builds and we can make
-    # the evergreen.yml make this decision
-    if env.TargetOSIs("windows"):
-        env.Alias("archive-dist", "zip-dist")
-        env.Alias("archive-dist-debug", "zip-dist-debug")
-        env.Alias("archive-mh", "zip-mh")
-        env.Alias("archive-mh-debug", "zip-mh-debug")
-    else:
-        env.Alias("archive-dist", "tar-dist")
-        env.Alias("archive-dist-debug", "tar-dist-debug")
-        env.Alias("archive-mh", "tar-mh")
-        env.Alias("archive-mh-debug", "tar-mh-debug")
+
+# We have finished all SConscripts and targets, so we can ask
+# auto_install_binaries to finalize the installation setup.
+env.FinalizeInstallDependencies()
+
 
 # We don't want installing files to cause them to flow into the cache,
 # since presumably we can re-install them from the origin if needed.

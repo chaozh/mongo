@@ -27,12 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/canonical_query.h"
 
+#include "mongo/db/catalog/collection.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/namespace_string.h"
@@ -42,64 +43,9 @@
 #include "mongo/db/query/indexability.h"
 #include "mongo/db/query/projection_parser.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
-
-/**
- * Comparator for MatchExpression nodes.  Returns an integer less than, equal to, or greater
- * than zero if 'lhs' is less than, equal to, or greater than 'rhs', respectively.
- *
- * Sorts by:
- * 1) operator type (MatchExpression::MatchType)
- * 2) path name (MatchExpression::path())
- * 3) sort order of children
- * 4) number of children (MatchExpression::numChildren())
- *
- * The third item is needed to ensure that match expression trees which should have the same
- * cache key always sort the same way. If you're wondering when the tuple (operator type, path
- * name) could ever be equal, consider this query:
- *
- * {$and:[{$or:[{a:1},{a:2}]},{$or:[{a:1},{b:2}]}]}
- *
- * The two OR nodes would compare as equal in this case were it not for tuple item #3 (sort
- * order of children).
- */
-int matchExpressionComparator(const MatchExpression* lhs, const MatchExpression* rhs) {
-    MatchExpression::MatchType lhsMatchType = lhs->matchType();
-    MatchExpression::MatchType rhsMatchType = rhs->matchType();
-    if (lhsMatchType != rhsMatchType) {
-        return lhsMatchType < rhsMatchType ? -1 : 1;
-    }
-
-    StringData lhsPath = lhs->path();
-    StringData rhsPath = rhs->path();
-    int pathsCompare = lhsPath.compare(rhsPath);
-    if (pathsCompare != 0) {
-        return pathsCompare;
-    }
-
-    const size_t numChildren = std::min(lhs->numChildren(), rhs->numChildren());
-    for (size_t childIdx = 0; childIdx < numChildren; ++childIdx) {
-        int childCompare =
-            matchExpressionComparator(lhs->getChild(childIdx), rhs->getChild(childIdx));
-        if (childCompare != 0) {
-            return childCompare;
-        }
-    }
-
-    if (lhs->numChildren() != rhs->numChildren()) {
-        return lhs->numChildren() < rhs->numChildren() ? -1 : 1;
-    }
-
-    // They're equal!
-    return 0;
-}
-
-bool matchExpressionLessThan(const MatchExpression* lhs, const MatchExpression* rhs) {
-    return matchExpressionComparator(lhs, rhs) < 0;
-}
 
 bool parsingCanProduceNoopMatchNodes(const ExtensionsCallback& extensionsCallback,
                                      MatchExpressionParser::AllowedFeatureSet allowedFeatures) {
@@ -153,10 +99,19 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
     // Make MatchExpression.
     boost::intrusive_ptr<ExpressionContext> newExpCtx;
     if (!expCtx.get()) {
-        newExpCtx.reset(new ExpressionContext(opCtx, collator.get(), qr->getRuntimeConstants()));
+        newExpCtx = make_intrusive<ExpressionContext>(opCtx,
+                                                      std::move(collator),
+                                                      qr->nss(),
+                                                      qr->getRuntimeConstants(),
+                                                      qr->getLetParameters());
     } else {
         newExpCtx = expCtx;
-        invariant(CollatorInterface::collatorsMatch(collator.get(), expCtx->getCollator()));
+        // A collator can enter through both the QueryRequest and ExpressionContext arguments.
+        // This invariant ensures that both collators are the same because downstream we
+        // pull the collator from only one of the ExpressionContext carrier.
+        if (collator.get() && expCtx->getCollator()) {
+            invariant(CollatorInterface::collatorsMatch(collator.get(), expCtx->getCollator()));
+        }
     }
 
     StatusWithMatchExpression statusWithMatcher = MatchExpressionParser::parse(
@@ -175,7 +130,6 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
                  std::move(qr),
                  parsingCanProduceNoopMatchNodes(extensionsCallback, allowedFeatures),
                  std::move(me),
-                 std::move(collator),
                  projectionPolicies);
 
     if (!initStatus.isOK()) {
@@ -200,11 +154,6 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
         return qrStatus;
     }
 
-    std::unique_ptr<CollatorInterface> collator;
-    if (baseQuery.getCollator()) {
-        collator = baseQuery.getCollator()->clone();
-    }
-
     // Make the CQ we'll hopefully return.
     std::unique_ptr<CanonicalQuery> cq(new CanonicalQuery());
     Status initStatus = cq->init(opCtx,
@@ -212,7 +161,6 @@ StatusWith<std::unique_ptr<CanonicalQuery>> CanonicalQuery::canonicalize(
                                  std::move(qr),
                                  baseQuery.canHaveNoopMatchNodes(),
                                  root->shallowClone(),
-                                 std::move(collator),
                                  ProjectionPolicies::findProjectionPolicies());
 
     if (!initStatus.isOK()) {
@@ -226,17 +174,14 @@ Status CanonicalQuery::init(OperationContext* opCtx,
                             std::unique_ptr<QueryRequest> qr,
                             bool canHaveNoopMatchNodes,
                             std::unique_ptr<MatchExpression> root,
-                            std::unique_ptr<CollatorInterface> collator,
                             const ProjectionPolicies& projectionPolicies) {
     _expCtx = expCtx;
     _qr = std::move(qr);
-    _collator = std::move(collator);
 
     _canHaveNoopMatchNodes = canHaveNoopMatchNodes;
 
-    // Normalize, sort and validate tree.
-    _root = MatchExpression::optimize(std::move(root));
-    sortTree(_root.get());
+    // Normalize and validate tree.
+    _root = MatchExpression::normalize(std::move(root));
     auto validStatus = isValid(_root.get(), *_qr);
     if (!validStatus.isOK()) {
         return validStatus.getStatus();
@@ -270,6 +215,11 @@ Status CanonicalQuery::init(OperationContext* opCtx,
         return ex.toStatus();
     }
 
+    // If the 'returnKey' option is set, then the plan should produce index key metadata.
+    if (_qr->returnKey()) {
+        _metadataDeps.set(DocumentMetadataFields::kIndexKey);
+    }
+
     return Status::OK();
 }
 
@@ -284,25 +234,29 @@ void CanonicalQuery::initSortPattern(QueryMetadataBitSet unavailableMetadata) {
     // We have already validated that if there is a $natural sort and a hint, that the hint
     // also specifies $natural with the same direction. Therefore, it is safe to clear the $natural
     // sort and rewrite it as a $natural hint.
-    if (_qr->getSort()["$natural"]) {
+    if (_qr->getSort()[QueryRequest::kNaturalSortField]) {
         _qr->setHint(_qr->getSort());
         _qr->setSort(BSONObj{});
     }
 
     _sortPattern = SortPattern{_qr->getSort(), _expCtx};
     _metadataDeps |= _sortPattern->metadataDeps(unavailableMetadata);
+
+    // If the results of this query might have to be merged on a remote node, then that node might
+    // need the sort key metadata. Request that the plan generates this metadata.
+    if (_expCtx->needsMerge) {
+        _metadataDeps.set(DocumentMetadataFields::kSortKey);
+    }
 }
 
 void CanonicalQuery::setCollator(std::unique_ptr<CollatorInterface> collator) {
-    _collator = std::move(collator);
+    auto collatorRaw = collator.get();
+    // We must give the ExpressionContext the same collator.
+    _expCtx->setCollator(std::move(collator));
 
     // The collator associated with the match expression tree is now invalid, since we have reset
-    // the object owned by '_collator'. We must associate the match expression tree with the new
-    // value of '_collator'.
-    _root->setCollator(_collator.get());
-
-    // In a similar vein, we must give the ExpressionContext the same collator.
-    _expCtx->setCollator(_collator.get());
+    // the collator owned by the ExpressionContext.
+    _root->setCollator(collatorRaw);
 }
 
 // static
@@ -335,17 +289,6 @@ bool CanonicalQuery::isSimpleIdQuery(const BSONObj& query) {
     return hasID;
 }
 
-// static
-void CanonicalQuery::sortTree(MatchExpression* tree) {
-    for (size_t i = 0; i < tree->numChildren(); ++i) {
-        sortTree(tree->getChild(i));
-    }
-    if (auto&& children = tree->getChildVector()) {
-        std::stable_sort(children->begin(), children->end(), matchExpressionLessThan);
-    }
-}
-
-// static
 size_t CanonicalQuery::countNodes(const MatchExpression* root, MatchExpression::MatchType type) {
     size_t sum = 0;
     if (type == root->matchType()) {
@@ -465,6 +408,12 @@ StatusWith<QueryMetadataBitSet> CanonicalQuery::isValid(MatchExpression* root,
     // TEXT and tailable are incompatible.
     if (numText > 0 && request.isTailable()) {
         return Status(ErrorCodes::BadValue, "text and tailable cursor not allowed in same query");
+    }
+
+    // NEAR and tailable are incompatible.
+    if (numGeoNear > 0 && request.isTailable()) {
+        return Status(ErrorCodes::BadValue,
+                      "Tailable cursors and geo $near cannot be used together");
     }
 
     // $natural sort order must agree with hint.

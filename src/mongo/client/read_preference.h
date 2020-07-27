@@ -31,6 +31,7 @@
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/hedging_mode_gen.h"
+#include "mongo/client/read_preference_gen.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/optime.h"
@@ -40,35 +41,12 @@ namespace mongo {
 template <typename T>
 class StatusWith;
 
-enum class ReadPreference {
-    /**
-     * Read from primary only. All operations produce an error (throw an exception where
-     * applicable) if primary is unavailable. Cannot be combined with tags.
-     */
-    PrimaryOnly = 0,
+using ReadPreference = ReadPreferenceEnum;
 
-    /**
-     * Read from primary if available, otherwise a secondary. Tags will only be applied in the
-     * event that the primary is unavailable and a secondary is read from. In this event only
-     * secondaries matching the tags provided would be read from.
-     */
-    PrimaryPreferred,
-
-    /**
-     * Read from secondary if available, otherwise error.
-     */
-    SecondaryOnly,
-
-    /**
-     * Read from a secondary if available, otherwise read from the primary.
-     */
-    SecondaryPreferred,
-
-    /**
-     * Read from any member.
-     */
-    Nearest,
-};
+/**
+ * Validate a ReadPreference string. This is intended for use as an IDL validator callback.
+ */
+Status validateReadPreferenceMode(const std::string& prefStr);
 
 /**
  * A simple object for representing the list of tags requested by a $readPreference.
@@ -201,6 +179,12 @@ struct ReadPreferenceSetting {
      */
     static StatusWith<ReadPreferenceSetting> fromInnerBSON(const BSONObj& readPrefSettingObj);
     static StatusWith<ReadPreferenceSetting> fromInnerBSON(const BSONElement& readPrefSettingObj);
+
+    /**
+        Utilized by IDL types in order to get the unwrapped ReadPreferenceSetting object.
+        It checks that the status is OK and then if so it will return the underlying object.
+    */
+    static ReadPreferenceSetting fromInnerBSONForIDL(const BSONObj& readPrefSettingObj);
 
     /**
      * Parses a ReadPreference setting from an object that may contain a $readPreference object

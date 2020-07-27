@@ -2,7 +2,12 @@
 //
 // Only run this test with the WiredTiger storage engine, since we expect other storage engines to
 // return early because they do not support snapshot read concern.
-// @tags: [requires_wiredtiger, uses_transactions, uses_atclustertime]
+// @tags: [
+//   requires_persistence,
+//   requires_wiredtiger,
+//   uses_atclustertime,
+//   uses_transactions,
+// ]
 
 function _getClusterTime(rst) {
     const pingRes = assert.commandWorked(rst.getPrimary().adminCommand({ping: 1}));
@@ -35,8 +40,8 @@ if (!testDB.serverStatus().storageEngine.supportsSnapshotReadConcern) {
     return;
 }
 
-const session = testDB.getMongo().startSession({causalConsistency: false});
-const sessionDb = session.getDatabase(dbName);
+let session = testDB.getMongo().startSession({causalConsistency: false});
+let sessionDb = session.getDatabase(dbName);
 
 const clusterTime = _getClusterTime(rst);
 
@@ -99,24 +104,31 @@ session.startTransaction({
 assert.commandFailedWithCode(sessionDb.runCommand({find: collName}), ErrorCodes.InvalidOptions);
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
 
-// 'atClusterTime' cannot be used outside of a session.
-assert.commandFailedWithCode(
-    testDB.runCommand(
-        {find: collName, readConcern: {level: "snapshot", atClusterTime: clusterTime}}),
-    ErrorCodes.InvalidOptions);
-
 // 'atClusterTime' cannot be used with 'afterClusterTime'.
 session.startTransaction(
     {readConcern: {level: "snapshot", atClusterTime: clusterTime, afterClusterTime: clusterTime}});
 assert.commandFailedWithCode(sessionDb.runCommand({find: collName}), ErrorCodes.InvalidOptions);
 assert.commandFailedWithCode(session.abortTransaction_forTesting(), ErrorCodes.NoSuchTransaction);
-
 session.endSession();
+
+// 'atClusterTime' cannot be used within causally consistent sessions.
+session = testDB.getMongo().startSession();
+sessionDb = session.getDatabase(dbName);
+// Perform a local read to establish an 'afterClusterTime' for the session.
+assert.commandWorked(sessionDb.runCommand({find: collName}));
+assert(assert
+           .commandFailedWithCode(
+               sessionDb.runCommand(
+                   {find: collName, readConcern: {level: "snapshot", atClusterTime: clusterTime}}),
+               ErrorCodes.InvalidOptions)
+           .errmsg.includes("Specifying a timestamp for readConcern snapshot in a causally " +
+                            "consistent session is not allowed"));
+
 rst.stopSet();
 
 // readConcern with 'atClusterTime' should succeed regardless of value of 'enableTestCommands'.
 {
-    jsTest.setOption('enableTestCommands', false);
+    TestData.enableTestCommands = false;
     let rst = new ReplSetTest({nodes: 1});
     rst.startSet();
     rst.initiate();
@@ -130,7 +142,7 @@ rst.stopSet();
     session.endSession();
     rst.stopSet();
 
-    jsTest.setOption('enableTestCommands', true);
+    TestData.enableTestCommands = true;
     rst = new ReplSetTest({nodes: 1});
     rst.startSet();
     rst.initiate();

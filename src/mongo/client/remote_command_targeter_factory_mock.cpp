@@ -31,13 +31,6 @@
 
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 
-#include <memory>
-
-#include "mongo/base/status_with.h"
-#include "mongo/client/connection_string.h"
-#include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/util/assert_util.h"
-
 namespace mongo {
 namespace {
 
@@ -70,6 +63,10 @@ public:
 
     void markHostUnreachable(const HostAndPort& host, const Status& status) override {
         _mock->markHostUnreachable(host, status);
+    }
+
+    void markHostShuttingDown(const HostAndPort& host, const Status& status) override {
+        _mock->markHostShuttingDown(host, status);
     }
 
 private:

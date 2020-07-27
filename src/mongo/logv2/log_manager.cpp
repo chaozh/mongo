@@ -29,13 +29,17 @@
 
 #include "mongo/platform/basic.h"
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 #include "mongo/logv2/log_manager.h"
 
+#include <boost/log/core.hpp>
+
+#include "mongo/logv2/log.h"
 #include "mongo/logv2/log_domain.h"
 #include "mongo/logv2/log_domain_global.h"
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
 
 struct LogManager::Impl {
     Impl() {}
@@ -46,13 +50,40 @@ struct LogManager::Impl {
 
 LogManager::LogManager() {
     _impl = std::make_unique<Impl>();
+
+    boost::log::core::get()->set_exception_handler([]() {
+        thread_local uint32_t depth = 0;
+        auto depthGuard = makeGuard([]() { --depth; });
+        ++depth;
+        // Try and log that we failed to log
+        if (depth == 1) {
+            std::exception_ptr ex = nullptr;
+            try {
+                throw;
+            } catch (const DBException&) {
+                ex = std::current_exception();
+            } catch (...) {
+                LOGV2(4638200,
+                      "Exception during log, message not written to stream",
+                      "exception"_attr = exceptionToStatus());
+            }
+            if (ex)
+                std::rethrow_exception(ex);
+        }
+
+        // Logging exceptions are fatal in debug builds. Guard ourselves from additional logging
+        // during the assert that might also fail
+        if (kDebugBuild && depth <= 2) {
+            dassert(false, "Exception during log");
+        }
+    });
 }
 
 LogManager::~LogManager() {}
 
 LogManager& LogManager::global() {
-    static LogManager globalLogManager;
-    return globalLogManager;
+    static LogManager* globalLogManager = new LogManager();
+    return *globalLogManager;
 }
 
 LogDomain& LogManager::getGlobalDomain() {
@@ -67,5 +98,4 @@ LogComponentSettings& LogManager::getGlobalSettings() {
     return getGlobalDomainInternal().settings();
 }
 
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

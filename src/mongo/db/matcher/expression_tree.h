@@ -131,6 +131,14 @@ public:
     virtual void serialize(BSONObjBuilder* out, bool includePath) const;
 
     bool isTriviallyTrue() const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class OrMatchExpression : public ListOfMatchExpression {
@@ -160,6 +168,14 @@ public:
     virtual void serialize(BSONObjBuilder* out, bool includePath) const;
 
     bool isTriviallyFalse() const final;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class NorMatchExpression : public ListOfMatchExpression {
@@ -187,15 +203,25 @@ public:
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
     virtual void serialize(BSONObjBuilder* out, bool includePath) const;
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
+    }
 };
 
 class NotMatchExpression final : public MatchExpression {
 public:
-    explicit NotMatchExpression(MatchExpression* e) : MatchExpression(NOT), _exp(e) {}
+    explicit NotMatchExpression(MatchExpression* e,
+                                clonable_ptr<ErrorAnnotation> annotation = nullptr)
+        : MatchExpression(NOT, std::move(annotation)), _exp(e) {}
 
     virtual std::unique_ptr<MatchExpression> shallowClone() const {
         std::unique_ptr<NotMatchExpression> self =
-            std::make_unique<NotMatchExpression>(_exp->shallowClone().release());
+            std::make_unique<NotMatchExpression>(_exp->shallowClone().release(), _errorAnnotation);
         if (getTag()) {
             self->setTag(getTag()->clone());
         }
@@ -238,6 +264,14 @@ public:
 
     MatchCategory getCategory() const final {
         return MatchCategory::kLogical;
+    }
+
+    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
+        visitor->visit(this);
+    }
+
+    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
+        visitor->visit(this);
     }
 
 private:

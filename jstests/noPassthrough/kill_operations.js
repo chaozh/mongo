@@ -4,12 +4,18 @@
 (function() {
 "use strict";
 
+load("jstests/libs/parallelTester.js");  // For Thread.
+
 const kDbName = "kill_operations";
 const kCollName = "test";
+const kNumDocs = 10;
+const kBatchSize = 2;
 
 const kOpKey1 = "57710eee-37cf-4c68-a3ac-0b0b900c15d2";
 const kOpKey2 = "488f6050-e331-4483-b356-230a41ec477e";
 const kOpKey3 = "c3eb12fc-4638-4464-8f51-312724ad1710";
+const kOpKey4 = "c7148048-fcf8-4caa-9756-59728052d6a7";
+const kOpKey5 = "c7148048-fcf8-4caa-9756-59728052d6a8";
 
 const st = new ShardingTest({shards: 1, rs: {nodes: 1}, mongos: 1});
 const shardConn = st.rs0.getPrimary();
@@ -82,13 +88,19 @@ function threadRoutine({connStr, dbName, collName, opKey}) {
         limit: 1,
         clientOperationKey: uuidOpKey,
     });
-    assert.commandFailed(ret);
+    assert.commandFailedWithCode(ret, ErrorCodes.Interrupted);
 }
 
 function runTest(conn) {
     const db = conn.getDB(kDbName);
+    const coll = db.getCollection(kCollName);
+
     assert.commandWorked(db.dropDatabase());
-    assert.commandWorked(db.getCollection(kCollName).insert({x: 1}));
+    let bulk = coll.initializeUnorderedBulkOp();
+    for (let i = 0; i < kNumDocs; ++i) {
+        bulk.insert({x: i});
+    }
+    assert.commandWorked(bulk.execute());
 
     // Kill one missing opKey
     killOpKey(conn, [kOpKey1]);
@@ -140,6 +152,30 @@ function runTest(conn) {
     } finally {
         unblockFinds();
     }
+
+    // Test that _killOperations kills the cursors that are associated with the given
+    // operationKeys, and does not fail if any of the cursors are already closed.
+    const res4 = assert.commandWorked(db.runCommand({
+        find: kCollName,
+        filter: {x: {$gte: 0}},
+        batchSize: kBatchSize,
+        clientOperationKey: UUID(kOpKey4),
+    }));
+    const cursorId4 = res4.cursor.id;
+    assert.neq(0, cursorId4);
+
+    const res5 = assert.commandWorked(db.runCommand({
+        find: kCollName,
+        filter: {x: {$lt: 0}},
+        batchSize: kBatchSize,
+        clientOperationKey: UUID(kOpKey5),
+    }));
+    const cursorId5 = res5.cursor.id;
+    assert.eq(0, cursorId5);
+
+    killOpKey(conn, [kOpKey4, kOpKey5]);
+    assert.commandFailedWithCode(db.runCommand({getMore: cursorId4, collection: kCollName}),
+                                 ErrorCodes.CursorNotFound);
 }
 
 // Test killOp against mongod.

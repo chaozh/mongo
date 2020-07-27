@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -36,8 +36,8 @@
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/decorable.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -69,44 +69,52 @@ void ReplClientInfo::setLastOp(OperationContext* opCtx, const OpTime& ot) {
 void ReplClientInfo::setLastOpToSystemLastOpTime(OperationContext* opCtx) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx->getServiceContext());
     if (replCoord->isReplEnabled() && opCtx->writesAreReplicated()) {
+        auto latestWriteOpTimeSW = replCoord->getLatestWriteOpTime(opCtx);
+        auto status = latestWriteOpTimeSW.getStatus();
         OpTime systemOpTime;
-        auto status = [&] {
-            try {
-                // Get the latest OpTime from oplog.
-                systemOpTime = replCoord->getLatestWriteOpTime(opCtx);
-                return Status::OK();
-            } catch (const DBException& e) {
-                // Fall back to use my lastAppliedOpTime if we failed to get the latest OpTime from
-                // storage. In most cases, it is safe to ignore errors because if
-                // getLatestWriteOpTime throws, we cannot use the same opCtx to wait for
-                // writeConcern anyways. But getLastError from the same client could use a different
-                // opCtx to wait for the lastOp. So this is a best effort attempt to set the lastOp
-                // to the in-memory lastAppliedOpTime (which could be lagged). And this is a known
-                // bug in getLastError.
-                systemOpTime = replCoord->getMyLastAppliedOpTime();
-                if (e.toStatus() == ErrorCodes::OplogOperationUnsupported ||
-                    e.toStatus() == ErrorCodes::NamespaceNotFound ||
-                    e.toStatus() == ErrorCodes::CollectionIsEmpty ||
-                    ErrorCodes::isNotMasterError(e.toStatus())) {
-                    // It is ok if the storage engine does not support getLatestOplogTimestamp() or
-                    // if the oplog is empty. If the node stepped down in between, it is correct to
-                    // use lastAppliedOpTime as last OpTime.
-                    return Status::OK();
-                }
-                return e.toStatus();
+        if (status.isOK()) {
+            systemOpTime = latestWriteOpTimeSW.getValue();
+        } else {
+            // Fall back to use my lastAppliedOpTime if we failed to get the latest OpTime from
+            // storage. In most cases, it is safe to ignore errors because if
+            // getLatestWriteOpTime returns an error, we cannot use the same opCtx to wait for
+            // writeConcern anyways. But getLastError from the same client could use a different
+            // opCtx to wait for the lastOp. So this is a best effort attempt to set the lastOp
+            // to the in-memory lastAppliedOpTime (which could be lagged). And this is a known
+            // bug in getLastError.
+            systemOpTime = replCoord->getMyLastAppliedOpTime();
+            if (status == ErrorCodes::OplogOperationUnsupported ||
+                status == ErrorCodes::NamespaceNotFound ||
+                status == ErrorCodes::CollectionIsEmpty || ErrorCodes::isNotMasterError(status)) {
+                // It is ok if the storage engine does not support getLatestOplogTimestamp() or
+                // if the oplog is empty. If the node stepped down in between, it is correct to
+                // use lastAppliedOpTime as last OpTime.
+                status = Status::OK();
             }
-        }();
+            // We will continue trying to set client's lastOp to lastAppliedOpTime as a best-effort
+            // alternative to getLatestWriteOpTime. And we will then throw after setting client's
+            // lastOp if getLatestWriteOpTime has failed with a error code other than the ones
+            // above.
+        }
 
-        // If the system optime has gone backwards, that must mean that there was a rollback.
-        // This is safe, but the last op for a Client should never go backwards, so just leave
-        // the last op for this Client as it was.
-        if (systemOpTime >= _lastOp) {
+        // If the system timestamp has gone backwards, that must mean that there was a rollback.
+        // If the system optime has a higher term but a lower timestamp than the client's lastOp, it
+        // means that this node's wallclock time was ahead of the current primary's before it rolled
+        // back. This is safe, but the timestamp of the last op for a Client should never go
+        // backwards, so just leave the last op for this Client as it was.
+        if (systemOpTime.getTerm() >= _lastOp.getTerm() &&
+            systemOpTime.getTimestamp() >= _lastOp.getTimestamp()) {
             _lastOp = systemOpTime;
         } else {
-            log() << "Not setting the last OpTime for this Client from " << _lastOp
-                  << " to the current system time of " << systemOpTime
-                  << " as that would be moving the OpTime backwards.  This should only happen if "
-                     "there was a rollback recently";
+            LOGV2(21280,
+                  "Not setting the last OpTime for this Client from {lastOp} to the current system "
+                  "time of {systemOpTime} as that would be moving the OpTime backwards.  This "
+                  "should only happen if there was a rollback recently",
+                  "Not setting the last OpTime for this Client to the current system time as that "
+                  "would be moving the OpTime backwards. This should only happen if there was a "
+                  "rollback recently",
+                  "lastOp"_attr = _lastOp,
+                  "systemOpTime"_attr = systemOpTime);
         }
 
         lastOpInfo(opCtx).lastOpSetExplicitly = true;
@@ -122,7 +130,11 @@ void ReplClientInfo::setLastOpToSystemLastOpTimeIgnoringInterrupt(OperationConte
     } catch (const ExceptionForCat<ErrorCategory::Interruption>& e) {
         // In most cases, it is safe to ignore interruption errors because we cannot use the same
         // OperationContext to wait for writeConcern anyways.
-        LOG(2) << "Ignoring set last op interruption error: " << e.toStatus();
+        LOGV2_DEBUG(21281,
+                    2,
+                    "Ignoring set last op interruption error: {error}",
+                    "Ignoring set last op interruption error",
+                    "error"_attr = e.toStatus());
     }
 }
 

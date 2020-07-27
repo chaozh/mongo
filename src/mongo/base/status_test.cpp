@@ -280,12 +280,12 @@ TEST(Transformers, ExceptionToStatus) {
     ASSERT_TRUE(fromBoostExcept.reason().find("boost::exception") != std::string::npos);
 }
 
-DEATH_TEST(ErrorExtraInfo, InvariantAllRegistered, "Invariant failure parsers::") {
+DEATH_TEST_REGEX(ErrorExtraInfo, InvariantAllRegistered, "Invariant failure.*parsers::") {
     ErrorExtraInfo::invariantHaveAllParsers();
 }
 
 #ifdef MONGO_CONFIG_DEBUG_BUILD
-DEATH_TEST(ErrorExtraInfo, DassertShouldHaveExtraInfo, "Fatal Assertion 40680") {
+DEATH_TEST_REGEX(ErrorExtraInfo, DassertShouldHaveExtraInfo, "Fatal assertion.*40680") {
     Status(ErrorCodes::ForTestingErrorExtraInfo, "");
 }
 #else
@@ -294,6 +294,31 @@ TEST(ErrorExtraInfo, ConvertCodeOnMissingExtraInfo) {
     ASSERT_EQ(status, ErrorCodes::duplicateCodeForTest(40671));
 }
 #endif
+
+TEST(ErrorExtraInfo, OptionalExtraInfoDoesNotThrowAndReturnsOriginalError) {
+    const auto status = Status(ErrorCodes::ForTestingOptionalErrorExtraInfo, "");
+    ASSERT_EQ(status, ErrorCodes::ForTestingOptionalErrorExtraInfo);
+    // The ErrorExtraInfo pointer should be nullptr.
+    ASSERT(!status.extraInfo());
+}
+
+TEST(ErrorExtraInfo, OptionalExtraInfoStatusParserThrows) {
+    const auto status =
+        Status(ErrorCodes::ForTestingOptionalErrorExtraInfo, "", fromjson("{data: 123}"));
+    ASSERT_EQ(status, ErrorCodes::duplicateCodeForTest(4696200));
+    ASSERT(!status.extraInfo());
+    ASSERT(!status.extraInfo<OptionalErrorExtraInfoExample>());
+}
+
+TEST(ErrorExtraInfo, OptionalExtraInfoStatusParserWorks) {
+    OptionalErrorExtraInfoExample::EnableParserForTest whenInScope;
+    const auto status =
+        Status(ErrorCodes::ForTestingOptionalErrorExtraInfo, "", fromjson("{data: 123}"));
+    ASSERT_EQ(status, ErrorCodes::ForTestingOptionalErrorExtraInfo);
+    ASSERT(status.extraInfo());
+    ASSERT(status.extraInfo<OptionalErrorExtraInfoExample>());
+    ASSERT_EQ(status.extraInfo<OptionalErrorExtraInfoExample>()->data, 123);
+}
 
 TEST(ErrorExtraInfo, TypedConstructorWorks) {
     const auto status = Status(ErrorExtraInfoExample(123), "");

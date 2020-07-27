@@ -29,12 +29,15 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream_gen.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/resume_token.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
 
@@ -48,10 +51,11 @@ public:
     public:
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec) {
-            return std::make_unique<LiteParsed>(nss);
+            return std::make_unique<LiteParsed>(spec.fieldName(), nss);
         }
 
-        explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
+        explicit LiteParsed(std::string parseTimeName, NamespaceString nss)
+            : LiteParsedDocumentSource(std::move(parseTimeName)), _nss(std::move(nss)) {}
 
         bool isChangeStream() const final {
             return true;
@@ -101,6 +105,9 @@ public:
     // The name of the field where the document key (_id and shard key, if present) will be found
     // after the transformation.
     static constexpr StringData kDocumentKeyField = "documentKey"_sd;
+
+    // The name of the field where the pre-image document will be found, if requested and available.
+    static constexpr StringData kFullDocumentBeforeChangeField = "fullDocumentBeforeChange"_sd;
 
     // The name of the field where the full document will be found after the transformation. The
     // full document is only present for certain types of operations, such as an insert.
@@ -210,6 +217,12 @@ private:
  */
 class DocumentSourceOplogMatch final : public DocumentSourceMatch {
 public:
+    DocumentSourceOplogMatch(const DocumentSourceOplogMatch& other) : DocumentSourceMatch(other) {}
+
+    virtual boost::intrusive_ptr<DocumentSourceMatch> clone() const {
+        return make_intrusive<std::decay_t<decltype(*this)>>(*this);
+    }
+
     static boost::intrusive_ptr<DocumentSourceOplogMatch> create(
         BSONObj filter, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
@@ -228,7 +241,7 @@ public:
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
 
 private:
-    DocumentSourceOplogMatch(BSONObj filter, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    using DocumentSourceMatch::DocumentSourceMatch;
 };
 
 }  // namespace mongo

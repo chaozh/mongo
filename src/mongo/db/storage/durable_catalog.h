@@ -134,6 +134,10 @@ public:
                                     const NamespaceString& toNss,
                                     bool stayTemp) = 0;
 
+    /**
+     * Expects (invariants) that all of the index catalog entries have been removed already via
+     * removeIndex.
+     */
     virtual Status dropCollection(OperationContext* opCtx, RecordId catalogId) = 0;
 
     /**
@@ -151,6 +155,15 @@ public:
                                   StringData idxName,
                                   long long newExpireSeconds) = 0;
 
+    /*
+     * Hide or unhide the given index. A hidden index will not be considered for use by the
+     * query planner.
+     */
+    virtual void updateHiddenSetting(OperationContext* opCtx,
+                                     RecordId catalogId,
+                                     StringData idxName,
+                                     bool hidden) = 0;
+
     /** Compares the UUID argument to the UUID obtained from the metadata. Returns true if they are
      * equal, false otherwise.
      */
@@ -162,6 +175,11 @@ public:
      * Updates the 'temp' setting for this collection.
      */
     virtual void setIsTemp(OperationContext* opCtx, RecordId catalogId, bool isTemp) = 0;
+
+    /**
+     * Updates whether updates/deletes should store their pre-images in the opLog.
+     */
+    virtual void setRecordPreImages(OperationContext* opCtx, RecordId catalogId, bool val) = 0;
 
     /**
      * Updates the validator for this collection.

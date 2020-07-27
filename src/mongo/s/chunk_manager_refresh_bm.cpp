@@ -122,7 +122,10 @@ void BM_IncrementalRefreshOfPessimalBalancedDistribution(benchmark::State& state
     }
 }
 
-BENCHMARK(BM_IncrementalRefreshOfPessimalBalancedDistribution)->Args({2, 50000});
+BENCHMARK(BM_IncrementalRefreshOfPessimalBalancedDistribution)
+    ->Args({2, 50000})
+    ->Args({2, 250000})
+    ->Args({2, 500000});
 
 template <typename ShardSelectorFn>
 auto BM_FullBuildOfChunkManager(benchmark::State& state, ShardSelectorFn selectShard) {
@@ -269,6 +272,24 @@ void BM_GetShardIdsForRange(benchmark::State& state,
 }
 
 template <typename CollectionMetadataBuilderFn>
+void BM_GetShardIdsForRangeMinKeyToMaxKey(benchmark::State& state,
+                                          CollectionMetadataBuilderFn makeCollectionMetadata) {
+    const int nShards = state.range(0);
+    const int nChunks = state.range(1);
+
+    auto cm = makeCollectionMetadata(nShards, nChunks);
+    auto min = BSON("_id" << MINKEY);
+    auto max = BSON("_id" << MAXKEY);
+
+    for (auto keepRunning : state) {
+        std::set<ShardId> shardIds;
+        cm->getChunkManager()->getShardIdsForRange(min, max, &shardIds);
+    }
+
+    state.SetItemsProcessed(state.iterations());
+}
+
+template <typename CollectionMetadataBuilderFn>
 void BM_KeyBelongsToMe(benchmark::State& state,
                        CollectionMetadataBuilderFn makeCollectionMetadata) {
     const int nShards = state.range(0);
@@ -333,6 +354,12 @@ MONGO_INITIALIZER(RegisterBenchmarks)(InitializerContext* context) {
             BM_GetShardIdsForRange, Pessimal, makeChunkManagerWithPessimalBalancedDistribution),
         REGISTER_BENCHMARK_CAPTURE(
             BM_GetShardIdsForRange, Optimal, makeChunkManagerWithOptimalBalancedDistribution),
+        REGISTER_BENCHMARK_CAPTURE(BM_GetShardIdsForRangeMinKeyToMaxKey,
+                                   Pessimal,
+                                   makeChunkManagerWithPessimalBalancedDistribution),
+        REGISTER_BENCHMARK_CAPTURE(BM_GetShardIdsForRangeMinKeyToMaxKey,
+                                   Optimal,
+                                   makeChunkManagerWithOptimalBalancedDistribution),
         REGISTER_BENCHMARK_CAPTURE(
             BM_KeyBelongsToMe, Pessimal, makeChunkManagerWithPessimalBalancedDistribution),
         REGISTER_BENCHMARK_CAPTURE(

@@ -389,6 +389,7 @@ var ShardingTest = function(params) {
     this.stop = function(opts = {}) {
         this.checkUUIDsConsistentAcrossCluster();
         this.checkIndexesConsistentAcrossCluster();
+        this.checkOrphansAreDeleted();
 
         if (jsTestOptions().alwaysUseLogFiles) {
             if (opts.noCleanData === false) {
@@ -559,7 +560,7 @@ var ShardingTest = function(params) {
     this.chunkDiff = function(collName, dbName) {
         var c = this.chunkCounts(collName, dbName);
 
-        var min = 100000000;
+        var min = Number.MAX_VALUE;
         var max = 0;
         for (var s in c) {
             if (c[s] < min)
@@ -710,13 +711,18 @@ var ShardingTest = function(params) {
 
     /**
      * Kills the mongos with index n.
+     *
+     * @param {boolean} [extraOptions.waitPid=true] if true, we will wait for the process to
+     * terminate after stopping it.
      */
-    this.stopMongos = function(n, opts) {
+    this.stopMongos = function(n, opts, {
+        waitpid: waitpid = true,
+    } = {}) {
         if (otherParams.useBridge) {
-            MongoRunner.stopMongos(unbridgedMongos[n], undefined, opts);
+            MongoRunner.stopMongos(unbridgedMongos[n], undefined, opts, waitpid);
             this["s" + n].stop();
         } else {
-            MongoRunner.stopMongos(this["s" + n], undefined, opts);
+            MongoRunner.stopMongos(this["s" + n], undefined, opts, waitpid);
         }
     };
 
@@ -964,67 +970,67 @@ var ShardingTest = function(params) {
      * Returns whether any settings to ShardingTest or jsTestOptions indicate this is a multiversion
      * cluster.
      *
-     * Checks for 'last-stable' bin versions via:
+     * Checks for 'last-lts' bin versions via:
      *     jsTestOptions().shardMixedBinVersions, jsTestOptions().mongosBinVersion,
      *     otherParams.configOptions.binVersion, otherParams.shardOptions.binVersion,
      *     otherParams.mongosOptions.binVersion
      */
     this.isMixedVersionCluster = function() {
-        var lastStableBinVersion = MongoRunner.getBinVersionFor('last-stable');
+        var lastLTSBinVersion = MongoRunner.getBinVersionFor('last-lts');
 
         // Must check shardMixedBinVersion because it causes shardOptions.binVersion to be an object
         // (versionIterator) rather than a version string. Must check mongosBinVersion, as well,
         // because it does not update mongosOptions.binVersion.
         if (jsTestOptions().shardMixedBinVersions ||
             (jsTestOptions().mongosBinVersion &&
-             MongoRunner.areBinVersionsTheSame(lastStableBinVersion,
+             MongoRunner.areBinVersionsTheSame(lastLTSBinVersion,
                                                jsTestOptions().mongosBinVersion))) {
             return true;
         }
 
-        // Check for 'last-stable' config servers.
+        // Check for 'last-lts' config servers.
         if (otherParams.configOptions && otherParams.configOptions.binVersion &&
             MongoRunner.areBinVersionsTheSame(
-                lastStableBinVersion,
+                lastLTSBinVersion,
                 MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion))) {
             return true;
         }
         for (var i = 0; i < numConfigs; ++i) {
             if (otherParams['c' + i] && otherParams['c' + i].binVersion &&
                 MongoRunner.areBinVersionsTheSame(
-                    lastStableBinVersion,
+                    lastLTSBinVersion,
                     MongoRunner.getBinVersionFor(otherParams['c' + i].binVersion))) {
                 return true;
             }
         }
 
-        // Check for 'last-stable' mongod servers.
+        // Check for 'last-lts' mongod servers.
         if (otherParams.shardOptions && otherParams.shardOptions.binVersion &&
             MongoRunner.areBinVersionsTheSame(
-                lastStableBinVersion,
+                lastLTSBinVersion,
                 MongoRunner.getBinVersionFor(otherParams.shardOptions.binVersion))) {
             return true;
         }
         for (var i = 0; i < numShards; ++i) {
             if (otherParams['d' + i] && otherParams['d' + i].binVersion &&
                 MongoRunner.areBinVersionsTheSame(
-                    lastStableBinVersion,
+                    lastLTSBinVersion,
                     MongoRunner.getBinVersionFor(otherParams['d' + i].binVersion))) {
                 return true;
             }
         }
 
-        // Check for 'last-stable' mongos servers.
+        // Check for 'last-lts' mongos servers.
         if (otherParams.mongosOptions && otherParams.mongosOptions.binVersion &&
             MongoRunner.areBinVersionsTheSame(
-                lastStableBinVersion,
+                lastLTSBinVersion,
                 MongoRunner.getBinVersionFor(otherParams.mongosOptions.binVersion))) {
             return true;
         }
         for (var i = 0; i < numMongos; ++i) {
             if (otherParams['s' + i] && otherParams['s' + i].binVersion &&
                 MongoRunner.areBinVersionsTheSame(
-                    lastStableBinVersion,
+                    lastLTSBinVersion,
                     MongoRunner.getBinVersionFor(otherParams['s' + i].binVersion))) {
                 return true;
             }
@@ -1214,7 +1220,7 @@ var ShardingTest = function(params) {
 
     let randomSeedAlreadySet = false;
 
-    if (jsTest.options().randomBinVersions) {
+    if (jsTest.options().useRandomBinVersionsWithinReplicaSet) {
         // We avoid setting the random seed unequivocally to avoid unexpected behavior in tests
         // that already make use of Random.setRandomSeed(). This conditional can be removed if
         // it becomes the standard to always be generating the seed through ShardingTest.
@@ -1259,11 +1265,11 @@ var ShardingTest = function(params) {
                     // If the test doesn't depend on specific shard binVersions, create a mixed
                     // version
                     // shard cluster that randomly assigns shard binVersions, half "latest" and half
-                    // "last-stable".
+                    // "last-lts".
                     if (!otherParams.shardOptions.binVersion) {
                         Random.setRandomSeed();
                         otherParams.shardOptions.binVersion =
-                            MongoRunner.versionIterator(["latest", "last-stable"], true);
+                            MongoRunner.versionIterator(["latest", "last-lts"], true);
                     }
                 }
 
@@ -1334,11 +1340,11 @@ var ShardingTest = function(params) {
                 }
                 // If the test doesn't depend on specific shard binVersions, create a mixed version
                 // shard cluster that randomly assigns shard binVersions, half "latest" and half
-                // "last-stable".
+                // "last-lts".
                 if (!otherParams.shardOptions.binVersion) {
                     Random.setRandomSeed();
                     otherParams.shardOptions.binVersion =
-                        MongoRunner.versionIterator(["latest", "last-stable"], true);
+                        MongoRunner.versionIterator(["latest", "last-lts"], true);
                 }
             }
 
@@ -1489,6 +1495,7 @@ var ShardingTest = function(params) {
         }
 
         var rs = this._rs[i].test;
+        rs.awaitNodesAgreeOnPrimary();
         rs.getPrimary().getDB("admin").foo.save({x: 1});
 
         if (this.keyFile) {
@@ -1498,7 +1505,6 @@ var ShardingTest = function(params) {
         }
 
         rs.awaitSecondaryNodes();
-
         var rsConn = new Mongo(rs.getURL());
         rsConn.name = rs.getURL();
 
@@ -1512,6 +1518,7 @@ var ShardingTest = function(params) {
     this.configRS.initiateWithAnyNodeAsPrimary(config);
 
     // Wait for master to be elected before starting mongos
+    this.configRS.awaitNodesAgreeOnPrimary();
     var csrsPrimary = this.configRS.getPrimary();
 
     print("ShardingTest startup and initiation for all nodes took " + (new Date() - startTime) +
@@ -1537,6 +1544,12 @@ var ShardingTest = function(params) {
         options = Object.merge(options, otherParams.mongosOptions);
         options = Object.merge(options, otherParams["s" + i]);
 
+        // The default time for mongos quiesce mode in response to SIGTERM is 15 seconds.
+        // Reduce this to 100ms for faster shutdown.
+        options.setParameter = options.setParameter || {};
+        options.setParameter.mongosShutdownTimeoutMillisForSignaledShutdown =
+            options.setParameter.mongosShutdownTimeoutMillisForSignaledShutdown || 100;
+
         options.port = options.port || _allocatePortForMongos();
 
         mongosOptions.push(options);
@@ -1546,7 +1559,7 @@ var ShardingTest = function(params) {
     if (_hasNewFeatureCompatibilityVersion() && this.isMixedVersionCluster()) {
         function setFeatureCompatibilityVersion() {
             assert.commandWorked(
-                csrsPrimary.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+                csrsPrimary.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
 
             // Wait for the new featureCompatibilityVersion to propagate to all nodes in the CSRS
             // to ensure that older versions of mongos can successfully connect.
@@ -1695,12 +1708,12 @@ var ShardingTest = function(params) {
     // Ensure that the sessions collection exists so jstests can run things with
     // logical sessions and test them. We do this by forcing an immediate cache refresh
     // on the config server, which auto-shards the collection for the cluster.
-    var lastStableBinVersion = MongoRunner.getBinVersionFor('last-stable');
+    var lastLTSBinVersion = MongoRunner.getBinVersionFor('last-lts');
     if ((!otherParams.configOptions) ||
         (otherParams.configOptions && !otherParams.configOptions.binVersion) ||
         (otherParams.configOptions && otherParams.configOptions.binVersion &&
          MongoRunner.areBinVersionsTheSame(
-             lastStableBinVersion,
+             lastLTSBinVersion,
              MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion)))) {
         this.configRS.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1});
 
@@ -1750,3 +1763,7 @@ ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {};
 
 // Stub for a hook to check that indexes are consistent across shards.
 ShardingTest.prototype.checkIndexesConsistentAcrossCluster = function() {};
+
+ShardingTest.prototype.checkOrphansAreDeleted = function() {
+    print("Unhooked function");
+};

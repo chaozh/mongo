@@ -59,7 +59,7 @@ public:
 
     ReplicationCoordinatorExternalStateMock();
     virtual ~ReplicationCoordinatorExternalStateMock();
-    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startThreads() override;
     virtual void startSteadyStateReplication(OperationContext* opCtx,
                                              ReplicationCoordinator* replCoord) override;
     virtual void stopDataReplication(OperationContext* opCtx) override;
@@ -76,7 +76,9 @@ public:
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx);
-    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config);
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx,
+                                            const BSONObj& config,
+                                            bool writeOplog);
     virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx);
     virtual Status storeLocalLastVoteDocument(OperationContext* opCtx, const LastVote& lastVote);
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime);
@@ -84,15 +86,14 @@ public:
     bool oplogExists(OperationContext* opCtx) override;
     virtual StatusWith<OpTimeAndWallTime> loadLastOpTimeAndWallTime(OperationContext* opCtx);
     virtual void closeConnections();
-    virtual void shardingOnStepDownHook();
-    virtual void clearOplogVisibilityStateForStepDown() override;
+    virtual void onStepDownHook();
     virtual void signalApplierToChooseNewSyncSource();
     virtual void stopProducer();
     virtual void startProducerIfStopped();
     virtual bool tooStale();
     virtual void dropAllSnapshots();
     virtual void updateCommittedSnapshot(const OpTime& newCommitPoint);
-    virtual void updateLocalSnapshot(const OpTime& optime);
+    virtual void updateLastAppliedSnapshot(const OpTime& optime);
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
     boost::optional<OpTime> getEarliestDropPendingOpTime() const final;
@@ -107,6 +108,12 @@ public:
      * messages.
      */
     void addSelf(const HostAndPort& host);
+
+    /**
+     * Remove all hosts from the list of hosts that this mock will match when responding to "isSelf"
+     * messages.
+     */
+    void clearSelfHosts();
 
     /**
      * Sets the return value for subsequent calls to loadLocalConfigDocument().

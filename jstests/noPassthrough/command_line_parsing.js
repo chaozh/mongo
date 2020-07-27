@@ -27,7 +27,6 @@ var m2result = m2.getDB("admin").runCommand("getCmdLineOpts");
 MongoRunner.stopMongod(m2);
 
 // remove variables that depend on the way the test is started.
-delete m2result.parsed.net.serviceExecutor;
 delete m2result.parsed.net.transportLayer;
 delete m2result.parsed.storage.mmapv1;
 delete m2result.parsed.setParameter;
@@ -36,7 +35,6 @@ delete m2result.parsed.storage.inMemory;
 delete m2result.parsed.storage.journal;
 delete m2result.parsed.storage.rocksdb;
 delete m2result.parsed.storage.wiredTiger;
-delete m2result.parsed.systemLog;
 delete m2result.parsed.replication;  // Removes enableMajorityReadConcern setting.
 assert.docEq(m2expected.parsed, m2result.parsed);
 
@@ -57,7 +55,6 @@ var m3result = m3.getDB("admin").runCommand("getCmdLineOpts");
 MongoRunner.stopMongod(m3);
 
 // remove variables that depend on the way the test is started.
-delete m3result.parsed.net.serviceExecutor;
 delete m3result.parsed.net.transportLayer;
 delete m3result.parsed.storage.mmapv1;
 delete m3result.parsed.setParameter;
@@ -66,6 +63,5 @@ delete m3result.parsed.storage.inMemory;
 delete m3result.parsed.storage.journal;
 delete m3result.parsed.storage.rocksdb;
 delete m3result.parsed.storage.wiredTiger;
-delete m3result.parsed.systemLog;
 delete m3result.parsed.replication;  // Removes enableMajorityReadConcern setting.
 assert.docEq(m3expected.parsed, m3result.parsed);

@@ -54,7 +54,7 @@ public:
     /**
      * Does nothing.
      */
-    void shutdown() override;
+    void shutdown(OperationContext* opCtx) override;
 
     StatusWith<SharedSemiFuture<ReplIndexBuildState::IndexCatalogStats>> startIndexBuild(
         OperationContext* opCtx,
@@ -65,14 +65,40 @@ public:
         IndexBuildProtocol protocol,
         IndexBuildOptions indexBuildOptions) override;
 
+    void setSignalAndCancelVoteRequestCbkIfActive(WithLock ReplIndexBuildStateLk,
+                                                  OperationContext* opCtx,
+                                                  std::shared_ptr<ReplIndexBuildState> replState,
+                                                  IndexBuildAction signal) override;
+
     /**
      * None of the following functions should ever be called on an embedded server node.
      */
-    Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) override;
+    Status voteCommitIndexBuild(OperationContext* opCtx,
+                                const UUID& buildUUID,
+                                const HostAndPort& hostAndPort) override;
     Status setCommitQuorum(OperationContext* opCtx,
                            const NamespaceString& nss,
                            const std::vector<StringData>& indexNames,
                            const CommitQuorumOptions& newCommitQuorum) override;
+
+private:
+    void _signalIfCommitQuorumIsSatisfied(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    bool _signalIfCommitQuorumNotEnabled(OperationContext* opCtx,
+                                         std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    void _signalPrimaryForCommitReadiness(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    IndexBuildAction _drainSideWritesUntilNextActionIsAvailable(
+        OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) {
+        return {};
+    };
+
+    void _waitForNextIndexBuildActionAndCommit(OperationContext* opCtx,
+                                               std::shared_ptr<ReplIndexBuildState> replState,
+                                               const IndexBuildOptions& indexBuildOptions) override;
 };
 
 }  // namespace mongo

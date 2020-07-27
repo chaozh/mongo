@@ -5,7 +5,9 @@
  * enableMajorityReadConcern=true.
  * Rollback after restarting with enableMajorityReadConcern=true succeeds if the common point is at
  * least the stable timestamp, i.e. we do not attempt to roll back operations that were included in
- * @tags: [requires_persistence, requires_fcv_44]
+ * @tags: [
+ *   requires_persistence,
+ * ]
  */
 (function() {
 "use strict";
@@ -51,13 +53,17 @@ jsTest.log("Attempt to roll back. This will fassert.");
 rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
 rollbackTest.transitionToSyncSourceOperationsDuringRollback();
 assert.soon(() => {
-    return rawMongoProgramOutput().indexOf("Fatal Assertion 51121") !== -1;
+    return rawMongoProgramOutput().search(/Fatal assertion.+51121/) != -1;
 });
 
 jsTest.log(
     "Restart the rollback node with enableMajorityReadConcern=false. Now the rollback can succeed.");
 const allowedExitCode = 14;
 rollbackTest.restartNode(0, 15, {enableMajorityReadConcern: "false"}, allowedExitCode);
+
+// Ensure that the secondary has completed rollback by waiting for its last optime to equal the
+// primary's.
+rollbackTest.awaitReplication();
 
 // Fix counts for "local.startup_log", since they are corrupted by this rollback.
 // transitionToSteadyStateOperations() checks collection counts.

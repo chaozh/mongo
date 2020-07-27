@@ -62,10 +62,8 @@ struct StorageEngineOptions {
 
 class StorageEngineImpl final : public StorageEngineInterface, public StorageEngine {
 public:
-    /**
-     * @param engine - ownership passes to me.
-     */
-    StorageEngineImpl(KVEngine* engine, StorageEngineOptions options = StorageEngineOptions());
+    StorageEngineImpl(std::unique_ptr<KVEngine> engine,
+                      StorageEngineOptions options = StorageEngineOptions());
 
     virtual ~StorageEngineImpl();
 
@@ -79,10 +77,6 @@ public:
         return _supportsDocLocking;
     }
 
-    virtual bool supportsDBLocking() const override {
-        return _supportsDBLocking;
-    }
-
     virtual bool supportsCappedCollections() const override {
         return _supportsCappedCollections;
     }
@@ -91,7 +85,7 @@ public:
 
     virtual Status dropDatabase(OperationContext* opCtx, StringData db) override;
 
-    virtual int flushAllFiles(OperationContext* opCtx, bool sync) override;
+    virtual void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) override;
 
     virtual Status beginBackup(OperationContext* opCtx) override;
 
@@ -99,7 +93,7 @@ public:
 
     virtual Status disableIncrementalBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<BackupInformation> beginNonBlockingBackup(
+    virtual StatusWith<std::unique_ptr<StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override;
@@ -126,16 +120,14 @@ public:
 
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
+    virtual Timestamp getInitialDataTimestamp() override;
+
     virtual void setOldestTimestampFromStable() override;
 
     virtual void setOldestTimestamp(Timestamp newOldestTimestamp) override;
 
     virtual void setOldestActiveTransactionTimestampCallback(
         StorageEngine::OldestActiveTransactionTimestampCallback) override;
-
-    virtual bool isCacheUnderPressure(OperationContext* opCtx) const override;
-
-    virtual void setCachePressureForTest(int pressure) override;
 
     virtual bool supportsRecoverToStableTimestamp() const override;
 
@@ -159,13 +151,11 @@ public:
 
     bool supportsOplogStones() const final;
 
+    bool supportsResumableIndexBuilds() const final;
+
     bool supportsPendingDrops() const final;
 
     void clearDropPendingState() final;
-
-    bool supportsTwoPhaseIndexBuild() const final;
-
-    void triggerJournalFlush() const final;
 
     SnapshotManager* getSnapshotManager() const final;
 
@@ -332,22 +322,6 @@ public:
         return _catalog.get();
     }
 
-    std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) override {
-        return _engine->getCheckpointLock(opCtx);
-    }
-
-    void addIndividuallyCheckpointedIndexToList(const std::string& ident) override {
-        return _engine->addIndividuallyCheckpointedIndexToList(ident);
-    }
-
-    void clearIndividuallyCheckpointedIndexesList() override {
-        return _engine->clearIndividuallyCheckpointedIndexesList();
-    }
-
-    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const override {
-        return _engine->isInIndividuallyCheckpointedIndexesList(ident);
-    }
-
     StatusWith<ReconcileResult> reconcileCatalogAndIdents(OperationContext* opCtx) override;
 
     std::string getFilesystemPathForDb(const std::string& dbName) const override;
@@ -409,6 +383,15 @@ private:
      */
     void _onMinOfCheckpointAndOldestTimestampChanged(const Timestamp& timestamp);
 
+    /**
+     * Returns whether the given ident is an internal ident and if it should be dropped or used to
+     * resume an index build.
+     */
+    bool _handleInternalIdents(OperationContext* opCtx,
+                               const std::string& ident,
+                               ReconcileResult* reconcileResult,
+                               std::set<std::string>* internalIdentsToDrop);
+
     class RemoveDBChange;
 
     // This must be the first member so it is destroyed last.
@@ -423,7 +406,6 @@ private:
     TimestampMonitor::TimestampListener _minOfCheckpointAndOldestTimestampListener;
 
     const bool _supportsDocLocking;
-    const bool _supportsDBLocking;
     const bool _supportsCappedCollections;
     Timestamp _initialDataTimestamp = Timestamp::kAllowUnstableCheckpointsSentinel;
 

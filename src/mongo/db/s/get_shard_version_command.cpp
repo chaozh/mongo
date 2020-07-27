@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,10 +38,8 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -88,29 +86,21 @@ public:
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
-        ShardingState* const shardingState = ShardingState::get(opCtx);
-        if (shardingState->enabled()) {
-            result.append(
-                "configServer",
-                Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
-        } else {
-            result.append("configServer", "");
-        }
+        uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
-        ShardedConnectionInfo* const sci = ShardedConnectionInfo::get(opCtx->getClient(), false);
-        result.appendBool("inShardedMode", sci != nullptr);
+        result.append(
+            "configServer",
+            Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
 
-        if (sci && sci->getVersion(nss.ns())) {
-            result.appendTimestamp("mine", sci->getVersion(nss.ns())->toLong());
-        } else {
-            result.appendTimestamp("mine", 0);
-        }
+        // Legacy boolean related to sharded connections. To remove in 4.8.
+        result.appendBool("inShardedMode", false);
+        result.appendTimestamp("mine", 0);
 
         AutoGetCollection autoColl(
             opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsPermitted);
-        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
+        auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
 
-        const auto optMetadata = css->getCurrentMetadataIfKnown();
+        const auto optMetadata = csr->getCurrentMetadataIfKnown();
         if (!optMetadata) {
             result.append("global", "UNKNOWN");
 
@@ -119,20 +109,16 @@ public:
             }
         } else {
             const auto& metadata = *optMetadata;
-            result.appendTimestamp("global", metadata->getShardVersion().toLong());
+            result.appendTimestamp("global", metadata.getShardVersion().toLong());
 
             if (cmdObj["fullMetadata"].trueValue()) {
                 BSONObjBuilder metadataBuilder(result.subobjStart("metadata"));
-                if (metadata->isSharded()) {
-                    metadata->toBSONBasic(metadataBuilder);
+                if (metadata.isSharded()) {
+                    metadata.toBSONBasic(metadataBuilder);
 
                     BSONArrayBuilder chunksArr(metadataBuilder.subarrayStart("chunks"));
-                    metadata->toBSONChunks(&chunksArr);
+                    metadata.toBSONChunks(&chunksArr);
                     chunksArr.doneFast();
-
-                    BSONArrayBuilder pendingArr(metadataBuilder.subarrayStart("pending"));
-                    css->toBSONPending(pendingArr);
-                    pendingArr.doneFast();
                 }
                 metadataBuilder.doneFast();
             }

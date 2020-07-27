@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -150,6 +150,10 @@ boost::optional<TxnNumber> ClusterClientCursorMock::getTxnNumber() const {
 }
 
 boost::optional<ReadPreferenceSetting> ClusterClientCursorMock::getReadPreference() const {
+    return boost::none;
+}
+
+boost::optional<ReadConcernArgs> ClusterClientCursorMock::getReadConcern() const {
     return boost::none;
 }
 

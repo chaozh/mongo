@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,9 +35,9 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -60,7 +60,10 @@ PeriodicJobAnchor launchBalancerConfigRefresher(ServiceContext* serviceContext) 
 
             Status status = balancerConfig->refreshAndCheck(opCtx.get());
             if (!status.isOK()) {
-                log() << "Failed to refresh balancer configuration" << causedBy(status);
+                LOGV2(22048,
+                      "Failed to refresh balancer configuration: {error}",
+                      "Failed to refresh balancer configuration",
+                      "error"_attr = redact(status));
             }
         },
         Seconds(30));

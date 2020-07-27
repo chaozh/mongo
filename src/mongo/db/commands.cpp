@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -54,6 +54,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
@@ -62,12 +63,13 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/invariant.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 
-using logger::LogComponent;
+using logv2::LogComponent;
+const std::set<std::string> kNoApiVersions = {};
+const std::set<std::string> kApiVersions1 = {"1"};
 
 namespace {
 
@@ -110,12 +112,12 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
 }
 
 // The command names that are allowed in a multi-document transaction.
-const StringMap<int> txnCmdWhitelistFCV44 = {
-    {"create", 1}, {"createIndexes", 1}, {"_configsvrCreateCollection", 1}};
 const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
                                         {"aggregate", 1},
                                         {"commitTransaction", 1},
                                         {"coordinateCommitTransaction", 1},
+                                        {"create", 1},
+                                        {"createIndexes", 1},
                                         {"delete", 1},
                                         {"distinct", 1},
                                         {"find", 1},
@@ -128,14 +130,15 @@ const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
                                         {"prepareTransaction", 1},
                                         {"update", 1}};
 
-// The commands that can be run on the 'admin' database in multi-document transactions.
-const StringMap<int> txnAdminCommands = {{"abortTransaction", 1},
-                                         {"commitTransaction", 1},
-                                         {"coordinateCommitTransaction", 1},
-                                         {"prepareTransaction", 1}};
+auto getCommandInvocationHooksHandle =
+    ServiceContext::declareDecoration<std::shared_ptr<CommandInvocationHooks>>();
 
 }  // namespace
 
+void CommandInvocationHooks::set(ServiceContext* serviceContext,
+                                 std::shared_ptr<CommandInvocationHooks> hooks) {
+    getCommandInvocationHooksHandle(serviceContext) = std::move(hooks);
+}
 
 //////////////////////////////////////////////////////////////
 // CommandHelpers
@@ -162,6 +165,23 @@ BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgR
         appendCommandStatusNoThrow(body, ex.toStatus());
     }
     return replyBuilder.releaseBody();
+}
+
+void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
+                                          const OpMsgRequest& request,
+                                          CommandInvocation* invocation,
+                                          rpc::ReplyBuilderInterface* response) {
+    auto hooks = getCommandInvocationHooksHandle(opCtx->getServiceContext());
+
+    if (hooks) {
+        hooks->onBeforeRun(opCtx, request, invocation);
+    }
+
+    invocation->run(opCtx, response);
+
+    if (hooks) {
+        hooks->onAfterRun(opCtx, request, invocation);
+    }
 }
 
 void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
@@ -316,8 +336,9 @@ bool CommandHelpers::extractOrAppendOk(BSONObjBuilder& reply) {
         // If ok is present, use its truthiness.
         return okField.trueValue();
     }
+
     // Missing "ok" field is an implied success.
-    CommandHelpers::appendSimpleCommandStatus(reply, true);
+    reply.append("ok", 1.0);
     return true;
 }
 
@@ -327,9 +348,12 @@ void CommandHelpers::appendCommandWCStatus(BSONObjBuilder& result,
     if (!awaitReplicationStatus.isOK() && !result.hasField("writeConcernError")) {
         WriteConcernErrorDetail wcError;
         wcError.setStatus(awaitReplicationStatus);
+        BSONObjBuilder errInfoBuilder;
         if (wcResult.wTimedOut) {
-            wcError.setErrInfo(BSON("wtimeout" << true));
+            errInfoBuilder.append("wtimeout", true);
         }
+        errInfoBuilder.append(kWriteConcernField, wcResult.wcUsed.toBSON());
+        wcError.setErrInfo(errInfoBuilder.obj());
         result.append("writeConcernError", wcError.toBSON());
     }
 }
@@ -453,29 +477,22 @@ void CommandHelpers::canUseTransactions(const NamespaceString& nss,
             cmdName != "count"_sd);
 
     auto inTxnWhitelist = txnCmdWhitelist.find(cmdName) != txnCmdWhitelist.cend();
-    auto inTxnWhitelistFCV44 = txnCmdWhitelistFCV44.find(cmdName) != txnCmdWhitelistFCV44.cend();
-    auto isFullyUpgradedTo44 =
-        (serverGlobalParams.featureCompatibility.getVersion() ==
-         ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
-
-    uassert(ErrorCodes::OperationNotSupportedInTransaction,
-            str::stream() << "Cannot run '" << cmdName
-                          << "' in a multi-document transaction unless the "
-                             "featureCompatibilityVersion is equal to 4.4.",
-            isFullyUpgradedTo44 || !inTxnWhitelistFCV44);
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction.",
-            inTxnWhitelist || inTxnWhitelistFCV44);
+            inTxnWhitelist);
 
     const auto dbName = nss.db();
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run command against the '" << dbName
                           << "' database in a transaction.",
-            dbName != NamespaceString::kLocalDb &&
-                (dbName != NamespaceString::kAdminDb ||
-                 txnAdminCommands.find(cmdName) != txnAdminCommands.cend()));
+            dbName != NamespaceString::kLocalDb);
+
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
+            str::stream() << "Cannot run command against the '" << nss
+                          << "' collection in a transaction.",
+            !nss.isSystemDotProfile());
 
     if (allowTransactionsOnConfigDatabase) {
         uassert(ErrorCodes::OperationNotSupportedInTransaction,
@@ -503,33 +520,61 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
                                                         const CommandInvocation* invocation,
                                                         Client* client) {
     const Command* cmd = invocation->definition();
-    const NamespaceString& nss = invocation->ns();
+    NamespaceString nss;
+    try {
+        nss = invocation->ns();
+    } catch (const ExceptionFor<ErrorCodes::InvalidNamespace>&) {
+        return false;
+    }
+    return shouldActivateFailCommandFailPoint(data, nss, cmd, client);
+}
+
+bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
+                                                        const NamespaceString& nss,
+                                                        const Command* cmd,
+                                                        Client* client) {
     if (cmd->getName() == "configureFailPoint"_sd)  // Banned even if in failCommands.
         return false;
-
-    if (data.hasField("threadName") &&
-        (client->desc() !=
-         data.getStringField(
-             "threadName"))) {  // only activate failpoint on thread from certain client
-        return false;
-    }
-
-    if (client->session() && (client->session()->getTags() & transport::Session::kInternalClient)) {
-        if (!data.hasField("failInternalCommands") || !data.getBoolField("failInternalCommands")) {
-            return false;
-        }
-    }
 
     if (!client->session()) {
         return false;
     }
 
-    if (data.hasField("namespace") && nss != NamespaceString(data.getStringField("namespace"))) {
+    auto threadName = client->desc();
+    auto appName = StringData();
+    if (const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata()) {
+        appName = clientMetadata.get().getApplicationName();
+    }
+    auto isInternalClient = client->session()->getTags() & transport::Session::kInternalClient;
+
+    if (data.hasField("threadName") && (threadName != data.getStringField("threadName"))) {
+        return false;  // only activate failpoint on thread from certain client
+    }
+
+    if (data.hasField("appName") && (appName != data.getStringField("appName"))) {
+        return false;  // only activate failpoint on connection with a certain appName
+    }
+
+    if (data.hasField("namespace") && (nss != NamespaceString(data.getStringField("namespace")))) {
+        return false;
+    }
+
+    if (!(data.hasField("failInternalCommands") && data.getBoolField("failInternalCommands")) &&
+        isInternalClient) {
         return false;
     }
 
     for (auto&& failCommand : data.getObjectField("failCommands")) {
         if (failCommand.type() == String && cmd->hasAlias(failCommand.valueStringData())) {
+            LOGV2(4898500,
+                  "Should activate 'failCommand' failpoint",
+                  "data"_attr = data,
+                  "threadName"_attr = threadName,
+                  "appName"_attr = appName,
+                  "namespace"_attr = nss,
+                  "isInternalClient"_attr = isInternalClient,
+                  "command"_attr = cmd->getName());
+
             return true;
         }
     }
@@ -540,6 +585,7 @@ bool CommandHelpers::shouldActivateFailCommandFailPoint(const BSONObj& data,
 void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
                                                   const CommandInvocation* invocation) {
     bool closeConnection;
+    bool blockConnection;
     bool hasErrorCode;
     /**
      * Default value is used to suppress the uassert for `errorExtraInfo` if `errorCode` is not set.
@@ -565,22 +611,53 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
 
             if (closeConnection) {
                 opCtx->getClient()->session()->end();
-                log() << "Failing command '" << cmd->getName()
-                      << "' via 'failCommand' failpoint. Action: closing connection.";
+                LOGV2(20431,
+                      "Failing {command} via 'failCommand' failpoint: closing connection",
+                      "Failing command via 'failCommand' failpoint: closing connection",
+                      "command"_attr = cmd->getName());
                 uasserted(50985, "Failing command due to 'failCommand' failpoint");
             }
 
+            if (blockConnection) {
+                long long blockTimeMS = 0;
+                uassert(ErrorCodes::InvalidOptions,
+                        "must specify 'blockTimeMS' when 'blockConnection' is true",
+                        data.hasField("blockTimeMS") &&
+                            bsonExtractIntegerField(data, "blockTimeMS", &blockTimeMS).isOK());
+                uassert(ErrorCodes::InvalidOptions,
+                        "'blockTimeMS' must be non-negative",
+                        blockTimeMS >= 0);
+
+                LOGV2(20432,
+                      "Blocking {command} via 'failCommand' failpoint for {blockTime}",
+                      "Blocking command via 'failCommand' failpoint",
+                      "command"_attr = cmd->getName(),
+                      "blockTime"_attr = Milliseconds{blockTimeMS});
+                opCtx->sleepFor(Milliseconds{blockTimeMS});
+                LOGV2(20433,
+                      "Unblocking {command} via 'failCommand' failpoint",
+                      "Unblocking command via 'failCommand' failpoint",
+                      "command"_attr = cmd->getName());
+            }
+
             if (hasExtraInfo) {
-                log() << "Failing command '" << cmd->getName()
-                      << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
-                      << " and " << errorExtraInfo << ".";
+                LOGV2(20434,
+                      "Failing {command} via 'failCommand' failpoint: returning {errorCode} and "
+                      "{errorExtraInfo}",
+                      "Failing command via 'failCommand' failpoint",
+                      "command"_attr = cmd->getName(),
+                      "errorCode"_attr = errorCode,
+                      "errorExtraInfo"_attr = errorExtraInfo);
                 uassertStatusOK(Status(ErrorCodes::Error(errorCode),
                                        "Failing command due to 'failCommand' failpoint",
                                        errorExtraInfo.Obj()));
             } else if (hasErrorCode) {
-                log() << "Failing command '" << cmd->getName()
-                      << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
-                      << ".";
+                LOGV2(
+                    20435,
+                    "Failing command {command} via 'failCommand' failpoint: returning {errorCode}",
+                    "Failing command via 'failCommand' failpoint",
+                    "command"_attr = cmd->getName(),
+                    "errorCode"_attr = errorCode);
                 uasserted(ErrorCodes::Error(errorCode),
                           "Failing command due to 'failCommand' failpoint");
             }
@@ -594,8 +671,11 @@ void CommandHelpers::evaluateFailCommandFailPoint(OperationContext* opCtx,
             hasExtraInfo = data.hasField("errorExtraInfo") &&
                 bsonExtractTypedField(data, "errorExtraInfo", BSONType::Object, &errorExtraInfo)
                     .isOK();
+            blockConnection = data.hasField("blockConnection") &&
+                bsonExtractBooleanField(data, "blockConnection", &blockConnection).isOK() &&
+                blockConnection;
             return shouldActivateFailCommandFailPoint(data, invocation, opCtx->getClient()) &&
-                (closeConnection || hasErrorCode);
+                (closeConnection || blockConnection || hasErrorCode);
         });
 }
 
@@ -618,8 +698,25 @@ void CommandHelpers::handleMarkKillOnClientDisconnect(OperationContext* opCtx,
         });
 }
 
+namespace {
+// We store the CommandInvocation as a shared_ptr on the OperationContext in case we need to persist
+// the invocation past the lifetime of the op. If so, this shared_ptr can be copied off to another
+// thread. If not, there is only one shared_ptr and the invocation goes out of scope when the op
+// ends.
+auto invocationForOpCtx = OperationContext::declareDecoration<std::shared_ptr<CommandInvocation>>();
+}  // namespace
+
 //////////////////////////////////////////////////////////////
 // CommandInvocation
+
+void CommandInvocation::set(OperationContext* opCtx,
+                            std::shared_ptr<CommandInvocation> invocation) {
+    invocationForOpCtx(opCtx) = std::move(invocation);
+}
+
+std::shared_ptr<CommandInvocation> CommandInvocation::get(OperationContext* opCtx) {
+    return invocationForOpCtx(opCtx);
+}
 
 CommandInvocation::~CommandInvocation() = default;
 
@@ -645,7 +742,11 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
             }
         }
     } catch (const DBException& e) {
-        log(LogComponent::kAccessControl) << e.toStatus();
+        LOGV2_OPTIONS(20436,
+                      {LogComponent::kAccessControl},
+                      "Checking authorization failed: {error}",
+                      "Checking authorization failed",
+                      "error"_attr = e.toStatus());
         CommandHelpers::auditLogAuthEvent(opCtx, this, request, e.code());
         throw;
     }
@@ -662,13 +763,13 @@ public:
                BasicCommandWithReplyBuilderInterface* command)
         : CommandInvocation(command),
           _command(command),
-          _request(&request),
-          _dbName(_request->getDatabase().toString()) {}
+          _request(request),
+          _dbName(_request.getDatabase().toString()) {}
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
-        opCtx->lockState()->setDebugInfo(redact(_request->body));
-        bool ok = _command->runWithReplyBuilder(opCtx, _dbName, _request->body, result);
+        opCtx->lockState()->setDebugInfo(redact(_request.body).toString());
+        bool ok = _command->runWithReplyBuilder(opCtx, _dbName, _request.body, result);
         if (!ok) {
             BSONObjBuilder bob = result->getBodyBuilder();
             CommandHelpers::appendSimpleCommandStatus(bob, ok);
@@ -678,7 +779,7 @@ private:
     void explain(OperationContext* opCtx,
                  ExplainOptions::Verbosity verbosity,
                  rpc::ReplyBuilderInterface* result) override {
-        uassertStatusOK(_command->explain(opCtx, *_request, verbosity, result));
+        uassertStatusOK(_command->explain(opCtx, _request, verbosity, result));
     }
 
     NamespaceString ns() const override {
@@ -693,6 +794,15 @@ private:
         return _command->supportsReadConcern(cmdObj(), level);
     }
 
+    bool supportsReadMirroring() const override {
+        return _command->supportsReadMirroring(cmdObj());
+    }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob) const override {
+        invariant(cmdObj().isOwned());
+        _command->appendMirrorableRequest(bob, cmdObj());
+    }
+
     bool allowsAfterClusterTime() const override {
         return _command->allowsAfterClusterTime(cmdObj());
     }
@@ -703,15 +813,15 @@ private:
 
     void doCheckAuthorization(OperationContext* opCtx) const override {
         uassertStatusOK(_command->checkAuthForOperation(
-            opCtx, _request->getDatabase().toString(), _request->body));
+            opCtx, _request.getDatabase().toString(), _request.body));
     }
 
     const BSONObj& cmdObj() const {
-        return _request->body;
+        return _request.body;
     }
 
     BasicCommandWithReplyBuilderInterface* const _command;
-    const OpMsgRequest* const _request;
+    const OpMsgRequest _request;
     const std::string _dbName;
 };
 

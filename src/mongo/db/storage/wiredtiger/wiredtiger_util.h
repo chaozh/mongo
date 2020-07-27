@@ -108,13 +108,17 @@ public:
         _startupSuccessful = true;
     }
 
-private:
-    int suppressibleStartupErrorLog(WT_EVENT_HANDLER* handler,
-                                    WT_SESSION* sesion,
-                                    int errorCode,
-                                    const char* message);
+    bool isWtIncompatible() {
+        return _wtIncompatible;
+    }
 
+    void setWtIncompatible() {
+        _wtIncompatible = true;
+    }
+
+private:
     bool _startupSuccessful = false;
+    bool _wtIncompatible = false;
 };
 
 class WiredTigerUtil {
@@ -154,12 +158,9 @@ public:
      * that affect that window of maintained history.
      *
      * "snapshot-window-settings" : {
-     *      "cache pressure percentage threshold" : <num>,
-     *      "current cache pressure percentage" : <num>,
      *      "total number of SnapshotTooOld errors" : <num>,
-     *      "max target available snapshots window size in seconds" : <num>,
-     *      "target available snapshots window size in seconds" : <num>,
-     *      "current available snapshots window size in seconds" : <num>,
+     *      "minimum target snapshot window size in seconds" : <num>,
+     *      "current available snapshot window size in seconds" : <num>,
      *      "latest majority snapshot timestamp available" : <num>,
      *      "oldest majority snapshot timestamp available" : <num>
      * }

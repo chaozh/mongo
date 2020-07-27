@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -40,7 +40,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/oplog_buffer_blocking_queue.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/sequence_util.h"
 
@@ -61,7 +60,7 @@ ReplicationCoordinatorExternalStateMock::ReplicationCoordinatorExternalStateMock
 
 ReplicationCoordinatorExternalStateMock::~ReplicationCoordinatorExternalStateMock() {}
 
-void ReplicationCoordinatorExternalStateMock::startThreads(const ReplSettings& settings) {
+void ReplicationCoordinatorExternalStateMock::startThreads() {
     _threadsStarted = true;
 }
 
@@ -77,7 +76,7 @@ void ReplicationCoordinatorExternalStateMock::stopDataReplication(OperationConte
 
 Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(OperationContext* opCtx,
                                                                          const BSONObj& config) {
-    return storeLocalConfigDocument(opCtx, config);
+    return storeLocalConfigDocument(opCtx, config, false);
 }
 
 void ReplicationCoordinatorExternalStateMock::shutdown(OperationContext*) {}
@@ -104,6 +103,10 @@ void ReplicationCoordinatorExternalStateMock::addSelf(const HostAndPort& host) {
     _selfHosts.push_back(host);
 }
 
+void ReplicationCoordinatorExternalStateMock::clearSelfHosts() {
+    _selfHosts.clear();
+}
+
 HostAndPort ReplicationCoordinatorExternalStateMock::getClientHostAndPort(
     const OperationContext* opCtx) {
     return _clientHostAndPort;
@@ -120,7 +123,8 @@ StatusWith<BSONObj> ReplicationCoordinatorExternalStateMock::loadLocalConfigDocu
 }
 
 Status ReplicationCoordinatorExternalStateMock::storeLocalConfigDocument(OperationContext* opCtx,
-                                                                         const BSONObj& config) {
+                                                                         const BSONObj& config,
+                                                                         bool writeOplog) {
     if (_storeLocalConfigDocumentStatus.isOK()) {
         setLocalConfigDocument(StatusWith<BSONObj>(config));
         return Status::OK();
@@ -229,9 +233,7 @@ void ReplicationCoordinatorExternalStateMock::closeConnections() {
     _connectionsClosed = true;
 }
 
-void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
-
-void ReplicationCoordinatorExternalStateMock::clearOplogVisibilityStateForStepDown() {}
+void ReplicationCoordinatorExternalStateMock::onStepDownHook() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
 
@@ -248,7 +250,7 @@ void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
 void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(
     const OpTime& newCommitPoint) {}
 
-void ReplicationCoordinatorExternalStateMock::updateLocalSnapshot(const OpTime& optime) {}
+void ReplicationCoordinatorExternalStateMock::updateLastAppliedSnapshot(const OpTime& optime) {}
 
 bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
     return _areSnapshotsEnabled;

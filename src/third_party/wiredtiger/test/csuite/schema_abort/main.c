@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2019 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -85,10 +85,13 @@ typedef struct {
 static volatile THREAD_TS th_ts[MAX_TH];
 
 #define ENV_CONFIG_COMPAT ",compatibility=(release=\"2.9\")"
-#define ENV_CONFIG_DEF "create,log=(archive=false,file_max=10M,enabled)"
-#define ENV_CONFIG_TXNSYNC                             \
-    "create,log=(archive=false,file_max=10M,enabled)," \
-    "transaction_sync=(enabled,method=none)"
+#define ENV_CONFIG_DEF                                        \
+    "create,"                                                 \
+    "eviction_updates_trigger=95,eviction_updates_target=80," \
+    "log=(archive=false,file_max=10M,enabled)"
+#define ENV_CONFIG_TXNSYNC \
+    ENV_CONFIG_DEF         \
+    ",transaction_sync=(enabled,method=none)"
 #define ENV_CONFIG_REC "log=(archive=false,recover=on)"
 
 typedef struct {

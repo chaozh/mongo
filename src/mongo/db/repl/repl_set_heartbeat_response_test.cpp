@@ -70,6 +70,9 @@ TEST(ReplSetHeartbeatResponse, DefaultConstructThenSlowlyBuildToFullObj) {
     // set version
     hbResponse.setConfigVersion(1);
     ++fieldsSet;
+    // set config term.
+    hbResponse.setConfigTerm(1);
+    ++fieldsSet;
     // set setname
     hbResponse.setSetName("rs0");
     ++fieldsSet;
@@ -113,6 +116,7 @@ TEST(ReplSetHeartbeatResponse, DefaultConstructThenSlowlyBuildToFullObj) {
     ASSERT_EQUALS(fieldsSet, hbResponseObj.nFields());
     ASSERT_EQUALS("rs0", hbResponseObj["set"].String());
     ASSERT_EQUALS(1, hbResponseObj["v"].Number());
+    ASSERT_EQUALS(1, hbResponseObj["configTerm"].Number());
     ASSERT_EQUALS(Timestamp(10, 0), hbResponseObj["electionTime"].timestamp());
     ASSERT_EQUALS(Timestamp(0, 50), hbResponseObj["opTime"]["ts"].timestamp());
     ASSERT_EQUALS(Timestamp(0, 10), hbResponseObj["durableOpTime"]["ts"].timestamp());
@@ -120,7 +124,13 @@ TEST(ReplSetHeartbeatResponse, DefaultConstructThenSlowlyBuildToFullObj) {
     ASSERT_EQUALS(2, hbResponseObj["state"].numberLong());
     ASSERT_EQUALS("syncTarget:27017", hbResponseObj["syncingTo"].String());
 
-    initializeResult = hbResponseObjRoundTripChecker.initialize(hbResponseObj, 0);
+    // Verify that we allow an unknown field.
+    BSONObjBuilder hbResponseBob;
+    hbResponseBob.appendElements(hbResponseObj);
+    hbResponseBob.append("unknownField", 1);
+    auto cmdObj = hbResponseBob.obj();
+
+    initializeResult = hbResponseObjRoundTripChecker.initialize(cmdObj, 0);
     ASSERT_EQUALS(Status::OK(), initializeResult);
     ASSERT_EQUALS(hbResponseObj.toString(), hbResponseObjRoundTripChecker.toBSON().toString());
 }
@@ -307,9 +317,8 @@ TEST(ReplSetHeartbeatResponse, InitializeBadConfig) {
                   << "v" << 2  // needs a version to get this far in initialize()
                   << "config" << BSON("illegalFieldName" << 2));
     Status result = hbResponse.initialize(initializerObj, 0);
-    ASSERT_EQUALS(ErrorCodes::BadValue, result);
-    ASSERT_EQUALS("Unexpected field illegalFieldName in replica set configuration",
-                  result.reason());
+    ASSERT_NOT_OK(result);
+    ASSERT_STRING_CONTAINS(result.reason(), "'ReplSetConfig.illegalFieldName' is an unknown field");
 }
 
 TEST(ReplSetHeartbeatResponse, NoConfigStillInitializing) {

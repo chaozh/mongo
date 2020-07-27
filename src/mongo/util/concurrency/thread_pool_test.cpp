@@ -27,13 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
+#include <fmt/format.h>
 
 #include "mongo/base/init.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
@@ -43,12 +45,12 @@
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/thread_pool_test_common.h"
 #include "mongo/util/concurrency/thread_pool_test_fixture.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
 namespace {
 using namespace mongo;
+using namespace fmt::literals;
 
 MONGO_INITIALIZER(ThreadPoolCommonTests)(InitializerContext*) {
     addTestsForThreadPool("ThreadPoolCommon",
@@ -187,15 +189,18 @@ TEST_F(ThreadPoolTest, MaxPoolSize20MinPoolSize15) {
         << "Failed to reap excess threads after " << durationCount<Milliseconds>(reapTime) << "ms";
 }
 
-DEATH_TEST(ThreadPoolTest, MaxThreadsTooFewDies, "but the maximum must be at least 1") {
+DEATH_TEST_REGEX(ThreadPoolTest,
+                 MaxThreadsTooFewDies,
+                 "Cannot create pool.*with maximum number of threads.*less than 1") {
     ThreadPool::Options options;
     options.maxThreads = 0;
     ThreadPool pool(options);
 }
 
-DEATH_TEST(ThreadPoolTest,
-           MinThreadsTooManyDies,
-           "6 which is more than the configured maximum of 5") {
+DEATH_TEST_REGEX(
+    ThreadPoolTest,
+    MinThreadsTooManyDies,
+    R"#(.*Cannot create pool.*with minimum number of threads.*larger than the configured maximum.*minThreads":6,"maxThreads":5)#") {
     ThreadPool::Options options;
     options.maxThreads = 5;
     options.minThreads = 6;
@@ -211,9 +216,9 @@ TEST(ThreadPoolTest, LivePoolCleanedByDestructor) {
     // Destructor should reap leftover threads.
 }
 
-DEATH_TEST(ThreadPoolTest,
-           DestructionDuringJoinDies,
-           "Attempted to join pool DoubleJoinPool more than once") {
+DEATH_TEST_REGEX(ThreadPoolTest,
+                 DestructionDuringJoinDies,
+                 "Attempted to join pool.*more than once.*DoubleJoinPool") {
     // This test is a little complicated. We need to ensure that the ThreadPool destructor runs
     // while some thread is blocked running ThreadPool::join, to see that double-join is fatal in
     // the pool destructor. To do this, we first wait for minThreads threads to have started. Then,
@@ -254,29 +259,22 @@ DEATH_TEST(ThreadPoolTest,
 
 TEST_F(ThreadPoolTest, ThreadPoolRunsOnCreateThreadFunctionBeforeConsumingTasks) {
     unittest::Barrier barrier(2U);
-
-    bool onCreateThreadCalled = false;
-    std::string taskThreadName;
+    std::string journal;
     ThreadPool::Options options;
     options.threadNamePrefix = "mythread";
     options.maxThreads = 1U;
-    options.onCreateThread = [&onCreateThreadCalled,
-                              &taskThreadName](const std::string& threadName) {
-        onCreateThreadCalled = true;
-        taskThreadName = threadName;
+    options.onCreateThread = [&](const std::string& threadName) {
+        journal.append("[onCreate({})]"_format(threadName));
     };
 
     ThreadPool pool(options);
     pool.startup();
-
-    pool.schedule([&barrier](auto status) {
-        ASSERT_OK(status);
+    pool.schedule([&](auto status) {
+        journal.append("[Call({})]"_format(status.toString()));
         barrier.countDownAndWait();
     });
     barrier.countDownAndWait();
-
-    ASSERT_TRUE(onCreateThreadCalled);
-    ASSERT_EQUALS(options.threadNamePrefix + "0", taskThreadName);
+    ASSERT_EQUALS(journal, "[onCreate(mythread0)][Call(OK)]");
 }
 
 TEST(ThreadPoolTest, JoinAllRetiredThreads) {

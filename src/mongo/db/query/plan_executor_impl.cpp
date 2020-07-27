@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -42,22 +42,28 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/cached_plan.h"
-#include "mongo/db/exec/change_stream_proxy.h"
 #include "mongo/db/exec/collection_scan.h"
-#include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/count_scan.h"
+#include "mongo/db/exec/distinct_scan.h"
+#include "mongo/db/exec/idhack.h"
+#include "mongo/db/exec/index_scan.h"
+#include "mongo/db/exec/near.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/subplan.h"
+#include "mongo/db/exec/text.h"
 #include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/query/explain.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/mock_yield_policies.h"
-#include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/plan_yield_policy_impl.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/stacktrace.h"
 
@@ -80,24 +86,25 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(planExecutorAlwaysFails);
 MONGO_FAIL_POINT_DEFINE(planExecutorHangBeforeShouldWaitForInserts);
+MONGO_FAIL_POINT_DEFINE(planExecutorHangWhileYieldedInWaitForInserts);
 
 /**
  * Constructs a PlanYieldPolicy based on 'policy'.
  */
-std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(PlanExecutor* exec,
-                                                 PlanExecutor::YieldPolicy policy) {
+std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(PlanExecutorImpl* exec,
+                                                 PlanYieldPolicy::YieldPolicy policy) {
     switch (policy) {
-        case PlanExecutor::YieldPolicy::YIELD_AUTO:
-        case PlanExecutor::YieldPolicy::YIELD_MANUAL:
-        case PlanExecutor::YieldPolicy::NO_YIELD:
-        case PlanExecutor::YieldPolicy::WRITE_CONFLICT_RETRY_ONLY:
-        case PlanExecutor::YieldPolicy::INTERRUPT_ONLY: {
-            return std::make_unique<PlanYieldPolicy>(exec, policy);
+        case PlanYieldPolicy::YieldPolicy::YIELD_AUTO:
+        case PlanYieldPolicy::YieldPolicy::YIELD_MANUAL:
+        case PlanYieldPolicy::YieldPolicy::NO_YIELD:
+        case PlanYieldPolicy::YieldPolicy::WRITE_CONFLICT_RETRY_ONLY:
+        case PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY: {
+            return std::make_unique<PlanYieldPolicyImpl>(exec, policy);
         }
-        case PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT: {
+        case PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT: {
             return std::make_unique<AlwaysTimeOutYieldPolicy>(exec);
         }
-        case PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED: {
+        case PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED: {
             return std::make_unique<AlwaysPlanKilledYieldPolicy>(exec);
         }
         default:
@@ -126,96 +133,6 @@ PlanStage* getStageByType(PlanStage* root, StageType type) {
 }
 }  // namespace
 
-StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PlanExecutor::make(
-    std::unique_ptr<CanonicalQuery> cq,
-    std::unique_ptr<WorkingSet> ws,
-    std::unique_ptr<PlanStage> rt,
-    const Collection* collection,
-    YieldPolicy yieldPolicy,
-    NamespaceString nss,
-    std::unique_ptr<QuerySolution> qs) {
-    auto expCtx = cq->getExpCtx();
-    return PlanExecutorImpl::make(expCtx->opCtx,
-                                  std::move(ws),
-                                  std::move(rt),
-                                  std::move(qs),
-                                  std::move(cq),
-                                  expCtx,
-                                  collection,
-                                  nss,
-                                  yieldPolicy);
-}
-
-StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PlanExecutor::make(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    std::unique_ptr<WorkingSet> ws,
-    std::unique_ptr<PlanStage> rt,
-    const Collection* collection,
-    YieldPolicy yieldPolicy,
-    NamespaceString nss,
-    std::unique_ptr<QuerySolution> qs) {
-    return PlanExecutorImpl::make(expCtx->opCtx,
-                                  std::move(ws),
-                                  std::move(rt),
-                                  std::move(qs),
-                                  nullptr,
-                                  expCtx,
-                                  collection,
-                                  nss,
-                                  yieldPolicy);
-}
-
-StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PlanExecutor::make(
-    OperationContext* opCtx,
-    std::unique_ptr<WorkingSet> ws,
-    std::unique_ptr<PlanStage> rt,
-    const Collection* collection,
-    YieldPolicy yieldPolicy,
-    NamespaceString nss,
-    std::unique_ptr<QuerySolution> qs) {
-    return PlanExecutorImpl::make(opCtx,
-                                  std::move(ws),
-                                  std::move(rt),
-                                  std::move(qs),
-                                  nullptr,
-                                  nullptr,
-                                  collection,
-                                  nss,
-                                  yieldPolicy);
-}
-
-StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PlanExecutorImpl::make(
-    OperationContext* opCtx,
-    unique_ptr<WorkingSet> ws,
-    unique_ptr<PlanStage> rt,
-    unique_ptr<QuerySolution> qs,
-    unique_ptr<CanonicalQuery> cq,
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const Collection* collection,
-    NamespaceString nss,
-    YieldPolicy yieldPolicy) {
-
-    auto execImpl = new PlanExecutorImpl(opCtx,
-                                         std::move(ws),
-                                         std::move(rt),
-                                         std::move(qs),
-                                         std::move(cq),
-                                         expCtx,
-                                         collection,
-                                         std::move(nss),
-                                         yieldPolicy);
-    PlanExecutor::Deleter planDeleter(opCtx);
-    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec(execImpl, std::move(planDeleter));
-
-    // Perform plan selection, if necessary.
-    Status status = execImpl->_pickBestPlan();
-    if (!status.isOK()) {
-        return status;
-    }
-
-    return std::move(exec);
-}
-
 PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
                                    unique_ptr<WorkingSet> ws,
                                    unique_ptr<PlanStage> rt,
@@ -224,7 +141,7 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
                                    const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                    const Collection* collection,
                                    NamespaceString nss,
-                                   YieldPolicy yieldPolicy)
+                                   PlanYieldPolicy::YieldPolicy yieldPolicy)
     : _opCtx(opCtx),
       _cq(std::move(cq)),
       _expCtx(_cq ? _cq->getExpCtx() : expCtx),
@@ -233,9 +150,17 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
       _root(std::move(rt)),
       _nss(std::move(nss)),
       // There's no point in yielding if the collection doesn't exist.
-      _yieldPolicy(makeYieldPolicy(this, collection ? yieldPolicy : NO_YIELD)) {
+      _yieldPolicy(makeYieldPolicy(
+          this, collection ? yieldPolicy : PlanYieldPolicy::YieldPolicy::NO_YIELD)) {
     invariant(!_expCtx || _expCtx->opCtx == _opCtx);
     invariant(!_cq || !_expCtx || _cq->getExpCtx() == _expCtx);
+
+    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN stage.
+    // This is used for change streams in order to keep the the latest oplog timestamp and post
+    // batch resume token up to date as the oplog scan progresses.
+    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
+        _collScanStage = static_cast<CollectionScan*>(collectionScan);
+    }
 
     // We may still need to initialize _nss from either collection or _cq.
     if (!_nss.isEmpty()) {
@@ -248,6 +173,8 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
         invariant(_cq);
         _nss = _cq->getQueryRequest().nss();
     }
+
+    uassertStatusOK(_pickBestPlan());
 }
 
 Status PlanExecutorImpl::_pickBestPlan() {
@@ -293,19 +220,14 @@ PlanExecutorImpl::~PlanExecutorImpl() {
     invariant(_currentState == kDisposed);
 }
 
-string PlanExecutor::statestr(ExecState s) {
-    if (PlanExecutor::ADVANCED == s) {
-        return "ADVANCED";
-    } else if (PlanExecutor::IS_EOF == s) {
-        return "IS_EOF";
-    } else {
-        verify(PlanExecutor::FAILURE == s);
-        return "FAILURE";
+std::string PlanExecutor::statestr(ExecState execState) {
+    switch (execState) {
+        case PlanExecutor::ADVANCED:
+            return "ADVANCED";
+        case PlanExecutor::IS_EOF:
+            return "IS_EOF";
     }
-}
-
-WorkingSet* PlanExecutorImpl::getWorkingSet() const {
-    return _workingSet.get();
+    MONGO_UNREACHABLE;
 }
 
 PlanStage* PlanExecutorImpl::getRootStage() const {
@@ -322,10 +244,6 @@ const NamespaceString& PlanExecutorImpl::nss() const {
 
 OperationContext* PlanExecutorImpl::getOpCtx() const {
     return _opCtx;
-}
-
-const boost::intrusive_ptr<ExpressionContext>& PlanExecutorImpl::getExpCtx() const {
-    return _expCtx;
 }
 
 void PlanExecutorImpl::saveState() {
@@ -345,7 +263,7 @@ void PlanExecutorImpl::restoreState() {
             throw;
 
         // Handles retries by calling restoreStateWithoutRetrying() in a loop.
-        uassertStatusOK(_yieldPolicy->yieldOrInterrupt());
+        uassertStatusOK(_yieldPolicy->yieldOrInterrupt(getOpCtx()));
     }
 }
 
@@ -368,7 +286,6 @@ void PlanExecutorImpl::detachFromOperationContext() {
         _expCtx->opCtx = nullptr;
     }
     _currentState = kDetached;
-    _everDetachedFromOperationContext = true;
 }
 
 void PlanExecutorImpl::reattachToOperationContext(OperationContext* opCtx) {
@@ -387,14 +304,15 @@ void PlanExecutorImpl::reattachToOperationContext(OperationContext* opCtx) {
 }
 
 PlanExecutor::ExecState PlanExecutorImpl::getNext(BSONObj* objOut, RecordId* dlOut) {
-    const auto state = getNext(&_docOutput, dlOut);
-    if (objOut) {
-        *objOut = _docOutput.toBson();
+    const auto state = getNextDocument(&_docOutput, dlOut);
+    if (objOut && state == ExecState::ADVANCED) {
+        const bool includeMetadata = _expCtx && _expCtx->needsMerge;
+        *objOut = includeMetadata ? _docOutput.toBsonWithMetaData() : _docOutput.toBson();
     }
     return state;
 }
 
-PlanExecutor::ExecState PlanExecutorImpl::getNext(Document* objOut, RecordId* dlOut) {
+PlanExecutor::ExecState PlanExecutorImpl::getNextDocument(Document* objOut, RecordId* dlOut) {
     Snapshotted<Document> snapshotted;
     if (objOut) {
         snapshotted.value() = std::move(*objOut);
@@ -406,27 +324,6 @@ PlanExecutor::ExecState PlanExecutorImpl::getNext(Document* objOut, RecordId* dl
     }
 
     return state;
-}
-
-PlanExecutor::ExecState PlanExecutorImpl::getNextSnapshotted(Snapshotted<Document>* objOut,
-                                                             RecordId* dlOut) {
-    // Detaching from the OperationContext means that the returned snapshot ids could be invalid.
-    invariant(!_everDetachedFromOperationContext);
-    return _getNextImpl(objOut, dlOut);
-}
-
-PlanExecutor::ExecState PlanExecutorImpl::getNextSnapshotted(Snapshotted<BSONObj>* objOut,
-                                                             RecordId* dlOut) {
-    // Detaching from the OperationContext means that the returned snapshot ids could be invalid.
-    invariant(!_everDetachedFromOperationContext);
-    Snapshotted<Document> docOut;
-    docOut.value() = std::move(_docOutput);
-    const auto status = _getNextImpl(&docOut, dlOut);
-    if (objOut) {
-        *objOut = {docOut.snapshotId(), docOut.value().toBson()};
-    }
-    _docOutput = std::move(docOut.value());
-    return status;
 }
 
 bool PlanExecutorImpl::_shouldListenForInserts() {
@@ -472,8 +369,7 @@ std::shared_ptr<CappedInsertNotifier> PlanExecutorImpl::_getCappedInsertNotifier
     return collection->getCappedInsertNotifier();
 }
 
-PlanExecutor::ExecState PlanExecutorImpl::_waitForInserts(CappedInsertNotifierData* notifierData,
-                                                          Snapshotted<Document>* errorObj) {
+void PlanExecutorImpl::_waitForInserts(CappedInsertNotifierData* notifierData) {
     invariant(notifierData->notifier);
 
     // The notifier wait() method will not wait unless the version passed to it matches the
@@ -486,42 +382,31 @@ PlanExecutor::ExecState PlanExecutorImpl::_waitForInserts(CappedInsertNotifierDa
     ON_BLOCK_EXIT([curOp] { curOp->resumeTimer(); });
     auto opCtx = _opCtx;
     uint64_t currentNotifierVersion = notifierData->notifier->getVersion();
-    auto yieldResult = _yieldPolicy->yieldOrInterrupt([opCtx, notifierData] {
+    auto yieldResult = _yieldPolicy->yieldOrInterrupt(opCtx, [opCtx, notifierData] {
         const auto deadline = awaitDataState(opCtx).waitForInsertsDeadline;
         notifierData->notifier->waitUntil(notifierData->lastEOFVersion, deadline);
+        if (MONGO_unlikely(planExecutorHangWhileYieldedInWaitForInserts.shouldFail())) {
+            LOGV2(4452903,
+                  "PlanExecutor - planExecutorHangWhileYieldedInWaitForInserts fail point enabled. "
+                  "Blocking until fail point is disabled");
+            planExecutorHangWhileYieldedInWaitForInserts.pauseWhileSet();
+        }
     });
     notifierData->lastEOFVersion = currentNotifierVersion;
 
-    if (yieldResult.isOK()) {
-        // There may be more results, try to get more data.
-        return ADVANCED;
-    }
-
-    if (errorObj) {
-        *errorObj = Snapshotted<Document>(SnapshotId(),
-                                          WorkingSetCommon::buildMemberStatusObject(yieldResult));
-    }
-    return FAILURE;
+    uassertStatusOK(yieldResult);
 }
 
 PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* objOut,
                                                        RecordId* dlOut) {
     if (MONGO_unlikely(planExecutorAlwaysFails.shouldFail())) {
-        Status status(ErrorCodes::InternalError,
-                      str::stream() << "PlanExecutor hit planExecutorAlwaysFails fail point");
-        *objOut =
-            Snapshotted<Document>(SnapshotId(), WorkingSetCommon::buildMemberStatusObject(status));
-
-        return PlanExecutor::FAILURE;
+        uasserted(ErrorCodes::Error(4382101),
+                  "PlanExecutor hit planExecutorAlwaysFails fail point");
     }
 
     invariant(_currentState == kUsable);
     if (isMarkedAsKilled()) {
-        if (nullptr != objOut) {
-            *objOut = Snapshotted<Document>(SnapshotId(),
-                                            WorkingSetCommon::buildMemberStatusObject(_killStatus));
-        }
-        return PlanExecutor::FAILURE;
+        uassertStatusOK(_killStatus);
     }
 
     if (!_stash.empty()) {
@@ -548,15 +433,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
         //   2) some stage requested a yield, or
         //   3) we need to yield and retry due to a WriteConflictException.
         // In all cases, the actual yielding happens here.
-        if (_yieldPolicy->shouldYieldOrInterrupt()) {
-            auto yieldStatus = _yieldPolicy->yieldOrInterrupt();
-            if (!yieldStatus.isOK()) {
-                if (objOut) {
-                    *objOut = Snapshotted<Document>(
-                        SnapshotId(), WorkingSetCommon::buildMemberStatusObject(yieldStatus));
-                }
-                return PlanExecutor::FAILURE;
-            }
+        if (_yieldPolicy->shouldYieldOrInterrupt(_opCtx)) {
+            uassertStatusOK(_yieldPolicy->yieldOrInterrupt(_opCtx));
         }
 
         WorkingSetID id = WorkingSet::INVALID_ID;
@@ -626,7 +504,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
             }
         } else if (PlanStage::NEED_TIME == code) {
             // Fall through to yield check at end of large conditional.
-        } else if (PlanStage::IS_EOF == code) {
+        } else {
+            invariant(PlanStage::IS_EOF == code);
             if (MONGO_unlikely(planExecutorHangBeforeShouldWaitForInserts.shouldFail(
                     [this](const BSONObj& data) {
                         if (data.hasField("namespace") &&
@@ -635,29 +514,17 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
                         }
                         return true;
                     }))) {
-                log() << "PlanExecutor - planExecutorHangBeforeShouldWaitForInserts fail point "
-                         "enabled. Blocking until fail point is disabled.";
+                LOGV2(20946,
+                      "PlanExecutor - planExecutorHangBeforeShouldWaitForInserts fail point "
+                      "enabled. Blocking until fail point is disabled");
                 planExecutorHangBeforeShouldWaitForInserts.pauseWhileSet();
             }
             if (!_shouldWaitForInserts()) {
                 return PlanExecutor::IS_EOF;
             }
-            const ExecState waitResult = _waitForInserts(&cappedInsertNotifierData, objOut);
-            if (waitResult == PlanExecutor::ADVANCED) {
-                // There may be more results, keep going.
-                continue;
-            }
-            return waitResult;
-        } else {
-            invariant(PlanStage::FAILURE == code);
-
-            if (nullptr != objOut) {
-                invariant(WorkingSet::INVALID_ID != id);
-                auto statusObj = WorkingSetCommon::getStatusMemberDocument(*_workingSet, id);
-                *objOut = Snapshotted<Document>(SnapshotId(), *statusObj);
-            }
-
-            return PlanExecutor::FAILURE;
+            _waitForInserts(&cappedInsertNotifierData);
+            // There may be more results, keep going.
+            continue;
         }
     }
 }
@@ -684,37 +551,24 @@ void PlanExecutorImpl::dispose(OperationContext* opCtx) {
     _currentState = kDisposed;
 }
 
-Status PlanExecutorImpl::executePlan() {
+void PlanExecutorImpl::executePlan() {
     invariant(_currentState == kUsable);
     Document obj;
     PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
     while (PlanExecutor::ADVANCED == state) {
-        state = this->getNext(&obj, nullptr);
+        state = this->getNextDocument(&obj, nullptr);
     }
 
-    if (PlanExecutor::FAILURE == state) {
-        if (isMarkedAsKilled()) {
-            return _killStatus;
-        }
-
-        auto errorStatus = getMemberObjectStatus(obj);
-        invariant(!errorStatus.isOK());
-        return errorStatus.withContext(str::stream() << "Exec error resulting in state "
-                                                     << PlanExecutor::statestr(state));
+    if (isMarkedAsKilled()) {
+        uassertStatusOK(_killStatus);
     }
 
     invariant(!isMarkedAsKilled());
     invariant(PlanExecutor::IS_EOF == state);
-    return Status::OK();
-}
-
-
-void PlanExecutorImpl::enqueue(const Document& obj) {
-    _stash.push(obj.getOwned());
 }
 
 void PlanExecutorImpl::enqueue(const BSONObj& obj) {
-    enqueue(Document{obj});
+    _stash.push(Document{obj.getOwned()});
 }
 
 bool PlanExecutorImpl::isMarkedAsKilled() const {
@@ -730,34 +584,119 @@ bool PlanExecutorImpl::isDisposed() const {
     return _currentState == kDisposed;
 }
 
-bool PlanExecutorImpl::isDetached() const {
-    return _currentState == kDetached;
-}
-
 Timestamp PlanExecutorImpl::getLatestOplogTimestamp() const {
-    if (auto changeStreamProxy = getStageByType(_root.get(), STAGE_CHANGE_STREAM_PROXY)) {
-        return static_cast<ChangeStreamProxyStage*>(changeStreamProxy)->getLatestOplogTimestamp();
-    }
-    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
-        return static_cast<CollectionScan*>(collectionScan)->getLatestOplogTimestamp();
-    }
-    return Timestamp();
+    return _collScanStage ? _collScanStage->getLatestOplogTimestamp() : Timestamp{};
 }
 
 BSONObj PlanExecutorImpl::getPostBatchResumeToken() const {
-    if (auto changeStreamProxy = getStageByType(_root.get(), STAGE_CHANGE_STREAM_PROXY))
-        return static_cast<ChangeStreamProxyStage*>(changeStreamProxy)->getPostBatchResumeToken();
-    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
-        return static_cast<CollectionScan*>(collectionScan)->getResumeToken();
+    static const BSONObj kEmptyPBRT;
+    return _collScanStage ? _collScanStage->getPostBatchResumeToken() : kEmptyPBRT;
+}
+
+PlanExecutor::LockPolicy PlanExecutorImpl::lockPolicy() const {
+    // If this PlanExecutor is simply unspooling queued data, then there is no need to acquire
+    // locks.
+    if (_root->stageType() == StageType::STAGE_QUEUED_DATA) {
+        return LockPolicy::kLocksInternally;
     }
-    return {};
+
+    return LockPolicy::kLockExternally;
 }
 
-Status PlanExecutorImpl::getMemberObjectStatus(const Document& memberObj) const {
-    return WorkingSetCommon::getMemberObjectStatus(memberObj);
+std::string PlanExecutorImpl::getPlanSummary() const {
+    return Explain::getPlanSummary(_root.get());
 }
 
-Status PlanExecutorImpl::getMemberObjectStatus(const BSONObj& memberObj) const {
-    return WorkingSetCommon::getMemberObjectStatus(memberObj);
+void PlanExecutorImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
+    invariant(statsOut);
+
+    // We can get some of the fields we need from the common stats stored in the
+    // root stage of the plan tree.
+    const CommonStats* common = _root->getCommonStats();
+    statsOut->nReturned = common->advanced;
+
+    // The other fields are aggregations over the stages in the plan tree. We flatten
+    // the tree into a list and then compute these aggregations.
+    std::vector<const PlanStage*> stages;
+    Explain::flattenExecTree(_root.get(), &stages);
+
+    statsOut->totalKeysExamined = 0;
+    statsOut->totalDocsExamined = 0;
+
+    for (size_t i = 0; i < stages.size(); i++) {
+        statsOut->totalKeysExamined +=
+            Explain::getKeysExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
+        statsOut->totalDocsExamined +=
+            Explain::getDocsExamined(stages[i]->stageType(), stages[i]->getSpecificStats());
+
+        if (isSortStageType(stages[i]->stageType())) {
+            statsOut->hasSortStage = true;
+
+            auto sortStage = static_cast<const SortStage*>(stages[i]);
+            auto sortStats = static_cast<const SortStats*>(sortStage->getSpecificStats());
+            statsOut->usedDisk = sortStats->wasDiskUsed;
+        }
+
+        if (STAGE_IXSCAN == stages[i]->stageType()) {
+            const IndexScan* ixscan = static_cast<const IndexScan*>(stages[i]);
+            const IndexScanStats* ixscanStats =
+                static_cast<const IndexScanStats*>(ixscan->getSpecificStats());
+            statsOut->indexesUsed.insert(ixscanStats->indexName);
+        } else if (STAGE_COUNT_SCAN == stages[i]->stageType()) {
+            const CountScan* countScan = static_cast<const CountScan*>(stages[i]);
+            const CountScanStats* countScanStats =
+                static_cast<const CountScanStats*>(countScan->getSpecificStats());
+            statsOut->indexesUsed.insert(countScanStats->indexName);
+        } else if (STAGE_IDHACK == stages[i]->stageType()) {
+            const IDHackStage* idHackStage = static_cast<const IDHackStage*>(stages[i]);
+            const IDHackStats* idHackStats =
+                static_cast<const IDHackStats*>(idHackStage->getSpecificStats());
+            statsOut->indexesUsed.insert(idHackStats->indexName);
+        } else if (STAGE_DISTINCT_SCAN == stages[i]->stageType()) {
+            const DistinctScan* distinctScan = static_cast<const DistinctScan*>(stages[i]);
+            const DistinctScanStats* distinctScanStats =
+                static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
+            statsOut->indexesUsed.insert(distinctScanStats->indexName);
+        } else if (STAGE_TEXT == stages[i]->stageType()) {
+            const TextStage* textStage = static_cast<const TextStage*>(stages[i]);
+            const TextStats* textStats =
+                static_cast<const TextStats*>(textStage->getSpecificStats());
+            statsOut->indexesUsed.insert(textStats->indexName);
+        } else if (STAGE_GEO_NEAR_2D == stages[i]->stageType() ||
+                   STAGE_GEO_NEAR_2DSPHERE == stages[i]->stageType()) {
+            const NearStage* nearStage = static_cast<const NearStage*>(stages[i]);
+            const NearStats* nearStats =
+                static_cast<const NearStats*>(nearStage->getSpecificStats());
+            statsOut->indexesUsed.insert(nearStats->indexName);
+        } else if (STAGE_CACHED_PLAN == stages[i]->stageType()) {
+            const CachedPlanStage* cachedPlan = static_cast<const CachedPlanStage*>(stages[i]);
+            const CachedPlanStats* cachedStats =
+                static_cast<const CachedPlanStats*>(cachedPlan->getSpecificStats());
+            statsOut->replanReason = cachedStats->replanReason;
+        } else if (STAGE_MULTI_PLAN == stages[i]->stageType()) {
+            statsOut->fromMultiPlanner = true;
+        } else if (STAGE_COLLSCAN == stages[i]->stageType()) {
+            statsOut->collectionScans++;
+            const auto collScan = static_cast<const CollectionScan*>(stages[i]);
+            const auto collScanStats =
+                static_cast<const CollectionScanStats*>(collScan->getSpecificStats());
+            if (!collScanStats->tailable)
+                statsOut->collectionScansNonTailable++;
+        }
+    }
+}
+
+BSONObj PlanExecutorImpl::getStats() const {
+    // Serialize all stats from the winning plan.
+    auto mps = getMultiPlanStage();
+    auto winningPlanStats =
+        mps ? std::move(mps->getStats()->children[mps->bestPlanIdx()]) : _root->getStats();
+    return Explain::statsToBSON(*winningPlanStats);
+}
+
+MultiPlanStage* PlanExecutorImpl::getMultiPlanStage() const {
+    PlanStage* ps = getStageByType(_root.get(), StageType::STAGE_MULTI_PLAN);
+    invariant(ps == nullptr || ps->stageType() == StageType::STAGE_MULTI_PLAN);
+    return static_cast<MultiPlanStage*>(ps);
 }
 }  // namespace mongo

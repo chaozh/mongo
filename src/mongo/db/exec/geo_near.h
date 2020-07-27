@@ -69,16 +69,17 @@ struct GeoNearParams {
 class GeoNear2DStage final : public NearStage {
 public:
     GeoNear2DStage(const GeoNearParams& nearParams,
-                   OperationContext* opCtx,
+                   ExpressionContext* expCtx,
                    WorkingSet* workingSet,
+                   const Collection* collection,
                    const IndexDescriptor* twoDIndex);
 
 protected:
-    StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
-                                              WorkingSet* workingSet,
-                                              const Collection* collection) final;
+    std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                  WorkingSet* workingSet,
+                                                  const Collection* collection) final;
 
-    StatusWith<double> computeDistance(WorkingSetMember* member) final;
+    double computeDistance(WorkingSetMember* member) final;
 
     PlanStage::StageState initialize(OperationContext* opCtx,
                                      WorkingSet* workingSet,
@@ -87,22 +88,24 @@ protected:
 private:
     class DensityEstimator {
     public:
-        DensityEstimator(PlanStage::Children* children,
+        DensityEstimator(const Collection* collection,
+                         PlanStage::Children* children,
                          BSONObj infoObj,
                          const GeoNearParams* nearParams,
                          const R2Annulus& fullBounds);
 
-        PlanStage::StageState work(OperationContext* opCtx,
+        PlanStage::StageState work(ExpressionContext* expCtx,
                                    WorkingSet* workingSet,
                                    const IndexDescriptor* twoDIndex,
                                    WorkingSetID* out,
                                    double* estimatedDistance);
 
     private:
-        void buildIndexScan(OperationContext* opCtx,
+        void buildIndexScan(ExpressionContext* expCtx,
                             WorkingSet* workingSet,
                             const IndexDescriptor* twoDIndex);
 
+        const Collection* _collection;
         PlanStage::Children* _children;    // Points to PlanStage::_children in the NearStage.
         const GeoNearParams* _nearParams;  // Not owned here.
         const R2Annulus& _fullBounds;
@@ -135,18 +138,17 @@ private:
 class GeoNear2DSphereStage final : public NearStage {
 public:
     GeoNear2DSphereStage(const GeoNearParams& nearParams,
-                         OperationContext* opCtx,
+                         ExpressionContext* expCtx,
                          WorkingSet* workingSet,
+                         const Collection* collection,
                          const IndexDescriptor* s2Index);
 
-    ~GeoNear2DSphereStage();
-
 protected:
-    StatusWith<CoveredInterval*> nextInterval(OperationContext* opCtx,
-                                              WorkingSet* workingSet,
-                                              const Collection* collection) final;
+    std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                  WorkingSet* workingSet,
+                                                  const Collection* collection) final;
 
-    StatusWith<double> computeDistance(WorkingSetMember* member) final;
+    double computeDistance(WorkingSetMember* member) final;
 
     PlanStage::StageState initialize(OperationContext* opCtx,
                                      WorkingSet* workingSet,
@@ -156,24 +158,26 @@ private:
     // Estimate the density of data by search the nearest cells level by level around center.
     class DensityEstimator {
     public:
-        DensityEstimator(PlanStage::Children* children,
+        DensityEstimator(const Collection* collection,
+                         PlanStage::Children* children,
                          const GeoNearParams* nearParams,
                          const S2IndexingParams& indexParams,
                          const R2Annulus& fullBounds);
 
         // Search for a document in neighbors at current level.
         // Return IS_EOF is such document exists and set the estimated distance to the nearest doc.
-        PlanStage::StageState work(OperationContext* opCtx,
+        PlanStage::StageState work(ExpressionContext* expCtx,
                                    WorkingSet* workingSet,
                                    const IndexDescriptor* s2Index,
                                    WorkingSetID* out,
                                    double* estimatedDistance);
 
     private:
-        void buildIndexScan(OperationContext* opCtx,
+        void buildIndexScan(ExpressionContext* expCtx,
                             WorkingSet* workingSet,
                             const IndexDescriptor* s2Index);
 
+        const Collection* _collection;
         PlanStage::Children* _children;    // Points to PlanStage::_children in the NearStage.
         const GeoNearParams* _nearParams;  // Not owned here.
         const S2IndexingParams _indexParams;

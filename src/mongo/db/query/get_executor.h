@@ -30,7 +30,7 @@
 #pragma once
 
 #include "mongo/db/catalog/index_catalog_entry.h"
-#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
@@ -47,6 +47,17 @@ namespace mongo {
 
 class Collection;
 class CountRequest;
+
+/**
+ * Make an ExpressionContext to be used for non-aggregate commands. The result of this can be passed
+ * into any of the getExecutor* functions.
+ *
+ * Note that the getExecutor* functions may change the collation on the returned ExpressionContext
+ * if the collection has a default collation and no collation was specifically requested
+ * ('requestCollation' is empty).
+ */
+boost::intrusive_ptr<ExpressionContext> makeExpressionContextForGetExecutor(
+    OperationContext* opCtx, const BSONObj& requestCollation, const NamespaceString& nss);
 
 /**
  * Filter indexes retrieved from index catalog by
@@ -110,7 +121,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     OperationContext* opCtx,
     Collection* collection,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
-    PlanExecutor::YieldPolicy yieldPolicy,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions = 0);
 
 /**
@@ -192,10 +203,7 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln,
  * distinct.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
-    OperationContext* opCtx,
-    Collection* collection,
-    size_t plannerOptions,
-    ParsedDistinct* parsedDistinct);
+    Collection* collection, size_t plannerOptions, ParsedDistinct* parsedDistinct);
 
 /*
  * Get a PlanExecutor for a query executing as part of a count command.
@@ -205,7 +213,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDist
  * executing a count.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
-    OperationContext* opCtx,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
     Collection* collection,
     const CountCommand& request,
     bool explain,
@@ -231,7 +239,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
  * If the query cannot be executed, returns a Status indicating why.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
-    OperationContext* opCtx,
     OpDebug* opDebug,
     Collection* collection,
     ParsedDelete* parsedDelete,
@@ -258,7 +265,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
  * If the query cannot be executed, returns a Status indicating why.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
-    OperationContext* opCtx,
     OpDebug* opDebug,
     Collection* collection,
     ParsedUpdate* parsedUpdate,

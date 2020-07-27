@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -42,10 +42,10 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/add_shard_request_type.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -129,8 +129,11 @@ public:
             parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize() : kMaxSizeMBDefault);
 
         if (!addShardResult.isOK()) {
-            log() << "addShard request '" << parsedRequest << "'"
-                  << "failed" << causedBy(addShardResult.getStatus());
+            LOGV2(21920,
+                  "addShard request '{request}' failed: {error}",
+                  "addShard request failed",
+                  "request"_attr = parsedRequest,
+                  "error"_attr = addShardResult.getStatus());
             uassertStatusOK(addShardResult.getStatus());
         }
 

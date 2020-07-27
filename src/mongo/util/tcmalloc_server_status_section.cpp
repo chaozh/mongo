@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #ifdef _WIN32
 #define NVALGRIND
@@ -42,7 +42,6 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/service_context.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/tcmalloc_parameters_gen.h"
 
 namespace mongo {
@@ -151,9 +150,16 @@ public:
 #if MONGO_HAVE_GPERFTOOLS_SIZE_CLASS_STATS
             if (verbosity >= 2) {
                 // Size class information
-                BSONArrayBuilder arr;
-                MallocExtension::instance()->SizeClasses(&arr, appendSizeClassInfo);
-                sub.append("size_classes", arr.arr());
+                std::pair<BSONArrayBuilder, BSONArrayBuilder> builders(
+                    builder.subarrayStart("size_classes"), BSONArrayBuilder());
+
+                // Size classes and page heap info is dumped in 1 call so that the performance
+                // sensitive tcmalloc page heap lock is only taken once
+                MallocExtension::instance()->SizeClasses(
+                    &builders, appendSizeClassInfo, appendPageHeapInfo);
+
+                builders.first.done();
+                builder.append("page_heap", builders.second.arr());
             }
 #endif
 
@@ -176,7 +182,9 @@ private:
 
 #if MONGO_HAVE_GPERFTOOLS_SIZE_CLASS_STATS
     static void appendSizeClassInfo(void* bsonarr_builder, const base::MallocSizeClass* stats) {
-        BSONArrayBuilder* builder = reinterpret_cast<BSONArrayBuilder*>(bsonarr_builder);
+        BSONArrayBuilder& builder =
+            reinterpret_cast<std::pair<BSONArrayBuilder, BSONArrayBuilder>*>(bsonarr_builder)
+                ->first;
         BSONObjBuilder doc;
 
         doc.appendNumber("bytes_per_object", stats->bytes_per_obj);
@@ -188,7 +196,22 @@ private:
         doc.appendNumber("free_bytes", stats->free_bytes);
         doc.appendNumber("allocated_bytes", stats->alloc_bytes);
 
-        builder->append(doc.obj());
+        builder.append(doc.obj());
+    }
+
+    static void appendPageHeapInfo(void* bsonarr_builder, const base::PageHeapSizeClass* stats) {
+        BSONArrayBuilder& builder =
+            reinterpret_cast<std::pair<BSONArrayBuilder, BSONArrayBuilder>*>(bsonarr_builder)
+                ->second;
+        BSONObjBuilder doc;
+
+        doc.appendNumber("pages", stats->pages);
+        doc.appendNumber("normal_spans", stats->normal_spans);
+        doc.appendNumber("unmapped_spans", stats->unmapped_spans);
+        doc.appendNumber("normal_bytes", stats->normal_bytes);
+        doc.appendNumber("unmapped_bytes", stats->unmapped_bytes);
+
+        builder.append(doc.obj());
     }
 #endif
 } tcmallocServerStatusSection;

@@ -27,8 +27,13 @@
  *    it in the license file.
  */
 
+#include <boost/optional.hpp>
+
+#include "mongo/base/error_codes.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/basic.h"
 
+#include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
 
 #include "mongo/util/periodic_runner_impl.h"
@@ -68,6 +73,14 @@ class PeriodicRunnerImplTest : public PeriodicRunnerImplTestNoSetup {
 public:
     void setUp() override {
         PeriodicRunnerImplTestNoSetup::setUp();
+    }
+
+    auto makeStoppedJob() {
+        PeriodicRunner::PeriodicJob job("job", [](Client* client) {}, Seconds{1});
+        auto jobAnchor = runner().makeJob(std::move(job));
+        jobAnchor.start();
+        jobAnchor.stop();
+        return jobAnchor;
     }
 };
 
@@ -435,6 +448,60 @@ TEST_F(PeriodicRunnerImplTest, ChangingIntervalWorks) {
     }
 
     tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, StopProperlyInterruptsOpCtx) {
+    Milliseconds interval{5};
+    unittest::Barrier barrier(2);
+    AtomicWord<bool> killed{false};
+
+    PeriodicRunner::PeriodicJob job(
+        "job",
+        [&barrier, &killed](Client* client) {
+            stdx::condition_variable cv;
+            auto mutex = MONGO_MAKE_LATCH();
+            barrier.countDownAndWait();
+
+            try {
+                auto opCtx = client->makeOperationContext();
+                stdx::unique_lock<Latch> lk(mutex);
+                opCtx->waitForConditionOrInterrupt(cv, lk, [] { return false; });
+            } catch (const ExceptionForCat<ErrorCategory::Interruption>& e) {
+                ASSERT_EQ(e.code(), ErrorCodes::ClientMarkedKilled);
+                killed.store(true);
+                return;
+            }
+
+            MONGO_UNREACHABLE;
+        },
+        interval);
+
+    auto jobAnchor = runner().makeJob(std::move(job));
+    jobAnchor.start();
+
+    barrier.countDownAndWait();
+
+    jobAnchor.stop();
+    ASSERT(killed.load());
+
+    tearDown();
+}
+
+TEST_F(PeriodicRunnerImplTest, ThrowsErrorOnceStopped) {
+    auto jobAnchor = makeStoppedJob();
+    ASSERT_THROWS_CODE_AND_WHAT(jobAnchor.start(),
+                                AssertionException,
+                                ErrorCodes::PeriodicJobIsStopped,
+                                "Attempted to start an already stopped job");
+    ASSERT_THROWS_CODE_AND_WHAT(jobAnchor.pause(),
+                                AssertionException,
+                                ErrorCodes::PeriodicJobIsStopped,
+                                "Attempted to pause an already stopped job");
+    ASSERT_THROWS_CODE_AND_WHAT(jobAnchor.resume(),
+                                AssertionException,
+                                ErrorCodes::PeriodicJobIsStopped,
+                                "Attempted to resume an already stopped job");
+    jobAnchor.stop();
 }
 
 }  // namespace

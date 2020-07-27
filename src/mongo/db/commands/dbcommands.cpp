@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +45,6 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -84,12 +83,13 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/version.h"
@@ -255,7 +255,6 @@ public:
             dropCollection(opCtx,
                            nsToDrop,
                            result,
-                           {},
                            DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
         return true;
     }
@@ -318,10 +317,10 @@ public:
         const NamespaceString ns = cmd.getNamespace();
 
         if (cmd.getAutoIndexId()) {
-            const char* deprecationWarning =
-                "the autoIndexId option is deprecated and will be removed in a future release";
-            warning() << deprecationWarning;
-            result.append("note", deprecationWarning);
+#define DEPR_23800 "The autoIndexId option is deprecated and will be removed in a future release"
+            LOGV2_WARNING(23800, DEPR_23800);
+            result.append("note", DEPR_23800);
+#undef DEPR_23800
         }
 
         // Ensure that the 'size' field is present if 'capped' is set to true.
@@ -405,19 +404,17 @@ public:
 } cmdCreate;
 
 class CmdDatasize : public ErrmsgCommandDeprecated {
-    virtual string parseNs(const string& dbname, const BSONObj& cmdObj) const {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
-    }
-
 public:
     CmdDatasize() : ErrmsgCommandDeprecated("dataSize", "datasize") {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
+
     std::string help() const override {
         return "determine data size for a set of data in a certain range"
                "\nexample: { dataSize:\"blog.posts\", keyPattern:{x:1}, min:{x:10}, max:{x:55} }"
@@ -431,19 +428,23 @@ public:
                "\nnote: This command may take a while to run";
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+
+    string parseNs(const string& dbname, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool errmsgRun(OperationContext* opCtx,
                    const string& dbname,
                    const BSONObj& jsobj,
                    string& errmsg,
-                   BSONObjBuilder& result) {
+                   BSONObjBuilder& result) override {
         Timer timer;
 
         string ns = jsobj.firstElement().String();
@@ -452,9 +453,32 @@ public:
         BSONObj keyPattern = jsobj.getObjectField("keyPattern");
         bool estimate = jsobj["estimate"].trueValue();
 
-        AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
-
+        const NamespaceString nss(ns);
+        AutoGetCollectionForReadCommand ctx(opCtx, nss);
         Collection* collection = ctx.getCollection();
+
+        const auto collDesc =
+            CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
+
+        if (collDesc.isSharded()) {
+            const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
+            uassert(ErrorCodes::BadValue,
+                    "keyPattern must be empty or must be an object that equals the shard key",
+                    keyPattern.isEmpty() ||
+                        (SimpleBSONObjComparator::kInstance.evaluate(shardKeyPattern.toBSON() ==
+                                                                     keyPattern)));
+
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "min value " << min << " does not have shard key",
+                    min.isEmpty() || shardKeyPattern.isShardKey(min));
+            min = shardKeyPattern.normalizeShardKey(min);
+
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "max value " << max << " does not have shard key",
+                    max.isEmpty() || shardKeyPattern.isShardKey(max));
+            max = shardKeyPattern.normalizeShardKey(max);
+        }
+
         long long numRecords = 0;
         if (collection) {
             numRecords = collection->numRecords(opCtx);
@@ -477,7 +501,8 @@ public:
                 result.append("millis", timer.millis());
                 return 1;
             }
-            exec = InternalPlanner::collectionScan(opCtx, ns, collection, PlanExecutor::NO_YIELD);
+            exec = InternalPlanner::collectionScan(
+                opCtx, ns, collection, PlanYieldPolicy::YieldPolicy::NO_YIELD);
         } else if (min.isEmpty() || max.isEmpty()) {
             errmsg = "only one of min or max specified";
             return false;
@@ -507,7 +532,7 @@ public:
                                               min,
                                               max,
                                               BoundInclusion::kIncludeStartKeyOnly,
-                                              PlanExecutor::NO_YIELD);
+                                              PlanYieldPolicy::YieldPolicy::NO_YIELD);
         }
 
         long long avgObjSize = collection->dataSize(opCtx) / numRecords;
@@ -518,27 +543,28 @@ public:
         long long size = 0;
         long long numObjects = 0;
 
-        RecordId loc;
-        BSONObj obj;
-        PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &loc))) {
-            if (estimate)
-                size += avgObjSize;
-            else
-                size += collection->getRecordStore()->dataFor(opCtx, loc).size();
+        try {
+            RecordId loc;
+            while (PlanExecutor::ADVANCED == exec->getNext(static_cast<BSONObj*>(nullptr), &loc)) {
+                if (estimate)
+                    size += avgObjSize;
+                else
+                    size += collection->getRecordStore()->dataFor(opCtx, loc).size();
 
-            numObjects++;
+                numObjects++;
 
-            if ((maxSize && size > maxSize) || (maxObjects && numObjects > maxObjects)) {
-                result.appendBool("maxReached", true);
-                break;
+                if ((maxSize && size > maxSize) || (maxObjects && numObjects > maxObjects)) {
+                    result.appendBool("maxReached", true);
+                    break;
+                }
             }
-        }
-
-        if (PlanExecutor::FAILURE == state) {
-            warning() << "Internal error while reading " << ns;
-            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                "Executor error while reading during dataSize command"));
+        } catch (DBException& exception) {
+            LOGV2_WARNING(23801,
+                          "Internal error while reading {namespace}",
+                          "Internal error while reading",
+                          "namespace"_attr = ns);
+            exception.addContext("Executor error while reading during dataSize command");
+            throw;
         }
 
         ostringstream os;
@@ -561,6 +587,9 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+    bool maintenanceOk() const override {
+        return false;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -644,6 +673,9 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
+    bool maintenanceOk() const override {
+        return false;
+    }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
@@ -720,7 +752,8 @@ public:
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
                 // TODO: OldClientContext legacy, needs to be removed
-                CurOp::get(opCtx)->enter_inlock(dbname.c_str(), db->getProfilingLevel());
+                CurOp::get(opCtx)->enter_inlock(
+                    dbname.c_str(), CollectionCatalog::get(opCtx).getDatabaseProfileLevel(dbname));
             }
 
             db->getStats(opCtx, &result, scale);

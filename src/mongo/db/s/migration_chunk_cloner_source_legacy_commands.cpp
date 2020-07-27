@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -347,11 +347,6 @@ public:
         } while (arrBuilder.arrSize() == 0 && !hasMigrationCompleted);
 
         result.appendArray("oplog", arrBuilder.arr());
-
-        // TODO: SERVER-40187 remove after v4.2. This is to indicate the caller that this server
-        // waits for notification on new oplog entries to send over so the caller doesn't need
-        // to throttle.
-        result.append("waitsForNewOplog", true);
 
         return true;
     }

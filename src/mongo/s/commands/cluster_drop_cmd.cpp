@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -72,6 +72,14 @@ public:
              BSONObjBuilder& result) override {
 
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot drop collection in config database",
+                nss.db() != NamespaceString::kConfigDb);
+
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot drop collection in admin database",
+                nss.db() != NamespaceString::kAdminDb);
 
         // Invalidate the routing table cache entry for this collection so that we reload it the
         // next time it is accessed, even if sending the command to the config server fails due

@@ -77,8 +77,7 @@ public:
     Status dropReplicatedDatabases(OperationContext* opCtx) override;
 
     Status createOplog(OperationContext* opCtx, const NamespaceString& nss) override;
-    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx,
-                                       const NamespaceString& nss) override;
+    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx) override;
 
     Status createCollection(OperationContext* opCtx,
                             const NamespaceString& nss,
@@ -143,6 +142,14 @@ public:
                           const NamespaceString& nss,
                           const BSONObj& filter) override;
 
+    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
+        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) override;
+
+    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) override;
+
+    Timestamp getLatestOplogTimestamp(OperationContext* opCtx) override;
+
     StatusWith<StorageInterface::CollectionSize> getCollectionSize(
         OperationContext* opCtx, const NamespaceString& nss) override;
 
@@ -160,7 +167,7 @@ public:
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
-    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
+    Timestamp recoverToStableTimestamp(OperationContext* opCtx) override;
 
     bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override;
 

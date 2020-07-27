@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -38,12 +38,12 @@
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/log.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -300,7 +300,7 @@ class WatchdogMonitorThreadTest : public ServiceContextTest {};
 TEST_F(WatchdogMonitorThreadTest, Basic) {
     ManualResetEvent deathEvent;
     WatchdogDeathCallback deathCallback = [&deathEvent]() {
-        log() << "Death signalled";
+        LOGV2(23431, "Death signalled");
         deathEvent.set();
     };
 
@@ -345,7 +345,7 @@ private:
 TEST_F(WatchdogMonitorThreadTest, SleepyHungCheck) {
     ManualResetEvent deathEvent;
     WatchdogDeathCallback deathCallback = [&deathEvent]() {
-        log() << "Death signalled";
+        LOGV2(23432, "Death signalled");
         deathEvent.set();
     };
 
@@ -375,7 +375,7 @@ class WatchdogMonitorTest : public ServiceContextTest {};
 TEST_F(WatchdogMonitorTest, SleepyHungCheck) {
     ManualResetEvent deathEvent;
     WatchdogDeathCallback deathCallback = [&deathEvent]() {
-        log() << "Death signalled";
+        LOGV2(23433, "Death signalled");
         deathEvent.set();
     };
 
@@ -394,7 +394,7 @@ TEST_F(WatchdogMonitorTest, SleepyHungCheck) {
 }
 
 // Positive: Make sure watchdog monitor terminates the process if a check is unresponsive
-DEATH_TEST(WatchdogMonitorTest, Death, "") {
+DEATH_TEST_F(WatchdogMonitorTest, Death, "") {
     auto sleepyCheck = std::make_unique<SleepyCheck>();
 
     std::vector<std::unique_ptr<WatchdogCheck>> checks;
@@ -405,14 +405,15 @@ DEATH_TEST(WatchdogMonitorTest, Death, "") {
 
     monitor.start();
 
-    sleepmillis(1000);
+    // In TSAN builds, we need to wait enough time for death to be triggered
+    sleepsecs(100);
 }
 
 // Positive: Make sure the monitor can be paused and resumed, and it does not trigger death
 TEST_F(WatchdogMonitorTest, PauseAndResume) {
 
     WatchdogDeathCallback deathCallback = []() {
-        log() << "Death signalled, it should not have been";
+        LOGV2(23434, "Death signalled, it should not have been");
         invariant(false);
     };
 

@@ -29,10 +29,19 @@
 
 #pragma once
 
+#include <fmt/format.h>
+
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
+
 namespace mongo {
 namespace feature_compatibility_version_documentation {
-constexpr StringData kCompatibilityLink =
-    "http://dochub.mongodb.org/core/4.0-feature-compatibility"_sd;
-constexpr StringData kUpgradeLink = "http://dochub.mongodb.org/core/4.0-upgrade-fcv"_sd;
+using namespace fmt::literals;
+
+const std::string kCompatibilityLink =
+    "https://docs.mongodb.com/master/release-notes/{}-compatibility/#feature-compatibility"_format(
+        FeatureCompatibilityVersionParser::kLastLTS);
+const std::string kUpgradeLink =
+    "https://docs.mongodb.com/master/release-notes/{}/#upgrade-procedures"_format(
+        FeatureCompatibilityVersionParser::kLastLTS);
 }  // namespace feature_compatibility_version_documentation
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -39,21 +39,18 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
-#include "mongo/db/s/implicit_create_collection.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_config_optime_gossip.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
-#include "mongo/logger/redaction.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
-#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -84,11 +81,16 @@ public:
             if (ErrorCodes::isExceededTimeLimitError(rcStatus.code())) {
                 const int debugLevel =
                     serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
-                LOG(debugLevel) << "Command on database " << request.getDatabase()
-                                << " timed out waiting for read concern to be satisfied. Command: "
-                                << redact(ServiceEntryPointCommon::getRedactedCopyForLogging(
-                                       invocation->definition(), request.body))
-                                << ". Info: " << redact(rcStatus);
+                LOGV2_DEBUG(21975,
+                            debugLevel,
+                            "Command on database {db} timed out waiting for read concern to be "
+                            "satisfied. Command: {command}. Info: {error}",
+                            "Command timed out waiting for read concern to be satisfied",
+                            "db"_attr = request.getDatabase(),
+                            "command"_attr =
+                                redact(ServiceEntryPointCommon::getRedactedCopyForLogging(
+                                    invocation->definition(), request.body)),
+                            "error"_attr = redact(rcStatus));
             }
 
             uassertStatusOK(rcStatus);
@@ -183,17 +185,17 @@ public:
     void handleException(const DBException& e, OperationContext* opCtx) const override {
         // If we got a stale config, wait in case the operation is stuck in a critical section
         if (auto sce = e.extraInfo<StaleConfigInfo>()) {
+            // A config server acting as a router may return a StaleConfig exception, but a config
+            // server won't contain data for a sharded collection, so skip handling the exception.
+            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                return;
+            }
+
             if (sce->getCriticalSectionSignal()) {
                 // Set migration critical section on operation sharding state: operation will wait
                 // for the migration to finish before returning.
                 auto& oss = OperationShardingState::get(opCtx);
                 oss.setMigrationCriticalSectionSignal(sce->getCriticalSectionSignal());
-            }
-
-            if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-                serverGlobalParams.featureCompatibility.getVersion() ==
-                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-                invariant(sce->getShardId());
             }
 
             if (!opCtx->getClient()->isInDirectClient()) {
@@ -206,14 +208,6 @@ public:
             if (!opCtx->getClient()->isInDirectClient()) {
                 onDbVersionMismatchNoExcept(
                     opCtx, sce->getDb(), sce->getVersionReceived(), sce->getVersionWanted())
-                    .ignore();
-            }
-        } else if (auto cannotImplicitCreateCollInfo =
-                       e.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-            if (ShardingState::get(opCtx)->enabled() &&
-                serverGlobalParams.featureCompatibility.getVersion() ==
-                    ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
-                onCannotImplicitlyCreateCollection(opCtx, cannotImplicitCreateCollInfo->getNss())
                     .ignore();
             }
         }
@@ -244,15 +238,13 @@ public:
             repl::OpTime lastOpTimeFromClient =
                 repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             replCoord->prepareReplMetadata(request.body, lastOpTimeFromClient, metadataBob);
-            // For commands from mongos, append some info to help getLastError(w) work.
-            // TODO: refactor out of here as part of SERVER-18236
+
             if (isShardingAware || isConfig) {
+                // For commands from mongos, append some info to help getLastError(w) work.
                 rpc::ShardingMetadata(lastOpTimeFromClient, replCoord->getElectionId())
                     .writeToMetadata(metadataBob)
                     .transitional_ignore();
-            }
 
-            if (isShardingAware || isConfig) {
                 auto lastCommittedOpTime = replCoord->getLastCommittedOpTime();
                 metadataBob->append(kLastCommittedOpTimeFieldName,
                                     lastCommittedOpTime.getTimestamp());

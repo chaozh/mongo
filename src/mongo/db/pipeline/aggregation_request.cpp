@@ -36,6 +36,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
@@ -188,40 +189,47 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
 
             auto writeConcern = uassertStatusOK(WriteConcernOptions::parse(elem.embeddedObject()));
             request.setWriteConcern(writeConcern);
-        } else if (kRuntimeConstants == fieldName) {
+        } else if (kRuntimeConstantsName == fieldName) {
+            // TODO SERVER-46384: Remove 'runtimeConstants' in 4.5 since it is redundant with 'let'
             try {
                 IDLParserErrorContext ctx("internalRuntimeConstants");
                 request.setRuntimeConstants(RuntimeConstants::parse(ctx, elem.Obj()));
             } catch (const DBException& ex) {
                 return ex.toStatus();
             }
-        } else if (fieldName == "mergeByPBRT"_sd) {
-            // TODO SERVER-41900: we must retain the ability to ingest the 'mergeByPBRT' field for
-            // 4.4 upgrade purposes, since a 4.2 mongoS will always send {mergeByPBRT:true} to the
-            // shards. We do nothing with it because mergeByPBRT is the only mode available in 4.4.
-            // Remove this final vestige of mergeByPBRT during the 4.5 development cycle.
-        } else if (fieldName == kUse44SortKeys) {
-            // TODO (SERVER-43361): After branching for 4.5, we will accept this option but ignore
-            // it, as we will be able to assume that any supported mongoS will be recent enough to
-            // understand the 4.4 sort key format. In the version that follows, we will be able to
-            // completely remove this option.
+        } else if (kLetName == fieldName) {
+            if (elem.type() != BSONType::Object)
+                return {ErrorCodes::TypeMismatch,
+                        str::stream()
+                            << fieldName << " must be an object, not a " << typeName(elem.type())};
+            auto bob = BSONObjBuilder{request.getLetParameters()};
+            bob.appendElementsUnique(elem.embeddedObject());
+            request._letParameters = bob.obj();
+        } else if (fieldName == kUse44SortKeysName) {
             if (elem.type() != BSONType::Bool) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << kUse44SortKeys << " must be a boolean, not a "
+                        str::stream() << kUse44SortKeysName << " must be a boolean, not a "
                                       << typeName(elem.type())};
             }
-
-            request.setUse44SortKeys(elem.boolean());
-        } else if (fieldName == kUseNewUpsert) {
-            // TODO SERVER-44884: After branching for 4.5, we will continue to accept this option
-            // for upgrade purposes but will ignore it, as any supported version will be capable of
-            // using the new upsert mechanism. In 4.7 we will completely remove this parameter.
+            // TODO SERVER-47065: A 4.6 node still has to accept the 'use44SortKeys' field, since it
+            // could be included in a command sent from a 4.4 mongos or 4.4 mongod. In 4.7, this
+            // code to tolerate the 'use44SortKeys' field can be deleted.
+        } else if (fieldName == "useNewUpsert"_sd) {
+            // TODO SERVER-46751: we must retain the ability to ingest the 'useNewUpsert' field for
+            // 4.6 upgrade purposes, since a 4.4 mongoS will always send {useNewUpsert:true} to the
+            // shards. We do nothing with it because useNewUpsert will be automatically used in 4.6
+            // when appropriate. Remove this final vestige of useNewUpsert during the 4.7 dev cycle.
+        } else if (fieldName == kIsMapReduceCommandName) {
             if (elem.type() != BSONType::Bool) {
                 return {ErrorCodes::TypeMismatch,
-                        str::stream() << kUseNewUpsert << " must be a boolean, not a "
+                        str::stream() << kIsMapReduceCommandName << " must be a boolean, not a "
                                       << typeName(elem.type())};
             }
-            request.setUseNewUpsert(elem.boolean());
+            request.setIsMapReduceCommand(elem.boolean());
+        } else if (isMongocryptdArgument(fieldName)) {
+            return {ErrorCodes::FailedToParse,
+                    str::stream() << "unrecognized field '" << elem.fieldName()
+                                  << "'. This command may be meant for a mongocryptd process."};
         } else if (!isGenericArgument(fieldName)) {
             return {ErrorCodes::FailedToParse,
                     str::stream() << "unrecognized field '" << elem.fieldName() << "'"};
@@ -261,7 +269,7 @@ StatusWith<AggregationRequest> AggregationRequest::parseFromBSON(
     }
 
     return request;
-}
+}  // namespace mongo
 
 NamespaceString AggregationRequest::parseNs(const std::string& dbname, const BSONObj& cmdObj) {
     auto firstElement = cmdObj.firstElement();
@@ -319,9 +327,9 @@ Document AggregationRequest::serializeToCommandObj() const {
         {WriteConcernOptions::kWriteConcernField,
          _writeConcern ? Value(_writeConcern->toBSON()) : Value()},
         // Only serialize runtime constants if any were specified.
-        {kRuntimeConstants, _runtimeConstants ? Value(_runtimeConstants->toBSON()) : Value()},
-        {kUse44SortKeys, _use44SortKeys ? Value(true) : Value()},
-        {kUseNewUpsert, _useNewUpsert ? Value(true) : Value()},
+        {kRuntimeConstantsName, _runtimeConstants ? Value(_runtimeConstants->toBSON()) : Value()},
+        {kIsMapReduceCommandName, _isMapReduceCommand ? Value(true) : Value()},
+        {kLetName, !_letParameters.isEmpty() ? Value(_letParameters) : Value()},
     };
 }
 }  // namespace mongo

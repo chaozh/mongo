@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/storage/durable_catalog_impl.h"
 
@@ -37,21 +37,21 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/catalog/index_timestamp_helper.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/durable_catalog_feature_tracker.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/bits.h"
 #include "mongo/platform/random.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -140,6 +140,47 @@ bool indexTypeSupportsPathLevelMultikeyTracking(StringData accessMethod) {
     return accessMethod == IndexNames::BTREE || accessMethod == IndexNames::GEO_2DSPHERE;
 }
 
+/**
+ * Returns true if writes to the catalog entry for the input namespace require being timestamped.
+ */
+bool requiresTimestampForCatalogWrite(OperationContext* opCtx, const NamespaceString& nss) {
+    if (!nss.isReplicated() || nss.coll().startsWith("tmp.mr.") || nss.isDropPendingNamespace()) {
+        return false;
+    }
+
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (!replCoord->isReplEnabled()) {
+        return false;
+    }
+
+    if (replCoord->canAcceptWritesFor(opCtx, nss)) {
+        return false;
+    }
+
+    // If there is a timestamp already assigned, there's no need to explicitly assign a timestamp.
+    if (opCtx->recoveryUnit()->isTimestamped()) {
+        return false;
+    }
+
+    // Nodes in `startup` do not need to timestamp writes.
+    // Nodes in the oplog application phase of initial sync (`startup2`) must not timestamp writes
+    // before the `initialDataTimestamp`.  Nodes in initial sync may also be in the `removed` state
+    // due to DNS resolution errors; they may continue writing during that time.
+    const auto memberState = replCoord->getMemberState();
+    if (memberState.startup() || memberState.startup2() || memberState.removed()) {
+        return false;
+    }
+
+    // When rollback completes, index builds may be restarted, which requires untimestamped catalog
+    // writes. Additionally, it's illegal to timestamp a write later than the timestamp associated
+    // with the node exiting the rollback state.
+    if (memberState.rollback()) {
+        return false;
+    }
+
+    return true;
+}
+
 }  // namespace
 
 using std::string;
@@ -219,9 +260,15 @@ public:
         // Intentionally ignoring failure here. Since we've removed the metadata pointing to the
         // index, we should never see it again anyway.
         if (_engine->getStorageEngine()->supportsPendingDrops() && commitTimestamp) {
-            log() << "Deferring table drop for index '" << _indexName << "' on collection '"
-                  << _indexNss << (_uuid ? " (" + _uuid->toString() + ")'" : "") << ". Ident: '"
-                  << _ident << "', commit timestamp: '" << commitTimestamp << "'";
+            LOGV2(22206,
+                  "Deferring table drop for index '{index}' on collection "
+                  "'{namespace}{uuid}. Ident: '{ident}', commit timestamp: '{commitTimestamp}'",
+                  "Deferring table drop for index",
+                  "index"_attr = _indexName,
+                  logAttrs(_indexNss),
+                  "uuid"_attr = _uuid,
+                  "ident"_attr = _ident,
+                  "commitTimestamp"_attr = commitTimestamp);
             _engine->addDropPendingIdent(*commitTimestamp, _indexNss, _ident);
         } else {
             auto kvEngine = _engine->getEngine();
@@ -345,7 +392,11 @@ DurableCatalogImpl::FeatureTracker::FeatureBits DurableCatalogImpl::FeatureTrack
     auto nonRepairableFeaturesStatus = bsonExtractTypedField(
         obj, kNonRepairableFeaturesFieldName, BSONType::NumberLong, &nonRepairableFeaturesElem);
     if (!nonRepairableFeaturesStatus.isOK()) {
-        error() << "error: exception extracting typed field with obj:" << redact(obj);
+        LOGV2_ERROR(22215,
+                    "error: exception extracting typed field with obj:{obj}",
+                    "Exception extracting typed field from obj",
+                    "obj"_attr = redact(obj),
+                    "fieldName"_attr = kNonRepairableFeaturesFieldName);
         fassert(40111, nonRepairableFeaturesStatus);
     }
 
@@ -353,7 +404,11 @@ DurableCatalogImpl::FeatureTracker::FeatureBits DurableCatalogImpl::FeatureTrack
     auto repairableFeaturesStatus = bsonExtractTypedField(
         obj, kRepairableFeaturesFieldName, BSONType::NumberLong, &repairableFeaturesElem);
     if (!repairableFeaturesStatus.isOK()) {
-        error() << "error: exception extracting typed field with obj:" << redact(obj);
+        LOGV2_ERROR(22216,
+                    "error: exception extracting typed field with obj:{obj}",
+                    "Exception extracting typed field from obj",
+                    "obj"_attr = redact(obj),
+                    "fieldName"_attr = kRepairableFeaturesFieldName);
         fassert(40112, repairableFeaturesStatus);
     }
 
@@ -539,7 +594,11 @@ StatusWith<DurableCatalog::Entry> DurableCatalogImpl::_addEntry(OperationContext
     _catalogIdToEntryMap[res.getValue()] = {res.getValue(), ident, nss};
     opCtx->recoveryUnit()->registerChange(std::make_unique<AddIdentChange>(this, res.getValue()));
 
-    LOG(1) << "stored meta data for " << nss.ns() << " @ " << res.getValue();
+    LOGV2_DEBUG(22207,
+                1,
+                "stored meta data for {nss_ns} @ {res_getValue}",
+                "nss_ns"_attr = nss.ns(),
+                "res_getValue"_attr = res.getValue());
     return {{res.getValue(), ident, nss}};
 }
 
@@ -552,7 +611,7 @@ std::string DurableCatalogImpl::getIndexIdent(OperationContext* opCtx,
 }
 
 BSONObj DurableCatalogImpl::_findEntry(OperationContext* opCtx, RecordId catalogId) const {
-    LOG(3) << "looking up metadata for: " << catalogId;
+    LOGV2_DEBUG(22208, 3, "looking up metadata for: {catalogId}", "catalogId"_attr = catalogId);
     RecordData data;
     if (!_rs->findRecord(opCtx, catalogId, &data)) {
         // since the in memory meta data isn't managed with mvcc
@@ -567,11 +626,11 @@ BSONObj DurableCatalogImpl::_findEntry(OperationContext* opCtx, RecordId catalog
 BSONCollectionCatalogEntry::MetaData DurableCatalogImpl::getMetaData(OperationContext* opCtx,
                                                                      RecordId catalogId) const {
     BSONObj obj = _findEntry(opCtx, catalogId);
-    LOG(3) << " fetched CCE metadata: " << obj;
+    LOGV2_DEBUG(22209, 3, " fetched CCE metadata: {obj}", "obj"_attr = obj);
     BSONCollectionCatalogEntry::MetaData md;
     const BSONElement mdElement = obj["md"];
     if (mdElement.isABSONObj()) {
-        LOG(3) << "returning metadata: " << mdElement;
+        LOGV2_DEBUG(22210, 3, "returning metadata: {mdElement}", "mdElement"_attr = mdElement);
         md.parse(mdElement.Obj());
     }
     return md;
@@ -584,17 +643,6 @@ void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
     BSONObj obj = _findEntry(opCtx, catalogId);
 
     {
-        // Remove the index spec 'ns' field if FCV is set to 4.4.
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-            for (size_t i = 0; i < md.indexes.size(); i++) {
-                if (md.indexes[i].spec.hasField("ns")) {
-                    md.indexes[i].spec = md.indexes[i].spec.removeField("ns");
-                }
-            }
-        }
-
         // rebuilt doc
         BSONObjBuilder b;
         b.append("md", md.toBSON());
@@ -627,12 +675,11 @@ void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
         obj = b.obj();
     }
 
-    if (IndexTimestampHelper::requiresGhostCommitTimestampForCatalogWrite(opCtx, nss) &&
-        !nss.isDropPendingNamespace()) {
+    if (requiresTimestampForCatalogWrite(opCtx, nss)) {
         opCtx->recoveryUnit()->setMustBeTimestamped();
     }
 
-    LOG(3) << "recording new metadata: " << obj;
+    LOGV2_DEBUG(22211, 3, "recording new metadata: {obj}", "obj"_attr = obj);
     Status status = _rs->updateRecord(opCtx, catalogId, obj.objdata(), obj.objsize());
     fassert(28521, status);
 }
@@ -649,7 +696,7 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
 
         BSONCollectionCatalogEntry::MetaData md;
         md.parse(old["md"].Obj());
-        md.rename(toNss.ns());
+        md.ns = toNss.ns();
         if (!stayTemp)
             md.options.temp = false;
         b.append("md", md.toBSON());
@@ -674,9 +721,7 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
         it->second.nss = fromName;
     });
 
-    NamespaceString fromNss(fromName);
-    if (IndexTimestampHelper::requiresGhostCommitTimestampForCatalogWrite(opCtx, fromNss) &&
-        !fromNss.isDropPendingNamespace()) {
+    if (requiresTimestampForCatalogWrite(opCtx, fromName)) {
         opCtx->recoveryUnit()->setMustBeTimestamped();
     }
 
@@ -693,7 +738,11 @@ Status DurableCatalogImpl::_removeEntry(OperationContext* opCtx, RecordId catalo
     opCtx->recoveryUnit()->registerChange(
         std::make_unique<RemoveIdentChange>(this, catalogId, it->second));
 
-    LOG(1) << "deleting metadata for " << it->second.nss << " @ " << catalogId;
+    LOGV2_DEBUG(22212,
+                1,
+                "deleting metadata for {it_second_nss} @ {catalogId}",
+                "it_second_nss"_attr = it->second.nss,
+                "catalogId"_attr = catalogId);
     _rs->deleteRecord(opCtx, catalogId);
     _catalogIdToEntryMap.erase(it);
 
@@ -781,7 +830,11 @@ StatusWith<std::string> DurableCatalogImpl::newOrphanedIdent(OperationContext* o
     _catalogIdToEntryMap[res.getValue()] = Entry(res.getValue(), ident, ns);
     opCtx->recoveryUnit()->registerChange(std::make_unique<AddIdentChange>(this, res.getValue()));
 
-    LOG(1) << "stored meta data for orphaned collection " << ns << " @ " << res.getValue();
+    LOGV2_DEBUG(22213,
+                1,
+                "stored meta data for orphaned collection {ns} @ {res_getValue}",
+                "ns"_attr = ns,
+                "res_getValue"_attr = res.getValue());
     return {ns.ns()};
 }
 
@@ -847,15 +900,6 @@ Status DurableCatalogImpl::dropCollection(OperationContext* opCtx, RecordId cata
     }
 
     invariant(opCtx->lockState()->isCollectionLockedForMode(entry.nss, MODE_X));
-    invariant(getTotalIndexCount(opCtx, catalogId) == getCompletedIndexCount(opCtx, catalogId));
-    {
-        std::vector<std::string> indexNames;
-        getAllIndexes(opCtx, catalogId, &indexNames);
-        for (size_t i = 0; i < indexNames.size(); i++) {
-            Status status = removeIndex(opCtx, catalogId, indexNames[i]);
-        }
-    }
-
     invariant(getTotalIndexCount(opCtx, catalogId) == 0);
 
     // Remove metadata from mdb_catalog
@@ -871,8 +915,13 @@ Status DurableCatalogImpl::dropCollection(OperationContext* opCtx, RecordId cata
             StorageEngineInterface* engine = catalog->_engine;
             auto storageEngine = engine->getStorageEngine();
             if (storageEngine->supportsPendingDrops() && commitTimestamp) {
-                log() << "Deferring table drop for collection '" << entry.nss
-                      << "'. Ident: " << entry.ident << ", commit timestamp: " << commitTimestamp;
+                LOGV2(22214,
+                      "Deferring table drop for collection '{namespace}'. Ident: {ident}, "
+                      "commit timestamp: {commitTimestamp}",
+                      "Deferring table drop for collection",
+                      logAttrs(entry.nss),
+                      "ident"_attr = entry.ident,
+                      "commitTimestamp"_attr = commitTimestamp);
                 engine->addDropPendingIdent(*commitTimestamp, entry.nss, entry.ident);
             } else {
                 // Intentionally ignoring failure here. Since we've removed the metadata pointing to
@@ -899,10 +948,25 @@ void DurableCatalogImpl::updateTTLSetting(OperationContext* opCtx,
                                           long long newExpireSeconds) {
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
     int offset = md.findIndexOffset(idxName);
-    invariant(offset >= 0);
+    invariant(offset >= 0,
+              str::stream() << "cannot update TTL setting for index " << idxName << " @ "
+                            << catalogId << " : " << md.toBSON());
     md.indexes[offset].updateTTLSetting(newExpireSeconds);
     putMetaData(opCtx, catalogId, md);
 }
+
+void DurableCatalogImpl::updateHiddenSetting(OperationContext* opCtx,
+                                             RecordId catalogId,
+                                             StringData idxName,
+                                             bool hidden) {
+
+    BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
+    int offset = md.findIndexOffset(idxName);
+    invariant(offset >= 0);
+    md.indexes[offset].updateHiddenSetting(hidden);
+    putMetaData(opCtx, catalogId, md);
+}
+
 
 bool DurableCatalogImpl::isEqualToMetadataUUID(OperationContext* opCtx,
                                                RecordId catalogId,
@@ -914,6 +978,12 @@ bool DurableCatalogImpl::isEqualToMetadataUUID(OperationContext* opCtx,
 void DurableCatalogImpl::setIsTemp(OperationContext* opCtx, RecordId catalogId, bool isTemp) {
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
     md.options.temp = isTemp;
+    putMetaData(opCtx, catalogId, md);
+}
+
+void DurableCatalogImpl::setRecordPreImages(OperationContext* opCtx, RecordId catalogId, bool val) {
+    BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
+    md.options.recordPreImages = val;
     putMetaData(opCtx, catalogId, md);
 }
 
@@ -1004,7 +1074,9 @@ boost::optional<UUID> DurableCatalogImpl::getIndexBuildUUID(OperationContext* op
                                                             StringData indexName) const {
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
     int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
+    invariant(offset >= 0,
+              str::stream() << "cannot get build UUID for index " << indexName << " @ " << catalogId
+                            << " : " << md.toBSON());
     return md.indexes[offset].buildUUID;
 }
 
@@ -1013,7 +1085,9 @@ void DurableCatalogImpl::indexBuildSuccess(OperationContext* opCtx,
                                            StringData indexName) {
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
     int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
+    invariant(offset >= 0,
+              str::stream() << "cannot mark index " << indexName << " as ready @ " << catalogId
+                            << " : " << md.toBSON());
     md.indexes[offset].ready = true;
     md.indexes[offset].buildUUID = boost::none;
     putMetaData(opCtx, catalogId, md);
@@ -1026,7 +1100,9 @@ bool DurableCatalogImpl::isIndexMultikey(OperationContext* opCtx,
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
 
     int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
+    invariant(offset >= 0,
+              str::stream() << "cannot get multikey for index " << indexName << " @ " << catalogId
+                            << " : " << md.toBSON());
 
     if (multikeyPaths && !md.indexes[offset].multikeyPaths.empty()) {
         *multikeyPaths = md.indexes[offset].multikeyPaths;
@@ -1042,7 +1118,9 @@ bool DurableCatalogImpl::setIndexIsMultikey(OperationContext* opCtx,
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
 
     int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
+    invariant(offset >= 0,
+              str::stream() << "cannot set index " << indexName << " as multikey @ " << catalogId
+                            << " : " << md.toBSON());
 
     const bool tracksPathLevelMultikeyInfo = !md.indexes[offset].multikeyPaths.empty();
     if (tracksPathLevelMultikeyInfo) {
@@ -1067,7 +1145,7 @@ bool DurableCatalogImpl::setIndexIsMultikey(OperationContext* opCtx,
         // Store new path components that cause this index to be multikey in catalog's index
         // metadata.
         for (size_t i = 0; i < multikeyPaths.size(); ++i) {
-            std::set<size_t>& indexMultikeyComponents = md.indexes[offset].multikeyPaths[i];
+            MultikeyComponents& indexMultikeyComponents = md.indexes[offset].multikeyPaths[i];
             for (const auto multikeyComponent : multikeyPaths[i]) {
                 auto result = indexMultikeyComponents.insert(multikeyComponent);
                 newPathIsMultikey = newPathIsMultikey || result.second;
@@ -1119,7 +1197,9 @@ BSONObj DurableCatalogImpl::getIndexSpec(OperationContext* opCtx,
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
 
     int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
+    invariant(offset >= 0,
+              str::stream() << "cannot get index spec for " << indexName << " @ " << catalogId
+                            << " : " << md.toBSON());
 
     BSONObj spec = md.indexes[offset].spec.getOwned();
     return spec;
@@ -1160,7 +1240,9 @@ bool DurableCatalogImpl::isIndexReady(OperationContext* opCtx,
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
 
     int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
+    invariant(offset >= 0,
+              str::stream() << "cannot get ready status for index " << indexName << " @ "
+                            << catalogId << " : " << md.toBSON());
     return md.indexes[offset].ready;
 }
 
@@ -1169,7 +1251,9 @@ KVPrefix DurableCatalogImpl::getIndexPrefix(OperationContext* opCtx,
                                             StringData indexName) const {
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
     int offset = md.findIndexOffset(indexName);
-    invariant(offset >= 0);
+    invariant(offset >= 0,
+              str::stream() << "cannot get prefix for index " << indexName << " @ " << catalogId
+                            << " : " << md.toBSON());
     return md.indexes[offset].prefix;
 }
 }  // namespace mongo

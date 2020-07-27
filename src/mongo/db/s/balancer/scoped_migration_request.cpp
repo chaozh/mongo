@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,9 +35,9 @@
 
 #include "mongo/db/s/balancer/type_migration.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -68,8 +68,11 @@ ScopedMigrationRequest::~ScopedMigrationRequest() {
         _opCtx, MigrationType::ConfigNS, migrationDocumentIdentifier, kMajorityWriteConcern);
 
     if (!result.isOK()) {
-        LOG(0) << "Failed to remove config.migrations document for migration '"
-               << migrationDocumentIdentifier.toString() << "'" << causedBy(redact(result));
+        LOGV2(21900,
+              "Failed to remove config.migrations document for migration '{migration}': {error}",
+              "Failed to remove config.migrations document for migration",
+              "migration"_attr = migrationDocumentIdentifier.toString(),
+              "error"_attr = redact(result));
     }
 }
 
@@ -141,10 +144,16 @@ StatusWith<ScopedMigrationRequest> ScopedMigrationRequest::writeMigration(
             MigrateInfo activeMigrateInfo = statusWithActiveMigration.getValue().toMigrateInfo();
             if (activeMigrateInfo.to != migrateInfo.to ||
                 activeMigrateInfo.from != migrateInfo.from) {
-                log() << "Failed to write document '" << redact(migrateInfo.toString())
-                      << "' to config.migrations because there is already an active migration for"
-                      << " that chunk: '" << redact(activeMigrateInfo.toString()) << "'."
-                      << causedBy(redact(result));
+                LOGV2(
+                    21901,
+                    "Failed to write document '{newMigration}' to config.migrations because there "
+                    "is already an active migration for that chunk: "
+                    "'{activeMigration}': {error}",
+                    "Failed to write document to config.migrations because there "
+                    "is already an active migration for that chunk",
+                    "newMigration"_attr = redact(migrateInfo.toString()),
+                    "activeMigration"_attr = redact(activeMigrateInfo.toString()),
+                    "error"_attr = redact(result));
                 return result;
             }
 
@@ -195,8 +204,13 @@ Status ScopedMigrationRequest::tryToRemoveMigration() {
 void ScopedMigrationRequest::keepDocumentOnDestruct() {
     invariant(_opCtx);
     _opCtx = nullptr;
-    LOG(1) << "Keeping config.migrations document with namespace '" << _nss << "' and minKey '"
-           << _minKey << "' for balancer recovery";
+    LOGV2_DEBUG(21902,
+                1,
+                "Keeping config.migrations document with namespace {namespace} and minKey "
+                "{minKey} for balancer recovery",
+                "Keeping config.migrations document for balancer recovery",
+                "namespace"_attr = _nss,
+                "minKey"_attr = _minKey);
 }
 
 }  // namespace mongo

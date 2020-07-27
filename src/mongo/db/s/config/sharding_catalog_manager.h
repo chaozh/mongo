@@ -40,7 +40,6 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/request_types/rename_collection_gen.h"
 #include "mongo/s/shard_key_pattern.h"
 
 namespace mongo {
@@ -93,14 +92,6 @@ public:
     ShardingCatalogManager(ServiceContext* serviceContext,
                            std::unique_ptr<executor::TaskExecutor> addShardExecutor);
     ~ShardingCatalogManager();
-
-    /**
-     * Indicates the desired modification to the config.chunks and config.tags collections during
-     * setFeatureCompatibilityVersion.
-     *
-     * TODO SERVER-44034: Remove this enum.
-     */
-    enum class ConfigUpgradeType { kUpgrade, kDowngrade };
 
     /**
      * Instantiates an instance of the sharding catalog manager and installs it on the specified
@@ -325,37 +316,12 @@ public:
     void ensureDropCollectionCompleted(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
-     * Renames collection with namespace 'nssSource' to namespace 'nssTarget'.
-     *
-     * request - the renameCollection request parsed into an idlType. Contains the fields specified
-     * in the docs that renameCollection requires: {renameCollection, to, dropTarget, stayTemp}.
-     * sourceUuid - the collection's uuid.
-     * passthroughFields - the requestBody in the opMsg, used to get the passthrough fields of the
-     * request.
-     *
-     * Throws exceptions on errors.
-     */
-    void renameCollection(OperationContext* opCtx,
-                          const ConfigsvrRenameCollection& request,
-                          const UUID& sourceUuid,
-                          const BSONObj& passthroughFields);
-
-    /**
      * Iterates through each entry in config.collections that does not have a UUID, generates a UUID
      * for the collection, and updates the entry with the generated UUID.
      *
      * If this function is not necessary for SERVER-33247, it can be removed.
      */
     void generateUUIDsForExistingShardedCollections(OperationContext* opCtx);
-
-    /**
-     * Creates a new unsharded collection with the given options.
-     *
-     * Throws exception on errors.
-     */
-    void createCollection(OperationContext* opCtx,
-                          const NamespaceString& ns,
-                          const CollectionOptions& options);
 
     /**
      * Refines the shard key of an existing collection with namespace 'nss'. Here, 'shardKey'
@@ -416,14 +382,6 @@ public:
      * Runs the setFeatureCompatibilityVersion command on all shards.
      */
     Status setFeatureCompatibilityVersionOnShards(OperationContext* opCtx, const BSONObj& cmdObj);
-
-    /**
-     * Changes the _id format of all documents in config.chunks and config.tags to use either the
-     * format introduced in 4.4 or the format expected by a 4.2 binary.
-     *
-     * TODO SERVER-44034: Remove this method.
-     */
-    void upgradeOrDowngradeChunksAndTags(OperationContext* opCtx, ConfigUpgradeType upgradeType);
 
     //
     // For Diagnostics

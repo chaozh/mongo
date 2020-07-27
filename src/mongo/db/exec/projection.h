@@ -43,7 +43,7 @@ namespace mongo {
  */
 class ProjectionStage : public PlanStage {
 protected:
-    ProjectionStage(boost::intrusive_ptr<ExpressionContext> expCtx,
+    ProjectionStage(ExpressionContext* expCtx,
                     const BSONObj& projObj,
                     WorkingSet* ws,
                     std::unique_ptr<PlanStage> child,
@@ -71,7 +71,7 @@ private:
      * Runs either the default complete implementation or a fast path depending on how this was
      * constructed.
      */
-    virtual Status transform(WorkingSetMember* member) const = 0;
+    virtual void transform(WorkingSetMember* member) const = 0;
 
     // Used to retrieve a WorkingSetMember as part of 'doWork()'.
     WorkingSet& _ws;
@@ -99,7 +99,7 @@ public:
     }
 
 private:
-    Status transform(WorkingSetMember* member) const final;
+    void transform(WorkingSetMember* member) const final;
 
     // Represents all metadata used in the projection.
     const QueryMetadataBitSet _requestedMetadata;
@@ -117,7 +117,7 @@ public:
     /**
      * ProjectionNodeCovered should obtain a fast-path object through this constructor.
      */
-    ProjectionStageCovered(boost::intrusive_ptr<ExpressionContext> expCtx,
+    ProjectionStageCovered(ExpressionContext* expCtx,
                            const BSONObj& projObj,
                            const projection_ast::Projection* projection,
                            WorkingSet* ws,
@@ -129,7 +129,7 @@ public:
     }
 
 private:
-    Status transform(WorkingSetMember* member) const final;
+    void transform(WorkingSetMember* member) const final;
 
     // Field names present in the simple projection.
     FieldSet _includedFields;
@@ -156,7 +156,7 @@ public:
     /**
      * ProjectionNodeSimple should obtain a fast-path object through this constructor.
      */
-    ProjectionStageSimple(boost::intrusive_ptr<ExpressionContext> expCtx,
+    ProjectionStageSimple(ExpressionContext* expCtx,
                           const BSONObj& projObj,
                           const projection_ast::Projection* projection,
                           WorkingSet* ws,
@@ -167,7 +167,7 @@ public:
     }
 
 private:
-    Status transform(WorkingSetMember* member) const final;
+    void transform(WorkingSetMember* member) const final;
 
     // Has the field names present in the simple projection.
     stdx::unordered_set<std::string> _includedFields;

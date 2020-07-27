@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kConnectionPool
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kConnectionPool
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/s/sharding_task_executor_pool_controller.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 

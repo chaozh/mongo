@@ -27,16 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/migration_coordinator.h"
 
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -49,61 +51,112 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeSendingAbortDecision);
 MONGO_FAIL_POINT_DEFINE(hangBeforeForgettingMigrationAfterCommitDecision);
 MONGO_FAIL_POINT_DEFINE(hangBeforeForgettingMigrationAfterAbortDecision);
 
+namespace {
+
+LogicalSessionId getSystemLogicalSessionId() {
+    static auto lsid = makeSystemLogicalSessionId();
+    return lsid;
+}
+
+TxnNumber getNextTxnNumber() {
+    static AtomicWord<TxnNumber> nextTxnNumber{0};
+    return nextTxnNumber.fetchAndAdd(2);
+}
+
+}  // namespace
+
 namespace migrationutil {
 
-MigrationCoordinator::MigrationCoordinator(UUID migrationId,
+MigrationCoordinator::MigrationCoordinator(MigrationSessionId sessionId,
                                            ShardId donorShard,
                                            ShardId recipientShard,
                                            NamespaceString collectionNamespace,
                                            UUID collectionUuid,
                                            ChunkRange range,
-                                           ChunkVersion preMigrationChunkVersion)
-    : _migrationInfo(migrationId,
+                                           ChunkVersion preMigrationChunkVersion,
+                                           bool waitForDelete)
+    : _migrationInfo(UUID::gen(),
+                     std::move(sessionId),
+                     getSystemLogicalSessionId(),
+                     getNextTxnNumber(),
                      std::move(collectionNamespace),
                      collectionUuid,
                      std::move(donorShard),
                      std::move(recipientShard),
                      std::move(range),
-                     std::move(preMigrationChunkVersion)) {}
+                     std::move(preMigrationChunkVersion)),
+      _waitForDelete(waitForDelete) {}
+
+MigrationCoordinator::MigrationCoordinator(const MigrationCoordinatorDocument& doc)
+    : _migrationInfo(doc) {}
 
 MigrationCoordinator::~MigrationCoordinator() = default;
 
-void MigrationCoordinator::startMigration(OperationContext* opCtx, bool waitForDelete) {
-    LOG(0) << _logPrefix() << "Persisting migration coordinator doc";
+const UUID& MigrationCoordinator::getMigrationId() const {
+    return _migrationInfo.getId();
+}
+
+const LogicalSessionId& MigrationCoordinator::getLsid() const {
+    return _migrationInfo.getLsid();
+}
+
+TxnNumber MigrationCoordinator::getTxnNumber() const {
+    return _migrationInfo.getTxnNumber();
+}
+
+void MigrationCoordinator::startMigration(OperationContext* opCtx) {
+    LOGV2_DEBUG(23889,
+                2,
+                "Persisting migration coordinator doc",
+                "migrationDoc"_attr = _migrationInfo.toBSON());
     migrationutil::persistMigrationCoordinatorLocally(opCtx, _migrationInfo);
 
-    LOG(0) << _logPrefix() << "Persisting range deletion task on donor";
+    LOGV2_DEBUG(23890,
+                2,
+                "Persisting range deletion task on donor",
+                "migrationId"_attr = _migrationInfo.getId());
     RangeDeletionTask donorDeletionTask(_migrationInfo.getId(),
                                         _migrationInfo.getNss(),
                                         _migrationInfo.getCollectionUuid(),
                                         _migrationInfo.getDonorShardId(),
                                         _migrationInfo.getRange(),
-                                        waitForDelete ? CleanWhenEnum::kNow
-                                                      : CleanWhenEnum::kDelayed);
+                                        _waitForDelete ? CleanWhenEnum::kNow
+                                                       : CleanWhenEnum::kDelayed);
     donorDeletionTask.setPending(true);
-    migrationutil::persistRangeDeletionTaskLocally(opCtx, donorDeletionTask);
+    migrationutil::persistRangeDeletionTaskLocally(
+        opCtx, donorDeletionTask, WriteConcerns::kMajorityWriteConcern);
 }
 
 void MigrationCoordinator::setMigrationDecision(Decision decision) {
-    LOG(0) << _logPrefix() << "MigrationCoordinator setting migration decision to "
-           << (decision == Decision::kCommitted ? "committed" : "aborted");
+    LOGV2_DEBUG(23891,
+                2,
+                "MigrationCoordinator setting migration decision to {decision}",
+                "MigrationCoordinator setting migration decision",
+                "decision"_attr = (decision == Decision::kCommitted ? "committed" : "aborted"),
+                "migrationId"_attr = _migrationInfo.getId());
     _decision = decision;
 }
 
 
-void MigrationCoordinator::completeMigration(OperationContext* opCtx) {
+boost::optional<SemiFuture<void>> MigrationCoordinator::completeMigration(OperationContext* opCtx) {
     if (!_decision) {
-        LOG(0) << _logPrefix()
-               << "Migration completed without setting a decision. This node might have started "
-                  "stepping down or shutting down after having initiated commit against the config "
-                  "server but before having found out if the commit succeeded. The new primary of "
-                  "this replica set will complete the migration coordination.";
-        return;
+        LOGV2(
+            23892,
+            "Migration completed without setting a decision. This node might have "
+            "started stepping down or shutting down after having initiated commit against the "
+            "config server but before having found out if the commit succeeded. The new primary of "
+            "this replica set will complete the migration coordination.",
+            "migrationId"_attr = _migrationInfo.getId());
+        return boost::none;
     }
 
-    LOG(0) << _logPrefix() << "MigrationCoordinator delivering decision "
-           << (_decision == Decision::kCommitted ? "committed" : "aborted")
-           << " to self and to recipient";
+    LOGV2(23893,
+          "MigrationCoordinator delivering decision {decision} to self and to recipient",
+          "MigrationCoordinator delivering decision to self and to recipient",
+          "decision"_attr = (_decision == Decision::kCommitted ? "committed" : "aborted"),
+          "migrationId"_attr = _migrationInfo.getId());
+
+    boost::optional<SemiFuture<void>> cleanupCompleteFuture = boost::none;
 
     switch (*_decision) {
         case Decision::kAborted:
@@ -111,52 +164,111 @@ void MigrationCoordinator::completeMigration(OperationContext* opCtx) {
             hangBeforeForgettingMigrationAfterAbortDecision.pauseWhileSet();
             break;
         case Decision::kCommitted:
-            _commitMigrationOnDonorAndRecipient(opCtx);
+            cleanupCompleteFuture = _commitMigrationOnDonorAndRecipient(opCtx);
             hangBeforeForgettingMigrationAfterCommitDecision.pauseWhileSet();
             break;
     }
+
     forgetMigration(opCtx);
+
+    return cleanupCompleteFuture;
 }
 
-void MigrationCoordinator::_commitMigrationOnDonorAndRecipient(OperationContext* opCtx) {
+SemiFuture<void> MigrationCoordinator::_commitMigrationOnDonorAndRecipient(
+    OperationContext* opCtx) {
     hangBeforeMakingCommitDecisionDurable.pauseWhileSet();
 
-    LOG(0) << _logPrefix() << "Making commit decision durable";
+    LOGV2_DEBUG(
+        23894, 2, "Making commit decision durable", "migrationId"_attr = _migrationInfo.getId());
     migrationutil::persistCommitDecision(opCtx, _migrationInfo.getId());
+
+    LOGV2_DEBUG(23895,
+                2,
+                "Bumping transaction number with lsid {lsid} and current txnNumber "
+                "{currentTxnNumber} on recipient shard {recipientShardId}",
+                "Bumping transaction number on recipient shard",
+                "recipientShardId"_attr = _migrationInfo.getRecipientShardId(),
+                "lsid"_attr = _migrationInfo.getLsid().toBSON(),
+                "currentTxnNumber"_attr = _migrationInfo.getTxnNumber(),
+                "migrationId"_attr = _migrationInfo.getId());
+    migrationutil::advanceTransactionOnRecipient(opCtx,
+                                                 _migrationInfo.getRecipientShardId(),
+                                                 _migrationInfo.getLsid(),
+                                                 _migrationInfo.getTxnNumber());
 
     hangBeforeSendingCommitDecision.pauseWhileSet();
 
-    LOG(0) << _logPrefix() << "Deleting range deletion task on recipient";
+    LOGV2_DEBUG(23896,
+                2,
+                "Deleting range deletion task on recipient",
+                "migrationId"_attr = _migrationInfo.getId());
     migrationutil::deleteRangeDeletionTaskOnRecipient(
         opCtx, _migrationInfo.getRecipientShardId(), _migrationInfo.getId());
 
-    LOG(0) << _logPrefix() << "Marking range deletion task on donor as ready for processing";
+    LOGV2_DEBUG(23897,
+                2,
+                "Marking range deletion task on donor as ready for processing",
+                "migrationId"_attr = _migrationInfo.getId());
     migrationutil::markAsReadyRangeDeletionTaskLocally(opCtx, _migrationInfo.getId());
+
+    // At this point the decision cannot be changed and will be recovered in the event of a
+    // failover, so it is safe to schedule the deletion task after updating the persisted state.
+    LOGV2_DEBUG(23898,
+                2,
+                "Scheduling range deletion task on donor",
+                "migrationId"_attr = _migrationInfo.getId());
+    RangeDeletionTask deletionTask(_migrationInfo.getId(),
+                                   _migrationInfo.getNss(),
+                                   _migrationInfo.getCollectionUuid(),
+                                   _migrationInfo.getDonorShardId(),
+                                   _migrationInfo.getRange(),
+                                   _waitForDelete ? CleanWhenEnum::kNow : CleanWhenEnum::kDelayed);
+    return migrationutil::submitRangeDeletionTask(opCtx, deletionTask).semi();
 }
 
 void MigrationCoordinator::_abortMigrationOnDonorAndRecipient(OperationContext* opCtx) {
     hangBeforeMakingAbortDecisionDurable.pauseWhileSet();
 
-    LOG(0) << _logPrefix() << "Making abort decision durable";
+    LOGV2_DEBUG(
+        23899, 2, "Making abort decision durable", "migrationId"_attr = _migrationInfo.getId());
     migrationutil::persistAbortDecision(opCtx, _migrationInfo.getId());
+
+    LOGV2_DEBUG(23900,
+                2,
+                "Bumping transaction number with lsid {lsid} and current txnNumber "
+                "{currentTxnNumber} on recipient shard {recipientShardId}",
+                "Bumping transaction number on recipient shard",
+                "recipientShardId"_attr = _migrationInfo.getRecipientShardId(),
+                "lsid"_attr = _migrationInfo.getLsid().toBSON(),
+                "currentTxnNumber"_attr = _migrationInfo.getTxnNumber(),
+                "migrationId"_attr = _migrationInfo.getId());
+    migrationutil::advanceTransactionOnRecipient(opCtx,
+                                                 _migrationInfo.getRecipientShardId(),
+                                                 _migrationInfo.getLsid(),
+                                                 _migrationInfo.getTxnNumber());
 
     hangBeforeSendingAbortDecision.pauseWhileSet();
 
-    LOG(0) << _logPrefix() << "Deleting range deletion task on donor";
+    LOGV2_DEBUG(23901,
+                2,
+                "Deleting range deletion task on donor",
+                "migrationId"_attr = _migrationInfo.getId());
     migrationutil::deleteRangeDeletionTaskLocally(opCtx, _migrationInfo.getId());
 
-    LOG(0) << _logPrefix() << "Marking range deletion task on recipient as ready for processing";
+    LOGV2_DEBUG(23902,
+                2,
+                "Marking range deletion task on recipient as ready for processing",
+                "migrationId"_attr = _migrationInfo.getId());
     migrationutil::markAsReadyRangeDeletionTaskOnRecipient(
         opCtx, _migrationInfo.getRecipientShardId(), _migrationInfo.getId());
 }
 
 void MigrationCoordinator::forgetMigration(OperationContext* opCtx) {
-    LOG(0) << _logPrefix() << "Deleting migration coordinator document";
+    LOGV2_DEBUG(23903,
+                2,
+                "Deleting migration coordinator document",
+                "migrationId"_attr = _migrationInfo.getId());
     migrationutil::deleteMigrationCoordinatorDocumentLocally(opCtx, _migrationInfo.getId());
-}
-
-std::string MigrationCoordinator::_logPrefix() const {
-    return str::stream() << "[migration-coordinator-" << _migrationInfo.getId() << "] ";
 }
 
 }  // namespace migrationutil

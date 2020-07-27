@@ -67,8 +67,17 @@ public:
         _preImageDocumentKey = std::move(value);
     }
 
+    const BSONObj& getPreImage() const {
+        return _fullPreImage;
+    }
+
+    void setPreImage(BSONObj value) {
+        _fullPreImage = std::move(value);
+    }
+
 private:
     BSONObj _preImageDocumentKey;
+    BSONObj _fullPreImage;
 };
 
 /**
@@ -81,14 +90,14 @@ public:
 
     // Helpers to generate ReplOperation.
     static ReplOperation makeInsertOperation(const NamespaceString& nss,
-                                             boost::optional<UUID> uuid,
+                                             UUID uuid,
                                              const BSONObj& docToInsert);
     static ReplOperation makeUpdateOperation(const NamespaceString nss,
-                                             boost::optional<UUID> uuid,
+                                             UUID uuid,
                                              const BSONObj& update,
                                              const BSONObj& criteria);
     static ReplOperation makeDeleteOperation(const NamespaceString& nss,
-                                             boost::optional<UUID> uuid,
+                                             UUID uuid,
                                              const BSONObj& docToDelete);
 
     static ReplOperation makeCreateCommand(const NamespaceString nss,
@@ -137,6 +146,14 @@ public:
 
     void setUpsert(boost::optional<bool> value) & {
         getDurableReplOperation().setUpsert(std::move(value));
+    }
+
+    void setPreImageOpTime(boost::optional<OpTime> value) {
+        getDurableReplOperation().setPreImageOpTime(std::move(value));
+    }
+
+    const boost::optional<OpTime>& getPreImageOpTime() const {
+        return getDurableReplOperation().getPreImageOpTime();
     }
 
     void setTimestamp(Timestamp value) & {
@@ -300,6 +317,11 @@ public:
     }
 
     /**
+     * Returns whether if the oplog entry is the last applyOps in a multiple-entry transaction.
+     */
+    bool isEndOfLargeTransaction() const;
+
+    /**
      * Returns if this is a prepared 'commitTransaction' oplog entry.
      */
     bool isPreparedCommit() const {
@@ -317,10 +339,15 @@ public:
     }
 
     /**
-     * Returns whether the oplog entry represents an applyOps with a commnd inside. This will occur
-     * if a multi-document transaction performs a command.
+     * Returns whether the oplog entry represents a single oplog entry transaction.
      */
-    bool isTransactionWithCommand() const;
+    bool isSingleOplogEntryTransaction() const;
+
+    /**
+     * Returns whether the oplog entry represents an applyOps with a command inside. This is only
+     * for transactions with only one oplog entry.
+     */
+    bool isSingleOplogEntryTransactionWithCommand() const;
 
     /**
      * Returns if the oplog entry is for a CRUD operation.

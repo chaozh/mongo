@@ -27,19 +27,19 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/mozjs/session.h"
 
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/mozjs/bson.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/mongo.h"
 #include "mongo/scripting/mozjs/scripting_util_gen.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -152,7 +152,10 @@ void SessionInfo::finalize(js::FreeOp* fop, JSObject* obj) {
             auto status = exceptionToStatus();
 
             try {
-                LOG(0) << "Failed to end session " << lsid << " due to " << status;
+                LOGV2_INFO(22791,
+                           "Failed to end logical session",
+                           "lsid"_attr = lsid,
+                           "error"_attr = status);
             } catch (...) {
                 // This is here in case logging fails.
             }

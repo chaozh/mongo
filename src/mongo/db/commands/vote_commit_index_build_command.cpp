@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +36,7 @@
 #include "mongo/db/commands/vote_commit_index_build_gen.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -71,19 +71,36 @@ public:
         using InvocationBase::InvocationBase;
 
         void typedRun(OperationContext* opCtx) {
-            uassertStatusOK(IndexBuildsCoordinator::get(opCtx)->voteCommitIndexBuild(
-                request().getCommandParameter(), request().getHostAndPort()));
+            auto lastOpBeforeRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
 
-            // Must set the latest op time on the OperationContext in case no write was needed in
-            // voteCommitIndexBuild above, i.e. if this command is called several times before it is
-            // successful regarding write concern.
-            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+            const auto& cmd = request();
+            LOGV2_DEBUG(3856208,
+                        1,
+                        "Received voteCommitIndexBuild request for index build: {buildUUID}, "
+                        "from host: {host}",
+                        "Received voteCommitIndexBuild request",
+                        "buildUUID"_attr = cmd.getCommandParameter(),
+                        "host"_attr = cmd.getHostAndPort().toString());
+            auto voteStatus = IndexBuildsCoordinator::get(opCtx)->voteCommitIndexBuild(
+                opCtx, cmd.getCommandParameter(), cmd.getHostAndPort());
+
+            // No need to wait for majority write concern if we fail to persist the voter's info.
+            uassertStatusOK(voteStatus);
+
+            auto lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+            // Update the client's last optime to last oplog entry's opTime.
+            // This case can hit only if the member has already voted for that index build. So, to
+            // make sure the voter's info won't be rolled back, we wait for the oplog's last entry's
+            // opTime to be majority replicated.
+            if (lastOpBeforeRun == lastOpAfterRun) {
+                repl::ReplClientInfo::forClient(opCtx->getClient())
+                    .setLastOpToSystemLastOpTime(opCtx);
+            }
         }
 
     private:
         NamespaceString ns() const override {
-            MONGO_UNREACHABLE;
-            return {};
+            return NamespaceString(request().getDbName(), "");
         }
 
         bool supportsWriteConcern() const override {

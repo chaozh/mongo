@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/unittest/unittest.h"
 
 #include "mongo/platform/random.h"
-#include "mongo/util/log.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/timer.h"
 

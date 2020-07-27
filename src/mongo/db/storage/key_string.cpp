@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -39,11 +39,11 @@
 #include "mongo/base/data_cursor.h"
 #include "mongo/base/data_view.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/db/exec/sbe/values/value_builder.h"
 #include "mongo/platform/bits.h"
 #include "mongo/platform/strnlen.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 
 #define keyStringAssert(msgid, msg, expr) \
     uassert(msgid, str::stream() << "KeyString format error: " << msg, expr)
@@ -53,6 +53,8 @@
 namespace mongo {
 
 using std::string;
+
+template class StackBufBuilderBase<KeyString::TypeBits::SmallStackSize>;
 
 namespace KeyString {
 
@@ -1196,7 +1198,7 @@ void BuilderBase<BufferT>::_appendPreshiftedIntegerPortion(uint64_t value,
 
 template <class BufferT>
 void BuilderBase<BufferT>::_appendBytes(const void* source, size_t bytes, bool invert) {
-    char* const base = _buffer.skip(bytes);
+    char* const base = _buffer().skip(bytes);
 
     if (invert) {
         memcpy_flipBits(base, source, bytes);
@@ -1211,12 +1213,13 @@ void BuilderBase<BufferT>::_appendBytes(const void* source, size_t bytes, bool i
 // ----------------------------------------------------------------------
 
 namespace {
+template <class Stream>
 void toBsonValue(uint8_t ctype,
                  BufReader* reader,
                  TypeBits::Reader* typeBits,
                  bool inverted,
                  Version version,
-                 BSONObjBuilderValueStream* stream,
+                 Stream* stream,
                  uint32_t depth);
 
 void toBson(BufReader* reader,
@@ -1275,12 +1278,13 @@ Decimal128 readDecimalContinuation(BufReader* reader, bool inverted, Decimal128 
     return num;
 }
 
+template <class Stream>
 void toBsonValue(uint8_t ctype,
                  BufReader* reader,
                  TypeBits::Reader* typeBits,
                  bool inverted,
                  Version version,
-                 BSONObjBuilderValueStream* stream,
+                 Stream* stream,
                  uint32_t depth) {
     keyStringAssert(ErrorCodes::Overflow,
                     "KeyString encoding exceeded maximum allowable BSON nesting depth",
@@ -2563,8 +2567,41 @@ int compare(const char* leftBuf, const char* rightBuf, size_t leftSize, size_t r
     return leftSize < rightSize ? -1 : 1;
 }
 
-template class BuilderBase<BufBuilder>;
-template class BuilderBase<StackBufBuilder>;
+int Value::compareWithTypeBits(const Value& other) const {
+    return KeyString::compare(getBuffer(), other.getBuffer(), _buffer.size(), other._buffer.size());
+}
+
+bool readSBEValue(BufReader* reader,
+                  TypeBits::Reader* typeBits,
+                  bool inverted,
+                  Version version,
+                  sbe::value::ValueBuilder* valueBuilder) {
+    uint8_t ctype;
+    if (!reader->remaining() || (ctype = readType<uint8_t>(reader, inverted)) == kEnd) {
+        return false;
+    }
+
+    // This function is only intended to read stored index entries. The 'kLess' and 'kGreater'
+    // "discriminator" types are used for querying and are never stored in an index.
+    invariant(ctype > kLess && ctype < kGreater);
+
+    const uint32_t depth = 1;  // This function only gets called for a top-level KeyString::Value.
+    toBsonValue(ctype, reader, typeBits, inverted, version, valueBuilder, depth);
+    return true;
+}
+
+void Value::serializeWithoutRecordId(BufBuilder& buf) const {
+    dassert(decodeRecordIdAtEnd(_buffer.get(), _ksSize).isValid());
+
+    const int32_t sizeWithoutRecordId = sizeWithoutRecordIdAtEnd(_buffer.get(), _ksSize);
+    buf.appendNum(sizeWithoutRecordId);                 // Serialize size of KeyString
+    buf.appendBuf(_buffer.get(), sizeWithoutRecordId);  // Serialize KeyString
+    buf.appendBuf(_buffer.get() + _ksSize, _buffer.size() - _ksSize);  // Serialize TypeBits
+}
+
+template class BuilderBase<Builder>;
+template class BuilderBase<HeapBuilder>;
+template class BuilderBase<PooledBuilder>;
 
 }  // namespace KeyString
 

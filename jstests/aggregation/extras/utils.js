@@ -127,6 +127,13 @@ function documentEq(dl, dr, verbose = false, valueComparator) {
     return true;
 }
 
+/**
+ * Returns true if both 'al' and 'ar' are arrays of the same length with the same elements according
+ * to valueComparator.  Order of the elements within the arrays is not significant.
+ *
+ * This is a predicate, not an assertion; use assert.sameMembers() in assert.js for the
+ * equivalent assertion.
+ */
 function arrayEq(al, ar, verbose = false, valueComparator) {
     const debug = msg => verbose ? print(msg) : null;  // Helper to log 'msg' iff 'verbose' is true.
 
@@ -263,6 +270,14 @@ function assertErrorCode(coll, pipe, code, errmsg, options = {}) {
     } else {
         assert.eq(cursorRes.code, code, tojson(cursorRes));
     }
+}
+
+/**
+ * Assert that an aggregation fails with a list of specific codes.
+ */
+function assertErrorCodes(coll, pipe, codes) {
+    const response = assert.commandFailedWithCode(
+        coll.getDB().runCommand({aggregate: coll.getName(), pipeline: pipe, cursor: {}}), codes);
 }
 
 /**

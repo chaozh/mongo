@@ -27,11 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 #include <ostream>
@@ -51,14 +51,15 @@ Status::ErrorInfo* Status::ErrorInfo::create(ErrorCodes::Error code,
         return nullptr;
     if (extra) {
         // The public API prevents getting in to this state.
-        invariant(ErrorCodes::shouldHaveExtraInfo(code));
-    } else if (ErrorCodes::shouldHaveExtraInfo(code)) {
+        invariant(ErrorCodes::canHaveExtraInfo(code));
+    } else if (ErrorCodes::mustHaveExtraInfo(code)) {
+        // If an ErrorExtraInfo class is non-optional, return an error.
+
         // This is possible if code calls a 2-argument Status constructor with a code that should
         // have extra info.
         if (kDebugBuild) {
             // Make it easier to find this issue by fatally failing in debug builds.
-            severe() << "Code " << code << " is supposed to have extra info";
-            fassertFailed(40680);
+            LOGV2_FATAL(40680, "Code {code} is supposed to have extra info", "code"_attr = code);
         }
 
         // In release builds, replace the error code. This maintains the invariant that all Statuses
@@ -126,8 +127,10 @@ StringBuilderImpl<Allocator>& operator<<(StringBuilderImpl<Allocator>& sb, const
             // This really shouldn't happen but it would be really annoying if it broke error
             // logging in production.
             if (kDebugBuild) {
-                severe() << "Error serializing extra info for " << status.code()
-                         << " in Status::toString()";
+                LOGV2_FATAL_CONTINUE(
+                    23806,
+                    "Error serializing extra info for {status_code} in Status::toString()",
+                    "status_code"_attr = status.code());
                 std::terminate();
             }
         }

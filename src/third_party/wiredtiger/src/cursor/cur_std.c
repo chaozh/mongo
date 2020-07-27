@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -29,7 +29,7 @@ __wt_cursor_cached(WT_CURSOR *cursor)
 {
     WT_SESSION_IMPL *session;
 
-    session = (WT_SESSION_IMPL *)cursor->session;
+    session = CUR2S(cursor);
     WT_RET_MSG(session, ENOTSUP, "Cursor has been closed");
 }
 
@@ -42,7 +42,7 @@ __wt_cursor_notsup(WT_CURSOR *cursor)
 {
     WT_SESSION_IMPL *session;
 
-    session = (WT_SESSION_IMPL *)cursor->session;
+    session = CUR2S(cursor);
     WT_RET_MSG(session, ENOTSUP, "Unsupported cursor operation");
 }
 
@@ -142,7 +142,7 @@ __wt_cursor_modify_value_format_notsup(WT_CURSOR *cursor, WT_MODIFY *entries, in
     WT_UNUSED(nentries);
 
     if (cursor->value_format != NULL && strlen(cursor->value_format) != 0) {
-        session = (WT_SESSION_IMPL *)cursor->session;
+        session = CUR2S(cursor);
         WT_RET_MSG(session, ENOTSUP,
           "WT_CURSOR.modify only supported for 'S' and 'u' value "
           "formats");
@@ -221,7 +221,7 @@ __wt_cursor_kv_not_set(WT_CURSOR *cursor, bool key) WT_GCC_FUNC_ATTRIBUTE((cold)
 {
     WT_SESSION_IMPL *session;
 
-    session = (WT_SESSION_IMPL *)cursor->session;
+    session = CUR2S(cursor);
 
     WT_RET_MSG(session, cursor->saved_err == 0 ? EINVAL : cursor->saved_err, "requires %s be set",
       key ? "key" : "value");
@@ -238,7 +238,11 @@ __wt_cursor_copy_release_item(WT_CURSOR *cursor, WT_ITEM *item) WT_GCC_FUNC_ATTR
     WT_DECL_RET;
     WT_SESSION_IMPL *session;
 
-    session = (WT_SESSION_IMPL *)cursor->session;
+    session = CUR2S(cursor);
+
+    /* Bail out if the item has been cleared. */
+    if (item->data == NULL)
+        return (0);
 
     /*
      * Whether or not we own the memory for the item, make a copy of the data and use that instead.
@@ -375,7 +379,7 @@ __wt_cursor_get_keyv(WT_CURSOR *cursor, uint32_t flags, va_list ap)
         WT_ERR(__wt_cursor_kv_not_set(cursor, true));
 
     /* Force an allocated copy when using cursor copy debug. */
-    if (F_ISSET(S2C(session), WT_CONN_DEBUG_CURSOR_COPY))
+    if (FLD_ISSET(S2C(session)->debug_flags, WT_CONN_DEBUG_CURSOR_COPY))
         WT_ERR(__wt_buf_grow(session, &cursor->key, cursor->key.size));
 
     if (WT_CURSOR_RECNO(cursor)) {
@@ -480,9 +484,10 @@ err:
      * memory in the meantime, free it.
      */
     if (tmp.mem != NULL) {
-        if (buf->mem == NULL && !F_ISSET(S2C(session), WT_CONN_DEBUG_CURSOR_COPY)) {
+        if (buf->mem == NULL && !FLD_ISSET(S2C(session)->debug_flags, WT_CONN_DEBUG_CURSOR_COPY)) {
             buf->mem = tmp.mem;
             buf->memsize = tmp.memsize;
+            F_SET(cursor, WT_CURSTD_DEBUG_COPY_KEY);
         } else
             __wt_free(session, tmp.mem);
     }
@@ -523,7 +528,7 @@ __wt_cursor_get_valuev(WT_CURSOR *cursor, va_list ap)
         WT_ERR(__wt_cursor_kv_not_set(cursor, false));
 
     /* Force an allocated copy when using cursor copy debug. */
-    if (F_ISSET(S2C(session), WT_CONN_DEBUG_CURSOR_COPY))
+    if (FLD_ISSET(S2C(session)->debug_flags, WT_CONN_DEBUG_CURSOR_COPY))
         WT_ERR(__wt_buf_grow(session, &cursor->value, cursor->value.size));
 
     /* Fast path some common cases. */
@@ -619,9 +624,10 @@ err:
      * memory in the meantime, free it.
      */
     if (tmp.mem != NULL) {
-        if (buf->mem == NULL && !F_ISSET(S2C(session), WT_CONN_DEBUG_CURSOR_COPY)) {
+        if (buf->mem == NULL && !FLD_ISSET(S2C(session)->debug_flags, WT_CONN_DEBUG_CURSOR_COPY)) {
             buf->mem = tmp.mem;
             buf->memsize = tmp.memsize;
+            F_SET(cursor, WT_CURSTD_DEBUG_COPY_VALUE);
         } else
             __wt_free(session, tmp.mem);
     }
@@ -640,7 +646,7 @@ __wt_cursor_cache(WT_CURSOR *cursor, WT_DATA_HANDLE *dhandle)
     WT_SESSION_IMPL *session;
     uint64_t bucket;
 
-    session = (WT_SESSION_IMPL *)cursor->session;
+    session = CUR2S(cursor);
     WT_ASSERT(session, !F_ISSET(cursor, WT_CURSTD_CACHED) && dhandle != NULL);
 
     WT_TRET(cursor->reset(cursor));
@@ -648,6 +654,9 @@ __wt_cursor_cache(WT_CURSOR *cursor, WT_DATA_HANDLE *dhandle)
     /* Don't keep buffers allocated for cached cursors. */
     __wt_buf_free(session, &cursor->key);
     __wt_buf_free(session, &cursor->value);
+
+    /* Discard the underlying WT_CURSOR_BTREE buffers. */
+    __wt_btcur_cache((WT_CURSOR_BTREE *)cursor);
 
     /*
      * Acquire a reference while decrementing the in-use counter. After this point, the dhandle may
@@ -681,7 +690,7 @@ __wt_cursor_reopen(WT_CURSOR *cursor, WT_DATA_HANDLE *dhandle)
     WT_SESSION_IMPL *session;
     uint64_t bucket;
 
-    session = (WT_SESSION_IMPL *)cursor->session;
+    session = CUR2S(cursor);
     WT_ASSERT(session, F_ISSET(cursor, WT_CURSTD_CACHED));
 
     if (dhandle != NULL) {
@@ -886,7 +895,7 @@ __wt_cursor_close(WT_CURSOR *cursor)
 {
     WT_SESSION_IMPL *session;
 
-    session = (WT_SESSION_IMPL *)cursor->session;
+    session = CUR2S(cursor);
 
     if (F_ISSET(cursor, WT_CURSTD_OPEN)) {
         TAILQ_REMOVE(&session->cursors, cursor, q);
@@ -943,11 +952,11 @@ __cursor_modify(WT_CURSOR *cursor, WT_MODIFY *entries, int nentries)
      * read-uncommitted transaction, or outside of an explicit transaction. Disallow here as well,
      * for consistency.
      */
-    if (session->txn.isolation != WT_ISO_SNAPSHOT)
+    if (session->txn->isolation != WT_ISO_SNAPSHOT)
         WT_ERR_MSG(session, ENOTSUP,
           "not supported in read-committed or read-uncommitted "
           "transactions");
-    if (F_ISSET(&session->txn, WT_TXN_AUTOCOMMIT))
+    if (F_ISSET(session->txn, WT_TXN_AUTOCOMMIT))
         WT_ERR_MSG(session, ENOTSUP, "not supported in implicit transactions");
 
     WT_ERR(__cursor_checkkey(cursor));
@@ -989,7 +998,7 @@ __wt_cursor_reconfigure(WT_CURSOR *cursor, const char *config)
             else
                 F_CLR(cursor, WT_CURSTD_APPEND);
         } else
-            WT_ERR_NOTFOUND_OK(ret);
+            WT_ERR_NOTFOUND_OK(ret, false);
     }
 
     /*
@@ -1001,7 +1010,7 @@ __wt_cursor_reconfigure(WT_CURSOR *cursor, const char *config)
         else
             F_CLR(cursor, WT_CURSTD_OVERWRITE);
     } else
-        WT_ERR_NOTFOUND_OK(ret);
+        WT_ERR_NOTFOUND_OK(ret, false);
 
 err:
     API_END_RET(session, ret);
@@ -1060,7 +1069,7 @@ __wt_cursor_init(
     WT_SESSION_IMPL *session;
     bool readonly;
 
-    session = (WT_SESSION_IMPL *)cursor->session;
+    session = CUR2S(cursor);
 
     if (cursor->internal_uri == NULL)
         WT_RET(__wt_strdup(session, uri, &cursor->internal_uri));
@@ -1103,10 +1112,16 @@ __wt_cursor_init(
      */
     WT_RET(__wt_config_gets_def(session, cfg, "dump", 0, &cval));
     if (cval.len != 0 && owner == NULL) {
-        F_SET(cursor, WT_STRING_MATCH("json", cval.str, cval.len) ?
-            WT_CURSTD_DUMP_JSON :
-            (WT_STRING_MATCH("print", cval.str, cval.len) ? WT_CURSTD_DUMP_PRINT :
-                                                            WT_CURSTD_DUMP_HEX));
+        uint32_t dump_flag;
+        if (WT_STRING_MATCH("json", cval.str, cval.len))
+            dump_flag = WT_CURSTD_DUMP_JSON;
+        else if (WT_STRING_MATCH("print", cval.str, cval.len))
+            dump_flag = WT_CURSTD_DUMP_PRINT;
+        else if (WT_STRING_MATCH("pretty", cval.str, cval.len))
+            dump_flag = WT_CURSTD_DUMP_PRETTY;
+        else
+            dump_flag = WT_CURSTD_DUMP_HEX;
+        F_SET(cursor, dump_flag);
         /*
          * Dump cursors should not have owners: only the top-level cursor should be wrapped in a
          * dump cursor.

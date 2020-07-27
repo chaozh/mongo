@@ -2,7 +2,7 @@
 // featureCompatibilityVersion values.
 
 /**
- * These constants represent the current "latest" and "last-stable" values for the
+ * These constants represent the current "latest", "last-continuous" and "last-lts" values for the
  * featureCompatibilityVersion parameter. They should only be used for testing of upgrade-downgrade
  * scenarios that are intended to be maintained between releases.
  *
@@ -10,24 +10,47 @@
  * multiple times.
  */
 
-var latestFCV = "4.4";
-var lastStableFCV = "4.2";
+var latestFCV = "4.5.1";
+var lastContinuousFCV = "4.4";
+var lastLTSFCV = "4.4";
 
 /**
  * Checks the featureCompatibilityVersion document and server parameter. The
  * featureCompatibilityVersion document is of the form {_id: "featureCompatibilityVersion", version:
- * <required>, targetVersion: <optional>}. The getParameter result is of the form
- * {featureCompatibilityVersion: {version: <required>, targetVersion: <optional>}, ok: 1}.
+ * <required>, targetVersion: <optional>, previousVersion: <optional>}. The getParameter result is
+ * of the form {featureCompatibilityVersion: {version: <required>, targetVersion: <optional>,
+ * previousVersion: <optional>}, ok: 1}.
  */
 function checkFCV(adminDB, version, targetVersion) {
     let res = adminDB.runCommand({getParameter: 1, featureCompatibilityVersion: 1});
     assert.commandWorked(res);
     assert.eq(res.featureCompatibilityVersion.version, version, tojson(res));
     assert.eq(res.featureCompatibilityVersion.targetVersion, targetVersion, tojson(res));
+    // When both version and targetVersion are equal to lastContinuousFCV or lastLTSFCV, downgrade
+    // is in progress. This tests that previousVersion is always equal to latestFCV in downgrading
+    // states or undefined otherwise.
+    const isDowngrading = (version === lastLTSFCV && targetVersion === lastLTSFCV) ||
+        (version === lastContinuousFCV && targetVersion === lastContinuousFCV);
+    if (isDowngrading) {
+        assert.eq(res.featureCompatibilityVersion.previousVersion, latestFCV, tojson(res));
+    } else {
+        assert.eq(res.featureCompatibilityVersion.previousVersion, undefined, tojson(res));
+    }
 
-    let doc = adminDB.system.version.findOne({_id: "featureCompatibilityVersion"});
+    // This query specifies an explicit readConcern because some FCV tests pass a connection that
+    // has manually run isMaster with internalClient, and mongod expects internalClients (ie. other
+    // cluster members) to include read/write concern (on commands that accept read/write concern).
+    let doc = adminDB.system.version.find({_id: "featureCompatibilityVersion"})
+                  .limit(1)
+                  .readConcern("local")
+                  .next();
     assert.eq(doc.version, version, tojson(doc));
     assert.eq(doc.targetVersion, targetVersion, tojson(doc));
+    if (isDowngrading) {
+        assert.eq(doc.previousVersion, latestFCV, tojson(doc));
+    } else {
+        assert.eq(doc.previousVersion, undefined, tojson(doc));
+    }
 }
 
 /**

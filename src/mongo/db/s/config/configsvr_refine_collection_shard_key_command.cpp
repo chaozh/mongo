@@ -27,21 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/shard_key_util.h"
-#include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/refine_collection_shard_key_gen.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -64,12 +64,6 @@ public:
             uassert(ErrorCodes::InvalidOptions,
                     "refineCollectionShardKey must be called with majority writeConcern",
                     opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
-
-            uassert(ErrorCodes::CommandNotSupported,
-                    "'refineCollectionShardKey' is only supported in feature compatibility version "
-                    "4.4",
-                    serverGlobalParams.featureCompatibility.getVersion() ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
 
             // Set the operation context read concern level to local for reads into the config
             // database.
@@ -128,27 +122,31 @@ public:
                                   << collType.getKeyPattern().toString(),
                     oldShardKeyPattern.isExtendedBy(newShardKeyPattern));
 
-            const auto dbType =
-                uassertStatusOK(
-                    catalogClient->getDatabase(
-                        opCtx, nss.db().toString(), repl::ReadConcernArgs::get(opCtx).getLevel()))
-                    .value;
-            const auto primaryShardId = dbType.getPrimary();
-            const auto primaryShard =
-                uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, primaryShardId));
+            // Indexes are loaded using shard versions, so validating the shard key may need to be
+            // retried on StaleConfig errors.
+            auto catalogCache = Grid::get(opCtx)->catalogCache();
+            sharded_agg_helpers::shardVersionRetry(
+                opCtx,
+                catalogCache,
+                nss,
+                "validating indexes for refineCollectionShardKey"_sd,
+                [&] {
+                    // Note a shard key index will never be created automatically for refining a
+                    // shard key, so no default collation is needed.
+                    shardkeyutil::validateShardKeyIndexExistsOrCreateIfPossible(
+                        opCtx,
+                        nss,
+                        proposedKey,
+                        newShardKeyPattern,
+                        boost::none,
+                        collType.getUnique(),
+                        shardkeyutil::ValidationBehaviorsRefineShardKey(opCtx, nss));
+                });
 
-            // Since createIndexIfPossible is false, we have no need for default collation and set
-            // it to boost::none.
-            shardkeyutil::validateShardKeyAgainstExistingIndexes(opCtx,
-                                                                 nss,
-                                                                 proposedKey,
-                                                                 newShardKeyPattern,
-                                                                 primaryShard,
-                                                                 boost::none,
-                                                                 collType.getUnique(),
-                                                                 false);  // createIndexIfPossible
-
-            LOG(0) << "CMD: refineCollectionShardKey: " << request().toBSON({});
+            LOGV2(21922,
+                  "CMD: refineCollectionShardKey: {request}",
+                  "CMD: refineCollectionShardKey",
+                  "request"_attr = request().toBSON({}));
 
             audit::logRefineCollectionShardKey(opCtx->getClient(), nss.ns(), proposedKey);
 

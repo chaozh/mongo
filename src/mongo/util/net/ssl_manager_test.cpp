@@ -27,15 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_manager.h"
 
 #include "mongo/config.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 #include "mongo/util/net/dh_openssl.h"
@@ -78,10 +78,17 @@ TEST(SSLManager, matchHostname) {
     for (const auto& test : tests) {
         if (bool(test.expected) != hostNameMatchForX509Certificates(test.hostname, test.certName)) {
             failure = true;
-            LOG(1) << "Failure for Hostname: " << test.hostname
-                   << " Certificate: " << test.certName;
+            LOGV2_DEBUG(23266,
+                        1,
+                        "Failure for Hostname: {test_hostname} Certificate: {test_certName}",
+                        "test_hostname"_attr = test.hostname,
+                        "test_certName"_attr = test.certName);
         } else {
-            LOG(1) << "Passed for Hostname: " << test.hostname << " Certificate: " << test.certName;
+            LOGV2_DEBUG(23267,
+                        1,
+                        "Passed for Hostname: {test_hostname} Certificate: {test_certName}",
+                        "test_hostname"_attr = test.hostname,
+                        "test_certName"_attr = test.certName);
         }
     }
     ASSERT_FALSE(failure);
@@ -242,6 +249,38 @@ TEST(SSLManager, MongoDBRolesParser) {
     }
 }
 
+TEST(SSLManager, TLSFeatureParser) {
+    {
+        // test correct feature resolution with one feature
+        unsigned char derData[] = {0x30, 0x03, 0x02, 0x01, 0x05};
+        std::vector<DERInteger> correctFeatures = {{0x05}};
+        auto swFeatures = parseTLSFeature(ConstDataRange(derData));
+        ASSERT_OK(swFeatures.getStatus());
+
+        auto features = swFeatures.getValue();
+        ASSERT_TRUE(features == correctFeatures);
+    }
+
+    {
+        // test incorrect feature resolution (malformed header)
+        unsigned char derData[] = {0xFF, 0x03, 0x02, 0x01, 0x05};
+        std::vector<DERInteger> correctFeatures = {{0x05}};
+        auto swFeatures = parseTLSFeature(ConstDataRange(derData));
+        ASSERT_NOT_OK(swFeatures.getStatus());
+    }
+
+    {
+        // test feature resolution with multiple features
+        unsigned char derData[] = {0x30, 0x06, 0x02, 0x01, 0x05, 0x02, 0x01, 0x01};
+        std::vector<DERInteger> correctFeatures = {{0x05}, {0x01}};
+        auto swFeatures = parseTLSFeature(ConstDataRange(derData));
+        ASSERT_OK(swFeatures.getStatus());
+
+        auto features = swFeatures.getValue();
+        ASSERT_TRUE(features == correctFeatures);
+    }
+}
+
 TEST(SSLManager, EscapeRFC2253) {
     ASSERT_EQ(escapeRfc2253("abc"), "abc");
     ASSERT_EQ(escapeRfc2253(" abc"), "\\ abc");
@@ -358,7 +397,7 @@ TEST(SSLManager, DNParsingAndNormalization) {
           {"2.5.4.7", "大田区, 東京都"}}}};
 
     for (const auto& test : tests) {
-        log() << "Testing DN \"" << test.first << "\"";
+        LOGV2(23268, "Testing DN \"{test_first}\"", "test_first"_attr = test.first);
         auto swDN = parseDN(test.first);
         ASSERT_OK(swDN.getStatus());
         ASSERT_OK(swDN.getValue().normalizeStrings());
@@ -370,7 +409,7 @@ TEST(SSLManager, DNParsingAndNormalization) {
 TEST(SSLManager, BadDNParsing) {
     std::vector<std::string> tests = {"CN=#12345", R"(CN=\B)", R"(CN=<", "\)"};
     for (const auto& test : tests) {
-        log() << "Testing bad DN: \"" << test << "\"";
+        LOGV2(23269, "Testing bad DN: \"{test}\"", "test"_attr = test);
         auto swDN = parseDN(test);
         ASSERT_NOT_OK(swDN.getStatus());
     }

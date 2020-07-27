@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -47,14 +47,21 @@ namespace {
 struct TestValue {
     TestValue(std::string in_value) : value(std::move(in_value)) {}
     TestValue(TestValue&&) = default;
-    TestValue(const TestValue&) = delete;
-    TestValue& operator=(const TestValue&) = delete;
 
     std::string value;
 };
 
 using TestValueCache = InvalidatingLRUCache<int, TestValue>;
 using TestValueHandle = TestValueCache::ValueHandle;
+
+using TestValueCacheCausallyConsistent = InvalidatingLRUCache<int, TestValue, Timestamp>;
+using TestValueHandleCausallyConsistent = TestValueCacheCausallyConsistent::ValueHandle;
+
+TEST(InvalidatingLRUCacheTest, StandaloneValueHandle) {
+    TestValueHandle standaloneHandle({"Standalone value"});
+    ASSERT(standaloneHandle.isValid());
+    ASSERT_EQ("Standalone value", standaloneHandle->value);
+}
 
 TEST(InvalidatingLRUCacheTest, ValueHandleOperators) {
     TestValueCache cache(1);
@@ -70,6 +77,29 @@ TEST(InvalidatingLRUCacheTest, ValueHandleOperators) {
         ASSERT_EQ("Test value", valueHandle->value);
         ASSERT_EQ("Test value", (*valueHandle).value);
     }
+}
+
+TEST(InvalidatingLRUCacheTest, CausalConsistency) {
+    TestValueCacheCausallyConsistent cache(1);
+
+    cache.insertOrAssign(2, TestValue("Value @ TS 100"), Timestamp(100));
+    ASSERT_EQ("Value @ TS 100", cache.get(2, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT_EQ("Value @ TS 100", cache.get(2, CacheCausalConsistency::kLatestKnown)->value);
+
+    auto value = cache.get(2, CacheCausalConsistency::kLatestCached);
+    cache.advanceTimeInStore(2, Timestamp(200));
+    ASSERT_EQ("Value @ TS 100", value->value);
+    ASSERT(!value.isValid());
+    ASSERT_EQ("Value @ TS 100", cache.get(2, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT(!cache.get(2, CacheCausalConsistency::kLatestCached).isValid());
+    ASSERT(!cache.get(2, CacheCausalConsistency::kLatestKnown));
+
+    // Intentionally push value for key with a timestamp higher than the one passed to advanceTime
+    cache.insertOrAssign(2, TestValue("Value @ TS 300"), Timestamp(300));
+    ASSERT_EQ("Value @ TS 100", value->value);
+    ASSERT(!value.isValid());
+    ASSERT_EQ("Value @ TS 300", cache.get(2, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT_EQ("Value @ TS 300", cache.get(2, CacheCausalConsistency::kLatestKnown)->value);
 }
 
 TEST(InvalidatingLRUCacheTest, InvalidateNonCheckedOutValue) {
@@ -229,6 +259,95 @@ TEST(InvalidatingLRUCacheTest, CheckedOutItemsAreInvalidatedWithPredicateWhenEvi
     }
 }
 
+TEST(InvalidatingLRUCacheTest, CausalConsistencyPreservedForEvictedCheckedOutKeys) {
+    TestValueCacheCausallyConsistent cache(1);
+
+    auto key1ValueAtTS10 =
+        cache.insertOrAssignAndGet(1, TestValue("Key 1 - Value @ TS 10"), Timestamp(10));
+
+    // This will evict key 1, but we have a handle to it, so it will stay accessible on the evicted
+    // list
+    cache.insertOrAssign(2, TestValue("Key 2 - Value @ TS 20"), Timestamp(20));
+
+    auto [cachedValueAtTS10, timeInStoreAtTS10] = cache.getCachedValueAndTimeInStore(1);
+    ASSERT_EQ(Timestamp(10), timeInStoreAtTS10);
+    ASSERT_EQ("Key 1 - Value @ TS 10", cachedValueAtTS10->value);
+    ASSERT_EQ("Key 1 - Value @ TS 10", key1ValueAtTS10->value);
+    ASSERT_EQ("Key 1 - Value @ TS 10", cache.get(1, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT_EQ("Key 1 - Value @ TS 10", cache.get(1, CacheCausalConsistency::kLatestKnown)->value);
+
+    cache.advanceTimeInStore(1, Timestamp(11));
+    auto [cachedValueAtTS11, timeInStoreAtTS11] = cache.getCachedValueAndTimeInStore(1);
+    ASSERT_EQ(Timestamp(11), timeInStoreAtTS11);
+    ASSERT(!key1ValueAtTS10.isValid());
+    ASSERT_EQ("Key 1 - Value @ TS 10", cachedValueAtTS11->value);
+    ASSERT_EQ("Key 1 - Value @ TS 10", key1ValueAtTS10->value);
+    ASSERT_EQ("Key 1 - Value @ TS 10", cache.get(1, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT(!cache.get(1, CacheCausalConsistency::kLatestKnown));
+
+    cache.insertOrAssign(1, TestValue("Key 1 - Value @ TS 12"), Timestamp(12));
+    ASSERT_EQ("Key 1 - Value @ TS 12", cache.get(1, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT_EQ("Key 1 - Value @ TS 12", cache.get(1, CacheCausalConsistency::kLatestKnown)->value);
+}
+
+TEST(InvalidatingLRUCacheTest, InvalidateAfterAdvanceTime) {
+    TestValueCacheCausallyConsistent cache(1);
+
+    cache.insertOrAssign(20, TestValue("Value @ TS 200"), Timestamp(200));
+    cache.advanceTimeInStore(20, Timestamp(250));
+    ASSERT_EQ("Value @ TS 200", cache.get(20, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT(!cache.get(20, CacheCausalConsistency::kLatestKnown));
+
+    cache.invalidate(20);
+    ASSERT(!cache.get(20, CacheCausalConsistency::kLatestCached));
+    ASSERT(!cache.get(20, CacheCausalConsistency::kLatestKnown));
+}
+
+TEST(InvalidatingLRUCacheTest, InsertEntryAtTimeLessThanAdvanceTime) {
+    TestValueCacheCausallyConsistent cache(1);
+
+    cache.insertOrAssign(20, TestValue("Value @ TS 200"), Timestamp(200));
+    cache.advanceTimeInStore(20, Timestamp(300));
+    ASSERT_EQ("Value @ TS 200", cache.get(20, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT(!cache.get(20, CacheCausalConsistency::kLatestKnown));
+
+    cache.insertOrAssign(20, TestValue("Value @ TS 250"), Timestamp(250));
+    ASSERT_EQ("Value @ TS 250", cache.get(20, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT(!cache.get(20, CacheCausalConsistency::kLatestKnown));
+
+    cache.insertOrAssign(20, TestValue("Value @ TS 300"), Timestamp(300));
+    ASSERT_EQ("Value @ TS 300", cache.get(20, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT_EQ("Value @ TS 300", cache.get(20, CacheCausalConsistency::kLatestKnown)->value);
+}
+
+TEST(InvalidatingLRUCacheTest, OrderOfDestructionOfHandlesDiffersFromOrderOfInsertion) {
+    TestValueCache cache(1);
+
+    boost::optional<TestValueCache::ValueHandle> firstValue(
+        cache.insertOrAssignAndGet(100, {"Key 100, Value 1"}));
+    ASSERT(*firstValue);
+    ASSERT(firstValue->isValid());
+
+    // This will invalidate the first value of key 100
+    auto secondValue = cache.insertOrAssignAndGet(100, {"Key 100, Value 2"});
+    ASSERT(secondValue);
+    ASSERT(secondValue.isValid());
+    ASSERT(!firstValue->isValid());
+
+    // This will evict the second value of key 100
+    cache.insertOrAssignAndGet(200, {"Key 200, Value 1"});
+    ASSERT(secondValue);
+    ASSERT(secondValue.isValid());
+    ASSERT(!firstValue->isValid());
+
+    // This makes the first value of 100's handle go away before the second value's hande
+    firstValue.reset();
+    ASSERT(secondValue.isValid());
+
+    cache.invalidate(100);
+    ASSERT(!secondValue.isValid());
+}
+
 TEST(InvalidatingLRUCacheTest, AssignWhileValueIsCheckedOutInvalidatesFirstValue) {
     TestValueCache cache(1);
 
@@ -307,12 +426,37 @@ TEST(InvalidatingLRUCacheTest, CacheSizeZeroInvalidateAllEntries) {
     }
 }
 
-template <typename TestFunc>
+TEST(InvalidatingLRUCacheTest, CacheSizeZeroCausalConsistency) {
+    TestValueCacheCausallyConsistent cache(0);
+
+    cache.advanceTimeInStore(100, Timestamp(30));
+    cache.insertOrAssign(100, TestValue("Value @ TS 30"), Timestamp(30));
+    auto [cachedValueAtTS30, timeInStoreAtTS30] = cache.getCachedValueAndTimeInStore(100);
+    ASSERT_EQ(Timestamp(), timeInStoreAtTS30);
+    ASSERT(!cachedValueAtTS30);
+
+    auto valueAtTS30 = cache.insertOrAssignAndGet(100, TestValue("Value @ TS 30"), Timestamp(30));
+    ASSERT_EQ("Value @ TS 30", cache.get(100, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT_EQ("Value @ TS 30", cache.get(100, CacheCausalConsistency::kLatestKnown)->value);
+
+    cache.advanceTimeInStore(100, Timestamp(35));
+    auto [cachedValueAtTS35, timeInStoreAtTS35] = cache.getCachedValueAndTimeInStore(100);
+    ASSERT_EQ(Timestamp(35), timeInStoreAtTS35);
+    ASSERT_EQ("Value @ TS 30", cachedValueAtTS35->value);
+    ASSERT_EQ("Value @ TS 30", cache.get(100, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT(!cache.get(100, CacheCausalConsistency::kLatestKnown));
+
+    auto valueAtTS40 = cache.insertOrAssignAndGet(100, TestValue("Value @ TS 40"), Timestamp(40));
+    ASSERT_EQ("Value @ TS 40", cache.get(100, CacheCausalConsistency::kLatestCached)->value);
+    ASSERT_EQ("Value @ TS 40", cache.get(100, CacheCausalConsistency::kLatestKnown)->value);
+}
+
+template <class TCache, typename TestFunc>
 void parallelTest(size_t cacheSize, TestFunc doTest) {
     constexpr auto kNumIterations = 100'000;
     constexpr auto kNumThreads = 4;
 
-    TestValueCache cache(cacheSize);
+    TCache cache(cacheSize);
 
     std::vector<stdx::thread> threads;
     for (int i = 0; i < kNumThreads; i++) {
@@ -329,7 +473,7 @@ void parallelTest(size_t cacheSize, TestFunc doTest) {
 }
 
 TEST(InvalidatingLRUCacheParallelTest, InsertOrAssignThenGet) {
-    parallelTest(1, [](TestValueCache& cache) mutable {
+    parallelTest<TestValueCache>(1, [](auto& cache) mutable {
         const int key = 100;
         cache.insertOrAssign(key, TestValue{"Parallel tester value"});
 
@@ -346,7 +490,7 @@ TEST(InvalidatingLRUCacheParallelTest, InsertOrAssignThenGet) {
 }
 
 TEST(InvalidatingLRUCacheParallelTest, InsertOrAssignAndGet) {
-    parallelTest(1, [](auto& cache) {
+    parallelTest<TestValueCache>(1, [](auto& cache) {
         const int key = 200;
         auto cachedItem = cache.insertOrAssignAndGet(key, TestValue{"Parallel tester value"});
         ASSERT(cachedItem);
@@ -357,12 +501,26 @@ TEST(InvalidatingLRUCacheParallelTest, InsertOrAssignAndGet) {
 }
 
 TEST(InvalidatingLRUCacheParallelTest, CacheSizeZeroInsertOrAssignAndGet) {
-    parallelTest(0, [](TestValueCache& cache) mutable {
+    parallelTest<TestValueCache>(0, [](auto& cache) mutable {
         const int key = 300;
         auto cachedItem = cache.insertOrAssignAndGet(key, TestValue{"Parallel tester value"});
         ASSERT(cachedItem);
 
         auto cachedItemSecondRef = cache.get(key);
+    });
+}
+
+TEST(InvalidatingLRUCacheParallelTest, AdvanceTime) {
+    AtomicWord<uint64_t> counter{0};
+
+    parallelTest<TestValueCacheCausallyConsistent>(0, [&counter](auto& cache) mutable {
+        const int key = 300;
+        cache.insertOrAssign(
+            key, TestValue{"Parallel tester value"}, Timestamp(counter.fetchAndAdd(1)));
+        auto latestCached = cache.get(key, CacheCausalConsistency::kLatestCached);
+        auto latestKnown = cache.get(key, CacheCausalConsistency::kLatestKnown);
+
+        cache.advanceTimeInStore(key, Timestamp(counter.fetchAndAdd(1)));
     });
 }
 

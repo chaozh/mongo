@@ -42,7 +42,6 @@
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/index_scan.h"
-#include "mongo/db/exec/pipeline_proxy.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/json.h"
@@ -51,7 +50,8 @@
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/pipeline/plan_executor_pipeline.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/dbtests/dbtests.h"
 
@@ -99,7 +99,7 @@ public:
     unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeCollScanExec(
         Collection* coll,
         BSONObj& filterObj,
-        PlanExecutor::YieldPolicy yieldPolicy = PlanExecutor::YieldPolicy::YIELD_MANUAL,
+        PlanYieldPolicy::YieldPolicy yieldPolicy = PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
         TailableModeEnum tailableMode = TailableModeEnum::kNormal) {
         CollectionScanParams csparams;
         csparams.direction = CollectionScanParams::FORWARD;
@@ -116,11 +116,11 @@ public:
 
         // Make the stage.
         unique_ptr<PlanStage> root(
-            new CollectionScan(&_opCtx, coll, csparams, ws.get(), cq.get()->root()));
+            new CollectionScan(cq->getExpCtxRaw(), coll, csparams, ws.get(), cq.get()->root()));
 
         // Hand the plan off to the executor.
-        auto statusWithPlanExecutor =
-            PlanExecutor::make(std::move(cq), std::move(ws), std::move(root), coll, yieldPolicy);
+        auto statusWithPlanExecutor = plan_executor_factory::make(
+            std::move(cq), std::move(ws), std::move(root), coll, yieldPolicy);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -153,9 +153,9 @@ public:
 
 
         unique_ptr<WorkingSet> ws(new WorkingSet());
-        auto ixscan = std::make_unique<IndexScan>(&_opCtx, ixparams, ws.get(), nullptr);
+        auto ixscan = std::make_unique<IndexScan>(_expCtx.get(), coll, ixparams, ws.get(), nullptr);
         unique_ptr<PlanStage> root =
-            std::make_unique<FetchStage>(&_opCtx, ws.get(), std::move(ixscan), nullptr, coll);
+            std::make_unique<FetchStage>(_expCtx.get(), ws.get(), std::move(ixscan), nullptr, coll);
 
         auto qr = std::make_unique<QueryRequest>(nss);
         auto statusWithCQ = CanonicalQuery::canonicalize(&_opCtx, std::move(qr));
@@ -164,8 +164,12 @@ public:
         verify(nullptr != cq.get());
 
         // Hand the plan off to the executor.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            std::move(cq), std::move(ws), std::move(root), coll, PlanExecutor::YIELD_MANUAL);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(std::move(cq),
+                                        std::move(ws),
+                                        std::move(root),
+                                        coll,
+                                        PlanYieldPolicy::YieldPolicy::YIELD_MANUAL);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -173,6 +177,9 @@ public:
 protected:
     const ServiceContext::UniqueOperationContext _opCtxPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_opCtxPtr;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss);
 
 private:
     const IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {
@@ -203,8 +210,6 @@ TEST_F(PlanExecutorTest, DropIndexScanAgg) {
 
     // Create the aggregation pipeline.
     std::vector<BSONObj> rawPipeline = {fromjson("{$match: {a: {$gte: 7, $lte: 10}}}")};
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx =
-        new ExpressionContextForTest(&_opCtx, AggregationRequest(nss, rawPipeline));
 
     // Create an "inner" plan executor and register it with the cursor manager so that it can
     // get notified when the collection is dropped.
@@ -214,17 +219,12 @@ TEST_F(PlanExecutorTest, DropIndexScanAgg) {
     // Wrap the "inner" plan executor in a DocumentSourceCursor and add it as the first source
     // in the pipeline.
     innerExec->saveState();
-    auto cursorSource = DocumentSourceCursor::create(collection, std::move(innerExec), expCtx);
-    auto pipeline = assertGet(Pipeline::create({cursorSource}, expCtx));
+    auto cursorSource = DocumentSourceCursor::create(
+        collection, std::move(innerExec), _expCtx, DocumentSourceCursor::CursorType::kRegular);
+    auto pipeline = Pipeline::create({cursorSource}, _expCtx);
 
-    // Create the output PlanExecutor that pulls results from the pipeline.
-    auto ws = std::make_unique<WorkingSet>();
-    auto proxy = std::make_unique<PipelineProxyStage>(&_opCtx, std::move(pipeline), ws.get());
-
-    auto statusWithPlanExecutor = PlanExecutor::make(
-        &_opCtx, std::move(ws), std::move(proxy), collection, PlanExecutor::NO_YIELD);
-    ASSERT_OK(statusWithPlanExecutor.getStatus());
-    auto outerExec = std::move(statusWithPlanExecutor.getValue());
+    auto outerExec =
+        plan_executor_factory::make(_expCtx, std::move(pipeline), false /* isChangeStream */);
 
     dropCollection();
 
@@ -243,11 +243,13 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfExceedsTimeLimitDuringYield) {
     BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
 
     Collection* coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT);
+    auto exec = makeCollScanExec(coll, filterObj, PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::FAILURE, exec->getNext(&resultObj, nullptr));
-    ASSERT_EQ(ErrorCodes::ExceededTimeLimit, WorkingSetCommon::getMemberObjectStatus(resultObj));
+    ASSERT_THROWS_CODE_AND_WHAT(exec->getNext(&resultObj, nullptr),
+                                DBException,
+                                ErrorCodes::ExceededTimeLimit,
+                                "Using AlwaysTimeOutYieldPolicy");
 }
 
 TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYieldButIsTailableAndAwaitData) {
@@ -260,12 +262,14 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYieldButIsTailableAndAwa
     Collection* coll = ctx.getCollection();
     auto exec = makeCollScanExec(coll,
                                  filterObj,
-                                 PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT,
+                                 PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT,
                                  TailableModeEnum::kTailableAndAwaitData);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::FAILURE, exec->getNext(&resultObj, nullptr));
-    ASSERT_EQ(ErrorCodes::ExceededTimeLimit, WorkingSetCommon::getMemberObjectStatus(resultObj));
+    ASSERT_THROWS_CODE_AND_WHAT(exec->getNext(&resultObj, nullptr),
+                                DBException,
+                                ErrorCodes::ExceededTimeLimit,
+                                "Using AlwaysTimeOutYieldPolicy");
 }
 
 TEST_F(PlanExecutorTest, ShouldNotSwallowExceedsTimeLimitDuringYieldButIsTailableButNotAwaitData) {
@@ -276,12 +280,16 @@ TEST_F(PlanExecutorTest, ShouldNotSwallowExceedsTimeLimitDuringYieldButIsTailabl
     BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
 
     Collection* coll = ctx.getCollection();
-    auto exec = makeCollScanExec(
-        coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT, TailableModeEnum::kTailable);
+    auto exec = makeCollScanExec(coll,
+                                 filterObj,
+                                 PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT,
+                                 TailableModeEnum::kTailable);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::FAILURE, exec->getNext(&resultObj, nullptr));
-    ASSERT_EQ(ErrorCodes::ExceededTimeLimit, WorkingSetCommon::getMemberObjectStatus(resultObj));
+    ASSERT_THROWS_CODE_AND_WHAT(exec->getNext(&resultObj, nullptr),
+                                DBException,
+                                ErrorCodes::ExceededTimeLimit,
+                                "Using AlwaysTimeOutYieldPolicy");
 }
 
 TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYield) {
@@ -292,11 +300,13 @@ TEST_F(PlanExecutorTest, ShouldReportErrorIfKilledDuringYield) {
     BSONObj filterObj = fromjson("{_id: {$gt: 0}}");
 
     Collection* coll = ctx.getCollection();
-    auto exec = makeCollScanExec(coll, filterObj, PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED);
+    auto exec = makeCollScanExec(coll, filterObj, PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED);
 
     BSONObj resultObj;
-    ASSERT_EQ(PlanExecutor::FAILURE, exec->getNext(&resultObj, nullptr));
-    ASSERT_EQ(ErrorCodes::QueryPlanKilled, WorkingSetCommon::getMemberObjectStatus(resultObj));
+    ASSERT_THROWS_CODE_AND_WHAT(exec->getNext(&resultObj, nullptr),
+                                DBException,
+                                ErrorCodes::QueryPlanKilled,
+                                "Using AlwaysPlanKilledYieldPolicy");
 }
 
 class PlanExecutorSnapshotTest : public PlanExecutorTest {

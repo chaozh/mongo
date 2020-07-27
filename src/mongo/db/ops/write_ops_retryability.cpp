@@ -35,7 +35,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/find_and_modify_result.h"
 #include "mongo/db/query/find_and_modify_request.h"
-#include "mongo/logger/redaction.h"
+#include "mongo/logv2/redaction.h"
 
 namespace mongo {
 namespace {
@@ -108,10 +108,8 @@ BSONObj extractPreOrPostImage(OperationContext* opCtx, const repl::OplogEntry& o
                                             : oplog.getPostImageOpTime().value();
 
     DBDirectClient client(opCtx);
-    auto oplogDoc = client.findOne(NamespaceString::kRsOplogNamespace.ns(),
-                                   opTime.asQuery(),
-                                   nullptr,
-                                   QueryOption_OplogReplay);
+    auto oplogDoc =
+        client.findOne(NamespaceString::kRsOplogNamespace.ns(), opTime.asQuery(), nullptr);
 
     uassert(40613,
             str::stream() << "oplog no longer contains the complete write history of this "

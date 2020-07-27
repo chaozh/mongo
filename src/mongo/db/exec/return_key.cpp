@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,31 +36,16 @@
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/pipeline/field_path.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
-using namespace fmt::literals;
-
 PlanStage::StageState ReturnKeyStage::doWork(WorkingSetID* out) {
     WorkingSetID id = WorkingSet::INVALID_ID;
     StageState status = child()->work(&id);
 
     if (PlanStage::ADVANCED == status) {
         WorkingSetMember* member = _ws.get(id);
-        Status indexKeyStatus = _extractIndexKey(member);
-
-        if (!indexKeyStatus.isOK()) {
-            warning() << "Couldn't execute {}, status = {}"_format(kStageName,
-                                                                   redact(indexKeyStatus));
-            *out = WorkingSetCommon::allocateStatusMember(&_ws, indexKeyStatus);
-            return PlanStage::FAILURE;
-        }
-
-        *out = id;
-    } else if (PlanStage::FAILURE == status) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
+        _extractIndexKey(member);
         *out = id;
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
@@ -78,7 +63,7 @@ std::unique_ptr<PlanStageStats> ReturnKeyStage::getStats() {
     return ret;
 }
 
-Status ReturnKeyStage::_extractIndexKey(WorkingSetMember* member) {
+void ReturnKeyStage::_extractIndexKey(WorkingSetMember* member) {
     if (!_sortKeyMetaFields.empty()) {
         invariant(member->metadata().hasSortKey());
     }
@@ -97,29 +82,15 @@ Status ReturnKeyStage::_extractIndexKey(WorkingSetMember* member) {
             continue;
         }
 
-        switch (_sortKeyFormat) {
-            case SortKeyFormat::k44SortKey:
-                md.setNestedField(
-                    fieldPath,
-                    Value(DocumentMetadataFields::serializeSortKeyAsArray(
-                        member->metadata().isSingleElementKey(), member->metadata().getSortKey())));
-                break;
-            case SortKeyFormat::k42SortKey:
-                md.setNestedField(
-                    fieldPath,
-                    Value(DocumentMetadataFields::serializeSortKeyAsObject(
-                        member->metadata().isSingleElementKey(), member->metadata().getSortKey())));
-                break;
-            default:
-                MONGO_UNREACHABLE;
-        }
+        md.setNestedField(
+            fieldPath,
+            Value(DocumentMetadataFields::serializeSortKey(member->metadata().isSingleElementKey(),
+                                                           member->metadata().getSortKey())));
     }
 
     member->keyData.clear();
     member->recordId = {};
     member->doc = {{}, md.freeze()};
     member->transitionToOwnedObj();
-
-    return Status::OK();
 }
 }  // namespace mongo

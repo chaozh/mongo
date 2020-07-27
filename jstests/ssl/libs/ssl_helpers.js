@@ -110,7 +110,7 @@ function testShardedLookup(shardingTest) {
  * Takes in two mongod/mongos configuration options and runs a basic
  * sharding test to see if they can work together...
  */
-function mixedShardTest(options1, options2, shouldSucceed, disableResumableRangeDeleter) {
+function mixedShardTest(options1, options2, shouldSucceed) {
     let authSucceeded = false;
     try {
         // Start ShardingTest with enableBalancer because ShardingTest attempts to turn
@@ -123,19 +123,12 @@ function mixedShardTest(options1, options2, shouldSucceed, disableResumableRange
         //
         // Once SERVER-14017 is fixed the "enableBalancer" line can be removed.
         // TODO: SERVER-43899 Make sharding_with_x509.js and mixed_mode_sharded_transition.js start
-        // shards as replica sets and remove disableResumableRangeDeleter parameter.
-        let otherOptions = {enableBalancer: true};
-
-        if (disableResumableRangeDeleter) {
-            otherOptions.shardAsReplicaSet = false;
-            otherOptions.shardOptions = {setParameter: {"disableResumableRangeDeleter": true}};
-        }
-
+        // shards as replica sets.
         var st = new ShardingTest({
             mongos: [options1],
             config: [options1],
             shards: [options1, options2],
-            other: otherOptions
+            other: {enableBalancer: true, shardAsReplicaSet: false},
         });
 
         // Create admin user in case the options include auth
@@ -204,6 +197,13 @@ function mixedShardTest(options1, options2, shouldSucceed, disableResumableRange
                     'CN=client,OU=KernelUser,O=MongoDB,L=New York City,ST=New York,C=US';
                 st.s.getDB('$external')
                     .createUser({user: x509User, roles: [{role: '__system', db: 'admin'}]});
+
+                // Check orphan hook needs a privileged user to auth as.
+                // Works only for stand alone shards.
+                st._connections.forEach((shardConn) => {
+                    shardConn.getDB('$external')
+                        .createUser({user: x509User, roles: [{role: '__system', db: 'admin'}]});
+                });
             }
 
             st.stop();
@@ -297,6 +297,21 @@ function isRHEL8() {
     return false;
 }
 
+function isUbuntu2004() {
+    if (_isWindows()) {
+        return false;
+    }
+
+    // Ubuntu 20.04 disables TLS 1.0 and TLS 1.1 as part their default crypto policy
+    // We skip tests on Ubuntu 20.04 that require these versions as a result.
+    const grep_result = runProgram('grep', 'focal', '/etc/os-release');
+    if (grep_result == 0) {
+        return true;
+    }
+
+    return false;
+}
+
 function isDebian10() {
     if (_isWindows()) {
         return false;
@@ -324,7 +339,7 @@ function sslProviderSupportsTLS1_0() {
         const cryptoPolicy = cat("/etc/crypto-policies/config");
         return cryptoPolicy.includes("LEGACY");
     }
-    return !isDebian10();
+    return !isDebian10() && !isUbuntu2004();
 }
 
 function sslProviderSupportsTLS1_1() {
@@ -332,7 +347,7 @@ function sslProviderSupportsTLS1_1() {
         const cryptoPolicy = cat("/etc/crypto-policies/config");
         return cryptoPolicy.includes("LEGACY");
     }
-    return !isDebian10();
+    return !isDebian10() && !isUbuntu2004();
 }
 
 function opensslVersionAsInt() {

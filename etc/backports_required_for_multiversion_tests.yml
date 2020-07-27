@@ -1,11 +1,11 @@
 # This file is intended to track tests that should be blacklisted from multiversion testing due to
-# changes that have not yet been backported to the last-stable development branch.
+# changes that have not yet been backported to the last-lts development branch.
 #
 # Usage:
 # Add the server ticket number and the path to the test file for the test you intend to blacklist
 # under the appropriate suite. Any test in a (ticket, test_file) pair that appears in this file but
-# not in the last-stable branch version of this file indicates that a commit has not yet been
-# backported to the last-stable branch and will be excluded from the multiversion suite
+# not in the last-lts branch version of this file indicates that a commit has not yet been
+# backported to the last-lts branch and will be excluded from the multiversion suite
 # corresponding to the root level suite key.
 #
 # Example:
@@ -15,51 +15,56 @@
 #
 # The above example will blacklist jstests/core/my_test_file.js from the
 # 'replica_sets_multiversion_gen' task until this file has been updated with the same
-# (ticket, test_file) pair on the last-stable branch.
+# (ticket, test_file) pair on the last-lts branch.
+#
+# Note:
+# For tests that need to be blacklisted for the 'replica_sets_multiversion' and
+# 'sharding_multiversion' suites, please instead add them under the 'exclude_files' key in
+# 'replica_sets_multiversion.yml' and 'sharding_multiversion.yml' respectively.
 #
 
 change_streams_multiversion:
 
 change_streams_sharded_collections_multiversion_passthrough:
+- ticket: SERVER-47810
+  test_file: jstests/change_streams/report_post_batch_resume_token.js
 
 concurrency_replication_multiversion:
 
 concurrency_sharded_replication_multiversion:
 
-replica_sets_jscore_multiversion_passthrough:
-- ticket: SERVER-35921
-  test_file: jstests/core/min_max_key.js
-- ticket: SERVER-40805
-  test_file: jstests/core/profile_find.js
-- ticket: SERVER-44260
-  test_file: jstests/core/txns/new_transaction_waits_for_previous_txn_table_updates.js
-
 replica_sets_multiversion:
-- ticket: SERVER-42825
-  test_file: jstests/replsets/kill_reads_with_prepare_conflicts_during_step_down.js
-- ticket: SERVER-42825
-  test_file: jstests/replsets/kill_reads_with_prepare_conflicts_during_step_up.js
-- ticket: SERVER-42825
-  test_file: jstests/replsets/no_disconnect_on_stepdown.js
-- ticket: SERVER-42825
-  test_file: jstests/replsets/read_operations_during_rollback.js
-- ticket: SERVER-42825
-  test_file: jstests/replsets/read_operations_during_step_down.js
-- ticket: SERVER-42825
-  test_file: jstests/replsets/read_operations_during_step_up.js
-- ticket: SERVER-42825
-  test_file: jstests/replsets/step_down_on_secondary.js
-- ticket: SERVER-45010
-  test_file: jstests/replsets/rollback_dup_ids_clean_shutdown_during_rollback.js
-- ticket: SERVER-45906
-  test_file: jstests/replsets/trigger_initial_stable_checkpoint.js
+- ticket: SERVER-49471
+  test_file: jstests/replsets/apply_prepare_txn_write_conflict_robustness.js
 
-sharding_multiversion:
-- ticket: SERVER-38691
-  test_file: jstests/sharding/explain_cmd.js
+replica_sets_jscore_multiversion_passthrough:
+- ticket: SERVER-47773
+  test_file: jstests/core/geo_near_tailable.js
+- ticket: SERVER-47469
+  test_file: jstests/core/apply_ops_system_dot_views.js
+- ticket: SERVER-48614
+  test_file: jstests/core/wildcard_index_partial_index.js
+- ticket: SERVER-48993
+  test_file: jstests/core/explode_for_sort_collation.js
+- ticket: SERVER-48525
+  test_file: jstests/core/txns/no_writes_to_config_transactions_with_prepared_transaction.js
 
 sharding_jscore_multiversion_passthrough:
+- ticket: SERVER-47773
+  test_file: jstests/core/geo_near_tailable.js
+- ticket: SERVER-47469
+  test_file: jstests/core/apply_ops_system_dot_views.js
+- ticket: SERVER-48614
+  test_file: jstests/core/wildcard_index_partial_index.js
+- ticket: SERVER-48993
+  test_file: jstests/core/explode_for_sort_collation.js
 
 sharded_collections_jscore_multiversion_passthrough:
-- ticket: SERVER-35921
-  test_file: jstests/core/min_max_key.js
+- ticket: SERVER-47773
+  test_file: jstests/core/geo_near_tailable.js
+- ticket: SERVER-47469
+  test_file: jstests/core/apply_ops_system_dot_views.js
+- ticket: SERVER-48614
+  test_file: jstests/core/wildcard_index_partial_index.js
+- ticket: SERVER-48993
+  test_file: jstests/core/explode_for_sort_collation.js

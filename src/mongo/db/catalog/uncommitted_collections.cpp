@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,6 @@
 #include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -47,9 +46,7 @@ UncommittedCollections& UncommittedCollections::get(OperationContext* opCtx) {
     return getUncommittedCollections(opCtx);
 }
 
-void UncommittedCollections::addToTxn(OperationContext* opCtx,
-                                      std::unique_ptr<Collection> coll,
-                                      Timestamp createTime) {
+void UncommittedCollections::addToTxn(OperationContext* opCtx, std::unique_ptr<Collection> coll) {
     auto collList = getUncommittedCollections(opCtx).getResources().lock();
     auto existingColl = collList->_collections.find(coll->uuid());
     uassert(31370,
@@ -64,19 +61,30 @@ void UncommittedCollections::addToTxn(OperationContext* opCtx,
 
     auto collListUnowned = getUncommittedCollections(opCtx).getResources();
 
-    opCtx->recoveryUnit()->registerPreCommitHook(
-        [collListUnowned, uuid, createTime](OperationContext* opCtx) {
-            UncommittedCollections::commit(opCtx, uuid, createTime, collListUnowned.lock().get());
-        });
+    opCtx->recoveryUnit()->onRollback([collListUnowned, uuid, nss]() {
+        UncommittedCollections::erase(uuid, nss, collListUnowned.lock().get());
+    });
+
+    opCtx->recoveryUnit()->registerPreCommitHook([collListUnowned, uuid](OperationContext* opCtx) {
+        UncommittedCollections::commit(opCtx, uuid, collListUnowned.lock().get());
+    });
+
+    // By this point, we may or may not have reserved an oplog slot for the collection creation.
+    // For example, multi-document transactions will only reserve the oplog slot at commit time.
+    // As a result, we may or may not have a reliable value to use to set the new collection's
+    // minimum visible snapshot until commit time.
+    // Pre-commit hooks do not presently have awareness of the commit timestamp, so we must
+    // register a separate onCommit handler to update the minVisibleTimestamp with the
+    // appropriate value.
+    // This is fine because the collection should not be visible in the catalog until a
+    // subsequent onCommit handler executes.
     opCtx->recoveryUnit()->onCommit(
-        [collListUnowned, collPtr, createTime](boost::optional<Timestamp> commitTs) {
-            // Verify that the collection was given a minVisibleTimestamp equal to the transactions
-            // commit timestamp.
-            invariant(collPtr->getMinimumVisibleSnapshot() == createTime);
+        [collListUnowned, collPtr](boost::optional<Timestamp> commitTs) {
+            if (commitTs) {
+                collPtr->setMinimumVisibleSnapshot(commitTs.get());
+            }
             UncommittedCollections::clear(collListUnowned.lock().get());
         });
-    opCtx->recoveryUnit()->onRollback(
-        [collListUnowned]() { UncommittedCollections::clear(collListUnowned.lock().get()); });
 }
 
 Collection* UncommittedCollections::getForTxn(OperationContext* opCtx,
@@ -108,9 +116,21 @@ Collection* UncommittedCollections::getForTxn(OperationContext* opCtx, const UUI
     return it->second.get();
 }
 
+void UncommittedCollections::erase(UUID uuid, NamespaceString nss, UncommittedCollectionsMap* map) {
+    map->erase(uuid, nss);
+}
+
+void UncommittedCollections::rollback(ServiceContext* svcCtx,
+                                      CollectionUUID uuid,
+                                      UncommittedCollectionsMap* map) {
+    auto collPtr = CollectionCatalog::get(svcCtx).deregisterCollection(uuid);
+    auto nss = collPtr.get()->ns();
+    map->_collections[uuid] = std::move(collPtr);
+    map->_nssIndex.insert({nss, uuid});
+}
+
 void UncommittedCollections::commit(OperationContext* opCtx,
                                     UUID uuid,
-                                    Timestamp createTs,
                                     UncommittedCollectionsMap* map) {
     if (map->_collections.count(uuid) == 0) {
         return;
@@ -119,12 +139,26 @@ void UncommittedCollections::commit(OperationContext* opCtx,
     auto it = map->_collections.find(uuid);
     // Invariant that a collection is found.
     invariant(it->second.get(), uuid.toString());
-    it->second->setMinimumVisibleSnapshot(createTs);
+    auto collPtr = it->second.get();
 
     auto nss = it->second->ns();
     CollectionCatalog::get(opCtx).registerCollection(uuid, &(it->second));
     map->_collections.erase(it);
     map->_nssIndex.erase(nss);
+    auto svcCtx = opCtx->getServiceContext();
+    auto collListUnowned = getUncommittedCollections(opCtx).getResources();
+
+    opCtx->recoveryUnit()->onRollback([svcCtx, collListUnowned, uuid]() {
+        UncommittedCollections::rollback(svcCtx, uuid, collListUnowned.lock().get());
+    });
+    opCtx->recoveryUnit()->onCommit([svcCtx, uuid, collPtr](boost::optional<Timestamp> commitTs) {
+        CollectionCatalog::get(svcCtx).makeCollectionVisible(uuid);
+        // If a commitTs exists, by this point a collection should have a minimum visible snapshot
+        // equal to `commitTs`.
+        invariant(!commitTs ||
+                  (collPtr->getMinimumVisibleSnapshot() &&
+                   collPtr->getMinimumVisibleSnapshot().get() == commitTs.get()));
+    });
 }
 
 bool UncommittedCollections::isUncommittedCollection(OperationContext* opCtx,
@@ -144,6 +178,10 @@ void UncommittedCollections::invariantHasExclusiveAccessToCollection(
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X) ||
                   isUncommittedCollection(opCtx, nss),
               nss.toString());
+}
+
+bool UncommittedCollections::isEmpty() {
+    return _resourcesPtr->empty();
 }
 
 }  // namespace mongo

@@ -45,13 +45,13 @@ using std::vector;
 // static
 const char* CountStage::kStageType = "COUNT";
 
-CountStage::CountStage(OperationContext* opCtx,
+CountStage::CountStage(ExpressionContext* expCtx,
                        Collection* collection,
                        long long limit,
                        long long skip,
                        WorkingSet* ws,
                        PlanStage* child)
-    : PlanStage(kStageType, opCtx), _limit(limit), _skip(skip), _leftToSkip(_skip), _ws(ws) {
+    : PlanStage(kStageType, expCtx), _limit(limit), _skip(skip), _leftToSkip(_skip), _ws(ws) {
     invariant(_skip >= 0);
     invariant(_limit >= 0);
     invariant(child);
@@ -84,12 +84,6 @@ PlanStage::StageState CountStage::doWork(WorkingSetID* out) {
     if (PlanStage::IS_EOF == state) {
         _commonStats.isEOF = true;
         return PlanStage::IS_EOF;
-    } else if (PlanStage::FAILURE == state) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return state;
     } else if (PlanStage::ADVANCED == state) {
         // We got a result. If we're still skipping, then decrement the number left to skip.
         // Otherwise increment the count until we hit the limit.

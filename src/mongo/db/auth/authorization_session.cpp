@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
@@ -53,7 +51,6 @@
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {

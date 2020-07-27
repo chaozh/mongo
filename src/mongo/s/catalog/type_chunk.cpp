@@ -47,7 +47,6 @@ const NamespaceString ChunkType::ConfigNS("config.chunks");
 const std::string ChunkType::ShardNSPrefix = "config.cache.chunks.";
 
 const BSONField<OID> ChunkType::name("_id");
-const BSONField<std::string> ChunkType::legacyName("_id");
 const BSONField<BSONObj> ChunkType::minShardID("_id");
 const BSONField<std::string> ChunkType::ns("ns");
 const BSONField<BSONObj> ChunkType::min("min");
@@ -174,6 +173,10 @@ boost::optional<ChunkRange> ChunkRange::overlapWith(ChunkRange const& other) con
                       le(_maxKey, other._maxKey) ? _maxKey : other._maxKey);
 }
 
+bool ChunkRange::overlaps(const ChunkRange& other) const {
+    return _minKey.woCompare(other._maxKey) < 0 && _maxKey.woCompare(other._minKey) > 0;
+}
+
 ChunkRange ChunkRange::unionWith(ChunkRange const& other) const {
     auto le = [](auto const& a, auto const& b) { return a.woCompare(b) <= 0; };
     return ChunkRange(le(_minKey, other._minKey) ? _minKey : other._minKey,
@@ -216,14 +219,9 @@ StatusWith<ChunkType> ChunkType::parseFromConfigBSONCommand(const BSONObj& sourc
         Status status = bsonExtractOIDField(source, name.name(), &chunkID);
         if (status.isOK()) {
             chunk._id = chunkID;
-        } else if (status == ErrorCodes::NoSuchKey || status == ErrorCodes::TypeMismatch) {
+        } else if (status == ErrorCodes::NoSuchKey) {
             // Ignore NoSuchKey because when chunks are sent in commands they are not required to
             // include it.
-            //
-            // Ignore TypeMismatch for compatibility with binaries 4.2 and earlier, since the _id
-            // type was changed from string to OID.
-            //
-            // TODO SERVER-44034: Stop ignoring TypeMismatch.
         } else {
             return status;
         }
@@ -308,11 +306,6 @@ StatusWith<ChunkType> ChunkType::fromConfigBSON(const BSONObj& source) {
             Status status = bsonExtractOIDField(source, name.name(), &chunkID);
             if (status.isOK()) {
                 chunk._id = chunkID;
-            } else if (status == ErrorCodes::TypeMismatch) {
-                // The format of _id changed between 4.2 and 4.4 so for compatibility with chunks
-                // created in earlier versions we ignore TypeMismatch.
-                //
-                // TODO SERVER-44034: Stop ignoring TypeMismatch.
             } else {
                 return status;
             }
@@ -326,26 +319,6 @@ BSONObj ChunkType::toConfigBSON() const {
     BSONObjBuilder builder;
     if (_id)
         builder.append(name.name(), getName());
-    if (_nss)
-        builder.append(ns.name(), getNS().ns());
-    if (_min)
-        builder.append(min.name(), getMin());
-    if (_max)
-        builder.append(max.name(), getMax());
-    if (_shard)
-        builder.append(shard.name(), getShard().toString());
-    if (_version)
-        _version->appendLegacyWithField(&builder, ChunkType::lastmod());
-    if (_jumbo)
-        builder.append(jumbo.name(), getJumbo());
-    addHistoryToBSON(builder);
-    return builder.obj();
-}
-
-BSONObj ChunkType::toConfigBSONLegacyID() const {
-    BSONObjBuilder builder;
-    if (_nss && _min)
-        builder.append(name.name(), genLegacyID(*_nss, *_min));
     if (_nss)
         builder.append(ns.name(), getNS().ns());
     if (_min)
@@ -505,13 +478,6 @@ Status ChunkType::validate() const {
                       str::stream() << "missing " << shard.name() << " field");
     }
 
-    // 'min' and 'max' must share the same fields.
-    if (_min->nFields() != _max->nFields()) {
-        return {ErrorCodes::BadValue,
-                str::stream() << "min and max don't have the same number of keys: " << *_min << ", "
-                              << *_max};
-    }
-
     BSONObjIterator minIt(getMin());
     BSONObjIterator maxIt(getMax());
     while (minIt.more() && maxIt.more()) {
@@ -523,6 +489,12 @@ Status ChunkType::validate() const {
                                   << *_max};
         }
     }
+
+    // 'min' and 'max' must share the same fields.
+    if (minIt.more() || maxIt.more())
+        return {ErrorCodes::BadValue,
+                str::stream() << "min and max don't have the same number of keys: " << *_min << ", "
+                              << *_max};
 
     // 'max' should be greater than 'min'.
     if (_min->woCompare(getMax()) >= 0) {
@@ -545,24 +517,6 @@ std::string ChunkType::toString() const {
     // toConfigBSON will include all the set fields, whereas toShardBSON includes only a subset and
     // requires them to be set.
     return toConfigBSON().toString();
-}
-
-std::string ChunkType::genLegacyID(const NamespaceString& nss, const BSONObj& o) {
-    StringBuilder buf;
-    buf << nss.ns() << "-";
-
-    BSONObjIterator i(o);
-    while (i.more()) {
-        BSONElement e = i.next();
-        buf << e.fieldName() << "_" << e.toString(false, true);
-    }
-
-    return buf.str();
-}
-
-std::string ChunkType::getLegacyName() const {
-    invariant(_nss && _min);
-    return genLegacyID(*_nss, *_min);
 }
 
 }  // namespace mongo

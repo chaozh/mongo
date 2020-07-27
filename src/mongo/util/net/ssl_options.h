@@ -53,6 +53,8 @@ class OptionSection;
 class Environment;
 }  // namespace optionenvironment
 
+constexpr auto kSSLCipherConfigDefault = "HIGH:!EXPORT:!aNULL@STRENGTH"_sd;
+
 struct SSLParams {
     using TLSCATrusts = std::map<SHA256Block, std::set<RoleName>>;
 
@@ -63,11 +65,12 @@ struct SSLParams {
     std::string sslPEMKeyFile;      // --tlsCertificateKeyFile
     std::string sslPEMKeyPassword;  // --tlsCertificateKeyFilePassword
     std::string sslClusterFile;     // --tlsInternalKeyFile
-    std::string sslClusterPassword;  // --tlsInternalKeyPassword
-    std::string sslCAFile;           // --tlsCAFile
-    std::string sslClusterCAFile;    // --tlsClusterCAFile
-    std::string sslCRLFile;          // --tlsCRLFile
-    std::string sslCipherConfig;     // --tlsCipherConfig
+    std::string sslClusterPassword;    // --tlsInternalKeyPassword
+    std::string sslCAFile;             // --tlsCAFile
+    std::string sslClusterCAFile;      // --tlsClusterCAFile
+    std::string sslCRLFile;            // --tlsCRLFile
+    std::string sslCipherConfig;       // --tlsCipherConfig
+    std::string sslCipherSuiteConfig;  // --tlsCipherSuiteConfig
 
     boost::optional<TLSCATrusts> tlsCATrusts;  // --setParameter tlsCATrusts
 
@@ -96,7 +99,7 @@ struct SSLParams {
         false;  // --setParameter suppressNoTLSPeerCertificateWarning
     bool tlsWithholdClientCertificate = false;  // --setParameter tlsWithholdClientCertificate
 
-    SSLParams() {
+    SSLParams() : sslCipherConfig(kSSLCipherConfigDefault) {
         sslMode.store(SSLMode_disabled);
     }
 

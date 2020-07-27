@@ -34,6 +34,9 @@
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_severity.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -56,6 +59,8 @@ protected:
 
     void tearDown() override;
 
+    void setInitialSyncId();
+
     StorageInterfaceMock _storageInterface;
     HostAndPort _source;
     std::unique_ptr<ThreadPool> _dbWorkThreadPool;
@@ -63,9 +68,13 @@ protected:
     std::unique_ptr<DBClientConnection> _mockClient;
     std::unique_ptr<InitialSyncSharedData> _sharedData;
     ClockSourceMock _clock;
+    UUID _initialSyncId = UUID::gen();
 
 private:
     static constexpr int kInitialRollbackId = 1;
+
+    unittest::MinimumLoggedSeverityGuard _verboseGuard{logv2::LogComponent::kReplicationInitialSync,
+                                                       logv2::LogSeverity::Debug(1)};
 };
 
 }  // namespace repl

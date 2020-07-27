@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -40,11 +40,10 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/message.h"
-#include "mongo/s/client/shard_connection.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/commands/strategy.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -62,9 +61,6 @@ BSONObj buildErrReply(const DBException& ex) {
 
 
 DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const Message& message) {
-    // Release any cached egress connections for client back to pool before destroying
-    auto guard = makeGuard(ShardConnection::releaseMyConnections);
-
     const int32_t msgId = message.header().getId();
     const NetworkOp op = message.operation();
 
@@ -96,7 +92,7 @@ DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const
 
         // Mark the op as complete, populate the response length, and log it if appropriate.
         CurOp::get(opCtx)->completeAndLogOperation(
-            opCtx, logger::LogComponent::kCommand, dbResponse.response.size());
+            opCtx, logv2::LogComponent::kCommand, dbResponse.response.size());
 
         return dbResponse;
     }
@@ -117,8 +113,13 @@ DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const
         }
 
 
-        LOG(3) << "Request::process begin ns: " << nss << " msg id: " << msgId
-               << " op: " << networkOpToString(op);
+        LOGV2_DEBUG(22867,
+                    3,
+                    "Request::process begin ns: {namespace} msg id: {msgId} op: {operation}",
+                    "Starting operation",
+                    "namespace"_attr = nss,
+                    "msgId"_attr = msgId,
+                    "operation"_attr = networkOpToString(op));
 
         switch (op) {
             case dbQuery:
@@ -146,12 +147,22 @@ DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const
                 MONGO_UNREACHABLE;
         }
 
-        LOG(3) << "Request::process end ns: " << nss << " msg id: " << msgId
-               << " op: " << networkOpToString(op);
+        LOGV2_DEBUG(22868,
+                    3,
+                    "Request::process end ns: {namespace} msg id: {msgId} op: {operation}",
+                    "Done processing operation",
+                    "namespace"_attr = nss,
+                    "msgId"_attr = msgId,
+                    "operation"_attr = networkOpToString(op));
 
     } catch (const DBException& ex) {
-        LOG(1) << "Exception thrown while processing " << networkOpToString(op) << " op for "
-               << nss.ns() << causedBy(ex);
+        LOGV2_DEBUG(22869,
+                    1,
+                    "Exception thrown while processing {operation} op for {namespace}: {error}",
+                    "Got an error while processing operation",
+                    "operation"_attr = networkOpToString(op),
+                    "namespace"_attr = nss.ns(),
+                    "error"_attr = ex);
 
         if (op == dbQuery || op == dbGetMore) {
             dbResponse = replyToQuery(buildErrReply(ex), ResultFlag_ErrSet);
@@ -166,7 +177,7 @@ DbResponse ServiceEntryPointMongos::handleRequest(OperationContext* opCtx, const
 
     // Mark the op as complete, populate the response length, and log it if appropriate.
     CurOp::get(opCtx)->completeAndLogOperation(
-        opCtx, logger::LogComponent::kCommand, dbResponse.response.size());
+        opCtx, logv2::LogComponent::kCommand, dbResponse.response.size());
 
     return dbResponse;
 }

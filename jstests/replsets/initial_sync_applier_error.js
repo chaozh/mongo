@@ -12,6 +12,7 @@
 (function() {
 "use strict";
 load("jstests/libs/fail_point_util.js");
+load("jstests/libs/logv2_helpers.js");
 
 var name = 'initial_sync_applier_error';
 var replSet = new ReplSetTest({
@@ -28,7 +29,8 @@ assert.commandWorked(coll.insert({_id: 0, content: "hi"}));
 
 // Add a secondary node but make it hang after retrieving the last op on the source
 // but before copying databases.
-var secondary = replSet.add({setParameter: "numInitialSyncAttempts=2"});
+var secondary =
+    replSet.add({setParameter: "numInitialSyncAttempts=2", rsConfig: {votes: 0, priority: 0}});
 secondary.setSlaveOk();
 
 let failPoint = configureFailPoint(secondary, 'initialSyncHangBeforeCopyingDatabases');
@@ -41,7 +43,11 @@ var newCollName = name + '_2';
 assert.commandWorked(coll.renameCollection(newCollName, true));
 failPoint.off();
 
-checkLog.contains(secondary, 'initial sync done');
+if (isJsonLog(secondary)) {
+    checkLog.contains(secondary, 'Initial sync done');
+} else {
+    checkLog.contains(secondary, 'initial sync done');
+}
 
 replSet.awaitReplication();
 replSet.awaitSecondaryNodes();

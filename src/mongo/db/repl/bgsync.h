@@ -33,7 +33,6 @@
 #include <memory>
 
 #include "mongo/base/status_with.h"
-#include "mongo/db/catalog/index_builds.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/data_replicator_external_state.h"
 #include "mongo/db/repl/oplog_applier.h"
@@ -166,8 +165,8 @@ private:
      *
      * requiredRBID is reset to empty after the first call.
      */
-    Status _enqueueDocuments(Fetcher::Documents::const_iterator begin,
-                             Fetcher::Documents::const_iterator end,
+    Status _enqueueDocuments(OplogFetcher::Documents::const_iterator begin,
+                             OplogFetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
     /**
@@ -200,7 +199,6 @@ private:
      */
     void _fallBackOnRollbackViaRefetch(OperationContext* opCtx,
                                        const HostAndPort& source,
-                                       const IndexBuilds& abortedIndexBuilds,
                                        int requiredRBID,
                                        OplogInterface* localOplog,
                                        OplogInterfaceRemote::GetConnectionFn getConnection);
@@ -208,7 +206,12 @@ private:
     // restart syncing
     void start(OperationContext* opCtx);
 
+    // Set the state and notify the condition variable.
+    void setState(WithLock, ProducerState newState);
+
     OpTime _readLastAppliedOpTime(OperationContext* opCtx);
+
+    long long _getRetrySleepMS();
 
     // This OplogApplier applies oplog entries fetched from the sync source.
     OplogApplier* const _oplogApplier;
@@ -244,6 +247,9 @@ private:
 
     // Thread running producerThread().
     std::unique_ptr<stdx::thread> _producerThread;  // (M)
+
+    // Condition variable to notify of _state and _inShutdown changes.
+    stdx::condition_variable _stateCv;  // (S)
 
     // Set to true if shutdown() has been called.
     bool _inShutdown = false;  // (M)

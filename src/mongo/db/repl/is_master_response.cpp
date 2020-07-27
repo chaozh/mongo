@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -494,9 +494,9 @@ void IsMasterResponse::setIsSecondary(bool secondary) {
     _secondary = secondary;
 }
 
-void IsMasterResponse::setReplSetName(const std::string& setName) {
+void IsMasterResponse::setReplSetName(StringData setName) {
     _setNameSet = true;
-    _setName = setName;
+    _setName = setName.toString();
 }
 
 void IsMasterResponse::setReplSetVersion(long long version) {

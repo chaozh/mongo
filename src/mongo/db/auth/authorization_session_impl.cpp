@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -53,8 +53,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -89,13 +89,15 @@ Status checkAuthForCreateOrModifyView(AuthorizationSession* authzSession,
         return Status::OK();
     }
 
-    // This check performs some validation but it is not exhaustive and may allow for an invalid
-    // pipeline specification. In this case the authorization check will succeed but the pipeline
-    // will fail to parse later in Command::run().
-    auto statusWithPrivs = authzSession->getPrivilegesForAggregate(
-        viewOnNs,
-        BSON("aggregate" << viewOnNs.coll() << "pipeline" << viewPipeline << "cursor" << BSONObj()),
-        isMongos);
+    auto status = AggregationRequest::parseFromBSON(viewNs,
+                                                    BSON("aggregate" << viewOnNs.coll()
+                                                                     << "pipeline" << viewPipeline
+                                                                     << "cursor" << BSONObj()));
+    if (!status.isOK())
+        return status.getStatus();
+
+    auto statusWithPrivs =
+        authzSession->getPrivilegesForAggregate(viewOnNs, status.getValue(), isMongos);
     PrivilegeVector privileges = uassertStatusOK(statusWithPrivs);
     if (!authzSession->isAuthorizedForPrivileges(privileges)) {
         return Status(ErrorCodes::Unauthorized, "unauthorized");
@@ -139,8 +141,10 @@ Status AuthorizationSessionImpl::addAndAuthorizeUser(OperationContext* opCtx,
     Status restrictionStatus =
         restrictionSet.validate(RestrictionEnvironment::get(*opCtx->getClient()));
     if (!restrictionStatus.isOK()) {
-        log() << "Failed to acquire user '" << userName
-              << "' because of unmet authentication restrictions: " << restrictionStatus.reason();
+        LOGV2(20240,
+              "Failed to acquire user because of unmet authentication restrictions",
+              "user"_attr = userName,
+              "reason"_attr = restrictionStatus.reason());
         return AuthorizationManager::authenticationFailedStatus;
     }
 
@@ -248,7 +252,7 @@ PrivilegeVector AuthorizationSessionImpl::getDefaultPrivileges() {
 }
 
 StatusWith<PrivilegeVector> AuthorizationSessionImpl::getPrivilegesForAggregate(
-    const NamespaceString& nss, const BSONObj& cmdObj, bool isMongos) {
+    const NamespaceString& nss, const AggregationRequest& request, bool isMongos) {
     if (!nss.isValid()) {
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "Invalid input namespace, " << nss.ns());
@@ -262,13 +266,7 @@ StatusWith<PrivilegeVector> AuthorizationSessionImpl::getPrivilegesForAggregate(
         return privileges;
     }
 
-    auto statusWithAggRequest = AggregationRequest::parseFromBSON(nss, cmdObj);
-    if (!statusWithAggRequest.isOK()) {
-        return statusWithAggRequest.getStatus();
-    }
-    AggregationRequest aggRequest = std::move(statusWithAggRequest.getValue());
-
-    const auto& pipeline = aggRequest.getPipeline();
+    const auto& pipeline = request.getPipeline();
 
     // If the aggregation pipeline is empty, confirm the user is authorized for find on 'nss'.
     if (pipeline.empty()) {
@@ -291,7 +289,7 @@ StatusWith<PrivilegeVector> AuthorizationSessionImpl::getPrivilegesForAggregate(
     for (auto&& pipelineStage : pipeline) {
         liteParsedDocSource = LiteParsedDocumentSource::parse(nss, pipelineStage);
         PrivilegeVector currentPrivs = liteParsedDocSource->requiredPrivileges(
-            isMongos, aggRequest.shouldBypassDocumentValidation());
+            isMongos, request.shouldBypassDocumentValidation());
         Privilege::addPrivilegesToPrivilegeVector(&privileges, currentPrivs);
     }
     return privileges;
@@ -535,12 +533,11 @@ bool AuthorizationSessionImpl::isAuthorizedToParseNamespaceElement(const BSONEle
     return true;
 }
 
-bool AuthorizationSessionImpl::isAuthorizedToCreateRole(
-    const struct auth::CreateOrUpdateRoleArgs& args) {
+bool AuthorizationSessionImpl::isAuthorizedToCreateRole(const RoleName& roleName) {
     // A user is allowed to create a role under either of two conditions.
 
     // The user may create a role if the authorization system says they are allowed to.
-    if (isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(args.roleName.getDB()),
+    if (isAuthorizedForActionsOnResource(ResourcePattern::forDatabaseName(roleName.getDB()),
                                          ActionType::createRole)) {
         return true;
     }
@@ -549,13 +546,15 @@ bool AuthorizationSessionImpl::isAuthorizedToCreateRole(
     // role. This implies they have obtained the role through an external authorization mechanism.
     if (_externalState->shouldAllowLocalhost()) {
         for (const auto& user : _authenticatedUsers) {
-            if (user->hasRole(args.roleName)) {
+            if (user->hasRole(roleName)) {
                 return true;
             }
         }
-        log() << "Not authorized to create the first role in the system '" << args.roleName
-              << "' using the localhost exception. The user needs to acquire the role through "
-                 "external authentication first.";
+        LOGV2(20241,
+              "Not authorized to create the first role in the system using the "
+              "localhost exception. The user needs to acquire the role through "
+              "external authentication first.",
+              "role"_attr = roleName);
     }
 
     return false;
@@ -765,45 +764,57 @@ void AuthorizationSessionImpl::_refreshUserInfoAsNeeded(OperationContext* opCtx)
                         Status restrictionStatus = restrictionSet.validate(
                             RestrictionEnvironment::get(*opCtx->getClient()));
                         if (!restrictionStatus.isOK()) {
-                            log() << "Removed user " << name
-                                  << " with unmet authentication restrictions from session cache of"
-                                  << " user information. Restriction failed because: "
-                                  << restrictionStatus.reason();
+                            LOGV2(20242,
+                                  "Removed user with unmet authentication restrictions from "
+                                  "session cache of user information. Restriction failed",
+                                  "user"_attr = name,
+                                  "reason"_attr = restrictionStatus.reason());
                             // If we remove from the UserSet, we cannot increment the iterator.
                             continue;
                         }
                     } catch (...) {
-                        log() << "Evaluating authentication restrictions for " << name
-                              << " resulted in an unknown exception. Removing user from the"
-                              << " session cache.";
+                        LOGV2(20243,
+                              "Evaluating authentication restrictions for user resulted in an "
+                              "unknown exception. Removing user from the session cache",
+                              "user"_attr = name);
                         continue;
                     }
 
                     // Success! Replace the old User object with the updated one.
                     removeGuard.dismiss();
                     _authenticatedUsers.replaceAt(it, std::move(updatedUser));
-                    LOG(1) << "Updated session cache of user information for " << name;
+                    LOGV2_DEBUG(20244,
+                                1,
+                                "Updated session cache of user information for user",
+                                "user"_attr = name);
                     break;
                 }
                 case ErrorCodes::UserNotFound: {
                     // User does not exist anymore; remove it from _authenticatedUsers.
-                    log() << "Removed deleted user " << name
-                          << " from session cache of user information.";
+                    LOGV2(20245,
+                          "Removed deleted user from session cache of user information",
+                          "user"_attr = name);
                     continue;  // No need to advance "it" in this case.
                 }
                 case ErrorCodes::UnsupportedFormat: {
                     // An auth subsystem has explicitly indicated a failure.
-                    log() << "Removed user " << name
-                          << " from session cache of user information because of refresh failure:"
-                          << " '" << status << "'.";
+                    LOGV2(20246,
+                          "Removed user from session cache of user information because of "
+                          "refresh failure",
+                          "user"_attr = name,
+                          "error"_attr = status);
                     continue;  // No need to advance "it" in this case.
                 }
                 default:
                     // Unrecognized error; assume that it's transient, and continue working with the
                     // out-of-date privilege data.
-                    warning() << "Could not fetch updated user privilege information for " << name
-                              << "; continuing to use old information.  Reason is "
-                              << redact(status);
+                    LOGV2_WARNING(20247,
+                                  "Could not fetch updated user privilege information for {user}; "
+                                  "continuing to use old information. Reason is {error}",
+                                  "Could not fetch updated user privilege information, continuing "
+                                  "to use old information"
+                                  "user"_attr = name,
+                                  "error"_attr = redact(status));
                     removeGuard.dismiss();
                     break;
             }

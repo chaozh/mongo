@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,11 +37,11 @@
 #include "mongo/db/server_options.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_factory.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -130,17 +130,20 @@ boost::optional<repl::OpTime> Grid::advanceConfigOpTime(OperationContext* opCtx,
         if (opCtx && opCtx->getClient()) {
             clientAddr = opCtx->getClient()->clientAddress(true);
         }
-        log() << "Received " << what << " " << clientAddr
-              << " indicating config server optime "
-                 "term has increased, previous optime "
-              << prevOpTime << ", now " << opTime;
+        LOGV2(22792,
+              "Received {reason} {clientAddress} indicating config server"
+              " term has increased, previous opTime {prevOpTime}, now {opTime}",
+              "Term advanced for config server",
+              "opTime"_attr = opTime,
+              "prevOpTime"_attr = prevOpTime,
+              "reason"_attr = what,
+              "clientAddress"_attr = clientAddr);
     }
     return prevOpTime;
 }
 
 boost::optional<repl::OpTime> Grid::_advanceConfigOpTime(const repl::OpTime& opTime) {
     invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
-
     stdx::lock_guard<Latch> lk(_mutex);
     if (_configOpTime < opTime) {
         repl::OpTime prev = _configOpTime;

@@ -41,10 +41,19 @@
 namespace mongo {
 namespace {
 
-std::unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj,
-                                                      const CollatorInterface* collator = nullptr) {
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(collator);
+/**
+ * Produce a MatchExpression from BSON.
+ *
+ * If the caller would like the MatchExpression to have a collation associated with it, they may
+ * pass in an ExpressionContext owning the collation. Otherwise the caller may pass nullptr and a
+ * default-constructed ExpressionContextForTest will be used.
+ */
+std::unique_ptr<MatchExpression> parseMatchExpression(
+    const BSONObj& obj, boost::intrusive_ptr<ExpressionContext> expCtx = nullptr) {
+    if (!expCtx) {
+        expCtx = make_intrusive<ExpressionContextForTest>();
+    }
+
     StatusWithMatchExpression status = MatchExpressionParser::parse(obj, std::move(expCtx));
     if (!status.isOK()) {
         FAIL(str::stream() << "failed to parse query: " << obj.toString()
@@ -400,6 +409,9 @@ TEST(PlanCacheIndexabilityTest, DiscriminatorForCollationIndicatesWhenCollations
     entry.collator = &collator;
     state.updateDiscriminators({entry});
 
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    expCtx->setCollator(collator.clone());
+
     auto discriminators = state.getDiscriminators("a");
     ASSERT_EQ(1U, discriminators.size());
     ASSERT(discriminators.find("a_1") != discriminators.end());
@@ -409,14 +421,13 @@ TEST(PlanCacheIndexabilityTest, DiscriminatorForCollationIndicatesWhenCollations
     // Index collator matches query collator.
     ASSERT_EQ(true,
               disc.isMatchCompatibleWithIndex(
-                  parseMatchExpression(fromjson("{a: 'abc'}"), &collator).get()));
+                  parseMatchExpression(fromjson("{a: 'abc'}"), expCtx).get()));
     ASSERT_EQ(true,
               disc.isMatchCompatibleWithIndex(
-                  parseMatchExpression(fromjson("{a: {$in: ['abc', 'xyz']}}"), &collator).get()));
-    ASSERT_EQ(
-        true,
-        disc.isMatchCompatibleWithIndex(
-            parseMatchExpression(fromjson("{a: {$_internalExprEq: 'abc'}}}"), &collator).get()));
+                  parseMatchExpression(fromjson("{a: {$in: ['abc', 'xyz']}}"), expCtx).get()));
+    ASSERT_EQ(true,
+              disc.isMatchCompatibleWithIndex(
+                  parseMatchExpression(fromjson("{a: {$_internalExprEq: 'abc'}}}"), expCtx).get()));
 
     // Expression is not a ComparisonMatchExpression, InternalExprEqMatchExpression or
     // InMatchExpression.
@@ -547,6 +558,10 @@ TEST(PlanCacheIndexabilityTest, WildcardWithCollationDiscriminator) {
     auto entryProjExecPair = makeWildcardEntry(BSON("a.$**" << 1));
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     entryProjExecPair.first.collator = &collator;
+
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    expCtx->setCollator(collator.clone());
+
     state.updateDiscriminators({entryProjExecPair.first});
 
     const auto unindexedPathDiscriminators = state.buildWildcardDiscriminators("notIndexed");
@@ -563,7 +578,7 @@ TEST(PlanCacheIndexabilityTest, WildcardWithCollationDiscriminator) {
         parseMatchExpression(fromjson("{a: \"hello world\"}"), nullptr).get()));
     // Match expression which uses the same collation as the index is.
     ASSERT_TRUE(disc.isMatchCompatibleWithIndex(
-        parseMatchExpression(fromjson("{a: \"hello world\"}"), &collator).get()));
+        parseMatchExpression(fromjson("{a: \"hello world\"}"), expCtx).get()));
 }
 
 TEST(PlanCacheIndexabilityTest, WildcardPartialIndexDiscriminator) {
@@ -580,15 +595,44 @@ TEST(PlanCacheIndexabilityTest, WildcardPartialIndexDiscriminator) {
     ASSERT_EQ(1U, discriminatorsA.size());
     ASSERT(discriminatorsA.find("indexName") != discriminatorsA.end());
 
-    const auto disc = discriminatorsA["indexName"];
+    const auto wildcardDiscriminators = discriminatorsA["indexName"];
 
-    // Match expression which queries for a value not included by the filter expression cannot use
-    // the index.
-    ASSERT_FALSE(disc.isMatchCompatibleWithIndex(parseMatchExpression(fromjson("{a: 0}")).get()));
+    // Since the fields in the partialFilterExpression are known a priori, they are _not_ part of
+    // the wildcard-discriminators, but rather the regular discriminators. Here we show that the
+    // wildcard discriminators consider all expressions on fields 'a' or 'b' to be compatible.
+    ASSERT_TRUE(wildcardDiscriminators.isMatchCompatibleWithIndex(
+        parseMatchExpression(fromjson("{a: 0}")).get()));
+    ASSERT_TRUE(wildcardDiscriminators.isMatchCompatibleWithIndex(
+        parseMatchExpression(fromjson("{a: 6}")).get()));
+    ASSERT_TRUE(wildcardDiscriminators.isMatchCompatibleWithIndex(
+        parseMatchExpression(fromjson("{b: 0}")).get()));
+    ASSERT_TRUE(wildcardDiscriminators.isMatchCompatibleWithIndex(
+        parseMatchExpression(fromjson("{b: 6}")).get()));
 
-    // Match expression which queries for a value included by the filter expression does not get
-    // discriminated out.
-    ASSERT_TRUE(disc.isMatchCompatibleWithIndex(parseMatchExpression(fromjson("{a: 6}")).get()));
+    // The regular (non-wildcard) set of discriminators for the path "a" should reflect whether a
+    // predicate on "a" is compatible with the partial filter expression.
+    {
+        discriminatorsA = state.getDiscriminators("a");
+        auto discriminatorsIt = discriminatorsA.find("indexName");
+        ASSERT(discriminatorsIt != discriminatorsA.end());
+        auto disc = discriminatorsIt->second;
+
+        ASSERT_FALSE(
+            disc.isMatchCompatibleWithIndex(parseMatchExpression(fromjson("{a: 0}")).get()));
+        ASSERT_TRUE(
+            disc.isMatchCompatibleWithIndex(parseMatchExpression(fromjson("{a: 6}")).get()));
+
+        ASSERT_FALSE(
+            disc.isMatchCompatibleWithIndex(parseMatchExpression(fromjson("{b: 0}")).get()));
+        ASSERT_FALSE(
+            disc.isMatchCompatibleWithIndex(parseMatchExpression(fromjson("{b: 6}")).get()));
+    }
+
+    // There shouldn't be any regular discriminators associated with path "b".
+    {
+        auto&& discriminatorsB = state.getDiscriminators("b");
+        ASSERT_FALSE(discriminatorsB.count("indexName"));
+    }
 }
 
 TEST(PlanCacheIndexabilityTest,

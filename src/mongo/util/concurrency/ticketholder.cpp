@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include <iostream>
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -47,8 +47,9 @@ namespace {
  * Accepts an errno code, prints its error message, and exits.
  */
 void failWithErrno(int err) {
-    severe() << "error in Ticketholder: " << errnoWithDescription(err);
-    fassertFailed(28604);
+    LOGV2_FATAL(28604,
+                "error in Ticketholder: {errnoWithDescription_err}",
+                "errnoWithDescription_err"_attr = errnoWithDescription(err));
 }
 
 /*
@@ -93,6 +94,11 @@ void TicketHolder::waitForTicket(OperationContext* opCtx) {
 }
 
 bool TicketHolder::waitForTicketUntil(OperationContext* opCtx, Date_t until) {
+    // Attempt to get a ticket without waiting in order to avoid expensive time calculations.
+    if (sem_trywait(&_sem) == 0) {
+        return true;
+    }
+
     const Milliseconds intervalMs(500);
     struct timespec ts;
 
@@ -218,7 +224,7 @@ Status TicketHolder::resize(int newSize) {
            << "more than newSize(" << newSize << ")";
 
         std::string errmsg = ss.str();
-        log() << errmsg;
+        LOGV2(23120, "{errmsg}", "errmsg"_attr = errmsg);
         return Status(ErrorCodes::BadValue, errmsg);
     }
 

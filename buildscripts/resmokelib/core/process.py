@@ -8,14 +8,16 @@ import atexit
 import logging
 import os
 import os.path
+import subprocess
 import sys
 import threading
-import subprocess
+from datetime import datetime
 
-from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
+from buildscripts.resmokelib import config as _config
 from buildscripts.resmokelib import errors
-from . import pipe  # pylint: disable=wrong-import-position
-from .. import utils  # pylint: disable=wrong-import-position
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.core import pipe
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
 
 # Attempt to avoid race conditions (e.g. hangs caused by a file descriptor being left open) when
 # starting subprocesses concurrently from multiple threads by guarding calls to subprocess.Popen()
@@ -70,8 +72,10 @@ class Process(object):
     """Wrapper around subprocess.Popen class."""
 
     # pylint: disable=protected-access
+    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-instance-attributes
 
-    def __init__(self, logger, args, env=None, env_vars=None):
+    def __init__(self, logger, args, env=None, env_vars=None, cwd=None):
         """Initialize the process with the specified logger, arguments, and environment."""
 
         # Ensure that executable files that don't already have an
@@ -88,8 +92,10 @@ class Process(object):
         self.pid = None
 
         self._process = None
+        self._recorder = None
         self._stdout_pipe = None
         self._stderr_pipe = None
+        self._cwd = cwd
 
     def start(self):
         """Start the process and the logger pipes for its stdout and stderr."""
@@ -110,10 +116,23 @@ class Process(object):
         close_fds = (sys.platform != "win32")
 
         with _POPEN_LOCK:
-            self._process = subprocess.Popen(self.args, bufsize=buffer_size, stdout=subprocess.PIPE,
-                                             stderr=subprocess.PIPE, close_fds=close_fds,
-                                             env=self.env, creationflags=creation_flags)
+            self._process = subprocess.Popen(
+                self.args, bufsize=buffer_size, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                close_fds=close_fds, env=self.env, creationflags=creation_flags, cwd=self._cwd)
             self.pid = self._process.pid
+
+            if _config.UNDO_RECORDER_PATH is not None and ("mongod" in self.args[0]
+                                                           or "mongos" in self.args[0]):
+                now_str = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+                recorder_output_file = "{logger}-{process}-{pid}-{t}.undo".format(
+                    logger=self.logger.name.replace('/', '-'),
+                    process=os.path.basename(self.args[0]), pid=self.pid, t=now_str)
+                recorder_args = [
+                    _config.UNDO_RECORDER_PATH, "--thread-fuzzing", "-p",
+                    str(self.pid), "-o", recorder_output_file
+                ]
+                self._recorder = subprocess.Popen(recorder_args, bufsize=buffer_size, env=self.env,
+                                                  creationflags=creation_flags)
 
         self._stdout_pipe = pipe.LoggerPipe(self.logger, logging.INFO, self._process.stdout)
         self._stderr_pipe = pipe.LoggerPipe(self.logger, logging.ERROR, self._process.stderr)
@@ -209,6 +228,14 @@ class Process(object):
         """Wait until process has terminated and all output has been consumed by the logger pipes."""
 
         return_code = self._process.wait(timeout)
+
+        if self._recorder is not None:
+            self.logger.info('Saving the UndoDB recording; it may take a few minutes...')
+            recorder_return = self._recorder.wait(timeout)
+            if recorder_return != 0:
+                raise errors.ServerFailure(
+                    "UndoDB live-record did not terminate correctly. This is likely a bug with UndoDB. "
+                    "Please record the logs and notify the #server-tig Slack channel")
 
         if self._stdout_pipe:
             self._stdout_pipe.wait_until_finished()

@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/client/dbclient_base.h"
+#include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/util/net/hostandport.h"
@@ -58,13 +59,15 @@ public:
     // XXX: is this valid or useful?
     void setOpCtx(OperationContext* opCtx);
 
-    virtual std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                                  Query query,
-                                                  int nToReturn = 0,
-                                                  int nToSkip = 0,
-                                                  const BSONObj* fieldsToReturn = nullptr,
-                                                  int queryOptions = 0,
-                                                  int batchSize = 0);
+    virtual std::unique_ptr<DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        Query query,
+        int nToReturn = 0,
+        int nToSkip = 0,
+        const BSONObj* fieldsToReturn = nullptr,
+        int queryOptions = 0,
+        int batchSize = 0,
+        boost::optional<BSONObj> readConcernObj = boost::none);
 
     virtual bool isFailed() const;
 
@@ -85,7 +88,8 @@ public:
                             const BSONObj& query = BSONObj(),
                             int options = 0,
                             int limit = 0,
-                            int skip = 0);
+                            int skip = 0,
+                            boost::optional<BSONObj> readConcernObj = boost::none);
 
     virtual ConnectionString::ConnectionType type() const;
 
@@ -103,6 +107,13 @@ public:
     bool isMongos() const final {
         return false;
     }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() override {
+        invariant(false);
+        return nullptr;
+    }
+#endif
 
 private:
     OperationContext* _opCtx;

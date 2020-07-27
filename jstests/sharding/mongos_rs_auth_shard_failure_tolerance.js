@@ -15,6 +15,7 @@
 // test, one shard does not have a primary.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
+TestData.skipCheckOrphans = true;
 
 // Replica set nodes started with --shardsvr do not enable key generation until they are added to a
 // sharded cluster and reject commands with gossiped clusterTime from users without the
@@ -23,7 +24,7 @@ TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 // time later in setup.
 //
 
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 var options = {rs: true, rsOptions: {nodes: 2}, keyFile: "jstests/libs/key1"};

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -48,12 +48,6 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
-#include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/write_concern.h"
-#include "mongo/db/write_concern_options.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -114,8 +108,8 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
-    auto exec = uassertStatusOK(
-        getExecutor(opCtx, collection, std::move(cq), PlanExecutor::NO_YIELD, options));
+    auto exec = uassertStatusOK(getExecutor(
+        opCtx, collection, std::move(cq), PlanYieldPolicy::YieldPolicy::NO_YIELD, options));
 
     PlanExecutor::ExecState state;
     BSONObj obj;
@@ -123,9 +117,6 @@ RecordId Helpers::findOne(OperationContext* opCtx,
     if (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &loc))) {
         return loc;
     }
-    massert(34427,
-            "Plan executor error: " + WorkingSetCommon::toStatusString(obj),
-            PlanExecutor::IS_EOF == state);
     return RecordId();
 }
 
@@ -173,10 +164,29 @@ RecordId Helpers::findById(OperationContext* opCtx,
     return catalog->getEntry(desc)->accessMethod()->findSingle(opCtx, idquery["_id"].wrap());
 }
 
+// Acquires necessary locks to read the collection with the given namespace. If this is an oplog
+// read, use AutoGetOplog for simplified locking.
+Collection* getCollectionForRead(OperationContext* opCtx,
+                                 const NamespaceString& ns,
+                                 boost::optional<AutoGetCollectionForReadCommand>& autoColl,
+                                 boost::optional<AutoGetOplog>& autoOplog) {
+    if (ns.isOplog()) {
+        // Simplify locking rules for oplog collection.
+        autoOplog.emplace(opCtx, OplogAccessMode::kRead);
+        return autoOplog->getCollection();
+    } else {
+        autoColl.emplace(opCtx, NamespaceString(ns));
+        return autoColl->getCollection();
+    }
+}
+
 bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& result) {
-    AutoGetCollectionForReadCommand ctx(opCtx, NamespaceString(ns));
-    auto exec =
-        InternalPlanner::collectionScan(opCtx, ns, ctx.getCollection(), PlanExecutor::NO_YIELD);
+    boost::optional<AutoGetCollectionForReadCommand> autoColl;
+    boost::optional<AutoGetOplog> autoOplog;
+    auto collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
+
+    auto exec = InternalPlanner::collectionScan(
+        opCtx, ns, collection, PlanYieldPolicy::YieldPolicy::NO_YIELD);
     PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     CurOp::get(opCtx)->done();
@@ -193,9 +203,12 @@ bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& res
 }
 
 bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, NamespaceString(ns));
+    boost::optional<AutoGetCollectionForReadCommand> autoColl;
+    boost::optional<AutoGetOplog> autoOplog;
+    auto collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
+
     auto exec = InternalPlanner::collectionScan(
-        opCtx, ns, autoColl.getCollection(), PlanExecutor::NO_YIELD, InternalPlanner::BACKWARD);
+        opCtx, ns, collection, PlanYieldPolicy::YieldPolicy::NO_YIELD, InternalPlanner::BACKWARD);
     PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     // Non-yielding collection scans from InternalPlanner will never error.
@@ -216,16 +229,25 @@ void Helpers::upsert(OperationContext* opCtx,
     BSONElement e = o["_id"];
     verify(e.type());
     BSONObj id = e.wrap();
+    upsert(opCtx, ns, id, o, fromMigrate);
+}
 
+void Helpers::upsert(OperationContext* opCtx,
+                     const string& ns,
+                     const BSONObj& filter,
+                     const BSONObj& updateMod,
+                     bool fromMigrate) {
     OldClientContext context(opCtx, ns);
 
     const NamespaceString requestNs(ns);
-    UpdateRequest request(requestNs);
+    auto request = UpdateRequest();
+    request.setNamespaceString(requestNs);
 
-    request.setQuery(id);
-    request.setUpdateModification(o);
+    request.setQuery(filter);
+    request.setUpdateModification(updateMod);
     request.setUpsert();
     request.setFromMigration(fromMigrate);
+    request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::NO_YIELD);
 
     update(opCtx, context.db(), request);
 }
@@ -234,7 +256,8 @@ void Helpers::putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj)
     OldClientContext context(opCtx, ns);
 
     const NamespaceString requestNs(ns);
-    UpdateRequest request(requestNs);
+    auto request = UpdateRequest();
+    request.setNamespaceString(requestNs);
 
     request.setUpdateModification(obj);
     request.setUpsert();

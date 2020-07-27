@@ -2,8 +2,9 @@
 //   does_not_support_stepdowns,
 //   requires_fastcount,
 //   requires_non_retryable_commands,
+//   uses_$out,
 //   uses_map_reduce_with_temp_collections,
-//   requires_fcv_44,
+//   requires_fcv_46,
 // ]
 
 /**
@@ -23,14 +24,8 @@
 load("jstests/concurrency/fsm_workload_helpers/server_types.js");
 // For isReplSet
 load("jstests/libs/fixture_helpers.js");
-
-function assertFailsValidation(res) {
-    if (res instanceof WriteResult || res instanceof BulkWriteResult) {
-        assert.writeErrorWithCode(res, ErrorCodes.DocumentValidationFailure, tojson(res));
-    } else {
-        assert.commandFailedWithCode(res, ErrorCodes.DocumentValidationFailure, tojson(res));
-    }
-}
+// For assertDocumentValidationFailure
+load("jstests/libs/doc_validation_utils.js");
 
 const dbName = 'bypass_document_validation';
 const collName = 'bypass_document_validation';
@@ -55,7 +50,8 @@ function runBypassDocumentValidationTest(validator) {
     // Test applyOps with a simple insert if not on mongos.
     if (!isMongos) {
         const op = [{op: 'i', ns: coll.getFullName(), o: {_id: 9}}];
-        assertFailsValidation(myDb.runCommand({applyOps: op, bypassDocumentValidation: false}));
+        assertDocumentValidationFailure(
+            myDb.runCommand({applyOps: op, bypassDocumentValidation: false}), coll);
         assert.eq(0, coll.count({_id: 9}));
         assert.commandWorked(myDb.runCommand({applyOps: op, bypassDocumentValidation: true}));
         assert.eq(1, coll.count({_id: 9}));
@@ -68,9 +64,9 @@ function runBypassDocumentValidationTest(validator) {
     assert.commandWorked(myDb.createCollection(outputCollName, {validator: validator}));
     const pipeline =
         [{$match: {_id: 1}}, {$project: {aggregation: {$add: [1]}}}, {$out: outputCollName}];
-    assert.throws(function() {
-        coll.aggregate(pipeline, {bypassDocumentValidation: false});
-    });
+    const cmd =
+        {aggregate: collName, cursor: {}, pipeline: pipeline, bypassDocumentValidation: false};
+    assertDocumentValidationFailure(myDb.runCommand(cmd), coll);
     assert.eq(0, outputColl.count({aggregation: 1}));
     coll.aggregate(pipeline, {bypassDocumentValidation: true});
     assert.eq(1, outputColl.count({aggregation: 1}));
@@ -97,7 +93,7 @@ function runBypassDocumentValidationTest(validator) {
         out: {replace: outputCollName},
         bypassDocumentValidation: false
     });
-    assertFailsValidation(res);
+    assertDocumentValidationFailure(res, coll);
     assert.eq(0, outputColl.count({value: 'mapReduce'}));
     res = myDb.runCommand({
         mapReduce: collName,
@@ -123,7 +119,7 @@ function runBypassDocumentValidationTest(validator) {
         out: {replace: outputCollName, db: myDb.getName()},
         bypassDocumentValidation: false
     });
-    assertFailsValidation(res);
+    assertDocumentValidationFailure(res, coll);
     assert.eq(0, outputColl.count({value: 'mapReduce'}));
     res = otherDb.runCommand({
         mapReduce: otherDbColl.getName(),
@@ -136,10 +132,10 @@ function runBypassDocumentValidationTest(validator) {
     assert.eq(1, outputColl.count({value: 'mapReduce'}));
     // Test the insert command. Includes a test for a document with no _id (SERVER-20859).
     res = myDb.runCommand({insert: collName, documents: [{}], bypassDocumentValidation: false});
-    assertFailsValidation(BulkWriteResult(res));
+    assertDocumentValidationFailure(BulkWriteResult(res), coll);
     res = myDb.runCommand(
         {insert: collName, documents: [{}, {_id: 6}], bypassDocumentValidation: false});
-    assertFailsValidation(BulkWriteResult(res));
+    assertDocumentValidationFailure(BulkWriteResult(res), coll);
     res = myDb.runCommand(
         {insert: collName, documents: [{}, {_id: 6}], bypassDocumentValidation: true});
     assert.commandWorked(res);
@@ -150,7 +146,7 @@ function runBypassDocumentValidationTest(validator) {
         updates: [{q: {}, u: {$set: {update: 1}}}],
         bypassDocumentValidation: false
     });
-    assertFailsValidation(BulkWriteResult(res));
+    assertDocumentValidationFailure(BulkWriteResult(res), coll);
     assert.eq(0, coll.count({update: 1}));
     res = myDb.runCommand({
         update: collName,
@@ -167,7 +163,7 @@ function runBypassDocumentValidationTest(validator) {
         updates: [{q: {}, u: [{$set: {pipeline: 1}}]}],
         bypassDocumentValidation: false
     });
-    assertFailsValidation(BulkWriteResult(res));
+    assertDocumentValidationFailure(BulkWriteResult(res), coll);
     assert.eq(0, coll.count({pipeline: 1}));
 
     assert.commandWorked(myDb.runCommand({

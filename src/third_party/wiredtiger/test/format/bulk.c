@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2019 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -59,7 +59,7 @@ bulk_commit_transaction(WT_SESSION *session)
     testutil_check(session->commit_transaction(session, buf));
 
     /* Update the oldest timestamp, otherwise updates are pinned in memory. */
-    timestamp_once();
+    timestamp_once(session, false);
 }
 
 /*
@@ -80,13 +80,14 @@ wts_load(void)
     WT_DECL_RET;
     WT_ITEM key, value;
     WT_SESSION *session;
+    uint32_t committed_keyno, keyno, v;
     bool is_bulk;
 
     conn = g.wts_conn;
 
     testutil_check(conn->open_session(conn, NULL, NULL, &session));
 
-    logop(session, "%s", "=============== bulk load start");
+    trace_msg("%s", "=============== bulk load start");
 
     /*
      * No bulk load with custom collators, the order of insertion will not match the collation
@@ -111,42 +112,31 @@ wts_load(void)
     if (g.c_txn_timestamps)
         bulk_begin_transaction(session);
 
-    while (++g.key_cnt <= g.c_rows) {
-        /* Do some checking every 10K operations. */
-        if (g.key_cnt % 10000 == 0) {
-            /* Report on progress. */
-            track("bulk load", g.key_cnt, NULL);
-
-            /* Restart the enclosing transaction so we don't overflow the cache. */
-            if (g.c_txn_timestamps) {
-                bulk_commit_transaction(session);
-                bulk_begin_transaction(session);
-            }
-        }
-
-        key_gen(&key, g.key_cnt);
-        val_gen(NULL, &value, g.key_cnt);
+    for (committed_keyno = keyno = 0; ++keyno <= g.c_rows;) {
+        key_gen(&key, keyno);
+        val_gen(NULL, &value, keyno);
 
         switch (g.type) {
         case FIX:
             if (!is_bulk)
-                cursor->set_key(cursor, g.key_cnt);
+                cursor->set_key(cursor, keyno);
             cursor->set_value(cursor, *(uint8_t *)value.data);
-            logop(session, "%-10s %" PRIu64 " {0x%02" PRIx8 "}", "bulk", g.key_cnt,
-              ((uint8_t *)value.data)[0]);
+            if (g.trace_all)
+                trace_msg("bulk %" PRIu32 " {0x%02" PRIx8 "}", keyno, ((uint8_t *)value.data)[0]);
             break;
         case VAR:
             if (!is_bulk)
-                cursor->set_key(cursor, g.key_cnt);
+                cursor->set_key(cursor, keyno);
             cursor->set_value(cursor, &value);
-            logop(session, "%-10s %" PRIu64 " {%.*s}", "bulk", g.key_cnt, (int)value.size,
-              (char *)value.data);
+            if (g.trace_all)
+                trace_msg("bulk %" PRIu32 " {%.*s}", keyno, (int)value.size, (char *)value.data);
             break;
         case ROW:
             cursor->set_key(cursor, &key);
             cursor->set_value(cursor, &value);
-            logop(session, "%-10s %" PRIu64 " {%.*s}, {%.*s}", "bulk", g.key_cnt, (int)key.size,
-              (char *)key.data, (int)value.size, (char *)value.data);
+            if (g.trace_all)
+                trace_msg("bulk %" PRIu32 " {%.*s}, {%.*s}", keyno, (int)key.size, (char *)key.data,
+                  (int)value.size, (char *)value.data);
             break;
         }
 
@@ -155,9 +145,6 @@ wts_load(void)
          * case, guaranteeing the load succeeds probably means future updates are also guaranteed to
          * succeed, which isn't what we want. If we run out of space in the initial load, reset the
          * row counter and continue.
-         *
-         * Decrease inserts, they can't be successful if we're at the cache limit, and increase the
-         * delete percentage to get some extra space once the run starts.
          */
         if ((ret = cursor->insert(cursor)) != 0) {
             testutil_assert(ret == WT_CACHE_FULL || ret == WT_ROLLBACK);
@@ -167,25 +154,53 @@ wts_load(void)
                 bulk_begin_transaction(session);
             }
 
-            if (g.c_insert_pct > 5)
+            /*
+             * Decrease inserts since they won't be successful if we're hitting cache limits, and
+             * increase the delete percentage to get some extra space once the run starts. We can't
+             * simply modify the values because they have to equal 100 when the database is reopened
+             * (we are going to rewrite the CONFIG file, too).
+             */
+            if (g.c_insert_pct > 5) {
+                g.c_delete_pct += g.c_insert_pct - 5;
                 g.c_insert_pct = 5;
-            if (g.c_delete_pct < 20)
-                g.c_delete_pct += 20;
+            }
+            v = g.c_write_pct / 2;
+            g.c_delete_pct += v;
+            g.c_write_pct -= v;
+
             break;
+        }
+
+        /* Restart the enclosing transaction every 5K operations so we don't overflow the cache. */
+        if (keyno % 5000 == 0) {
+            /* Report on progress. */
+            track("bulk load", keyno, NULL);
+
+            if (g.c_txn_timestamps) {
+                bulk_commit_transaction(session);
+                committed_keyno = keyno;
+                bulk_begin_transaction(session);
+            }
         }
     }
 
-    /* We may have exited the loop early, reset all of our counters to match our insert count. */
-    --g.key_cnt;
-    g.rows = g.key_cnt;
-    g.c_rows = (uint32_t)g.key_cnt;
+    /*
+     * Ideally, the insert loop runs until the number of rows plus one, in which case row counts are
+     * correct. If the loop exited early, reset the counters and rewrite the CONFIG file (so reopens
+     * aren't surprised).
+     */
+    if (keyno != g.c_rows + 1) {
+        g.rows = committed_keyno;
+        g.c_rows = (uint32_t)committed_keyno;
+        config_print(false);
+    }
 
     if (g.c_txn_timestamps)
         bulk_commit_transaction(session);
 
     testutil_check(cursor->close(cursor));
 
-    logop(session, "%s", "=============== bulk load stop");
+    trace_msg("%s", "=============== bulk load stop");
 
     testutil_check(session->close(session, NULL));
 

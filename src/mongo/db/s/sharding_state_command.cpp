@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,6 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -82,7 +81,7 @@ public:
             result.append("shardName", shardingState->shardId());
             result.append("clusterId", shardingState->clusterId());
 
-            CollectionShardingState::report(opCtx, &result);
+            CollectionShardingState::appendInfoForShardingStateCommand(opCtx, &result);
         }
 
         return true;

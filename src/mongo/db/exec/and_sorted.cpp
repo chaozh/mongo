@@ -45,8 +45,8 @@ using std::vector;
 // static
 const char* AndSortedStage::kStageType = "AND_SORTED";
 
-AndSortedStage::AndSortedStage(OperationContext* opCtx, WorkingSet* ws)
-    : PlanStage(kStageType, opCtx),
+AndSortedStage::AndSortedStage(ExpressionContext* expCtx, WorkingSet* ws)
+    : PlanStage(kStageType, expCtx),
       _ws(ws),
       _targetNode(numeric_limits<size_t>::max()),
       _targetId(WorkingSet::INVALID_ID),
@@ -114,19 +114,6 @@ PlanStage::StageState AndSortedStage::getTargetRecordId(WorkingSetID* out) {
 
         return PlanStage::NEED_TIME;
     } else if (PlanStage::IS_EOF == state) {
-        _isEOF = true;
-        return state;
-    } else if (PlanStage::FAILURE == state) {
-        *out = id;
-        // If a stage fails, it may create a status WSM to indicate why it
-        // failed, in which case 'id' is valid.  If ID is invalid, we
-        // create our own error message.
-        if (WorkingSet::INVALID_ID == id) {
-            str::stream ss;
-            ss << "sorted AND stage failed to read in results from first child";
-            Status status(ErrorCodes::InternalError, ss);
-            *out = WorkingSetCommon::allocateStatusMember(_ws, status);
-        }
         _isEOF = true;
         return state;
     } else {
@@ -205,14 +192,6 @@ PlanStage::StageState AndSortedStage::moveTowardTargetRecordId(WorkingSetID* out
             return PlanStage::NEED_TIME;
         }
     } else if (PlanStage::IS_EOF == state) {
-        _isEOF = true;
-        _ws->free(_targetId);
-        return state;
-    } else if (PlanStage::FAILURE == state) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
         _isEOF = true;
         _ws->free(_targetId);
         return state;

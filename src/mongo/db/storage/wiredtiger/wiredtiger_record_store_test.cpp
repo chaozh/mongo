@@ -275,8 +275,8 @@ RecordId _oplogOrderInsertOplog(OperationContext* opCtx,
 // Test that even when the oplog durability loop is paused, we can still advance the commit point as
 // long as the commit for each insert comes before the next insert starts.
 TEST(WiredTigerRecordStoreTest, OplogDurableVisibilityInOrder) {
-    ON_BLOCK_EXIT([] { WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::off); });
-    WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::alwaysOn);
+    ON_BLOCK_EXIT([] { WTPauseOplogVisibilityUpdateLoop.setMode(FailPoint::off); });
+    WTPauseOplogVisibilityUpdateLoop.setMode(FailPoint::alwaysOn);
 
     unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
     unique_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("local.oplog.rs", 100000, -1));
@@ -304,8 +304,8 @@ TEST(WiredTigerRecordStoreTest, OplogDurableVisibilityInOrder) {
 // Test that Oplog entries inserted while there are hidden entries do not become visible until the
 // op and all earlier ops are durable.
 TEST(WiredTigerRecordStoreTest, OplogDurableVisibilityOutOfOrder) {
-    ON_BLOCK_EXIT([] { WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::off); });
-    WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::alwaysOn);
+    ON_BLOCK_EXIT([] { WTPauseOplogVisibilityUpdateLoop.setMode(FailPoint::off); });
+    WTPauseOplogVisibilityUpdateLoop.setMode(FailPoint::alwaysOn);
 
     unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
     unique_ptr<RecordStore> rs(harnessHelper->newCappedRecordStore("local.oplog.rs", 100000, -1));
@@ -342,7 +342,7 @@ TEST(WiredTigerRecordStoreTest, OplogDurableVisibilityOutOfOrder) {
     ASSERT(wtrs->isOpHidden_forTest(id1));
     ASSERT(wtrs->isOpHidden_forTest(id2));
 
-    WTPausePrimaryOplogDurabilityLoop.setMode(FailPoint::off);
+    WTPauseOplogVisibilityUpdateLoop.setMode(FailPoint::off);
 
     rs->waitForAllEarlierOplogWritesToBeVisible(longLivedOp.get());
 
@@ -913,6 +913,86 @@ TEST(WiredTigerRecordStoreTest, GetLatestOplogTest) {
     op1->recoveryUnit()->commitUnitOfWork();
     // Committing the write at timestamp "2" does not change the top of oplog result.
     ASSERT_EQ(tsThree, wtrs->getLatestOplogTimestamp(op1.get()));
+}
+
+TEST(WiredTigerRecordStoreTest, CursorInActiveTxnAfterNext) {
+    unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
+
+    RecordId rid1;
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+
+        WriteUnitOfWork uow(opCtx.get());
+        StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
+        ASSERT_OK(res.getStatus());
+        rid1 = res.getValue();
+
+        res = rs->insertRecord(opCtx.get(), "b", 2, Timestamp());
+        ASSERT_OK(res.getStatus());
+
+        uow.commit();
+    }
+
+    // Cursors should always ensure they are in an active transaction when next() is called.
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto ru = WiredTigerRecoveryUnit::get(opCtx.get());
+
+        auto cursor = rs->getCursor(opCtx.get());
+        ASSERT(cursor->next());
+        ASSERT_TRUE(ru->inActiveTxn());
+
+        // Committing a WriteUnitOfWork will end the current transaction.
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_TRUE(ru->inActiveTxn());
+        wuow.commit();
+        ASSERT_FALSE(ru->inActiveTxn());
+
+        // If a cursor is used after a WUOW commits, it should implicitly start a new transaction.
+        ASSERT(cursor->next());
+        ASSERT_TRUE(ru->inActiveTxn());
+    }
+}
+
+TEST(WiredTigerRecordStoreTest, CursorInActiveTxnAfterSeek) {
+    unique_ptr<RecordStoreHarnessHelper> harnessHelper(newRecordStoreHarnessHelper());
+    unique_ptr<RecordStore> rs(harnessHelper->newNonCappedRecordStore());
+
+    RecordId rid1;
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+
+        WriteUnitOfWork uow(opCtx.get());
+        StatusWith<RecordId> res = rs->insertRecord(opCtx.get(), "a", 2, Timestamp());
+        ASSERT_OK(res.getStatus());
+        rid1 = res.getValue();
+
+        res = rs->insertRecord(opCtx.get(), "b", 2, Timestamp());
+        ASSERT_OK(res.getStatus());
+
+        uow.commit();
+    }
+
+    // Cursors should always ensure they are in an active transaction when seekExact() is called.
+    {
+        ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        auto ru = WiredTigerRecoveryUnit::get(opCtx.get());
+
+        auto cursor = rs->getCursor(opCtx.get());
+        ASSERT(cursor->seekExact(rid1));
+        ASSERT_TRUE(ru->inActiveTxn());
+
+        // Committing a WriteUnitOfWork will end the current transaction.
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_TRUE(ru->inActiveTxn());
+        wuow.commit();
+        ASSERT_FALSE(ru->inActiveTxn());
+
+        // If a cursor is used after a WUOW commits, it should implicitly start a new transaction.
+        ASSERT(cursor->seekExact(rid1));
+        ASSERT_TRUE(ru->inActiveTxn());
+    }
 }
 
 }  // namespace

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -63,9 +63,9 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
 
+namespace mongo {
 namespace {
 
-using namespace mongo;
 using namespace mongo::repl;
 using namespace mongo::repl::rollback_internal;
 
@@ -497,8 +497,7 @@ TEST_F(RSRollbackTest, RollbackInsertDocumentWithNoId) {
     stopCapturingLogMessages();
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
     ASSERT_STRING_CONTAINS(status.reason(), "unable to determine common point");
-    ASSERT_EQUALS(
-        1, countTextFormatLogLinesContaining("Cannot roll back op with no _id. ns: test.t,"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Cannot roll back op with no _id"));
     ASSERT_FALSE(rollbackSource.called);
 }
 
@@ -534,11 +533,7 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommand) {
         _coordinator,
         _replicationProcess.get()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1,
-                  countTextFormatLogLinesContaining(
-                      str::stream()
-                      << "Dropped index in rollback for collection: " << nss.toString()
-                      << ", UUID: " << options.uuid->toString() << ", index: a_1"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Dropped index in rollback"));
     {
         Lock::DBLock dbLock(_opCtx.get(), nss.db(), MODE_S);
         auto indexCatalog = collection->getIndexCatalog();
@@ -577,8 +572,7 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandIndexNotInCatalog) {
                            _coordinator,
                            _replicationProcess.get()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1,
-                  countTextFormatLogLinesContaining("Rollback failed to drop index a_1 in test.t"));
+    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Rollback failed to drop index"));
     {
         Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
         auto indexCatalog = collection->getIndexCatalog();
@@ -786,16 +780,8 @@ TEST_F(RSRollbackTest, RollingBackDropAndCreateOfSameIndexNameWithDifferentSpecs
         auto indexCatalog = collection->getIndexCatalog();
         ASSERT(indexCatalog);
         ASSERT_EQUALS(2, indexCatalog->numIndexesReady(_opCtx.get()));
-        ASSERT_EQUALS(1,
-                      countTextFormatLogLinesContaining(
-                          str::stream()
-                          << "Dropped index in rollback for collection: " << nss.toString()
-                          << ", UUID: " << options.uuid->toString() << ", index: a_1"));
-        ASSERT_EQUALS(1,
-                      countTextFormatLogLinesContaining(
-                          str::stream()
-                          << "Created index in rollback for collection: " << nss.toString()
-                          << ", UUID: " << options.uuid->toString() << ", index: a_1"));
+        ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Dropped index in rollback"));
+        ASSERT_EQUALS(1, countTextFormatLogLinesContaining("Created index in rollback"));
         std::vector<const IndexDescriptor*> indexes;
         indexCatalog->findIndexesByKeyPattern(_opCtx.get(), BSON("a" << 1), false, &indexes);
         ASSERT(indexes.size() == 1);
@@ -843,7 +829,7 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandMissingIndexName) {
     ASSERT_STRING_CONTAINS(status.reason(), "unable to determine common point");
     ASSERT_EQUALS(1,
                   countTextFormatLogLinesContaining(
-                      "Missing index name in createIndexes operation on rollback, document: "));
+                      "Missing index name in createIndexes operation on rollback"));
 }
 
 // Generators of standard index keys and names given an index 'id'.
@@ -1036,9 +1022,15 @@ TEST_F(RSRollbackTest, RollbackCommitIndexBuild) {
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), coll, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
 
+    auto buildUUID = UUID::gen();
+    // Store the commit quorum value for the index build in config.system.indexBuilds collection.
+    _insertDocument(_opCtx.get(),
+                    NamespaceString::kIndexBuildEntryNamespace,
+                    BSON("_id" << buildUUID << "collectionUUID" << options.uuid.get()
+                               << "indexNames" << BSON_ARRAY(idxName("0")) << "commitQuorum" << 0));
+
     auto commonOp = makeOpAndRecordId(1);
 
-    auto buildUUID = UUID::gen();
     auto commitIndexBuild = makeCommitIndexBuildOplogEntry(coll, buildUUID, indexSpec, 2);
 
     // Roll back a commit oplog entry, which will drop and restart the index build.
@@ -1060,8 +1052,10 @@ TEST_F(RSRollbackTest, RollbackCommitIndexBuild) {
     ASSERT_EQUALS(1, numIndexesInProgress(_opCtx.get(), nss, coll));
 
     // Kill the index build we just restarted so the fixture can shut down.
-    IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, Timestamp(), "");
+    ASSERT_OK(_coordinator->setFollowerMode(MemberState::RS_ROLLBACK));
+    ASSERT(IndexBuildsCoordinator::get(_opCtx.get())
+               ->abortIndexBuildByBuildUUID(
+                   _opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort, ""));
 }
 
 TEST_F(RSRollbackTest, RollbackAbortIndexBuild) {
@@ -1080,9 +1074,15 @@ TEST_F(RSRollbackTest, RollbackAbortIndexBuild) {
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), coll, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
 
+    auto buildUUID = UUID::gen();
+    // Store the commit quorum value for the index build in config.system.indexBuilds collection.
+    _insertDocument(_opCtx.get(),
+                    NamespaceString::kIndexBuildEntryNamespace,
+                    BSON("_id" << buildUUID << "collectionUUID" << options.uuid.get()
+                               << "indexNames" << BSON_ARRAY(idxName("0")) << "commitQuorum" << 0));
+
     auto commonOp = makeOpAndRecordId(1);
 
-    auto buildUUID = UUID::gen();
     auto abortIndexBuild = makeAbortIndexBuildOplogEntry(coll, buildUUID, indexSpec, 2);
 
     // Roll back an abort oplog entry, which will drop and restart the index build.
@@ -1104,8 +1104,10 @@ TEST_F(RSRollbackTest, RollbackAbortIndexBuild) {
     ASSERT_EQUALS(1, numIndexesInProgress(_opCtx.get(), nss, coll));
 
     // Kill the index build we just restarted so the fixture can shut down.
-    IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, Timestamp(), "");
+    ASSERT_OK(_coordinator->setFollowerMode(MemberState::RS_ROLLBACK));
+    ASSERT(IndexBuildsCoordinator::get(_opCtx.get())
+               ->abortIndexBuildByBuildUUID(
+                   _opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort, ""));
 }
 
 TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
@@ -1124,6 +1126,13 @@ TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
     int numIndexes = _createIndexOnEmptyCollection(_opCtx.get(), coll, nss, indexSpec);
     ASSERT_EQUALS(2, numIndexes);
 
+    auto buildUUID = UUID::gen();
+    // Store the commit quorum value for the index build in config.system.indexBuilds collection.
+    _insertDocument(_opCtx.get(),
+                    NamespaceString::kIndexBuildEntryNamespace,
+                    BSON("_id" << buildUUID << "collectionUUID" << options.uuid.get()
+                               << "indexNames" << BSON_ARRAY(idxName("0")) << "commitQuorum" << 0));
+
     auto commonOp = makeOpAndRecordId(1);
 
     // Don't roll-back anything.
@@ -1133,7 +1142,6 @@ TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
     // Even though the index has already completed, simulate that we aborted the index build before
     // rollback. We expect the index to be dropped and rebuilt.
     IndexBuildDetails build(coll->uuid());
-    auto buildUUID = UUID::gen();
     build.indexSpecs.push_back(indexSpec);
 
     IndexBuilds abortedBuilds{{buildUUID, build}};
@@ -1153,8 +1161,10 @@ TEST_F(RSRollbackTest, AbortedIndexBuildsAreRestarted) {
     ASSERT_EQUALS(1, numIndexesInProgress(_opCtx.get(), nss, coll));
 
     // Kill the index build we just restarted so the fixture can shut down.
-    IndexBuildsCoordinator::get(_opCtx.get())
-        ->abortIndexBuildByBuildUUID(_opCtx.get(), buildUUID, Timestamp(), "");
+    ASSERT_OK(_coordinator->setFollowerMode(MemberState::RS_ROLLBACK));
+    ASSERT(IndexBuildsCoordinator::get(_opCtx.get())
+               ->abortIndexBuildByBuildUUID(
+                   _opCtx.get(), buildUUID, IndexBuildAction::kRollbackAbort, ""));
 }
 
 TEST_F(RSRollbackTest, AbortedIndexBuildsAreNotRestartedWhenStartIsRolledBack) {
@@ -1227,62 +1237,6 @@ TEST_F(RSRollbackTest, RollbackUnknownCommand) {
                      _replicationProcess.get());
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
     ASSERT_STRING_CONTAINS(status.reason(), "unable to determine common point");
-}
-
-TEST_F(RSRollbackTest, RollbackDropCollectionCommand) {
-    createOplog(_opCtx.get());
-
-    OpTime dropTime = OpTime(Timestamp(2, 0), 5);
-    auto dpns = NamespaceString("test.t").makeDropPendingNamespace(dropTime);
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    auto coll = _createCollection(_opCtx.get(), dpns, options);
-    _dropPendingCollectionReaper->addDropPendingNamespace(_opCtx.get(), dropTime, dpns);
-
-    auto commonOperation = makeOpAndRecordId(1);
-    auto dropCollectionOperation =
-        std::make_pair(BSON("ts" << dropTime.getTimestamp() << "t" << dropTime.getTerm() << "op"
-                                 << "c"
-                                 << "ui" << coll->uuid() << "ns"
-                                 << "test.t"
-                                 << "wall" << Date_t() << "o"
-                                 << BSON("drop"
-                                         << "t")),
-                       RecordId(2));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
-        commonOperation,
-    })));
-
-    {
-        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
-        ASSERT_TRUE(autoCollDropPending.getCollection());
-        AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString("test.t"));
-        ASSERT_FALSE(autoColl.getCollection());
-    }
-    ASSERT_OK(syncRollback(_opCtx.get(),
-                           OplogInterfaceMock({dropCollectionOperation, commonOperation}),
-                           rollbackSource,
-                           {},
-                           {},
-                           _coordinator,
-                           _replicationProcess.get()));
-    ASSERT_FALSE(rollbackSource.called);
-    {
-        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
-        ASSERT_FALSE(autoCollDropPending.getCollection());
-        AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString("test.t"));
-        ASSERT_TRUE(autoColl.getCollection());
-    }
 }
 
 TEST_F(RSRollbackTest, RollbackRenameCollectionInSameDatabaseCommand) {
@@ -2190,7 +2144,7 @@ TEST(RSRollbackTest, LocalEntryWithoutOIsFatal) {
                   RSFatalException);
 }
 
-DEATH_TEST_F(RSRollbackTest, LocalUpdateEntryWithoutO2IsFatal, "Fatal Assertion") {
+DEATH_TEST_F(RSRollbackTest, LocalUpdateEntryWithoutO2IsFatal, "Fatal assertion") {
     const auto invalidOplogEntry = BSON("op"
                                         << "u"
                                         << "ui" << UUID::gen() << "ts" << Timestamp(1, 1) << "t"
@@ -2762,22 +2716,18 @@ TEST_F(RSRollbackTest, RollbackReturnsImmediatelyOnFailureToTransitionToRollback
              localOplogWithSingleOplogEntry,
              rollbackSourceWithInvalidOplog,
              {},
-             {},
              _coordinator,
              _replicationProcess.get());
     stopCapturingLogMessages();
 
-    ASSERT_EQUALS(
-        1, countTextFormatLogLinesContaining("Cannot transition from SECONDARY to ROLLBACK"));
+    ASSERT_EQUALS(1,
+                  countTextFormatLogLinesContaining("Cannot perform replica set state transition"));
     ASSERT_EQUALS(MemberState(MemberState::RS_SECONDARY), _coordinator->getMemberState());
 }
 
-DEATH_TEST_F(
-    RSRollbackTest,
-    RollbackUnrecoverableRollbackErrorTriggersFatalAssertion,
-    "Unable to complete rollback. A full resync may be needed: "
-    "UnrecoverableRollbackError: need to rollback, but unable to determine common point "
-    "between local and remote oplog: InvalidSyncSource: remote oplog empty or unreadable") {
+DEATH_TEST_REGEX_F(RSRollbackTest,
+                   RollbackUnrecoverableRollbackErrorTriggersFatalAssertion,
+                   "Unable to complete rollback. A full resync may be needed") {
     // rollback() should abort on getting UnrecoverableRollbackError from syncRollback(). An empty
     // local oplog will make syncRollback() return the intended error.
     OplogInterfaceMock localOplogWithSingleOplogEntry({makeNoopOplogEntryAndRecordId(Seconds(1))});
@@ -2786,7 +2736,6 @@ DEATH_TEST_F(
     rollback(_opCtx.get(),
              localOplogWithSingleOplogEntry,
              rollbackSourceWithInvalidOplog,
-             {},
              {},
              _coordinator,
              _replicationProcess.get());
@@ -2806,7 +2755,6 @@ TEST_F(RSRollbackTest, RollbackLogsRetryMessageAndReturnsOnNonUnrecoverableRollb
     rollback(_opCtx.get(),
              localOplogWithNoEntries,
              rollbackSourceWithValidOplog,
-             {},
              {},
              _coordinator,
              _replicationProcess.get(),
@@ -2833,15 +2781,13 @@ DEATH_TEST_F(RSRollbackTest,
     ASSERT_TRUE(ShardIdentityRollbackNotifier::get(_opCtx.get())->didRollbackHappen());
 
     createOplog(_opCtx.get());
-    rollback(
-        _opCtx.get(), localOplog, rollbackSource, {}, {}, _coordinator, _replicationProcess.get());
+    rollback(_opCtx.get(), localOplog, rollbackSource, {}, _coordinator, _replicationProcess.get());
 }
 
-DEATH_TEST_F(
+DEATH_TEST_REGEX_F(
     RSRollbackTest,
     RollbackTriggersFatalAssertionOnFailingToTransitionToRecoveringAfterSyncRollbackReturns,
-    "Failed to transition into RECOVERING; expected to be in state ROLLBACK; found self in "
-    "ROLLBACK") {
+    "Failed to perform replica set state transition") {
     auto commonOperation = makeNoopOplogEntryAndRecordId(Seconds(1));
     OplogInterfaceMock localOplog({commonOperation});
     RollbackSourceMock rollbackSource(
@@ -2850,8 +2796,7 @@ DEATH_TEST_F(
     _coordinator->failSettingFollowerMode(MemberState::RS_RECOVERING, ErrorCodes::IllegalOperation);
 
     createOplog(_opCtx.get());
-    rollback(
-        _opCtx.get(), localOplog, rollbackSource, {}, {}, _coordinator, _replicationProcess.get());
+    rollback(_opCtx.get(), localOplog, rollbackSource, {}, _coordinator, _replicationProcess.get());
 }
 
 // The testcases used here are trying to detect off-by-one errors in
@@ -2918,25 +2863,25 @@ TEST_F(RSRollbackTest, RollbackInvalidatesDefaultRWConcernCache) {
     // Put initial defaults in the cache.
     {
         RWConcernDefault origDefaults;
-        origDefaults.setEpoch(Timestamp(10, 20));
-        origDefaults.setSetTime(Date_t::fromMillisSinceEpoch(1234));
+        origDefaults.setUpdateOpTime(Timestamp(10, 20));
+        origDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(1234));
         _lookupMock.setLookupCallReturnValue(std::move(origDefaults));
     }
     auto origCachedDefaults = rwcDefaults.getDefault(_opCtx.get());
-    ASSERT_EQ(Timestamp(10, 20), *origCachedDefaults.getEpoch());
-    ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *origCachedDefaults.getSetTime());
+    ASSERT_EQ(Timestamp(10, 20), *origCachedDefaults.getUpdateOpTime());
+    ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *origCachedDefaults.getUpdateWallClockTime());
 
     // Change the mock's defaults, but don't invalidate the cache yet. The cache should still return
     // the original defaults.
     {
         RWConcernDefault newDefaults;
-        newDefaults.setEpoch(Timestamp(50, 20));
-        newDefaults.setSetTime(Date_t::fromMillisSinceEpoch(5678));
+        newDefaults.setUpdateOpTime(Timestamp(50, 20));
+        newDefaults.setUpdateWallClockTime(Date_t::fromMillisSinceEpoch(5678));
         _lookupMock.setLookupCallReturnValue(std::move(newDefaults));
 
         auto cachedDefaults = rwcDefaults.getDefault(_opCtx.get());
-        ASSERT_EQ(Timestamp(10, 20), *cachedDefaults.getEpoch());
-        ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *cachedDefaults.getSetTime());
+        ASSERT_EQ(Timestamp(10, 20), *cachedDefaults.getUpdateOpTime());
+        ASSERT_EQ(Date_t::fromMillisSinceEpoch(1234), *cachedDefaults.getUpdateWallClockTime());
     }
 
     // Rollback via refetch should invalidate the cache and getting the defaults should now return
@@ -2949,8 +2894,9 @@ TEST_F(RSRollbackTest, RollbackInvalidatesDefaultRWConcernCache) {
     _testRollbackDelete(_opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid(), doc);
 
     auto newCachedDefaults = rwcDefaults.getDefault(_opCtx.get());
-    ASSERT_EQ(Timestamp(50, 20), *newCachedDefaults.getEpoch());
-    ASSERT_EQ(Date_t::fromMillisSinceEpoch(5678), *newCachedDefaults.getSetTime());
+    ASSERT_EQ(Timestamp(50, 20), *newCachedDefaults.getUpdateOpTime());
+    ASSERT_EQ(Date_t::fromMillisSinceEpoch(5678), *newCachedDefaults.getUpdateWallClockTime());
 }
 
 }  // namespace
+}  // namespace mongo

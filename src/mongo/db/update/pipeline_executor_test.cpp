@@ -37,15 +37,47 @@
 #include "mongo/db/json.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/update/update_node_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
-using PipelineExecutorTest = UpdateNodeTest;
-using mongo::mutablebson::countChildren;
-using mongo::mutablebson::Element;
+/**
+ * Harness for running the tests with both $v:2 oplog entries enabled and disabled.
+ */
+class PipelineExecutorTest : public UpdateNodeTest {
+public:
+    void resetApplyParams() override {
+        UpdateNodeTest::resetApplyParams();
+    }
+
+    UpdateExecutor::ApplyParams getApplyParams(mutablebson::Element element) override {
+        auto applyParams = UpdateNodeTest::getApplyParams(element);
+
+        // Use the same parameters as the parent test fixture, but make sure a v2 log builder
+        // is provided and a normal log builder is not.
+        applyParams.logMode = _allowDeltaOplogEntries
+            ? ApplyParams::LogMode::kGenerateOplogEntry
+            : ApplyParams::LogMode::kGenerateOnlyV1OplogEntry;
+        return applyParams;
+    }
+
+    void run() {
+        _allowDeltaOplogEntries = false;
+        UpdateNodeTest::run();
+        _allowDeltaOplogEntries = true;
+        UpdateNodeTest::run();
+    }
+
+    bool deltaOplogEntryAllowed() const {
+        return _allowDeltaOplogEntries;
+    }
+
+private:
+    bool _allowDeltaOplogEntries = false;
+};
 
 TEST_F(PipelineExecutorTest, Noop) {
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -59,7 +91,7 @@ TEST_F(PipelineExecutorTest, Noop) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_TRUE(result.oplogEntry.isEmpty());
 }
 
 TEST_F(PipelineExecutorTest, ShouldNotCreateIdIfNoIdExistsAndNoneIsSpecified) {
@@ -68,13 +100,18 @@ TEST_F(PipelineExecutorTest, ShouldNotCreateIdIfNoIdExistsAndNoneIsSpecified) {
     std::vector<BSONObj> pipeline{fromjson("{$addFields: {a: 1, b: 2}}")};
     PipelineExecutor exec(expCtx, pipeline);
 
-    mutablebson::Document doc(fromjson("{c: 1, d: 2}"));
+    mutablebson::Document doc(fromjson("{c: 1, d: 'largeStringValue'}"));
     auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
-    ASSERT_EQUALS(fromjson("{c: 1, d: 2, a: 1, b: 2}"), doc);
+    ASSERT_EQUALS(fromjson("{c: 1, d: 'largeStringValue', a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{c: 1, d: 2, a: 1, b: 2}"), getLogDoc());
+    if (deltaOplogEntryAllowed()) {
+        ASSERT_BSONOBJ_BINARY_EQ(fromjson("{$v: 2, diff: {i: {a: 1, b: 2}}}"), result.oplogEntry);
+    } else {
+        ASSERT_BSONOBJ_BINARY_EQ(fromjson("{c: 1, d: 'largeStringValue', a: 1, b: 2}"),
+                                 result.oplogEntry);
+    }
 }
 
 TEST_F(PipelineExecutorTest, ShouldPreserveIdOfExistingDocumentIfIdNotReplaced) {
@@ -90,7 +127,7 @@ TEST_F(PipelineExecutorTest, ShouldPreserveIdOfExistingDocumentIfIdNotReplaced) 
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{_id: 0, a: 1, b: 2}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, a: 1, b: 2}"), result.oplogEntry);
 }
 
 TEST_F(PipelineExecutorTest, ShouldSucceedWhenImmutableIdIsNotModified) {
@@ -99,14 +136,19 @@ TEST_F(PipelineExecutorTest, ShouldSucceedWhenImmutableIdIsNotModified) {
     std::vector<BSONObj> pipeline{fromjson("{$addFields: {_id: 0, a: 1, b: 2}}")};
     PipelineExecutor exec(expCtx, pipeline);
 
-    mutablebson::Document doc(fromjson("{_id: 0, c: 1, d: 2}"));
+    mutablebson::Document doc(fromjson("{_id: 0, c: 1, d: 'largeStringValue'}"));
     addImmutablePath("_id");
     auto result = exec.applyUpdate(getApplyParams(doc.root()));
     ASSERT_FALSE(result.noop);
     ASSERT_TRUE(result.indexesAffected);
-    ASSERT_EQUALS(fromjson("{_id: 0, c: 1, d: 2, a: 1, b: 2}"), doc);
+    ASSERT_EQUALS(fromjson("{_id: 0, c: 1, d: 'largeStringValue', a: 1, b: 2}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{_id: 0, c: 1, d: 2, a: 1, b: 2}"), getLogDoc());
+    if (deltaOplogEntryAllowed()) {
+        ASSERT_BSONOBJ_BINARY_EQ(fromjson("{$v: 2, diff: {i: {a: 1, b: 2 }}}"), result.oplogEntry);
+    } else {
+        ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0, c: 1, d: 'largeStringValue', a: 1, b: 2}"),
+                                 result.oplogEntry);
+    }
 }
 
 TEST_F(PipelineExecutorTest, ComplexDoc) {
@@ -121,7 +163,14 @@ TEST_F(PipelineExecutorTest, ComplexDoc) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: [0, 1, 2], e: [], c: {d: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{a: 1, b: [0, 1, 2], e: [], c: {d: 1}}"), getLogDoc());
+    if (deltaOplogEntryAllowed()) {
+        ASSERT_BSONOBJ_BINARY_EQ(
+            fromjson("{$v: 2, diff: {i: {c: {d: 1}}, s: {b: {a: true, u1: 1} }}}"),
+            result.oplogEntry);
+    } else {
+        ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: [0, 1, 2], e: [], c: {d: 1}}"),
+                                 result.oplogEntry);
+    }
 }
 
 TEST_F(PipelineExecutorTest, CannotRemoveImmutablePath) {
@@ -153,7 +202,7 @@ TEST_F(PipelineExecutorTest, IdFieldIsNotRemoved) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{_id: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{_id: 0}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{_id: 0}"), result.oplogEntry);
 }
 
 TEST_F(PipelineExecutorTest, CannotReplaceImmutablePathWithArrayField) {
@@ -229,7 +278,7 @@ TEST_F(PipelineExecutorTest, CanAddImmutableField) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{c: 1, a: {b: 1}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{c: 1, a: {b: 1}}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{c: 1, a: {b: 1}}"), result.oplogEntry);
 }
 
 TEST_F(PipelineExecutorTest, CanAddImmutableId) {
@@ -245,7 +294,7 @@ TEST_F(PipelineExecutorTest, CanAddImmutableId) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{c: 1, _id: 0}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{c: 1, _id: 0}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{c: 1, _id: 0}"), result.oplogEntry);
 }
 
 TEST_F(PipelineExecutorTest, CannotCreateDollarPrefixedName) {
@@ -291,15 +340,15 @@ TEST_F(PipelineExecutorTest, RejectsInvalidConstantNames) {
 
     // Empty name.
     auto constants = BSON("" << 10);
-    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16869);
+    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16866);
 
     // Invalid first character.
     constants = BSON("^invalidFirstChar" << 10);
-    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16870);
+    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16867);
 
     // Contains invalid character.
     constants = BSON("contains*InvalidChar" << 10);
-    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16871);
+    ASSERT_THROWS_CODE(PipelineExecutor(expCtx, pipeline, constants), AssertionException, 16868);
 }
 
 TEST_F(PipelineExecutorTest, CanUseConstants) {
@@ -315,7 +364,7 @@ TEST_F(PipelineExecutorTest, CanUseConstants) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 10, c : {x: 1, y: 2}}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{a: 1, b: 10, c : {x: 1, y: 2}}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: 10, c : {x: 1, y: 2}}"), result.oplogEntry);
 }
 
 TEST_F(PipelineExecutorTest, CanUseConstantsAcrossMultipleUpdates) {
@@ -333,7 +382,7 @@ TEST_F(PipelineExecutorTest, CanUseConstantsAcrossMultipleUpdates) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 'foo'}"), doc1);
     ASSERT_FALSE(doc1.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{a: 1, b: 'foo'}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 1, b: 'foo'}"), result.oplogEntry);
 
     // Update second doc.
     mutablebson::Document doc2(fromjson("{a: 2}"));
@@ -343,7 +392,7 @@ TEST_F(PipelineExecutorTest, CanUseConstantsAcrossMultipleUpdates) {
     ASSERT_TRUE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 2, b: 'foo'}"), doc2);
     ASSERT_FALSE(doc2.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{a: 2, b: 'foo'}"), getLogDoc());
+    ASSERT_BSONOBJ_BINARY_EQ(fromjson("{a: 2, b: 'foo'}"), result.oplogEntry);
 }
 
 TEST_F(PipelineExecutorTest, NoopWithConstants) {
@@ -359,7 +408,7 @@ TEST_F(PipelineExecutorTest, NoopWithConstants) {
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_EQUALS(fromjson("{a: 1, b: 2}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
+    ASSERT_TRUE(result.oplogEntry.isEmpty());
 }
 
 }  // namespace

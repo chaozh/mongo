@@ -39,10 +39,11 @@
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/logger/log_severity.h"
+#include "mongo/logv2/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/message.h"
@@ -151,16 +152,24 @@ public:
      */
     void logout(const std::string& dbname, BSONObj& info) override;
 
-    std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                          Query query = Query(),
-                                          int nToReturn = 0,
-                                          int nToSkip = 0,
-                                          const BSONObj* fieldsToReturn = nullptr,
-                                          int queryOptions = 0,
-                                          int batchSize = 0) override {
+    std::unique_ptr<DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        Query query = Query(),
+        int nToReturn = 0,
+        int nToSkip = 0,
+        const BSONObj* fieldsToReturn = nullptr,
+        int queryOptions = 0,
+        int batchSize = 0,
+        boost::optional<BSONObj> readConcernObj = boost::none) override {
         checkConnection();
-        return DBClientBase::query(
-            nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
+        return DBClientBase::query(nsOrUuid,
+                                   query,
+                                   nToReturn,
+                                   nToSkip,
+                                   fieldsToReturn,
+                                   queryOptions,
+                                   batchSize,
+                                   readConcernObj);
     }
 
     unsigned long long query(std::function<void(DBClientCursorBatchIterator&)> f,
@@ -168,7 +177,8 @@ public:
                              Query query,
                              const BSONObj* fieldsToReturn,
                              int queryOptions,
-                             int batchSize = 0) override;
+                             int batchSize = 0,
+                             boost::optional<BSONObj> readConcernObj = boost::none) override;
 
     using DBClientBase::runCommandWithTarget;
     std::pair<rpc::UniqueReply, DBClientBase*> runCommandWithTarget(OpMsgRequest request) override;
@@ -189,6 +199,13 @@ public:
     bool isStillConnected() override;
 
     void setTags(transport::Session::TagMask tag);
+
+
+    /**
+     * Disconnects the client and interrupts operations if they are currently blocked waiting for
+     * the network. If autoreconnect is on, a connection will be re-established after reconnecting.
+     */
+    virtual void shutdown();
 
     /**
      * Causes an error to be reported the next time the connection is used. Will interrupt
@@ -284,7 +301,16 @@ public:
         return _isMongos;
     }
 
-    Status authenticateInternalUser() override;
+    Status authenticateInternalUser(
+        auth::StepDownBehavior stepDownBehavior = auth::StepDownBehavior::kKillConnection) override;
+
+    bool authenticatedDuringConnect() const override {
+        return _authenticatedDuringConnect;
+    }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() override;
+#endif
 
 protected:
     int _minWireVersion{0};
@@ -318,6 +344,9 @@ protected:
     void _checkConnection();
 
     bool _internalAuthOnReconnect = false;
+
+    auth::StepDownBehavior _internalAuthStepDownBehavior = auth::StepDownBehavior::kKillConnection;
+
     std::map<std::string, BSONObj> authCache;
 
     static AtomicWord<int> _numConnections;
@@ -342,6 +371,8 @@ private:
     MessageCompressorManager _compressorManager;
 
     MongoURI _uri;
+
+    bool _authenticatedDuringConnect = false;
 };
 
 BSONElement getErrField(const BSONObj& result);

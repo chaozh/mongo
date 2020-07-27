@@ -56,6 +56,7 @@ LogicalSessionId makeLogicalSessionId(const LogicalSessionFromClient& lsid,
                                       OperationContext* opCtx,
                                       std::initializer_list<Privilege> allowSpoof = {});
 LogicalSessionId makeLogicalSessionId(OperationContext* opCtx);
+LogicalSessionId makeSystemLogicalSessionId();
 
 /**
  * Factory functions to make logical session records. The overloads that
@@ -73,4 +74,9 @@ LogicalSessionIdSet makeLogicalSessionIds(const std::vector<LogicalSessionFromCl
                                           OperationContext* opCtx,
                                           std::initializer_list<Privilege> allowSpoof = {});
 
+namespace logical_session_id_helpers {
+
+void serializeLsidAndTxnNumber(OperationContext* opCtx, BSONObjBuilder* builder);
+
+}  // namespace logical_session_id_helpers
 }  // namespace mongo

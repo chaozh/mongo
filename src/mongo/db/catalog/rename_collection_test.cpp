@@ -216,7 +216,6 @@ void OpObserverMock::onInserts(OperationContext* opCtx,
         uasserted(ErrorCodes::OperationFailed, "insert failed");
     }
 
-    ASSERT_TRUE(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
     onInsertsIsTargetDatabaseExclusivelyLocked =
         opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_X);
 
@@ -312,7 +311,6 @@ protected:
     ServiceContext::UniqueOperationContext _opCtx;
     repl::ReplicationCoordinatorMock* _replCoord = nullptr;
     OpObserverMock* _opObserver = nullptr;
-    bool _supportsTwoPhaseIndexBuild = false;
     NamespaceString _sourceNss;
     NamespaceString _targetNss;
     NamespaceString _targetNssDifferentDb;
@@ -351,9 +349,6 @@ void RenameCollectionTest::setUp() {
     _opObserver = mockObserver.get();
     opObserver->addObserver(std::move(mockObserver));
     service->setOpObserver(std::move(opObserver));
-
-    // Cache two phase index build support setting.
-    _supportsTwoPhaseIndexBuild = IndexBuildsCoordinator::supportsTwoPhaseIndexBuild();
 
     _sourceNss = NamespaceString("test.foo");
     _targetNss = NamespaceString("test.bar");
@@ -546,7 +541,7 @@ TEST_F(RenameCollectionTest, RenameCollectionReturnsNotMasterIfNotPrimary) {
 
 TEST_F(RenameCollectionTest, TargetCollectionNameLong) {
     _createCollection(_opCtx.get(), _sourceNss);
-    const std::string targetCollectionName(500, 'a');
+    const std::string targetCollectionName(255, 'a');
     NamespaceString longTargetNss(_sourceNss.db(), targetCollectionName);
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, longTargetNss, {}));
 }
@@ -843,7 +838,7 @@ TEST_F(RenameCollectionTest,
 
 DEATH_TEST_F(RenameCollectionTest,
              RenameCollectionForApplyOpsTriggersFatalAssertionIfLogOpReturnsValidOpTime,
-             "unexpected renameCollection oplog entry written to the oplog with optime") {
+             "unexpected renameCollection oplog entry written to the oplog") {
     repl::UnreplicatedWritesBlock uwb(_opCtx.get());
     ASSERT_FALSE(_opCtx->writesAreReplicated());
 

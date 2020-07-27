@@ -43,7 +43,7 @@ ExprMatchExpression::ExprMatchExpression(boost::intrusive_ptr<Expression> expr,
 
 ExprMatchExpression::ExprMatchExpression(BSONElement elem,
                                          const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : ExprMatchExpression(Expression::parseOperand(expCtx, elem, expCtx->variablesParseState),
+    : ExprMatchExpression(Expression::parseOperand(expCtx.get(), elem, expCtx->variablesParseState),
                           expCtx) {}
 
 bool ExprMatchExpression::matches(const MatchableDocument* doc, MatchDetails* details) const {
@@ -92,8 +92,12 @@ bool ExprMatchExpression::equivalent(const MatchExpression* other) const {
 }
 
 void ExprMatchExpression::_doSetCollator(const CollatorInterface* collator) {
-    _expCtx->setCollator(collator);
-
+    // This function is used to give match expression nodes which don't keep a pointer to the
+    // ExpressionContext access to the ExpressionContext's collator. Since the operation only ever
+    // has a single CollatorInterface, and since that collator is kept on the ExpressionContext,
+    // the collator pointer that we're propagating throughout the MatchExpression tree must match
+    // the one inside the ExpressionContext.
+    invariant(collator == _expCtx->getCollator());
     if (_rewriteResult && _rewriteResult->matchExpression()) {
         _rewriteResult->matchExpression()->setCollator(collator);
     }
@@ -104,8 +108,8 @@ std::unique_ptr<MatchExpression> ExprMatchExpression::shallowClone() const {
     // TODO SERVER-31003: Replace Expression clone via serialization with Expression::clone().
     BSONObjBuilder bob;
     bob << "" << _expression->serialize(false);
-    boost::intrusive_ptr<Expression> clonedExpr =
-        Expression::parseOperand(_expCtx, bob.obj().firstElement(), _expCtx->variablesParseState);
+    boost::intrusive_ptr<Expression> clonedExpr = Expression::parseOperand(
+        _expCtx.get(), bob.obj().firstElement(), _expCtx->variablesParseState);
 
     auto clone = std::make_unique<ExprMatchExpression>(std::move(clonedExpr), _expCtx);
     if (_rewriteResult) {

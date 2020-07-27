@@ -3,6 +3,7 @@
 (function() {
 "use strict";
 
+load("jstests/libs/logv2_helpers.js");
 load("jstests/libs/write_concern_util.js");
 load("jstests/replsets/libs/election_metrics.js");
 load("jstests/replsets/rslib.js");
@@ -45,12 +46,14 @@ function checkOpInOplog(node, op, count) {
 function reconfigElectionAndCatchUpTimeout(electionTimeout, catchupTimeout) {
     // Reconnect all nodes to make sure reconfig succeeds.
     rst.nodes.forEach(reconnect);
+    // Wait for the config with the new term to propagate.
+    rst.waitForConfigReplication(rst.getPrimary());
     // Reconfigure replica set to decrease catchup timeout.
     var newConfig = rst.getReplSetConfigFromNode();
     newConfig.version++;
     newConfig.settings.catchUpTimeoutMillis = catchupTimeout;
     newConfig.settings.electionTimeoutMillis = electionTimeout;
-    reconfig(rst, newConfig);
+    reconfig(rst, newConfig, true);
     rst.awaitReplication();
     rst.awaitNodesAgreeOnPrimary();
 }
@@ -114,7 +117,11 @@ restartServerReplication(stepUpResults.oldSecondaries);
 assert.eq(stepUpResults.newPrimary, rst.getPrimary());
 
 // Wait until the new primary completes the transition to primary and writes a no-op.
-checkLog.contains(stepUpResults.newPrimary, "transition to primary complete");
+if (isJsonLog(stepUpResults.newPrimary)) {
+    checkLog.contains(stepUpResults.newPrimary, "Transition to primary complete");
+} else {
+    checkLog.contains(stepUpResults.newPrimary, "transition to primary complete");
+}
 // Check that the new primary's term has been updated because of the no-op.
 assert.eq(getLatestOp(stepUpResults.newPrimary).t, stepUpResults.latestOpOnNewPrimary.t + 1);
 

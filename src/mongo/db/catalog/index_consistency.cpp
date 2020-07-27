@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include <algorithm>
 
@@ -36,9 +36,11 @@
 #include "mongo/db/catalog/index_consistency.h"
 
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/validate_gen.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/util/log.h"
+#include "mongo/db/storage/storage_debug_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -76,7 +78,7 @@ IndexInfo::IndexInfo(const IndexDescriptor* descriptor)
 IndexConsistency::IndexConsistency(OperationContext* opCtx,
                                    CollectionValidation::ValidateState* validateState)
     : _validateState(validateState), _firstPhase(true) {
-    _indexKeyCount.resize(kNumHashBuckets);
+    _indexKeyBuckets.resize(kNumHashBuckets);
 
     for (const auto& index : _validateState->getIndexes()) {
         const IndexDescriptor* descriptor = index->descriptor();
@@ -98,8 +100,9 @@ size_t IndexConsistency::getMultikeyMetadataPathCount(IndexInfo* indexInfo) {
 }
 
 bool IndexConsistency::haveEntryMismatch() const {
-    return std::any_of(
-        _indexKeyCount.begin(), _indexKeyCount.end(), [](int count) -> bool { return count; });
+    return std::any_of(_indexKeyBuckets.begin(),
+                       _indexKeyBuckets.end(),
+                       [](const IndexKeyBucket& bucket) -> bool { return bucket.indexKeyCount; });
 }
 
 void IndexConsistency::setSecondPhase() {
@@ -112,9 +115,9 @@ void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap
     invariant(!_firstPhase);
 
     // We'll report up to 1MB for extra index entry errors and missing index entry errors.
-    const int kErrorSizeMB = 1 * 1024 * 1024;
-    int numMissingIndexEntriesSizeMB = 0;
-    int numExtraIndexEntriesSizeMB = 0;
+    const int kErrorSizeBytes = 1 * 1024 * 1024;
+    long numMissingIndexEntriesSizeBytes = 0;
+    long numExtraIndexEntriesSizeBytes = 0;
 
     int numMissingIndexEntryErrors = _missingIndexEntries.size();
     int numExtraIndexEntryErrors = 0;
@@ -128,13 +131,8 @@ void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap
     for (const auto& missingIndexEntry : _missingIndexEntries) {
         const BSONObj& entry = missingIndexEntry.second;
 
-        // Only count the indexKey and idKey fields towards the total size.
-        numMissingIndexEntriesSizeMB += entry["indexKey"].size();
-        if (entry.hasField("idKey")) {
-            numMissingIndexEntriesSizeMB += entry["idKey"].size();
-        }
-
-        if (numMissingIndexEntriesSizeMB <= kErrorSizeMB) {
+        numMissingIndexEntriesSizeBytes += entry.objsize();
+        if (numMissingIndexEntriesSizeBytes <= kErrorSizeBytes) {
             results->missingIndexEntries.push_back(entry);
         } else if (!missingIndexEntrySizeLimitWarning) {
             StringBuilder ss;
@@ -160,9 +158,8 @@ void IndexConsistency::addIndexEntryErrors(ValidateResultsMap* indexNsResultsMap
     for (const auto& extraIndexEntry : _extraIndexEntries) {
         const SimpleBSONObjSet& entries = extraIndexEntry.second;
         for (const auto& entry : entries) {
-            // Only count the indexKey field towards the total size.
-            numExtraIndexEntriesSizeMB += entry["indexKey"].size();
-            if (numExtraIndexEntriesSizeMB <= kErrorSizeMB) {
+            numExtraIndexEntriesSizeBytes += entry.objsize();
+            if (numExtraIndexEntriesSizeBytes <= kErrorSizeBytes) {
                 results->extraIndexEntries.push_back(entry);
             } else if (!extraIndexEntrySizeLimitWarning) {
                 StringBuilder ss;
@@ -211,9 +208,19 @@ void IndexConsistency::addDocKey(OperationContext* opCtx,
     if (_firstPhase) {
         // During the first phase of validation we only keep track of the count for the document
         // keys encountered.
-        _indexKeyCount[hash]++;
+        _indexKeyBuckets[hash].indexKeyCount++;
+        _indexKeyBuckets[hash].bucketSizeBytes += ks.getSize();
         indexInfo->numRecords++;
-    } else if (_indexKeyCount[hash]) {
+
+        if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+            LOGV2(4666602, "[validate](record) {hash_num}", "hash_num"_attr = hash);
+            const BSONObj& keyPatternBson = indexInfo->keyPattern;
+            auto keyStringBson = KeyString::toBsonSafe(
+                ks.getBuffer(), ks.getSize(), indexInfo->ord, ks.getTypeBits());
+            StorageDebugUtil::printKeyString(
+                recordId, ks, keyPatternBson, keyStringBson, "[validate](record)");
+        }
+    } else if (_indexKeyBuckets[hash].indexKeyCount) {
         // Found a document key for a hash bucket that had mismatches.
 
         // Get the documents _id index key.
@@ -245,9 +252,19 @@ void IndexConsistency::addIndexKey(const KeyString::Value& ks,
     if (_firstPhase) {
         // During the first phase of validation we only keep track of the count for the index entry
         // keys encountered.
-        _indexKeyCount[hash]--;
+        _indexKeyBuckets[hash].indexKeyCount--;
+        _indexKeyBuckets[hash].bucketSizeBytes += ks.getSize();
         indexInfo->numKeys++;
-    } else if (_indexKeyCount[hash]) {
+
+        if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
+            LOGV2(4666603, "[validate](index) {hash_num}", "hash_num"_attr = hash);
+            const BSONObj& keyPatternBson = indexInfo->keyPattern;
+            auto keyStringBson = KeyString::toBsonSafe(
+                ks.getBuffer(), ks.getSize(), indexInfo->ord, ks.getTypeBits());
+            StorageDebugUtil::printKeyString(
+                recordId, ks, keyPatternBson, keyStringBson, "[validate](index)");
+        }
+    } else if (_indexKeyBuckets[hash].indexKeyCount) {
         // Found an index key for a bucket that has inconsistencies.
         // If there is a corresponding document key for the index entry key, we remove the key from
         // the '_missingIndexEntries' map. However if there was no document key for the index entry
@@ -271,6 +288,69 @@ void IndexConsistency::addIndexKey(const KeyString::Value& ks,
             _missingIndexEntries.erase(key);
         }
     }
+}
+
+bool IndexConsistency::limitMemoryUsageForSecondPhase(ValidateResults* result) {
+    invariant(!_firstPhase);
+
+    const uint32_t maxMemoryUsageBytes = maxValidateMemoryUsageMB.load() * 1024 * 1024;
+    const uint64_t totalMemoryNeededBytes =
+        std::accumulate(_indexKeyBuckets.begin(),
+                        _indexKeyBuckets.end(),
+                        0,
+                        [](uint64_t bytes, const IndexKeyBucket& bucket) {
+                            return bucket.indexKeyCount ? bytes + bucket.bucketSizeBytes : bytes;
+                        });
+
+    if (totalMemoryNeededBytes <= maxMemoryUsageBytes) {
+        // The amount of memory we need is under the limit, so no need to do anything else.
+        return true;
+    }
+
+    bool hasNonZeroBucket = false;
+    uint64_t memoryUsedSoFarBytes = 0;
+    uint32_t smallestBucketBytes = std::numeric_limits<uint32_t>::max();
+    // Zero out any nonzero buckets that would put us over maxMemoryUsageBytes.
+    std::for_each(_indexKeyBuckets.begin(), _indexKeyBuckets.end(), [&](IndexKeyBucket& bucket) {
+        if (bucket.indexKeyCount == 0) {
+            return;
+        }
+
+        smallestBucketBytes = std::min(smallestBucketBytes, bucket.bucketSizeBytes);
+        if (bucket.bucketSizeBytes + memoryUsedSoFarBytes > maxMemoryUsageBytes) {
+            // Including this bucket would put us over the memory limit, so zero
+            // this bucket.
+            bucket.indexKeyCount = 0;
+            return;
+        }
+        memoryUsedSoFarBytes += bucket.bucketSizeBytes;
+        hasNonZeroBucket = true;
+    });
+
+    StringBuilder memoryLimitMessage;
+    memoryLimitMessage << "Memory limit for validation is currently set to "
+                       << maxValidateMemoryUsageMB.load()
+                       << "MB and can be configured via the 'maxValidateMemoryUsageMB' parameter.";
+
+    if (!hasNonZeroBucket) {
+        const uint32_t minMemoryNeededMB = (smallestBucketBytes / (1024 * 1024)) + 1;
+        StringBuilder ss;
+        ss << "Unable to report index entry inconsistencies due to memory limitations. Need at "
+              "least "
+           << minMemoryNeededMB << "MB to report at least one index entry inconsistency. "
+           << memoryLimitMessage.str();
+        result->errors.push_back(ss.str());
+        result->valid = false;
+
+        return false;
+    }
+
+    StringBuilder ss;
+    ss << "Not all index entry inconsistencies are reported due to memory limitations. "
+       << memoryLimitMessage.str();
+    result->errors.push_back(ss.str());
+
+    return true;
 }
 
 BSONObj IndexConsistency::_generateInfo(const IndexInfo& indexInfo,

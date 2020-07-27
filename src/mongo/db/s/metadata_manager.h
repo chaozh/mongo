@@ -66,10 +66,11 @@ public:
      *
      * Holding a reference on a particular instance of the metadata means that orphan cleanup is not
      * allowed to run and delete chunks which are covered by that metadata. When the returned
-     * ScopedCollectionMetadata goes out of scope, the reference counter on the metadata will be
+     * ScopedCollectionDescription goes out of scope, the reference counter on the metadata will be
      * decremented and if it reaches to zero, orphan cleanup may proceed.
      */
-    ScopedCollectionMetadata getActiveMetadata(const boost::optional<LogicalTime>& atClusterTime);
+    std::shared_ptr<ScopedCollectionDescription::Impl> getActiveMetadata(
+        const boost::optional<LogicalTime>& atClusterTime);
 
     /**
      * Returns the shard version of the active metadata object.
@@ -103,26 +104,10 @@ public:
 
     void setFilteringMetadata(CollectionMetadata newMetadata);
 
-    void toBSONPending(BSONArrayBuilder& bb) const;
-
     /**
      * Appends information on all the chunk ranges in rangesToClean to builder.
      */
     void append(BSONObjBuilder* builder) const;
-
-    /**
-     * Schedules any documents in `range` for immediate cleanup iff no running queries can depend
-     * on them, and adds the range to the list of ranges currently being received.
-     *
-     * Returns a future that will be resolved when the deletion either completes or fail.
-     */
-    SharedSemiFuture<void> beginReceive(ChunkRange const& range);
-
-    /**
-     * Removes `range` from the list of ranges currently being received, and schedules any documents
-     * in the range for immediate cleanup.
-     */
-    void forgetReceive(const ChunkRange& range);
 
     /**
      * Schedules documents in `range` for cleanup after any running queries that may depend on them
@@ -134,7 +119,9 @@ public:
      *
      * Returns a future that will be fulfilled when the range deletion completes or fails.
      */
-    SharedSemiFuture<void> cleanUpRange(ChunkRange const& range, bool shouldDelayBeforeDeletion);
+    SharedSemiFuture<void> cleanUpRange(ChunkRange const& range,
+                                        boost::optional<UUID> migrationId,
+                                        bool shouldDelayBeforeDeletion);
 
     /**
      * Returns the number of ranges scheduled to be cleaned, exclusive of such ranges that might
@@ -149,6 +136,12 @@ public:
      * useful for unit tests.
      */
     size_t numberOfRangesToCleanStillInUse() const;
+
+    /**
+     * Returns the number of ranges scheduled for deletion, regardless of whether they may still be
+     * in use by running queries.
+     */
+    size_t numberOfRangesScheduledForDeletion() const;
 
     /**
      * Reports whether any range still scheduled for deletion overlaps the argument range. If so,
@@ -235,6 +228,7 @@ private:
         const WithLock&,
         SemiFuture<void> waitForActiveQueriesToComplete,
         const ChunkRange& range,
+        boost::optional<UUID> migrationId,
         Seconds delayForActiveQueriesOnSecondariesToComplete);
 
     // ServiceContext from which to obtain instances of global support objects
@@ -252,14 +246,11 @@ private:
     // Mutex to protect the state below
     mutable Mutex _managerLock = MONGO_MAKE_LATCH("MetadataManager::_managerLock");
 
-    // Contains a list of collection metadata for the same collection epoch, ordered in
+    // Contains a list of collection metadata for the same collection uuid, ordered in
     // chronological order based on the refreshes that occurred. The entry at _metadata.back() is
     // the most recent metadata and is what is returned to new queries. The rest are previously
     // active collection metadata instances still in use by active server operations or cursors.
     std::list<std::shared_ptr<CollectionMetadataTracker>> _metadata;
-
-    // Chunk ranges being migrated into to the shard. Indexed by the min key of the range.
-    RangeMap _receivingChunks;
 
     // Ranges being deleted, or scheduled to be deleted, by a background task.
     std::list<std::pair<ChunkRange, SharedSemiFuture<void>>> _rangesScheduledForDeletion;

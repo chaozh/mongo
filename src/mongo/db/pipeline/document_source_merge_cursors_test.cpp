@@ -35,6 +35,7 @@
 
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/json.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
@@ -79,8 +80,8 @@ class DocumentSourceMergeCursorsTest : public ShardingTestFixture {
 public:
     DocumentSourceMergeCursorsTest() {
         TimeZoneDatabase::set(getServiceContext(), std::make_unique<TimeZoneDatabase>());
-        _expCtx = new ExpressionContext(operationContext(), nullptr);
-        _expCtx->ns = kTestNss;
+        _expCtx = new ExpressionContext(operationContext(), nullptr, kTestNss);
+        _expCtx->mongoProcessInterface = std::make_shared<StubMongoProcessInterface>(executor());
     }
 
     void setUp() override {
@@ -107,6 +108,8 @@ public:
         }
 
         setupShards(shards);
+
+        CurOp::get(operationContext())->ensureStarted();
     }
 
     boost::intrusive_ptr<ExpressionContext> getExpCtx() {
@@ -206,9 +209,8 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldReportEOFWithNoCursors) {
     cursors.emplace_back(makeRemoteCursor(
         kTestShardIds[1], kTestShardHosts[1], CursorResponse(expCtx->ns, kExhaustedCursorID, {})));
     armParams.setRemotes(std::move(cursors));
-    auto pipeline = uassertStatusOK(Pipeline::create({}, expCtx));
-    auto mergeCursorsStage =
-        DocumentSourceMergeCursors::create(executor(), std::move(armParams), expCtx);
+    auto pipeline = Pipeline::create({}, expCtx);
+    auto mergeCursorsStage = DocumentSourceMergeCursors::create(expCtx, std::move(armParams));
 
     ASSERT_TRUE(mergeCursorsStage->getNext().isEOF());
 }
@@ -230,9 +232,8 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldBeAbleToIterateCursorsUntilEOF) {
     cursors.emplace_back(
         makeRemoteCursor(kTestShardIds[1], kTestShardHosts[1], CursorResponse(expCtx->ns, 2, {})));
     armParams.setRemotes(std::move(cursors));
-    auto pipeline = uassertStatusOK(Pipeline::create({}, expCtx));
-    pipeline->addInitialSource(
-        DocumentSourceMergeCursors::create(executor(), std::move(armParams), expCtx));
+    auto pipeline = Pipeline::create({}, expCtx);
+    pipeline->addInitialSource(DocumentSourceMergeCursors::create(expCtx, std::move(armParams)));
 
     // Iterate the $mergeCursors stage asynchronously on a different thread, since it will block
     // waiting for network responses, which we will manually schedule below.
@@ -279,9 +280,8 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldNotKillCursorsIfTheyAreNotOwned) {
     cursors.emplace_back(
         makeRemoteCursor(kTestShardIds[1], kTestShardHosts[1], CursorResponse(expCtx->ns, 2, {})));
     armParams.setRemotes(std::move(cursors));
-    auto pipeline = uassertStatusOK(Pipeline::create({}, expCtx));
-    pipeline->addInitialSource(
-        DocumentSourceMergeCursors::create(executor(), std::move(armParams), expCtx));
+    auto pipeline = Pipeline::create({}, expCtx);
+    pipeline->addInitialSource(DocumentSourceMergeCursors::create(expCtx, std::move(armParams)));
 
     auto mergeCursors =
         checked_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get());
@@ -301,9 +301,8 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldKillCursorIfPartiallyIterated) {
     cursors.emplace_back(
         makeRemoteCursor(kTestShardIds[0], kTestShardHosts[0], CursorResponse(expCtx->ns, 1, {})));
     armParams.setRemotes(std::move(cursors));
-    auto pipeline = uassertStatusOK(Pipeline::create({}, expCtx));
-    pipeline->addInitialSource(
-        DocumentSourceMergeCursors::create(executor(), std::move(armParams), expCtx));
+    auto pipeline = Pipeline::create({}, expCtx);
+    pipeline->addInitialSource(DocumentSourceMergeCursors::create(expCtx, std::move(armParams)));
 
     // Iterate the pipeline asynchronously on a different thread, since it will block waiting for
     // network responses, which we will manually schedule below.
@@ -336,7 +335,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldKillCursorIfPartiallyIterated) {
 
 TEST_F(DocumentSourceMergeCursorsTest, ShouldEnforceSortSpecifiedViaARMParams) {
     auto expCtx = getExpCtx();
-    auto pipeline = uassertStatusOK(Pipeline::create({}, expCtx));
+    auto pipeline = Pipeline::create({}, expCtx);
 
     // Make a $mergeCursors stage with a sort on "x" and add it to the front of the pipeline.
     AsyncResultsMergerParams armParams;
@@ -348,8 +347,7 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldEnforceSortSpecifiedViaARMParams) {
     cursors.emplace_back(
         makeRemoteCursor(kTestShardIds[1], kTestShardHosts[1], CursorResponse(expCtx->ns, 2, {})));
     armParams.setRemotes(std::move(cursors));
-    pipeline->addInitialSource(
-        DocumentSourceMergeCursors::create(executor(), std::move(armParams), expCtx));
+    pipeline->addInitialSource(DocumentSourceMergeCursors::create(expCtx, std::move(armParams)));
 
     // After optimization we should only have a $mergeCursors stage.
     pipeline->optimizePipeline();
@@ -369,14 +367,14 @@ TEST_F(DocumentSourceMergeCursorsTest, ShouldEnforceSortSpecifiedViaARMParams) {
     onCommand([&](const auto& request) {
         return cursorResponseObj(expCtx->ns,
                                  kExhaustedCursorID,
-                                 {BSON("x" << 1 << "$sortKey" << BSON("" << 1)),
-                                  BSON("x" << 3 << "$sortKey" << BSON("" << 3))});
+                                 {BSON("x" << 1 << "$sortKey" << BSON_ARRAY(1)),
+                                  BSON("x" << 3 << "$sortKey" << BSON_ARRAY(3))});
     });
     onCommand([&](const auto& request) {
         return cursorResponseObj(expCtx->ns,
                                  kExhaustedCursorID,
-                                 {BSON("x" << 2 << "$sortKey" << BSON("" << 2)),
-                                  BSON("x" << 4 << "$sortKey" << BSON("" << 4))});
+                                 {BSON("x" << 2 << "$sortKey" << BSON_ARRAY(2)),
+                                  BSON("x" << 4 << "$sortKey" << BSON_ARRAY(4))});
     });
 
     future.default_timed_get();

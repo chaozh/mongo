@@ -1,12 +1,14 @@
 /**
- * Confirms that unique index builds on a primary are aborted when the node steps down during the
- * collection scan phase. This applies to both two phase and single phase index builds.
- * TODO: Handle JSON logs. See SERVER-45140
- * @tags: [requires_replication, requires_text_logs]
+ * Confirms that unique index builds are committed when a primary steps down during the collection
+ * scan phase. This applies to both two phase and single phase index builds.
+ * @tags: [
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";
 
+load("jstests/libs/logv2_helpers.js");
 load('jstests/noPassthrough/libs/index_build.js');
 
 const rst = new ReplSetTest({
@@ -19,12 +21,19 @@ const nodes = rst.startSet();
 rst.initiate();
 
 const primary = rst.getPrimary();
-const testDB = primary.getDB('test');
-const coll = testDB.getCollection('test');
+const dbName = 'test';
+const collName = 'coll';
+const testDB = primary.getDB(dbName);
+const coll = testDB.getCollection(collName);
 
-assert.commandWorked(coll.insert({a: 1}));
+const doc1 = {
+    _id: 1,
+    a: 1
+};
+assert.commandWorked(coll.insert(doc1));
 
 IndexBuildTest.pauseIndexBuilds(primary);
+IndexBuildTest.pauseIndexBuilds(rst.getSecondary());
 
 const createIdx =
     IndexBuildTest.startIndexBuild(primary, coll.getFullName(), {a: 1}, {unique: true});
@@ -34,23 +43,43 @@ const opId = IndexBuildTest.waitForIndexBuildToScanCollection(testDB, coll.getNa
 
 IndexBuildTest.assertIndexBuildCurrentOpContents(testDB, opId);
 
-try {
-    // Step down the primary.
-    assert.commandWorked(primary.adminCommand({replSetStepDown: 60, force: true}));
-} finally {
-    IndexBuildTest.resumeIndexBuilds(primary);
-}
+// Step down the primary.
+assert.commandWorked(primary.adminCommand({replSetStepDown: 60, force: true}));
+
+// Confirm failover.
+const newPrimary = rst.getPrimary();
+assert.neq(primary.port, newPrimary.port);
+
+// Insert a duplicate and then delete it. The index build should succeed.
+const doc2 = {
+    _id: 2,
+    a: 1
+};
+assert.commandWorked(newPrimary.getDB(dbName).getCollection(collName).insert(doc2));
+let res = assert.commandWorked(newPrimary.getDB(dbName).getCollection(collName).remove(doc2));
+assert.eq(1, res.nRemoved);
 
 // Wait for the index build to stop.
+IndexBuildTest.resumeIndexBuilds(primary);
+IndexBuildTest.resumeIndexBuilds(newPrimary);
 IndexBuildTest.waitForIndexBuildToStop(testDB);
+IndexBuildTest.waitForIndexBuildToStop(newPrimary.getDB(dbName));
 
 const exitCode = createIdx({checkExitSuccess: false});
-assert.neq(0, exitCode, 'expected shell to exit abnormally due to index build being terminated');
+assert.neq(0, exitCode, 'expected shell to exit abnormally due to index build being interrupted');
 
-// Wait for the IndexBuildCoordinator thread, not the command thread, to report the index build
-// as failed.
-checkLog.contains(primary, '[IndexBuildsCoordinatorMongod-0] Index build failed: ');
-IndexBuildTest.assertIndexes(coll, 1, ['_id_']);
+// The index build should have succeeded.
+rst.awaitReplication();
+const primaryColl = rst.getPrimary().getDB(dbName).getCollection(collName);
+res = assert.commandWorked(primaryColl.validate());
+assert(res.valid, 'expected validation to succeed: ' + tojson(res));
+
+const secondaryColl = rst.getSecondary().getDB(dbName).getCollection(collName);
+res = assert.commandWorked(secondaryColl.validate());
+assert(res.valid, 'expected validation to succeed: ' + tojson(res));
+
+IndexBuildTest.assertIndexes(primaryColl, 2, ['_id_', 'a_1']);
+IndexBuildTest.assertIndexes(secondaryColl, 2, ['_id_', 'a_1']);
 
 rst.stopSet();
 })();

@@ -1,7 +1,10 @@
 /**
  * Ensure serverStatus reports the total time spent sampling the oplog for all storage engines that
  * support OplogStones.
- * @tags: [ requires_wiredtiger, requires_persistence, requires_fcv_44 ]
+ * @tags: [
+ *   requires_persistence,
+ *   requires_wiredtiger,
+ * ]
  */
 (function() {
 "use strict";
@@ -49,8 +52,7 @@ assert.commandWorked(replSet.getPrimary().getDB(testDB).serverStatus());
 const maxSamplesPerLog = Math.ceil(kLoggingIntervalSeconds / kOplogSampleReadDelay);
 const minExpectedLogs = Math.floor(kNumOplogSamples / maxSamplesPerLog);
 
-checkLog.containsWithAtLeastCount(
-    replSet.getPrimary(), "Oplog sampling progress:", minExpectedLogs);
+checkLog.containsWithAtLeastCount(replSet.getPrimary(), "Oplog sampling progress", minExpectedLogs);
 assert(checkLog.checkContainsOnce(replSet.getPrimary(), "Oplog sampling complete"));
 
 replSet.stopSet();

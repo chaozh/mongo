@@ -51,6 +51,7 @@ class IndexAccessMethod;
 class IndexDescriptor;
 class MatchExpression;
 class OperationContext;
+class ExpressionContext;
 
 class IndexCatalogEntryImpl : public IndexCatalogEntry {
     IndexCatalogEntryImpl(const IndexCatalogEntryImpl&) = delete;
@@ -58,14 +59,11 @@ class IndexCatalogEntryImpl : public IndexCatalogEntry {
 
 public:
     IndexCatalogEntryImpl(OperationContext* opCtx,
+                          RecordId catalogId,
                           const std::string& ident,
                           std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
                           CollectionQueryInfo* queryInfo,               // not owned, optional
                           bool isFrozen);
-
-    ~IndexCatalogEntryImpl() final;
-
-    const NamespaceString& ns() const final;
 
     void init(std::unique_ptr<IndexAccessMethod> accessMethod) final;
 
@@ -115,6 +113,8 @@ public:
         return _collator.get();
     }
 
+    NamespaceString getNSSFromCatalog(OperationContext* opCtx) const final;
+
     /// ---------------------
 
     void setIsReady(bool newIsReady) final;
@@ -160,7 +160,9 @@ public:
      * namespace, index name, and multikey paths on the OperationContext rather than set the index
      * as multikey here.
      */
-    void setMultikey(OperationContext* opCtx, const MultikeyPaths& multikeyPaths) final;
+    void setMultikey(OperationContext* opCtx,
+                     const Collection* coll,
+                     const MultikeyPaths& multikeyPaths) final;
 
     // if this ready is ready for queries
     bool isReady(OperationContext* opCtx) const final;
@@ -186,7 +188,13 @@ public:
     void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
 private:
-    class SetMultikeyChange;
+    /**
+     * Sets this index to be multikey when we are running inside a multi-document transaction.
+     * Used by setMultikey() only.
+     */
+    Status _setMultikeyInMultiDocumentTransaction(OperationContext* opCtx,
+                                                  const Collection* collection,
+                                                  const MultikeyPaths& multikeyPaths);
 
     bool _catalogIsReady(OperationContext* opCtx) const;
     bool _catalogIsPresent(OperationContext* opCtx) const;
@@ -197,6 +205,13 @@ private:
      * See CollectionCatalogEntry::isIndexMultikey() for more details.
      */
     bool _catalogIsMultikey(OperationContext* opCtx, MultikeyPaths* multikeyPaths) const;
+
+    /**
+     * Sets on-disk multikey flag for this index.
+     */
+    void _catalogSetMultikey(OperationContext* opCtx,
+                             const Collection* collection,
+                             const MultikeyPaths& multikeyPaths);
 
     KVPrefix _catalogGetPrefix(OperationContext* opCtx) const;
 
@@ -214,11 +229,15 @@ private:
 
     std::unique_ptr<CollatorInterface> _collator;
     std::unique_ptr<MatchExpression> _filterExpression;
+    // Special ExpressionContext used to evaluate the partial filter expression.
+    boost::intrusive_ptr<ExpressionContext> _expCtxForFilter;
 
     // cached stuff
 
-    Ordering _ordering;  // TODO: this might be b-tree specific
-    bool _isReady;       // cache of NamespaceDetails info
+    const RecordId _catalogId;  // Location in the durable catalog of the collection entry
+                                // containing this index entry.
+    Ordering _ordering;         // TODO: this might be b-tree specific
+    bool _isReady;              // cache of NamespaceDetails info
     bool _isFrozen;
     AtomicWord<bool> _isDropped;  // Whether the index drop is committed.
 
@@ -227,9 +246,12 @@ private:
     // called.
     bool _indexTracksPathLevelMultikeyInfo = false;
 
-    // Set to true if this index is multikey. '_isMultikey' serves as a cache of the information
-    // stored in the NamespaceDetails or DurableCatalog.
-    AtomicWord<bool> _isMultikey;
+    // Set to true if this index may contain multikey data.
+    AtomicWord<bool> _isMultikeyForRead;
+
+    // Set to true after a transaction commit successfully updates multikey on the catalog data. At
+    // this point, future writers do not need to update the catalog.
+    AtomicWord<bool> _isMultikeyForWrite;
 
     // Controls concurrent access to '_indexMultikeyPaths'. We acquire this mutex rather than the
     // RESOURCE_METADATA lock as a performance optimization so that it is cheaper to detect whether

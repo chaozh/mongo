@@ -32,9 +32,19 @@
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/log_manager.h"
 #include "mongo/logv2/log_tag.h"
+#include "mongo/logv2/log_truncation.h"
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
+
+class UserAssertAfterLog {
+public:
+    UserAssertAfterLog() : errorCode(constants::kUserAssertWithLogID) {}
+    explicit UserAssertAfterLog(ErrorCodes::Error code) : errorCode(code) {}
+
+    int32_t errorCode;
+};
+
+enum class FatalMode { kAssert, kAssertNoTrace, kContinue };
 
 class LogOptions {
 public:
@@ -47,12 +57,37 @@ public:
 
     LogOptions(LogComponent component) : _component(component) {}
 
+    LogOptions(LogComponent component, FatalMode mode) : _component(component), _fatalMode(mode) {}
+
     LogOptions(LogDomain* domain) : _domain(domain) {}
 
     LogOptions(LogTag tags) : _tags(tags) {}
 
+    LogOptions(LogTruncation truncation) : _truncation(truncation) {}
+
+    LogOptions(UserAssertAfterLog uassertAfterLog)
+        : _userAssertErrorCode(uassertAfterLog.errorCode) {}
+
+    LogOptions(FatalMode mode) : _fatalMode(mode) {}
+
+    LogOptions(FatalMode mode, LogTruncation truncation)
+        : _truncation(truncation), _fatalMode(mode) {}
+
+    LogOptions(LogTag tags, LogTruncation truncation) : _tags(tags), _truncation(truncation) {}
+
     LogOptions(LogComponent component, LogDomain* domain, LogTag tags)
         : _domain(domain), _tags(tags), _component(component) {}
+
+    LogOptions(LogComponent component,
+               LogDomain* domain,
+               LogTag tags,
+               LogTruncation truncation,
+               FatalMode fatalMode)
+        : _domain(domain),
+          _tags(tags),
+          _component(component),
+          _truncation(truncation),
+          _fatalMode(fatalMode) {}
 
     LogComponent component() const {
         return _component;
@@ -66,11 +101,25 @@ public:
         return _tags;
     }
 
+    LogTruncation truncation() const {
+        return _truncation;
+    }
+
+    int32_t uassertErrorCode() const {
+        return _userAssertErrorCode;
+    }
+
+    FatalMode fatalMode() const {
+        return _fatalMode;
+    }
+
 private:
     LogDomain* _domain = &LogManager::global().getGlobalDomain();
     LogTag _tags;
     LogComponent _component = LogComponent::kAutomaticDetermination;
+    LogTruncation _truncation = constants::kDefaultTruncation;
+    int32_t _userAssertErrorCode = ErrorCodes::OK;
+    FatalMode _fatalMode = FatalMode::kAssert;
 };
 
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

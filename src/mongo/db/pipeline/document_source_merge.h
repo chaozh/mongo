@@ -31,6 +31,7 @@
 
 #include "mongo/db/pipeline/document_source_merge_gen.h"
 #include "mongo/db/pipeline/document_source_writer.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 
 namespace mongo {
 
@@ -68,21 +69,22 @@ public:
      * collection is unsharded. This ensures that the unique index verification happens once on
      * mongos and can be bypassed on the shards.
      */
-    class LiteParsed final : public LiteParsedDocumentSourceForeignCollection {
+    class LiteParsed final : public LiteParsedDocumentSourceNestedPipelines {
     public:
-        LiteParsed(NamespaceString foreignNss,
+        LiteParsed(std::string parseTimeName,
+                   NamespaceString foreignNss,
                    MergeWhenMatchedModeEnum whenMatched,
-                   MergeWhenNotMatchedModeEnum whenNotMatched)
-            : LiteParsedDocumentSourceForeignCollection(std::move(foreignNss)),
+                   MergeWhenNotMatchedModeEnum whenNotMatched,
+                   boost::optional<LiteParsedPipeline> onMatchedPipeline)
+            : LiteParsedDocumentSourceNestedPipelines(
+                  std::move(parseTimeName), std::move(foreignNss), std::move(onMatchedPipeline)),
               _whenMatched(whenMatched),
               _whenNotMatched(whenNotMatched) {}
-
-        using LiteParsedDocumentSourceForeignCollection::LiteParsedDocumentSourceForeignCollection;
 
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        bool allowedToPassthroughFromMongos() const final {
+        bool allowedToPassthroughFromMongos() const {
             return false;
         }
 
@@ -104,46 +106,15 @@ public:
 
     virtual ~DocumentSourceMerge() = default;
 
-    const char* getSourceName() const final override {
+    const char* getSourceName() const final {
         return kStageName.rawData();
     }
 
-    StageConstraints constraints(Pipeline::SplitState pipeState) const final override {
-        // A $merge to an unsharded collection should merge on the primary shard to perform local
-        // writes. A $merge to a sharded collection has no requirement, since each shard can perform
-        // its own portion of the write. We use 'kAnyShard' to direct it to execute on one of the
-        // shards in case some of the writes happen to end up being local.
-        //
-        // Note that this decision is inherently racy and subject to become stale. This is okay
-        // because either choice will work correctly, we are simply applying a heuristic
-        // optimization.
-        return {StreamType::kStreaming,
-                PositionRequirement::kLast,
-                pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _outputNs)
-                    ? HostTypeRequirement::kAnyShard
-                    : HostTypeRequirement::kPrimaryShard,
-                DiskUseRequirement::kWritesPersistentData,
-                FacetRequirement::kNotAllowed,
-                TransactionRequirement::kNotAllowed,
-                LookupRequirement::kNotAllowed};
-    }
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
-    boost::optional<DistributedPlanLogic> distributedPlanLogic() final override {
-        // It should always be faster to avoid splitting the pipeline if the output collection is
-        // sharded. If we avoid splitting the pipeline then each shard can perform the writes to the
-        // target collection in parallel.
-        //
-        // Note that this decision is inherently racy and subject to become stale. This is okay
-        // because either choice will work correctly, we are simply applying a heuristic
-        // optimization.
-        if (pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _outputNs)) {
-            return boost::none;
-        }
-        return DocumentSourceWriter::distributedPlanLogic();
-    }
+    boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
-    Value serialize(
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final override;
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
     /**
      * Creates a new $merge stage from the given arguments.
@@ -211,21 +182,7 @@ private:
         return bob.obj();
     }
 
-    void spill(BatchedObjects&& batch) override {
-        DocumentSourceWriteBlock writeBlock(pExpCtx->opCtx);
-
-        try {
-            auto targetEpoch = _targetCollectionVersion
-                ? boost::optional<OID>(_targetCollectionVersion->epoch())
-                : boost::none;
-
-            _descriptor.strategy(pExpCtx, _outputNs, _writeConcern, targetEpoch, std::move(batch));
-        } catch (const ExceptionFor<ErrorCodes::ImmutableField>& ex) {
-            uassertStatusOKWithContext(ex.toStatus(),
-                                       "$merge failed to update the matching document, did you "
-                                       "attempt to modify the _id or the shard key?");
-        }
-    }
+    void spill(BatchedObjects&& batch) override;
 
     void waitWhileFailPointEnabled() override;
 

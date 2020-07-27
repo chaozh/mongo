@@ -39,13 +39,15 @@ FTSAccessMethod::FTSAccessMethod(IndexCatalogEntry* btreeState,
     : AbstractIndexAccessMethod(btreeState, std::move(btree)),
       _ftsSpec(btreeState->descriptor()->infoObj()) {}
 
-void FTSAccessMethod::doGetKeys(const BSONObj& obj,
+void FTSAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                const BSONObj& obj,
                                 GetKeysContext context,
                                 KeyStringSet* keys,
                                 KeyStringSet* multikeyMetadataKeys,
                                 MultikeyPaths* multikeyPaths,
                                 boost::optional<RecordId> id) const {
-    ExpressionKeysPrivate::getFTSKeys(obj,
+    ExpressionKeysPrivate::getFTSKeys(pooledBufferBuilder,
+                                      obj,
                                       _ftsSpec,
                                       keys,
                                       getSortedDataInterface()->getKeyStringVersion(),

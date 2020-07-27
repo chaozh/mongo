@@ -39,6 +39,7 @@
 #include <cmath>
 #include <fmt/format.h>
 #include <functional>
+#include <pcrecpp.h>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -48,8 +49,8 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/logger/logstream_builder.h"
 #include "mongo/logger/message_log_domain.h"
+#include "mongo/logv2/log_detail.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest_helpers.h"
 #include "mongo/util/assert_util.h"
@@ -277,6 +278,20 @@
                           haystack);                                               \
         }()))
 
+#define ASSERT_STRING_SEARCH_REGEX(BIG_STRING, REGEX)                                           \
+    if (auto tup_ = std::tuple(std::string(BIG_STRING), std::string(REGEX));                    \
+        ::mongo::unittest::searchRegex(std::get<1>(tup_), std::get<0>(tup_))) {                 \
+    } else                                                                                      \
+        FAIL(([&] {                                                                             \
+            const auto& [haystack, sub] = tup_;                                                 \
+            return format(FMT_STRING("Expected to find regular expression {} /{}/ in {} ({})"), \
+                          #REGEX,                                                               \
+                          sub,                                                                  \
+                          #BIG_STRING,                                                          \
+                          haystack);                                                            \
+        }()))
+
+
 /**
  * Construct a single test, named `TEST_NAME` within the test Suite `SUITE_NAME`.
  *
@@ -330,16 +345,9 @@
 
 namespace mongo::unittest {
 
+bool searchRegex(const std::string& pattern, const std::string& string);
+
 class Result;
-
-void setupTestLogger();
-
-/**
- * Gets a LogstreamBuilder for logging to the unittest log domain, which may have
- * different target from the global log domain.
- */
-logger::LogstreamBuilder log();
-logger::LogstreamBuilder warning();
 
 /**
  * Representation of a collection of tests.
@@ -474,9 +482,7 @@ struct OldStyleSuiteInitializer {
     }
 
     void init(OldStyleSuiteSpecification& suiteSpec) const {
-        log() << "\t about to setupTests" << std::endl;
         suiteSpec.setupTests();
-        log() << "\t done setupTests" << std::endl;
         auto& suite = Suite::getSuite(suiteSpec.name());
         for (auto&& t : suiteSpec.tests()) {
             suite.add(t.name, "", t.fn);
@@ -570,11 +576,27 @@ protected:
      * the last call to startCapturingLogMessages() in this test.
      */
     const std::vector<std::string>& getCapturedTextFormatLogMessages() const;
+    std::vector<BSONObj> getCapturedBSONFormatLogMessages() const;
 
     /**
      * Returns the number of collected log lines containing "needle".
      */
     int64_t countTextFormatLogLinesContaining(const std::string& needle);
+
+    /**
+     * Returns the number of collected log lines where "needle" is a subset of a line.
+     *
+     * Does a Depth-First-Search of a BSON document. Validates each element in "needle" exists in
+     * "haystack". It ignores extra elements in "haystack".
+     *
+     * In example haystack:     { i : 1, a : { b : 1 } },
+     * a valid needles include: { i : 1}  or  {a : { b : 1}}
+     * It will not find { b: 1 } since it does not search recursively for sub-tree matches.
+     *
+     * If a BSON Element is undefined, it simply checks for its existence, not its type or value.
+     * This allows callers to test for the existence of elements in variable length log lines.
+     */
+    int64_t countBSONFormatLogLinesIsSubset(const BSONObj needle);
 
     /**
      * Prints the captured log lines.
@@ -586,10 +608,6 @@ private:
      * The test itself.
      */
     virtual void _doTest() = 0;
-
-
-    class CaptureLogs;
-    std::unique_ptr<CaptureLogs> _captureLogs;
 };
 
 /**

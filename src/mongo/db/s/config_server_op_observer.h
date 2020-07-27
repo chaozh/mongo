@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/op_observer.h"
+#include "mongo/platform/mutex.h"
 
 namespace mongo {
 
@@ -81,7 +82,7 @@ public:
                    OptionalCollectionUUID uuid,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override {}
+                   bool fromMigrate) override;
 
     void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override {}
 
@@ -114,7 +115,7 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {}
+                   boost::optional<IndexCollModInfo> indexInfo) override {}
 
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override {}
 
@@ -155,14 +156,15 @@ public:
 
     void onApplyOps(OperationContext* opCtx,
                     const std::string& dbName,
-                    const BSONObj& applyOpCmd) override {}
+                    const BSONObj& applyOpCmd) override;
 
     void onEmptyCapped(OperationContext* opCtx,
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) override {}
 
-    void onUnpreparedTransactionCommit(
-        OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) override {}
+    void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) override {}
 
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
@@ -172,12 +174,25 @@ public:
 
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) override {}
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) override {}
 
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override {}
 
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) override;
+
+private:
+    void _registerTopologyTimeTickPoint(Timestamp newTopologyTime);
+    void _tickTopologyTimeIfNecessary(ServiceContext* service, Timestamp newCommitPointTime);
+
+    // Guards access to the instance variables below.
+    Mutex _mutex = MONGO_MAKE_LATCH("ConfigServerOpObserver");
+
+    std::vector<Timestamp> _topologyTimeTickPoints;
 };
 
 }  // namespace mongo

@@ -8,7 +8,7 @@ load("jstests/replsets/rslib.js");
 (function() {
 "use strict";
 
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 var name = "rs_auth1";
@@ -72,6 +72,8 @@ assert.eq(result, 1, "login failed");
 print("Initializing replSet with config: " + tojson(rs.getReplSetConfig()));
 result = m.getDB("admin").runCommand({replSetInitiate: rs.getReplSetConfig()});
 assert.eq(result.ok, 1, "couldn't initiate: " + tojson(result));
+rs.awaitNodesAgreeOnPrimaryNoAuth();
+
 m.getDB('admin').logout();  // In case this node doesn't become primary, make sure its not auth'd
 
 var master = rs.getPrimary();
@@ -201,7 +203,9 @@ assert.soon(function() {
         rs.nodes[i].setSlaveOk();
         rs.nodes[i].getDB("admin").auth("foo", "bar");
         config = rs.nodes[i].getDB("local").system.replset.findOne();
-        if (config.version != 2) {
+        // We expect the config version to be 3 due to the initial config and then the
+        // 'newlyAdded' removal reconfig.
+        if (config.version !== 3) {
             return false;
         }
     }

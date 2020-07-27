@@ -1,9 +1,10 @@
 """The unittest.TestCase instances for setting up and tearing down fixtures."""
 
 from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
+from buildscripts.resmokelib.testing.fixtures.external import ExternalFixture
 from buildscripts.resmokelib.testing.testcases import interface
 from buildscripts.resmokelib.utils import registry
-from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
 
 
 class FixtureTestCase(interface.TestCase):  # pylint: disable=abstract-method
@@ -39,6 +40,8 @@ class FixtureSetupTestCase(FixtureTestCase):
             self.fixture.setup()
             self.logger.info("Waiting for %s to be ready.", self.fixture)
             self.fixture.await_ready()
+            if not isinstance(self.fixture, (fixture_interface.NoOpFixture, ExternalFixture)):
+                self.fixture.mongo_client().admin.command({"refreshLogicalSessionCacheNow": 1})
             self.logger.info("Finished the setup of %s.", self.fixture)
             self.return_code = 0
         except errors.ServerFailure as err:

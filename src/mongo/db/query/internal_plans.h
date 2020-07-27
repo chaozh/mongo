@@ -31,6 +31,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/exec/delete.h"
+#include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 
@@ -72,7 +73,7 @@ public:
         OperationContext* opCtx,
         StringData ns,
         Collection* collection,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         const Direction direction = FORWARD);
 
     /**
@@ -82,7 +83,7 @@ public:
         OperationContext* opCtx,
         Collection* collection,
         std::unique_ptr<DeleteStageParams> params,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD);
 
     /**
@@ -95,7 +96,7 @@ public:
         const BSONObj& startKey,
         const BSONObj& endKey,
         BoundInclusion boundInclusion,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD,
         int options = IXSCAN_DEFAULT);
 
@@ -110,7 +111,7 @@ public:
         const BSONObj& startKey,
         const BSONObj& endKey,
         BoundInclusion boundInclusion,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         Direction direction = FORWARD);
 
     /**
@@ -122,7 +123,7 @@ public:
         const UpdateStageParams& params,
         const IndexDescriptor* descriptor,
         const BSONObj& key,
-        PlanExecutor::YieldPolicy yieldPolicy);
+        PlanYieldPolicy::YieldPolicy yieldPolicy);
 
 private:
     /**
@@ -130,25 +131,27 @@ private:
      *
      * Used as a helper for collectionScan() and deleteWithCollectionScan().
      */
-    static std::unique_ptr<PlanStage> _collectionScan(OperationContext* opCtx,
-                                                      WorkingSet* ws,
-                                                      const Collection* collection,
-                                                      Direction direction);
+    static std::unique_ptr<PlanStage> _collectionScan(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        WorkingSet* ws,
+        const Collection* collection,
+        Direction direction);
 
     /**
      * Returns a plan stage that is either an index scan or an index scan with a fetch stage.
      *
      * Used as a helper for indexScan() and deleteWithIndexScan().
      */
-    static std::unique_ptr<PlanStage> _indexScan(OperationContext* opCtx,
-                                                 WorkingSet* ws,
-                                                 const Collection* collection,
-                                                 const IndexDescriptor* descriptor,
-                                                 const BSONObj& startKey,
-                                                 const BSONObj& endKey,
-                                                 BoundInclusion boundInclusion,
-                                                 Direction direction = FORWARD,
-                                                 int options = IXSCAN_DEFAULT);
+    static std::unique_ptr<PlanStage> _indexScan(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        WorkingSet* ws,
+        const Collection* collection,
+        const IndexDescriptor* descriptor,
+        const BSONObj& startKey,
+        const BSONObj& endKey,
+        BoundInclusion boundInclusion,
+        Direction direction = FORWARD,
+        int options = IXSCAN_DEFAULT);
 };
 
 }  // namespace mongo

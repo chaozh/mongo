@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +38,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/unique_message.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -45,7 +46,6 @@
 #include "mongo/s/catalog/type_shard_database.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace shardmetadatautil {
@@ -425,7 +425,13 @@ Status dropChunksAndDeleteCollectionsEntry(OperationContext* opCtx, const Namesp
             }
         }
 
-        LOG(1) << "Successfully cleared persisted chunk metadata for collection '" << nss << "'.";
+        LOGV2_DEBUG(
+            22090,
+            1,
+            "Successfully cleared persisted chunk metadata and collection entry for collection "
+            "{namespace}",
+            "Successfully cleared persisted chunk metadata and collection entry",
+            "namespace"_attr = nss);
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();
@@ -444,7 +450,10 @@ void dropChunks(OperationContext* opCtx, const NamespaceString& nss) {
         }
     }
 
-    LOG(1) << "Successfully cleared persisted chunk metadata for collection '" << nss << "'.";
+    LOGV2_DEBUG(22091,
+                1,
+                "Successfully cleared persisted chunk metadata for collection",
+                "namespace"_attr = nss);
 }
 
 Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
@@ -464,7 +473,11 @@ Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
         uassertStatusOK(
             getStatusFromWriteCommandResponse(deleteCommandResponse->getCommandReply()));
 
-        LOG(1) << "Successfully cleared persisted metadata for db '" << dbName.toString() << "'.";
+        LOGV2_DEBUG(22092,
+                    1,
+                    "Successfully cleared persisted metadata for db {db}",
+                    "Successfully cleared persisted metadata for db",
+                    "db"_attr = dbName);
         return Status::OK();
     } catch (const DBException& ex) {
         return ex.toStatus();

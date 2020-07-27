@@ -49,13 +49,15 @@ HashAccessMethod::HashAccessMethod(IndexCatalogEntry* btreeState,
     _collator = btreeState->getCollator();
 }
 
-void HashAccessMethod::doGetKeys(const BSONObj& obj,
+void HashAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                 const BSONObj& obj,
                                  GetKeysContext context,
                                  KeyStringSet* keys,
                                  KeyStringSet* multikeyMetadataKeys,
                                  MultikeyPaths* multikeyPaths,
                                  boost::optional<RecordId> id) const {
-    ExpressionKeysPrivate::getHashKeys(obj,
+    ExpressionKeysPrivate::getHashKeys(pooledBufferBuilder,
+                                       obj,
                                        _keyPattern,
                                        _seed,
                                        _hashVersion,

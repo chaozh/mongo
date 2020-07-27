@@ -15,21 +15,12 @@
  *                 *when the the collection has been dropped and recreated as empty.*
  * - behavior: Must be "unshardedOnly", or "versioned". Determines what system profiler checks are
  * performed.
- *
- * Tagged as 'requires_fcv_44', since this test cannot run against versions less then 4.4. This is
- * because 'planCacheListPlans' and 'planCacheListQueryShapes' were deleted in 4.4, and thus not
- * tested here. But this test asserts that all commands are covered, so will fail against a version
- * of the server which implements these commands.
- *
- * @tags: [
- *   requires_fcv_44,
- * ]
  */
 (function() {
 "use strict";
 
 load('jstests/libs/profiler.js');
-load('jstests/sharding/libs/last_stable_mongos_commands.js');
+load('jstests/sharding/libs/last_lts_mongos_commands.js');
 
 let db = "test";
 let coll = "foo";
@@ -62,6 +53,7 @@ let testCases = {
     _configsvrMoveChunk: {skip: "primary only"},
     _configsvrMovePrimary: {skip: "primary only"},
     _configsvrRemoveShardFromZone: {skip: "primary only"},
+    _configsvrReshardCollection: {skip: "primary only"},
     _configsvrShardCollection: {skip: "primary only"},
     _configsvrUpdateZoneKeyRange: {skip: "primary only"},
     _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
@@ -275,14 +267,16 @@ let testCases = {
     replSetUpdatePosition: {skip: "does not return user data"},
     replSetResizeOplog: {skip: "does not return user data"},
     resetError: {skip: "does not return user data"},
-    restartCatalog: {skip: "internal-only command"},
+    reshardCollection: {skip: "primary only"},
     resync: {skip: "primary only"},
     revokePrivilegesFromRole: {skip: "primary only"},
     revokeRolesFromRole: {skip: "primary only"},
     revokeRolesFromUser: {skip: "primary only"},
     rolesInfo: {skip: "primary only"},
+    rotateCertificates: {skip: "does not return user data"},
     saslContinue: {skip: "primary only"},
     saslStart: {skip: "primary only"},
+    sbe: {skip: "internal command"},
     serverStatus: {skip: "does not return user data"},
     setCommittedSnapshot: {skip: "does not return user data"},
     setDefaultRWConcern: {skip: "primary only"},
@@ -316,8 +310,8 @@ let testCases = {
     whatsmyuri: {skip: "does not return user data"}
 };
 
-commandsRemovedFromMongosIn44.forEach(function(cmd) {
-    testCases[cmd] = {skip: "must define test coverage for 4.2 backwards compatibility"};
+commandsRemovedFromMongosSinceLastLTS.forEach(function(cmd) {
+    testCases[cmd] = {skip: "must define test coverage for 4.4 backwards compatibility"};
 });
 
 let scenarios = {
@@ -502,8 +496,8 @@ let scenarios = {
     }
 };
 
-// Set the secondaries to priority 0 and votes 0 to prevent the primaries from stepping down.
-let rsOpts = {nodes: [{rsConfig: {votes: 1}}, {rsConfig: {priority: 0, votes: 0}}]};
+// Set the secondaries to priority 0 to prevent the primaries from stepping down.
+let rsOpts = {nodes: [{}, {rsConfig: {priority: 0}}]};
 let st = new ShardingTest({mongos: 2, shards: {rs0: rsOpts, rs1: rsOpts}});
 
 let freshMongos = st.s0;

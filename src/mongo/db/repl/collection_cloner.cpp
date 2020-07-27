@@ -27,19 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationInitialSync
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/string_data.h"
 #include "mongo/db/commands/list_collections_filter.h"
+#include "mongo/db/index_build_entry_helpers.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/repl/collection_bulk_loader.h"
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -68,6 +70,10 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
       _listIndexesStage("listIndexes", this, &CollectionCloner::listIndexesStage),
       _createCollectionStage("createCollection", this, &CollectionCloner::createCollectionStage),
       _queryStage("query", this, &CollectionCloner::queryStage),
+      _setupIndexBuildersForUnfinishedIndexesStage(
+          "setupIndexBuildersForUnfinishedIndexes",
+          this,
+          &CollectionCloner::setupIndexBuildersForUnfinishedIndexesStage),
       _progressMeter(1U,  // total will be replaced with count command result.
                      kProgressMeterSecondsBetween,
                      kProgressMeterCheckInterval,
@@ -94,11 +100,15 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
     _stats.ns = _sourceNss.ns();
 
     // Find out whether the sync source supports resumable queries.
-    _resumeSupported = (getClient()->getMaxWireVersion() == WireVersion::PLACEHOLDER_FOR_44);
+    _resumeSupported = (getClient()->getMaxWireVersion() >= WireVersion::RESUMABLE_INITIAL_SYNC);
 }
 
 BaseCloner::ClonerStages CollectionCloner::getStages() {
-    return {&_countStage, &_listIndexesStage, &_createCollectionStage, &_queryStage};
+    return {&_countStage,
+            &_listIndexesStage,
+            &_createCollectionStage,
+            &_queryStage,
+            &_setupIndexBuildersForUnfinishedIndexesStage};
 }
 
 
@@ -117,9 +127,12 @@ BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
     try {
         return ClonerStage<CollectionCloner>::run();
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-        log() << "CollectionCloner ns: '" << getCloner()->getSourceNss() << "' uuid: UUID(\""
-              << getCloner()->getSourceUuid()
-              << "\") stopped because collection was dropped on source.";
+        LOGV2(21132,
+              "CollectionCloner ns: '{namespace}' uuid: "
+              "UUID(\"{uuid}\") stopped because collection was dropped on source.",
+              "CollectionCloner stopped because collection was dropped on source",
+              "namespace"_attr = getCloner()->getSourceNss(),
+              "uuid"_attr = getCloner()->getSourceUuid());
         getCloner()->waitForDatabaseWorkToComplete();
         return kSkipRemainingStages;
     } catch (const DBException&) {
@@ -129,14 +142,20 @@ BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::countStage() {
-    auto count = getClient()->count(_sourceDbAndUuid, {} /* Query */, QueryOption_SlaveOk);
+    auto count = getClient()->count(_sourceDbAndUuid,
+                                    {} /* Query */,
+                                    QueryOption_SlaveOk,
+                                    0 /* limit */,
+                                    0 /* skip */,
+                                    ReadConcernArgs::kImplicitDefault);
 
     // The count command may return a negative value after an unclean shutdown,
     // so we set it to zero here to avoid aborting the collection clone.
     // Note that this count value is only used for reporting purposes.
     if (count < 0) {
-        warning() << "Count command returned negative value. Updating to 0 to allow progress "
-                     "meter to function properly. ";
+        LOGV2_WARNING(21142,
+                      "Count command returned negative value. Updating to 0 to allow progress "
+                      "meter to function properly");
         count = 0;
     }
 
@@ -149,42 +168,53 @@ BaseCloner::AfterStageBehavior CollectionCloner::countStage() {
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::listIndexesStage() {
-    auto indexSpecs = getClient()->getIndexSpecs(_sourceDbAndUuid, QueryOption_SlaveOk);
+    const bool includeBuildUUIDs = true;
+    auto indexSpecs =
+        getClient()->getIndexSpecs(_sourceDbAndUuid, includeBuildUUIDs, QueryOption_SlaveOk);
     if (indexSpecs.empty()) {
-        warning() << "No indexes found for collection " << _sourceNss.ns() << " while cloning from "
-                  << getSource();
+        LOGV2_WARNING(21143,
+                      "No indexes found for collection {namespace} while cloning from {source}",
+                      "No indexes found for collection while cloning",
+                      "namespace"_attr = _sourceNss.ns(),
+                      "source"_attr = getSource());
     }
+
+    // Parse the index specs into their respective state, ready or unfinished.
     for (auto&& spec : indexSpecs) {
-        if (spec["name"].str() == "_id_"_sd) {
+        if (spec.hasField("buildUUID")) {
+            _unfinishedIndexSpecs.push_back(spec.getOwned());
+        } else if (spec.hasField("name") && spec.getStringField("name") == "_id_"_sd) {
             _idIndexSpec = spec.getOwned();
         } else {
-            _indexSpecs.push_back(spec.getOwned());
+            _readyIndexSpecs.push_back(spec.getOwned());
         }
     }
+
     {
         stdx::lock_guard<Latch> lk(_mutex);
-        _stats.indexes = _indexSpecs.size() + (_idIndexSpec.isEmpty() ? 0 : 1);
+        _stats.indexes = _readyIndexSpecs.size() + _unfinishedIndexSpecs.size() +
+            (_idIndexSpec.isEmpty() ? 0 : 1);
     };
 
     if (!_idIndexSpec.isEmpty() && _collectionOptions.autoIndexId == CollectionOptions::NO) {
-        warning()
-            << "Found the _id_ index spec but the collection specified autoIndexId of false on ns:"
-            << this->_sourceNss;
+        LOGV2_WARNING(21144,
+                      "Found the _id_ index spec but the collection specified autoIndexId of false "
+                      "on ns:{namespace}",
+                      "Found the _id index spec but the collection specified autoIndexId of false",
+                      "namespace"_attr = this->_sourceNss);
     }
     return kContinueNormally;
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::createCollectionStage() {
     auto collectionBulkLoader = getStorageInterface()->createCollectionForBulkLoading(
-        _sourceNss, _collectionOptions, _idIndexSpec, _indexSpecs);
+        _sourceNss, _collectionOptions, _idIndexSpec, _readyIndexSpecs);
     uassertStatusOK(collectionBulkLoader.getStatus());
     _collLoader = std::move(collectionBulkLoader.getValue());
     return kContinueNormally;
 }
 
 BaseCloner::AfterStageBehavior CollectionCloner::queryStage() {
-    // Attempt to clean up cursor from the last retry (if applicable).
-    killOldQueryCursor();
     runQuery();
     waitForDatabaseWorkToComplete();
     // We want to free the _collLoader regardless of whether the commit succeeds.
@@ -193,21 +223,76 @@ BaseCloner::AfterStageBehavior CollectionCloner::queryStage() {
     return kContinueNormally;
 }
 
+BaseCloner::AfterStageBehavior CollectionCloner::setupIndexBuildersForUnfinishedIndexesStage() {
+    if (_unfinishedIndexSpecs.empty()) {
+        return kContinueNormally;
+    }
+
+    // Need to group the index specs by 'buildUUID' and start all the index specs with the same
+    // 'buildUUID' on the same index builder thread.
+    stdx::unordered_map<UUID, std::vector<BSONObj>, UUID::Hash> groupedIndexSpecs;
+    for (const auto& unfinishedSpec : _unfinishedIndexSpecs) {
+        UUID buildUUID = uassertStatusOK(UUID::parse(unfinishedSpec["buildUUID"]));
+        groupedIndexSpecs[buildUUID].push_back(unfinishedSpec["spec"].Obj());
+    }
+
+    auto opCtx = cc().makeOperationContext();
+
+    for (const auto& groupedIndexSpec : groupedIndexSpecs) {
+        std::vector<std::string> indexNames;
+        std::vector<BSONObj> indexSpecs;
+        for (const auto& indexSpec : groupedIndexSpec.second) {
+            std::string indexName = indexSpec.getStringField(IndexDescriptor::kIndexNameFieldName);
+            indexNames.push_back(indexName);
+            indexSpecs.push_back(indexSpec.getOwned());
+        }
+
+        UnreplicatedWritesBlock uwb(opCtx.get());
+
+        // This spawns a new thread and returns immediately once the index build has been
+        // registered with the IndexBuildsCoordinator.
+        try {
+            IndexBuildsCoordinator::get(opCtx.get())
+                ->applyStartIndexBuild(opCtx.get(),
+                                       IndexBuildsCoordinator::ApplicationMode::kInitialSync,
+                                       {getSourceUuid(),
+                                        repl::OplogEntry::CommandType::kStartIndexBuild,
+                                        "createIndexes",
+                                        groupedIndexSpec.first,
+                                        std::move(indexNames),
+                                        std::move(indexSpecs),
+                                        boost::none});
+        } catch (const ExceptionFor<ErrorCodes::IndexAlreadyExists>&) {
+            // Suppress the IndexAlreadyExists error code.
+            // It's possible for the DBDirectClient to return duplicate index specs with different
+            // buildUUIDs from the sync source due to getMore() making multiple network calls.
+            // In these cases, we can ignore this error as the oplog replay phase will correctly
+            // abort and start the appropriate indexes.
+            // Example:
+            // - listIndexes on the sync source sees x_1 (ready: false) with buildUUID ‘x’.
+            // - Sync source aborts the index build with buildUUID ‘x’.
+            // - Sync source starts x_1 (ready: false) with buildUUID ‘y’.
+            // - getMore on listIndexes sees x_1 with buildUUID 'y'.
+        }
+    }
+
+    return kContinueNormally;
+}
+
 void CollectionCloner::runQuery() {
     // Non-resumable query.
-    Query query = QUERY("query" << BSONObj() << "$readOnce" << true);
+    Query query;
 
     if (_resumeSupported) {
         if (_resumeToken) {
             // Resume the query from where we left off.
-            LOG(1) << "Collection cloner will resume the last successful query";
-            query = QUERY("query" << BSONObj() << "$readOnce" << true << "$_requestResumeToken"
-                                  << true << "$_resumeAfter" << _resumeToken.get());
+            LOGV2_DEBUG(21133, 1, "Collection cloner will resume the last successful query");
+            query = QUERY("query" << BSONObj() << "$_requestResumeToken" << true << "$_resumeAfter"
+                                  << _resumeToken.get());
         } else {
             // New attempt at a resumable query.
-            LOG(1) << "Collection cloner will run a new query";
-            query = QUERY("query" << BSONObj() << "$readOnce" << true << "$_requestResumeToken"
-                                  << true);
+            LOGV2_DEBUG(21134, 1, "Collection cloner will run a new query");
+            query = QUERY("query" << BSONObj() << "$_requestResumeToken" << true);
         }
         query.hint(BSON("$natural" << 1));
     }
@@ -224,7 +309,8 @@ void CollectionCloner::runQuery() {
                            nullptr /* fieldsToReturn */,
                            QueryOption_NoCursorTimeout | QueryOption_SlaveOk |
                                (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
-                           _collectionClonerBatchSize);
+                           _collectionClonerBatchSize,
+                           ReadConcernArgs::kImplicitDefault);
     } catch (...) {
         auto status = exceptionToStatus();
 
@@ -247,7 +333,10 @@ void CollectionCloner::runQuery() {
             // Collection has changed upstream. This will trigger the code block above next round,
             // (unless we find out the collection was dropped via getting a NamespaceNotFound).
             if (_queryStage.isCursorError(status)) {
-                log() << "Lost cursor during non-resumable query: " << status;
+                LOGV2(21135,
+                      "Lost cursor during non-resumable query: {error}",
+                      "Lost cursor during non-resumable query",
+                      "error"_attr = status);
                 _lostNonResumableCursor = true;
                 throw;
             }
@@ -265,11 +354,12 @@ void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
     {
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
         if (!getSharedData()->getInitialSyncStatus(lk).isOK()) {
-            std::string message = str::stream()
-                << "Collection cloning cancelled due to initial sync failure: "
-                << getSharedData()->getInitialSyncStatus(lk).toString();
-            log() << message;
-            uasserted(ErrorCodes::CallbackCanceled, message);
+            static constexpr char message[] =
+                "Collection cloning cancelled due to initial sync failure";
+            LOGV2(21136, message, "error"_attr = getSharedData()->getInitialSyncStatus(lk));
+            uasserted(ErrorCodes::CallbackCanceled,
+                      str::stream()
+                          << message << ": " << getSharedData()->getInitialSyncStatus(lk));
         }
     }
 
@@ -316,9 +406,12 @@ void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
             while (MONGO_unlikely(
                        initialSyncHangCollectionClonerAfterHandlingBatchResponse.shouldFail()) &&
                    !mustExit()) {
-                log() << "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
-                         "enabled for "
-                      << _sourceNss.toString() << ". Blocking until fail point is disabled.";
+                LOGV2(21137,
+                      "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
+                      "enabled for {namespace}. Blocking until fail point is disabled.",
+                      "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
+                      "enabled. Blocking until fail point is disabled",
+                      "namespace"_attr = _sourceNss.toString());
                 mongo::sleepsecs(1);
             }
         },
@@ -336,8 +429,10 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
         stdx::lock_guard<Latch> lk(_mutex);
         std::vector<BSONObj> docs;
         if (_documentsToInsert.size() == 0) {
-            warning() << "insertDocumentsCallback, but no documents to insert for ns:"
-                      << _sourceNss;
+            LOGV2_WARNING(21145,
+                          "insertDocumentsCallback, but no documents to insert for ns:{namespace}",
+                          "insertDocumentsCallback, but no documents to insert",
+                          "namespace"_attr = _sourceNss);
             return;
         }
         _documentsToInsert.swap(docs);
@@ -353,8 +448,9 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
 
     initialSyncHangDuringCollectionClone.executeIf(
         [&](const BSONObj&) {
-            log() << "initial sync - initialSyncHangDuringCollectionClone fail point "
-                     "enabled. Blocking until fail point is disabled.";
+            LOGV2(21138,
+                  "initial sync - initialSyncHangDuringCollectionClone fail point "
+                  "enabled. Blocking until fail point is disabled");
             while (MONGO_unlikely(initialSyncHangDuringCollectionClone.shouldFail()) &&
                    !mustExit()) {
                 mongo::sleepsecs(1);
@@ -375,36 +471,13 @@ void CollectionCloner::waitForDatabaseWorkToComplete() {
     _dbWorkTaskRunner.join();
 }
 
-void CollectionCloner::killOldQueryCursor() {
-    // No cursor stored. Do nothing.
-    if (_remoteCursorId == -1) {
-        return;
-    }
-
-    BSONObj infoObj;
-    auto nss = _sourceNss;
-    auto id = _remoteCursorId;
-
-    auto cmdObj = BSON("killCursors" << nss.coll() << "cursors" << BSON_ARRAY(id));
-    LOG(1) << "Attempting to kill old remote cursor with id: " << id;
-    try {
-        getClient()->runCommand(nss.db().toString(), cmdObj, infoObj);
-    } catch (...) {
-        log() << "Error while trying to kill remote cursor after transient query error";
-    }
-
-    // Clear the stored cursorId on success.
-    _remoteCursorId = -1;
-}
-
-void CollectionCloner::forgetOldQueryCursor() {
-    _remoteCursorId = -1;
-}
-
 // Throws.
 void CollectionCloner::abortNonResumableClone(const Status& status) {
     invariant(!_resumeSupported);
-    log() << "Error during non-resumable clone: " << status;
+    LOGV2(21141,
+          "Error during non-resumable clone: {error}",
+          "Error during non-resumable clone",
+          "error"_attr = status);
     std::string message = str::stream()
         << "Collection clone failed and is not resumable. nss: " << _sourceNss;
     uasserted(ErrorCodes::InitialSyncFailure, message);

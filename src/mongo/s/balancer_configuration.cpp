@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -43,9 +43,9 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -242,8 +242,11 @@ Status BalancerConfiguration::_refreshChunkSizeSettings(OperationContext* opCtx)
     }
 
     if (settings.getMaxChunkSizeBytes() != getMaxChunkSizeBytes()) {
-        log() << "MaxChunkSize changing from " << getMaxChunkSizeBytes() / (1024 * 1024) << "MB"
-              << " to " << settings.getMaxChunkSizeBytes() / (1024 * 1024) << "MB";
+        LOGV2(22640,
+              "Changing MaxChunkSize setting to {newMaxChunkSizeMB}MB from {oldMaxChunkSizeMB}MB",
+              "Changing MaxChunkSize setting",
+              "newMaxChunkSizeMB"_attr = settings.getMaxChunkSizeBytes() / (1024 * 1024),
+              "oldMaxChunkSizeMB"_attr = getMaxChunkSizeBytes() / (1024 * 1024));
 
         _maxChunkSizeBytes.store(settings.getMaxChunkSizeBytes());
     }
@@ -268,8 +271,11 @@ Status BalancerConfiguration::_refreshAutoSplitSettings(OperationContext* opCtx)
     }
 
     if (settings.getShouldAutoSplit() != getShouldAutoSplit()) {
-        log() << "ShouldAutoSplit changing from " << getShouldAutoSplit() << " to "
-              << settings.getShouldAutoSplit();
+        LOGV2(22641,
+              "Changing ShouldAutoSplit setting to {newShouldAutoSplit} from {oldShouldAutoSplit}",
+              "Changing ShouldAutoSplit setting",
+              "newShouldAutoSplit"_attr = settings.getShouldAutoSplit(),
+              "oldShouldAutoSplit"_attr = getShouldAutoSplit());
 
         _shouldAutoSplit.store(settings.getShouldAutoSplit());
     }
@@ -391,9 +397,17 @@ bool BalancerSettingsType::isTimeInBalancingWindow(const boost::posix_time::ptim
         return true;
     }
 
-    LOG(1).stream() << "inBalancingWindow: "
-                    << " now: " << now << " startTime: " << *_activeWindowStart
-                    << " stopTime: " << *_activeWindowStop;
+    auto timeToString = [](const boost::posix_time::ptime& time) {
+        std::ostringstream ss;
+        ss << time;
+        return ss.str();
+    };
+    LOGV2_DEBUG(24094,
+                1,
+                "inBalancingWindow",
+                "now"_attr = timeToString(now),
+                "activeWindowStart"_attr = timeToString(*_activeWindowStart),
+                "activeWindowStop"_attr = timeToString(*_activeWindowStop));
 
     if (*_activeWindowStop > *_activeWindowStart) {
         if ((now >= *_activeWindowStart) && (now <= *_activeWindowStop)) {

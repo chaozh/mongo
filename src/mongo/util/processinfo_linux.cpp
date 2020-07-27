@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -53,9 +53,10 @@
 #include <boost/filesystem.hpp>
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
+#include <pcrecpp.h>
 
+#include "mongo/logv2/log.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 
 #define KLONG long
 #define KLF "l"
@@ -244,6 +245,75 @@ public:
     // The current EIP (instruction pointer).
 };
 
+namespace {
+
+// As described in the /proc/[pid]/mountinfo section of `man 5 proc`:
+//
+// 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+// |  |  |    |     |     |          |          |      |     |
+// (1)(2)(3:4)(5)   (6)   (7)        (8)        (9)   (10)   (11)
+struct MountRecord {
+    bool parseLine(const std::string& line) {
+        static const pcrecpp::RE kRe{
+            //   (1)   (2)   (3)   (4)   (5)   (6)   (7)   (8)                (9)   (10)  (11)
+            R"re((\d+) (\d+) (\d+):(\d+) (\S+) (\S+) (\S+) ((?:\S+:\S+ ?)*) - (\S+) (\S+) (\S+))re"};
+        return kRe.FullMatch(line,
+                             &mountId,
+                             &parentId,
+                             &major,
+                             &minor,
+                             &root,
+                             &mountPoint,
+                             &options,
+                             &fields,
+                             &type,
+                             &source,
+                             &superOpt);
+    }
+
+    void appendBSON(BSONObjBuilder& bob) const {
+        bob.append("mountId", mountId)
+            .append("parentId", parentId)
+            .append("major", major)
+            .append("minor", minor)
+            .append("root", root)
+            .append("mountPoint", mountPoint)
+            .append("options", options)
+            .append("fields", fields)
+            .append("type", type)
+            .append("source", source)
+            .append("superOpt", superOpt);
+    }
+
+    int mountId;             //  (1) unique ID for the mount
+    int parentId;            //  (2) the ID of the parent mount (self for the root mount)
+    int major;               //  (3) major block device number (see stat(2))
+    int minor;               //  (4) minor block device number
+    std::string root;        //  (5) path in filesystem forming the root
+    std::string mountPoint;  //  (6) the mount point relative to the process's root
+    std::string options;     //  (7) per-mount options (see mount(2)).
+    std::string fields;      //  (8) zero or more: "tag[:value]" fields
+    std::string type;        //  (9) filesystem type: "type[.subtype]"
+    std::string source;      //  (10) fs-specific information or "none"
+    std::string superOpt;    //  (11) per-superblock options (see mount(2))
+};
+
+void appendMountInfo(BSONObjBuilder& bob) {
+    std::ifstream ifs("/proc/self/mountinfo");
+    if (!ifs)
+        return;
+    BSONArrayBuilder arr = bob.subarrayStart("mountInfo");
+    std::string line;
+    MountRecord rec;
+    while (ifs && getline(ifs, line)) {
+        if (rec.parseLine(line)) {
+            auto bob = BSONObjBuilder(arr.subobjStart());
+            rec.appendBSON(bob);
+        }
+    }
+}
+
+}  // namespace
 
 class LinuxSysHelper {
 public:
@@ -407,7 +477,7 @@ public:
             if (mongo::NumberParser{}(meminfo, &systemMem).isOK()) {
                 return systemMem * 1024;  // convert from kB to bytes
             } else
-                log() << "Unable to collect system memory information";
+                LOGV2(23338, "Unable to collect system memory information");
         }
         return 0;
     }
@@ -521,7 +591,9 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     LinuxSysHelper::getLinuxDistro(distroName, distroVersion);
 
     if (uname(&unameData) == -1) {
-        log() << "Unable to collect detailed system information: " << strerror(errno);
+        LOGV2(23339,
+              "Unable to collect detailed system information: {strerror_errno}",
+              "strerror_errno"_attr = strerror(errno));
     }
 
     osType = "Linux";
@@ -559,6 +631,8 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     bExtra.append("numPages", static_cast<int>(sysconf(_SC_PHYS_PAGES)));
     bExtra.append("maxOpenFiles", static_cast<int>(sysconf(_SC_OPEN_MAX)));
 
+    appendMountInfo(bExtra);
+
     _extraStats = bExtra.obj();
 }
 
@@ -573,8 +647,11 @@ bool ProcessInfo::checkNumaEnabled() {
         hasMultipleNodes = boost::filesystem::exists("/sys/devices/system/node/node1");
         hasNumaMaps = boost::filesystem::exists("/proc/self/numa_maps");
     } catch (boost::filesystem::filesystem_error& e) {
-        log() << "WARNING: Cannot detect if NUMA interleaving is enabled. "
-              << "Failed to probe \"" << e.path1().string() << "\": " << e.code().message();
+        LOGV2(23340,
+              "WARNING: Cannot detect if NUMA interleaving is enabled. Failed to probe "
+              "\"{e_path1_string}\": {e_code_message}",
+              "e_path1_string"_attr = e.path1().string(),
+              "e_code_message"_attr = e.code().message());
         return false;
     }
 
@@ -600,7 +677,9 @@ bool ProcessInfo::blockCheckSupported() {
 bool ProcessInfo::blockInMemory(const void* start) {
     unsigned char x = 0;
     if (mincore(const_cast<void*>(alignToStartOfPage(start)), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription();
+        LOGV2(23341,
+              "mincore failed: {errnoWithDescription}",
+              "errnoWithDescription"_attr = errnoWithDescription());
         return 1;
     }
     return x & 0x1;
@@ -611,7 +690,9 @@ bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<
     if (mincore(const_cast<void*>(alignToStartOfPage(start)),
                 numPages * getPageSize(),
                 reinterpret_cast<unsigned char*>(&out->front()))) {
-        log() << "mincore failed: " << errnoWithDescription();
+        LOGV2(23342,
+              "mincore failed: {errnoWithDescription}",
+              "errnoWithDescription"_attr = errnoWithDescription());
         return false;
     }
     for (size_t i = 0; i < numPages; ++i) {

@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
@@ -36,7 +34,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
-#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
 

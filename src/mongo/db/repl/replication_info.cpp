@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -49,24 +49,28 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_auth.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/speculative_auth.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/transport/ismaster_metrics.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
 
 namespace mongo {
 
+// Hangs in the beginning of each isMaster command when set.
 MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
+// Awaitable isMaster requests with the proper topologyVersions will sleep for maxAwaitTimeMS on
+// standalones. This failpoint will hang right before doing this sleep when set.
+MONGO_FAIL_POINT_DEFINE(hangWaitingForIsMasterResponseOnStandalone);
 
 using std::list;
 using std::string;
@@ -81,7 +85,7 @@ namespace {
  */
 TopologyVersion appendReplicationInfo(OperationContext* opCtx,
                                       BSONObjBuilder& result,
-                                      int level,
+                                      bool appendReplicationProcess,
                                       boost::optional<TopologyVersion> clientTopologyVersion,
                                       boost::optional<long long> maxAwaitTimeMS) {
     TopologyVersion topologyVersion;
@@ -97,7 +101,7 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
         auto isMasterResponse =
             replCoord->awaitIsMasterResponse(opCtx, horizonParams, clientTopologyVersion, deadline);
         result.appendElements(isMasterResponse->toBSON());
-        if (level) {
+        if (appendReplicationProcess) {
             replCoord->appendSlaveInfoData(&result);
         }
         invariant(isMasterResponse->getTopologyVersion());
@@ -118,75 +122,21 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
         // The topologyVersion never changes on a running standalone process, so just sleep for
         // maxAwaitTimeMS.
         invariant(maxAwaitTimeMS);
+
+        IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
+        ON_BLOCK_EXIT([&] { IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges(); });
+        if (MONGO_unlikely(hangWaitingForIsMasterResponseOnStandalone.shouldFail())) {
+            // Used in tests that wait for this failpoint to be entered to guarantee that the
+            // request is waiting and metrics have been updated.
+            LOGV2(31462, "Hanging due to hangWaitingForIsMasterResponseOnStandalone failpoint.");
+            hangWaitingForIsMasterResponseOnStandalone.pauseWhileSet(opCtx);
+        }
         opCtx->sleepFor(Milliseconds(*maxAwaitTimeMS));
     }
 
     result.appendBool("ismaster",
                       ReplicationCoordinator::get(opCtx)->isMasterForReportingPurposes());
 
-    if (level) {
-        BSONObjBuilder sources(result.subarrayStart("sources"));
-
-        DecimalCounter<unsigned> n;
-        list<BSONObj> src;
-        {
-            const NamespaceString localSources{"local.sources"};
-            AutoGetCollectionForReadCommand ctx(opCtx, localSources);
-            auto exec = InternalPlanner::collectionScan(
-                opCtx, localSources.ns(), ctx.getCollection(), PlanExecutor::NO_YIELD);
-            BSONObj obj;
-            PlanExecutor::ExecState state;
-            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
-                src.push_back(obj.getOwned());
-            }
-
-            // Non-yielding collection scans from InternalPlanner will never error.
-            invariant(PlanExecutor::IS_EOF == state);
-        }
-
-        for (list<BSONObj>::const_iterator i = src.begin(); i != src.end(); i++) {
-            BSONObj s = *i;
-            BSONObjBuilder bb;
-            bb.append(s["host"]);
-            string sourcename = s["source"].valuestr();
-            if (sourcename != "main")
-                bb.append(s["source"]);
-            {
-                BSONElement e = s["syncedTo"];
-                BSONObjBuilder t(bb.subobjStart("syncedTo"));
-                t.appendDate("time", e.timestampTime());
-                t.append("inc", static_cast<int>(e.timestampInc()));
-                t.done();
-            }
-
-            if (level > 1) {
-                invariant(!opCtx->lockState()->isLocked());
-                // note: there is no so-style timeout on this connection; perhaps we should have
-                // one.
-                ScopedDbConnection conn(s["host"].valuestr());
-
-                DBClientConnection* cliConn = dynamic_cast<DBClientConnection*>(&conn.conn());
-                if (cliConn && replAuthenticate(cliConn).isOK()) {
-                    BSONObj first = conn->findOne((string) "local.oplog.$" + sourcename,
-                                                  Query().sort(BSON("$natural" << 1)));
-                    BSONObj last = conn->findOne((string) "local.oplog.$" + sourcename,
-                                                 Query().sort(BSON("$natural" << -1)));
-                    bb.appendDate("masterFirst", first["ts"].timestampTime());
-                    bb.appendDate("masterLast", last["ts"].timestampTime());
-                    const auto lag = (last["ts"].timestampTime() - s["syncedTo"].timestampTime());
-                    bb.append("lagSeconds", durationCount<Milliseconds>(lag) / 1000.0);
-                }
-                conn.done();
-            }
-
-            sources.append(StringData{n}, bb.obj());
-            ++n;
-        }
-
-        sources.done();
-
-        replCoord->appendSlaveInfoData(&result);
-    }
 
     BSONObjBuilder topologyVersionBuilder(result.subobjStart("topologyVersion"));
     currentTopologyVersion.serialize(&topologyVersionBuilder);
@@ -208,12 +158,12 @@ public:
             return BSONObj();
         }
 
-        int level = configElement.numberInt();
+        bool appendReplicationProcess = configElement.numberInt() > 0;
 
         BSONObjBuilder result;
         appendReplicationInfo(opCtx,
                               result,
-                              level,
+                              appendReplicationProcess,
                               boost::none /* clientTopologyVersion */,
                               boost::none /* maxAwaitTimeMS */);
 
@@ -246,11 +196,27 @@ public:
         // TODO(siyuan) Output term of OpTime
         result.append("latestOptime", replCoord->getMyLastAppliedOpTime().getTimestamp());
 
-        BSONObj o;
-        uassert(17347,
-                "Problem reading earliest entry from oplog",
-                Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), o));
-        result.append("earliestOptime", o["ts"].timestamp());
+        auto earliestOplogTimestampFetch = [&] {
+            AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+            if (!oplogRead.getCollection()) {
+                return StatusWith<Timestamp>(ErrorCodes::NamespaceNotFound, "oplog doesn't exist");
+            }
+            return oplogRead.getCollection()->getRecordStore()->getEarliestOplogTimestamp(opCtx);
+        }();
+
+        if (earliestOplogTimestampFetch.getStatus() == ErrorCodes::OplogOperationUnsupported) {
+            // Falling back to use getSingleton if the storage engine does not support
+            // getEarliestOplogTimestamp.
+            BSONObj o;
+            if (Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), o)) {
+                earliestOplogTimestampFetch = o["ts"].timestamp();
+            }
+        }
+
+        uassert(
+            17347, "Problem reading earliest entry from oplog", earliestOplogTimestampFetch.isOK());
+        result.append("earliestOptime", earliestOplogTimestampFetch.getValue());
+
         return result.obj();
     }
 } oplogInfoServerStatus;
@@ -286,7 +252,6 @@ public:
                              rpc::ReplyBuilderInterface* replyBuilder) final {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
 
-        // TODO Unwind after SERVER-41070
         waitInIsMaster.pauseWhileSet(opCtx);
 
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
@@ -425,7 +390,10 @@ public:
 
             uassert(31373, "maxAwaitTimeMS must be a non-negative integer", *maxAwaitTimeMS >= 0);
 
-            LOG(3) << "Using maxAwaitTimeMS for awaitable isMaster protocol.";
+            LOGV2_DEBUG(23904, 3, "Using maxAwaitTimeMS for awaitable isMaster protocol.");
+
+            // Awaitable isMaster commands have high latency by design.
+            opCtx->setShouldIncrementLatencyStats(false);
         } else {
             uassert(31368,
                     (topologyVersionElement
@@ -464,11 +432,10 @@ public:
 
         result.append("readOnly", storageGlobalParams.readOnly);
 
-        const auto parameter = mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
-                                                  "automationServiceDescriptor",
-                                                  static_cast<ServerParameter*>(nullptr));
-        if (parameter)
-            parameter->append(opCtx, result, "automationServiceDescriptor");
+        const auto& params = ServerParameterSet::getGlobal()->getMap();
+        if (auto iter = params.find("automationServiceDescriptor");
+            iter != params.end() && iter->second)
+            iter->second->append(opCtx, result, "automationServiceDescriptor");
 
         if (opCtx->getClient()->session()) {
             MessageCompressorManager::forSession(opCtx->getClient()->session())
@@ -479,12 +446,15 @@ public:
         saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
 
         if (opCtx->isExhaust()) {
-            LOG(3) << "Using exhaust for isMaster protocol";
+            LOGV2_DEBUG(23905, 3, "Using exhaust for isMaster protocol");
 
             uassert(51756,
                     "An isMaster request with exhaust must specify 'maxAwaitTimeMS'",
                     maxAwaitTimeMSField);
             invariant(clientTopologyVersion);
+
+            InExhaustIsMaster::get(opCtx->getClient()->session().get())
+                ->setInExhaustIsMaster(true /* inExhaustIsMaster */);
 
             if (clientTopologyVersion->getProcessId() == currentTopologyVersion.getProcessId() &&
                 clientTopologyVersion->getCounter() == currentTopologyVersion.getCounter()) {
@@ -505,6 +475,8 @@ public:
                 replyBuilder->setNextInvocation(nextInvocationBuilder.obj());
             }
         }
+
+        handleIsMasterSpeculativeAuth(opCtx, cmdObj, &result);
 
         return true;
     }

@@ -5,35 +5,33 @@
  *  - failure in first batch
  *  - failure in subsequent batches
  *  - multiple resumable failures during the same clone
- *
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
 
 load("jstests/replsets/rslib.js");  // For setLogVerbosity()
 load("jstests/libs/fail_point_util.js");
+load("jstests/libs/logv2_helpers.js");
 
 // Verify the 'find' command received by the primary includes a resume token request.
 function checkHasRequestResumeToken() {
-    checkLog.contains(primary, "$_requestResumeToken: true");
+    checkLog.contains(primary, /\$_requestResumeToken"?: ?true/);
 }
 
 // Verify the 'find' command received by the primary has no resumeAfter (yet).
 function checkNoResumeAfter() {
     assert.throws(function() {
-        checkLog.contains(primary, "$_resumeAfter", 3 * 1000);
+        checkLog.contains(primary, /\$_resumeAfter/, 3 * 1000);
     });
 }
 
 // Verify the 'find' command received by the primary has resumeAfter set with the given recordId.
 function checkHasResumeAfter(recordId) {
-    checkLog.contains(primary, "$_resumeAfter: { $recordId: " + recordId + " }");
-}
-
-// Verify that we sent a killCursors command on the namespace we are cloning.
-function checkHasKillCursors() {
-    checkLog.contains(primary, "command test.test command: killCursors { killCursors: \"test\"");
+    if (isJsonLogNoConn()) {
+        checkLog.contains(primary, `"$_resumeAfter":{"$recordId":${recordId}}`);
+    } else {
+        checkLog.contains(primary, "$_resumeAfter: { $recordId: " + recordId + " }");
+    }
 }
 
 const beforeRetryFailPointName = "hangBeforeRetryingClonerStage";
@@ -60,10 +58,12 @@ assert.commandWorked(primaryDb.test.insert([
 
 jsTest.log("Adding a new node to the replica set");
 const secondary = rst.add({
-    rsConfig: {priority: 0},
+    rsConfig: {priority: 0, votes: 0},
     setParameter: {
         'failpoint.initialSyncHangBeforeCopyingDatabases': tojson({mode: 'alwaysOn'}),
-        'failpoint.initialSyncHangBeforeFinish': tojson({mode: 'alwaysOn'}),
+        // Hang right after cloning the last document.
+        'failpoint.initialSyncHangDuringCollectionClone':
+            tojson({mode: 'alwaysOn', data: {namespace: "test.test", numDocsToClone: 7}}),
         // This test is specifically testing that the cloners stop, so we turn off the
         // oplog fetcher to ensure that we don't inadvertently test that instead.
         'failpoint.hangBeforeStartingOplogFetcher': tojson({mode: 'alwaysOn'}),
@@ -168,13 +168,19 @@ beforeRetryFailPoint.off();
 afterBatchFailPoint.wait();
 checkHasRequestResumeToken();  // check params of second query resume
 checkHasResumeAfter(4 /* recordId */);
-checkHasKillCursors();
 assert.commandWorked(secondaryDb.adminCommand({clearLog: "global"}));
 
 // Reconnect nodes and turn off cloner failpoints.
 primary.reconnect(secondary);
 beforeRetryFailPoint.off();
 afterBatchFailPoint.off();
+
+// Make sure we have cloned all documents.
+assert.commandWorked(secondary.adminCommand({
+    waitForFailPoint: "initialSyncHangDuringCollectionClone",
+    timesEntered: 1,
+    maxTimeMS: kDefaultWaitForFailPointTimeout
+}));
 
 // Make sure we have cloned exactly four batches and have never requested the same batch more
 // than once.
@@ -183,9 +189,9 @@ assert(res.initialSyncStatus,
        () => "Response should have an 'initialSyncStatus' field: " + tojson(res));
 assert.eq(res.initialSyncStatus.databases.test["test.test"].fetchedBatches, 4);
 
-// Release the last initial sync failpoint.
-assert.commandWorked(
-    secondaryDb.adminCommand({configureFailPoint: "initialSyncHangBeforeFinish", mode: "off"}));
+// Release the last cloner failpoint.
+assert.commandWorked(secondaryDb.adminCommand(
+    {configureFailPoint: "initialSyncHangDuringCollectionClone", mode: "off"}));
 
 // Also let the oplog fetcher run so we can complete initial sync.
 jsTestLog("Releasing the oplog fetcher failpoint.");

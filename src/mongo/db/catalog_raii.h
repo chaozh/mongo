@@ -35,6 +35,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/views/view.h"
 
 namespace mongo {
@@ -61,15 +62,23 @@ public:
               Date_t deadline = Date_t::max());
 
     /**
-     * Returns nullptr if the database didn't exist.
+     * Returns the database, or nullptr if it didn't exist.
      */
     Database* getDb() const {
         return _db;
     }
 
+    /**
+     * Returns the database, creating it if it does not exist.
+     */
+    Database* ensureDbExists();
+
 private:
+    OperationContext* _opCtx;
+    const std::string _dbName;
+
     const Lock::DBLock _dbLock;
-    Database* const _db;
+    Database* _db;
 };
 
 /**
@@ -102,10 +111,17 @@ public:
                       Date_t deadline = Date_t::max());
 
     /**
-     * Returns nullptr if the database didn't exist.
+     * Returns the database, or nullptr if it didn't exist.
      */
     Database* getDb() const {
         return _autoDb.getDb();
+    }
+
+    /**
+     * Returns the database, creating it if it does not exist.
+     */
+    Database* ensureDbExists() {
+        return _autoDb.ensureDbExists();
     }
 
     /**
@@ -145,6 +161,11 @@ private:
 };
 
 /**
+ * Writes to system.views need to use a stronger lock to prevent inconsistencies like view cycles.
+ */
+LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode);
+
+/**
  * RAII-style class, which acquires a lock on the specified database in the requested mode and
  * obtains a reference to the database, creating it was non-existing. Used as a shortcut for
  * calls to DatabaseHolder::get(opCtx)->openDb(), taking care of locking details. The
@@ -170,15 +191,10 @@ public:
         return _db;
     }
 
-    bool justCreated() const {
-        return _justCreated;
-    }
-
 private:
     AutoGetDb _autoDb;
 
     Database* _db;
-    bool _justCreated{false};
 };
 
 /**
@@ -227,6 +243,61 @@ private:
     OperationContext* _opCtx;
     RecoveryUnit::ReadSource _originalReadSource;
     Timestamp _originalReadTimestamp;
+};
+
+/**
+ * RAII-style class to acquire proper locks using special oplog locking rules for oplog accesses.
+ *
+ * If storage engine supports document-level locking, only global lock is acquired:
+ * | OplogAccessMode | Global Lock |
+ * +-----------------+-------------|
+ * | kRead           | MODE_IS     |
+ * | kWrite          | MODE_IX     |
+ *
+ * Otherwise, database and collection intent locks are also acquired:
+ * | OplogAccessMode | Global Lock | 'local' DB Lock | 'oplog.rs' Collection Lock |
+ * +-----------------+-------------+-----------------+----------------------------|
+ * | kRead           | MODE_IS     | MODE_IS         | MODE_IS                    |
+ * | kWrite/kLogOp   | MODE_IX     | MODE_IX         | MODE_IX                    |
+ *
+ * kLogOp is a special mode for replication operation logging and it behaves similar to kWrite. The
+ * difference between kWrite and kLogOp is that kLogOp invariants that global IX lock is already
+ * held. It is the caller's responsibility to ensure the global lock already held is still valid
+ * within the lifetime of this object.
+ *
+ * Any acquired locks may be released when this object goes out of scope, therefore the oplog
+ * collection reference returned by this class should not be retained.
+ */
+enum class OplogAccessMode { kRead, kWrite, kLogOp };
+class AutoGetOplog {
+    AutoGetOplog(const AutoGetOplog&) = delete;
+    AutoGetOplog& operator=(const AutoGetOplog&) = delete;
+
+public:
+    AutoGetOplog(OperationContext* opCtx, OplogAccessMode mode, Date_t deadline = Date_t::max());
+
+    /**
+     * Return a pointer to the per-service-context LocalOplogInfo.
+     */
+    repl::LocalOplogInfo* getOplogInfo() const {
+        return _oplogInfo;
+    }
+
+    /**
+     * Returns a pointer to the oplog collection or nullptr if the oplog collection didn't exist.
+     */
+    Collection* getCollection() const {
+        return _oplog;
+    }
+
+private:
+    ShouldNotConflictWithSecondaryBatchApplicationBlock
+        _shouldNotConflictWithSecondaryBatchApplicationBlock;
+    boost::optional<Lock::GlobalLock> _globalLock;
+    boost::optional<Lock::DBLock> _dbWriteLock;
+    boost::optional<Lock::CollectionLock> _collWriteLock;
+    repl::LocalOplogInfo* _oplogInfo;
+    Collection* _oplog;
 };
 
 }  // namespace mongo

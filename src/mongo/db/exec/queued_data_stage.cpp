@@ -41,37 +41,21 @@ using std::vector;
 
 const char* QueuedDataStage::kStageType = "QUEUED_DATA";
 
-QueuedDataStage::QueuedDataStage(OperationContext* opCtx, WorkingSet* ws)
-    : PlanStage(kStageType, opCtx), _ws(ws) {}
+QueuedDataStage::QueuedDataStage(ExpressionContext* expCtx, WorkingSet* ws)
+    : PlanStage(kStageType, expCtx), _ws(ws) {}
 
 PlanStage::StageState QueuedDataStage::doWork(WorkingSetID* out) {
     if (isEOF()) {
         return PlanStage::IS_EOF;
     }
 
-    StageState state = _results.front();
-    _results.pop();
-
-    switch (state) {
-        case PlanStage::ADVANCED:
-            *out = _members.front();
-            _members.pop();
-            break;
-        case PlanStage::FAILURE:
-            // On FAILURE, this stage is reponsible for allocating the WorkingSetMember with
-            // the error details.
-            *out = WorkingSetCommon::allocateStatusMember(
-                _ws, Status(ErrorCodes::InternalError, "Queued data stage failure"));
-            break;
-        default:
-            break;
-    }
-
-    return state;
+    *out = _members.front();
+    _members.pop();
+    return PlanStage::ADVANCED;
 }
 
 bool QueuedDataStage::isEOF() {
-    return _results.empty();
+    return _members.empty();
 }
 
 unique_ptr<PlanStageStats> QueuedDataStage::getStats() {
@@ -87,15 +71,7 @@ const SpecificStats* QueuedDataStage::getSpecificStats() const {
     return &_specificStats;
 }
 
-void QueuedDataStage::pushBack(const PlanStage::StageState state) {
-    invariant(PlanStage::ADVANCED != state);
-    _results.push(state);
-}
-
 void QueuedDataStage::pushBack(const WorkingSetID& id) {
-    _results.push(PlanStage::ADVANCED);
-
-    // member lives in _ws.  We'll return it when _results hits ADVANCED.
     _members.push(id);
 }
 

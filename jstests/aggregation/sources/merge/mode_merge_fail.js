@@ -2,12 +2,12 @@
 //
 // Cannot implicitly shard accessed collections because a collection can be implictly created and
 // exists when none is expected.
-// @tags: [assumes_no_implicit_collection_creation_after_drop]
 (function() {
 "use strict";
 
-load("jstests/aggregation/extras/utils.js");  // For assertArrayEq.
-load("jstests/libs/fixture_helpers.js");      // For FixtureHelpers.isMongos.
+load("jstests/aggregation/extras/merge_helpers.js");  // For dropWithoutImplicitRecreate.
+load("jstests/aggregation/extras/utils.js");          // For assertArrayEq.
+load("jstests/libs/fixture_helpers.js");              // For FixtureHelpers.isMongos.
 
 const source = db[`${jsTest.name()}_source`];
 source.drop();
@@ -26,15 +26,37 @@ const pipeline = [mergeStage];
     assert.commandWorked(target.insert([{_id: 1, b: 1}, {_id: 3, b: 3}]));
     let error = assert.throws(() => source.aggregate(pipeline));
     assert.commandFailedWithCode(error, ErrorCodes.MergeStageNoMatchingDocument);
-    assertArrayEq(
-        {actual: target.find().toArray(), expected: [{_id: 1, a: 1, b: 1}, {_id: 3, a: 3, b: 3}]});
+    // Since there is no way to guarantee the ordering of the writes performed by $merge, it
+    // follows that the contents of the target collection will depend on when the write which
+    // triggers the MergeStageNoMatchingDocument error executes. As such, we test that the
+    // target collection contains some combination of its original documents and expected
+    // updates. In particular, it should be the case that each document has fields '_id' and
+    // 'b', but may or not have field 'a'. All present fields must share the same value as _id.
+    let checkOutputDocument = function(document) {
+        const hasB = document.hasOwnProperty("b");
+        const hasA = document.hasOwnProperty("a");
+        assert(hasB, document);
+        const bValue = document["b"];
+        assert.eq(bValue, document["_id"], document);
+        if (hasA) {
+            assert.eq(bValue, document["a"], document);
+        }
+    };
+
+    let result = target.find().toArray();
+    assert.eq(result.length, 2, result);
+    for (let elem of result) {
+        checkOutputDocument(elem);
+    }
 
     // Multiple documents without a match.
     assert(target.drop());
     assert.commandWorked(target.insert([{_id: 1, b: 1}]));
     error = assert.throws(() => source.aggregate(pipeline));
     assert.commandFailedWithCode(error, ErrorCodes.MergeStageNoMatchingDocument);
-    assertArrayEq({actual: target.find().toArray(), expected: [{_id: 1, a: 1, b: 1}]});
+    result = target.find().toArray();
+    assert.eq(result.length, 1, result);
+    checkOutputDocument(result[0]);
 })();
 
 // Test $merge when all documents in the source collection have a matching document in the
@@ -80,8 +102,7 @@ const pipeline = [mergeStage];
     const maxDocsInBatch = maxBatchSize / docSize;
 
     assert(source.drop());
-    assert(target.drop());
-
+    dropWithoutImplicitRecreate(target.getName());
     // Insert 'numDocs' documents of size 'docSize' into the source collection.
     generateCollection({coll: source, numDocs: numDocs, docSize: docSize});
 

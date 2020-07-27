@@ -3,12 +3,17 @@
 //
 // Tag this test as 'requires_find_command' to prevent it from running in the legacy passthroughs
 // and as 'requires_document_locking' because it uses retryable writes.
-// @tags: [requires_find_command, requires_document_locking, requires_fcv_44]
+// @tags: [
+//   requires_document_locking,
+//   requires_find_command,
+// ]
 //
 
 (function() {
 'use strict';
 load('jstests/libs/fail_point_util.js');
+load('jstests/libs/profiler.js');
+load('jstests/sharding/libs/shard_versioning_util.js');
 load('jstests/sharding/libs/sharded_transactions_helpers.js');
 
 const st = new ShardingTest({mongos: 2, shards: 2, rs: {nodes: 3}});
@@ -101,11 +106,14 @@ function validateCRUDAfterRefine() {
     assert.commandWorked(sessionDB.getCollection(kCollName).insert({a: 1, b: 1, c: 1, d: 1}));
     assert.commandWorked(sessionDB.getCollection(kCollName).insert({a: -1, b: -1, c: -1, d: -1}));
 
-    // The full shard key is not required when updating documents.
+    // The full shard key is not required in the resulting document when updating. The full shard
+    // key is still required in the query, however.
+    assert.commandFailedWithCode(
+        sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1}, {$set: {b: 2}}), 31025);
     assert.commandWorked(
-        sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1}, {$set: {b: 2}}));
+        sessionDB.getCollection(kCollName).update({a: 1, b: 1, c: 1, d: 1}, {$set: {b: 2}}));
     assert.commandWorked(
-        sessionDB.getCollection(kCollName).update({a: -1, b: -1, c: -1}, {$set: {b: 4}}));
+        sessionDB.getCollection(kCollName).update({a: -1, b: -1, c: -1, d: -1}, {$set: {b: 4}}));
 
     assert.eq(2, sessionDB.getCollection(kCollName).findOne({c: 1}).b);
     assert.eq(4, sessionDB.getCollection(kCollName).findOne({c: -1}).b);
@@ -629,6 +637,100 @@ assert.soon(() => oldPrimaryEpoch !==
 assert.soon(() => oldSecondaryEpoch ===
                 st.shard1.adminCommand({getShardVersion: kNsName, fullMetadata: true})
                     .metadata.shardVersionEpoch.toString());
+
+(() => {
+    //
+    // Verify listIndexes and checkShardingIndexes are retried on shard version errors and are sent
+    // with shard versions.
+    //
+
+    // Create a sharded collection with one chunk on shard0.
+    const dbName = "testShardVersions";
+    const collName = "fooShardVersions";
+    const ns = dbName + "." + collName;
+    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
+    st.ensurePrimaryShard(dbName, st.shard0.shardName);
+    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
+
+    const minKeyShardDB = st.rs0.getPrimary().getDB(dbName);
+    assert.commandWorked(minKeyShardDB.setProfilingLevel(2));
+
+    // Refining the shard key should internally retry on a stale epoch error for listIndexes and
+    // succeed.
+    assert.commandWorked(minKeyShardDB.adminCommand({
+        configureFailPoint: "failCommand",
+        mode: {times: 5},
+        data: {
+            errorCode: ErrorCodes.StaleEpoch,
+            failCommands: ["listIndexes"],
+            failInternalCommands: true
+        }
+    }));
+    assert.commandWorked(st.s.getCollection(ns).createIndex({x: 1, y: 1}));
+    assert.commandWorked(st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1}}));
+
+    // Refining the shard key should internally retry on a stale epoch error for checkShardingIndex
+    // and succeed.
+    assert.commandWorked(minKeyShardDB.adminCommand({
+        configureFailPoint: "failCommand",
+        mode: {times: 5},
+        data: {
+            errorCode: ErrorCodes.StaleEpoch,
+            failCommands: ["checkShardingIndex"],
+            failInternalCommands: true
+        }
+    }));
+    assert.commandWorked(st.s.getCollection(ns).createIndex({x: 1, y: 1, z: 1}));
+    assert.commandWorked(
+        st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1, z: 1}}));
+
+    // Verify both commands were sent with shard versions through the profiler.
+    profilerHasAtLeastOneMatchingEntryOrThrow({
+        profileDB: minKeyShardDB,
+        filter: {"command.listIndexes": collName, "command.shardVersion": {"$exists": true}}
+    });
+
+    profilerHasAtLeastOneMatchingEntryOrThrow({
+        profileDB: minKeyShardDB,
+        filter: {"command.checkShardingIndex": ns, "command.shardVersion": {"$exists": true}}
+    });
+
+    // Clean up.
+    assert.commandWorked(minKeyShardDB.setProfilingLevel(0));
+    assert(minKeyShardDB.system.profile.drop());
+})();
+
+(() => {
+    //
+    // Verify refineCollectionShardKey can return a StaleConfig error without crashing the config
+    // server.
+    //
+
+    // Create a sharded collection with one chunk on shard0.
+    const dbName = "testReturnStaleConfig";
+    const ns = dbName + ".fooReturnStaleConfig";
+    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
+    st.ensurePrimaryShard(dbName, st.shard0.shardName);
+    assert.commandWorked(st.s.adminCommand({shardCollection: ns, key: {x: 1}}));
+
+    // Move the last chunk away from shard0 without refreshing shard1 so it will be stale when its
+    // indexes are read during the next refine. Disable refreshes on shard1 so it will repeatedly
+    // return StaleConfig until refineCollectionShardKey runs out of retries.
+    ShardVersioningUtil.moveChunkNotRefreshRecipient(st.s, ns, st.shard0, st.shard1, {x: 1});
+
+    let disableRefreshesFailPoint =
+        configureFailPoint(st.rs1.getPrimary(), "skipShardFilteringMetadataRefresh");
+
+    assert.commandWorked(st.rs1.getPrimary().getCollection(ns).createIndex({x: 1, y: 1}));
+    assert.commandFailedWithCode(
+        st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1}}),
+        ErrorCodes.StaleConfig);
+
+    disableRefreshesFailPoint.off();
+
+    // The refresh should succeed now.
+    assert.commandWorked(st.s.adminCommand({refineCollectionShardKey: ns, key: {x: 1, y: 1}}));
+})();
 
 st.stop();
 })();

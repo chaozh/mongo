@@ -43,8 +43,10 @@
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
@@ -54,9 +56,7 @@
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
@@ -137,6 +137,8 @@ public:
                                     std::make_unique<repl::StorageInterfaceImpl>());
         MongoDSessionCatalog::onStepUp(operationContext());
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
+
+        setUnshardedFilteringMetadata(kNs);
     }
 
     void returnOplog(const std::vector<OplogEntry>& oplogList) {
@@ -267,6 +269,13 @@ public:
 
         ASSERT_TRUE(SessionCatalogMigrationDestination::State::Done ==
                     sessionMigration->getState());
+    }
+
+    void setUnshardedFilteringMetadata(const NamespaceString& nss) {
+        AutoGetDb autoDb(operationContext(), nss.db(), MODE_IX);
+        Lock::CollectionLock collLock(operationContext(), nss, MODE_IX);
+        CollectionShardingRuntime::get(operationContext(), nss)
+            ->setFilteringMetadata(operationContext(), CollectionMetadata());
     }
 
 private:
@@ -1721,7 +1730,9 @@ TEST_F(SessionCatalogMigrationDestinationTest, MigratingKnownStmtWhileOplogTrunc
 
     {
         AutoGetCollection oplogColl(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
+        WriteUnitOfWork wuow(opCtx);
         ASSERT_OK(oplogColl.getCollection()->truncate(opCtx));  // Empties the oplog collection.
+        wuow.commit();
     }
 
     {

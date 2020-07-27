@@ -1,7 +1,7 @@
 /**
- * When an index build on a secondary fails during the first two phases, we expect to receive a
- * abortIndexBuild oplog entry from the primary eventually. If we get a commitIndexBuild oplog entry
- * instead, the secondary should crash.
+ * When an index build on a secondary fails, we expect to receive a abortIndexBuild oplog entry from
+ * the primary eventually. If we get a commitIndexBuild oplog entry instead, the secondary should
+ * crash.
  * @tags: [
  *     requires_replication,
  * ]
@@ -28,14 +28,6 @@ rst.initiate();
 
 const primary = rst.getPrimary();
 
-// This test requires index builds to start on the createIndexes oplog entry and expects index
-// builds to be interrupted when the primary steps down.
-if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    jsTestLog('Two phase index builds not supported, skipping test.');
-    rst.stopSet();
-    return;
-}
-
 const testDB = primary.getDB('test');
 const coll = testDB.getCollection('test');
 
@@ -49,6 +41,8 @@ const secondary = rst.getSecondary();
 const secondaryDB = secondary.getDB(testDB.getName());
 assert.commandWorked(secondaryDB.adminCommand(
     {configureFailPoint: 'hangAfterStartingIndexBuildUnlocked', mode: 'alwaysOn'}));
+assert.commandWorked(
+    secondaryDB.adminCommand({configureFailPoint: 'failIndexBuildOnCommit', mode: 'alwaysOn'}));
 
 const createIdx = IndexBuildTest.startIndexBuild(primary, coll.getFullName(), {a: 1});
 
@@ -86,7 +80,7 @@ assert.soon(function() {
 // Secondary should crash on receiving the unexpected commitIndexBuild oplog entry.
 const fassertProcessExitCode = _isWindows() ? MongoRunner.EXIT_ABRUPT : MongoRunner.EXIT_ABORT;
 assert.eq(fassertProcessExitCode, res.exitCode);
-assert(rawMongoProgramOutput().match('Fatal assertion 51101 OperationFailed: Index build:'),
+assert(rawMongoProgramOutput().match('Fatal assertion.*4698902'),
        'Index build should have aborted secondary due to unexpected commitIndexBuild oplog entry.');
 
 // Check indexes on primary.

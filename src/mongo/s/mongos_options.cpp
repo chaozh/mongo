@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -43,8 +43,8 @@
 #include "mongo/config.h"
 #include "mongo/db/server_options_base.h"
 #include "mongo/db/server_options_server_helpers.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/version_mongos.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/str.h"
@@ -64,11 +64,12 @@ bool handlePreValidationMongosOptions(const moe::Environment& params,
         return false;
     }
     if (params.count("version") && params["version"].as<bool>() == true) {
-        printShardingVersionInfo(true);
+        logShardingVersionInfo(&std::cout);
         return false;
     }
     if (params.count("test") && params["test"].as<bool>() == true) {
-        setMinimumLoggedSeverity(::mongo::logger::LogSeverity::Debug(5));
+        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+            mongo::logv2::LogComponent::kDefault, ::mongo::logv2::LogSeverity::Debug(5));
         return false;
     }
 
@@ -90,6 +91,21 @@ Status canonicalizeMongosOptions(moe::Environment* params) {
         return ret;
     }
 
+    // "security.javascriptEnabled" comes from the config file, so override it if "noscripting"
+    // is set since that comes from the command line.
+    if (params->count("noscripting")) {
+        auto status = params->set("security.javascriptEnabled",
+                                  moe::Value(!(*params)["noscripting"].as<bool>()));
+        if (!status.isOK()) {
+            return status;
+        }
+
+        status = params->remove("noscripting");
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
     return Status::OK();
 }
 
@@ -106,9 +122,8 @@ Status storeMongosOptions(const moe::Environment& params) {
         }
     }
 
-    if (params.count("noscripting") || params.count("security.javascriptEnabled")) {
-        warning() << "The Javascript enabled/disabled options are not supported for mongos. "
-                     "(\"noscripting\" and/or \"security.javascriptEnabled\" are set.)";
+    if (params.count("security.javascriptEnabled")) {
+        mongosGlobalParams.scriptingEnabled = params["security.javascriptEnabled"].as<bool>();
     }
 
     if (!params.count("sharding.configDB")) {
@@ -140,11 +155,16 @@ Status storeMongosOptions(const moe::Environment& params) {
     }
     if (!resolvedSomeSeedSever) {
         if (!hostbyname(configdbConnectionString.getValue().getSetName().c_str()).empty()) {
-            warning() << "The replica set name \""
-                      << str::escape(configdbConnectionString.getValue().getSetName())
-                      << "\" resolves as a host name, but none of the servers in the seed list do. "
-                         "Did you reverse the replica set name and the seed list in "
-                      << str::escape(configdbConnectionString.getValue().toString()) << "?";
+            LOGV2_WARNING(24131,
+                          "The replica set name "
+                          "\"{str_escape_configdbConnectionString_getValue_getSetName}\" resolves "
+                          "as a host name, but none of the servers in the seed list do. "
+                          "Did you reverse the replica set name and the seed list in "
+                          "{str_escape_configdbConnectionString_getValue}?",
+                          "str_escape_configdbConnectionString_getValue_getSetName"_attr =
+                              str::escape(configdbConnectionString.getValue().getSetName()),
+                          "str_escape_configdbConnectionString_getValue"_attr =
+                              str::escape(configdbConnectionString.getValue().toString()));
         }
     }
 
@@ -154,8 +174,9 @@ Status storeMongosOptions(const moe::Environment& params) {
                          configdbConnectionString.getValue().getSetName()};
 
     if (mongosGlobalParams.configdbs.getServers().size() < 3) {
-        warning() << "Running a sharded cluster with fewer than 3 config servers should only be "
-                     "done for testing purposes and is not recommended for production.";
+        LOGV2_WARNING(24132,
+                      "Running a sharded cluster with fewer than 3 config servers should only be "
+                      "done for testing purposes and is not recommended for production.");
     }
 
     return Status::OK();

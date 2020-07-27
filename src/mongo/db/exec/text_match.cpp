@@ -45,12 +45,12 @@ using std::vector;
 
 const char* TextMatchStage::kStageType = "TEXT_MATCH";
 
-TextMatchStage::TextMatchStage(OperationContext* opCtx,
+TextMatchStage::TextMatchStage(ExpressionContext* expCtx,
                                unique_ptr<PlanStage> child,
                                const FTSQueryImpl& query,
                                const FTSSpec& spec,
                                WorkingSet* ws)
-    : PlanStage(kStageType, opCtx), _ftsMatcher(query, spec), _ws(ws) {
+    : PlanStage(kStageType, expCtx), _ftsMatcher(query, spec), _ws(ws) {
     _children.emplace_back(std::move(child));
 }
 
@@ -93,16 +93,6 @@ PlanStage::StageState TextMatchStage::doWork(WorkingSetID* out) {
             *out = WorkingSet::INVALID_ID;
             ++_specificStats.docsRejected;
             stageState = PlanStage::NEED_TIME;
-        }
-    } else if (stageState == PlanStage::FAILURE) {
-        // If a stage fails, it may create a status WSM to indicate why it
-        // failed, in which case '*out' is valid.  If ID is invalid, we
-        // create our own error message.
-        if (WorkingSet::INVALID_ID == *out) {
-            str::stream ss;
-            ss << "TEXT_MATCH stage failed to read in results from child";
-            Status status(ErrorCodes::InternalError, ss);
-            *out = WorkingSetCommon::allocateStatusMember(_ws, status);
         }
     }
 

@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/db/commands/mr_common.h"
 
 #include <string>
@@ -52,16 +50,15 @@
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
-#include "mongo/db/pipeline/expression_javascript.h"
+#include "mongo/db/pipeline/expression_function.h"
+#include "mongo/db/pipeline/expression_js_emit.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/util/intrusive_counter.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo::map_reduce_common {
 
 namespace {
-Rarely nonAtomicDeprecationSampler;  // Used to occasionally log deprecation messages.
 
 using namespace std::string_literals;
 
@@ -109,7 +106,9 @@ auto translateSort(boost::intrusive_ptr<ExpressionContext> expCtx, const BSONObj
 
 auto translateMap(boost::intrusive_ptr<ExpressionContext> expCtx, std::string code) {
     auto emitExpression = ExpressionInternalJsEmit::create(
-        expCtx, ExpressionFieldPath::parse(expCtx, "$$ROOT", expCtx->variablesParseState), code);
+        expCtx.get(),
+        ExpressionFieldPath::parse(expCtx.get(), "$$ROOT", expCtx->variablesParseState),
+        code);
     auto node = std::make_unique<projection_executor::InclusionNode>(
         ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kExcludeId});
     node->addExpressionForPath(FieldPath{"emits"s}, std::move(emitExpression));
@@ -123,15 +122,19 @@ auto translateMap(boost::intrusive_ptr<ExpressionContext> expCtx, std::string co
 }
 
 auto translateReduce(boost::intrusive_ptr<ExpressionContext> expCtx, std::string code) {
-    auto accumulatorArgument =
-        ExpressionFieldPath::parse(expCtx, "$emits", expCtx->variablesParseState);
-    auto reduceFactory = [expCtx, funcSource = code]() {
-        return AccumulatorInternalJsReduce::create(expCtx, funcSource);
+    auto initializer = ExpressionArray::create(expCtx.get(), {});
+    auto argument = ExpressionFieldPath::parse(expCtx.get(), "$emits", expCtx->variablesParseState);
+    auto reduceFactory = [expCtx, funcSource = std::move(code)]() {
+        return AccumulatorInternalJsReduce::create(expCtx.get(), funcSource);
     };
-    AccumulationStatement jsReduce("value", std::move(accumulatorArgument), reduceFactory);
-    auto groupExpr = ExpressionFieldPath::parse(expCtx, "$emits.k", expCtx->variablesParseState);
+    AccumulationStatement jsReduce("value",
+                                   AccumulationExpression(std::move(initializer),
+                                                          std::move(argument),
+                                                          std::move(reduceFactory)));
+    auto groupKeyExpression =
+        ExpressionFieldPath::parse(expCtx.get(), "$emits.k", expCtx->variablesParseState);
     return DocumentSourceGroup::create(expCtx,
-                                       std::move(groupExpr),
+                                       std::move(groupKeyExpression),
                                        make_vector<AccumulationStatement>(std::move(jsReduce)),
                                        boost::none);
 }
@@ -139,14 +142,16 @@ auto translateReduce(boost::intrusive_ptr<ExpressionContext> expCtx, std::string
 auto translateFinalize(boost::intrusive_ptr<ExpressionContext> expCtx,
                        MapReduceJavascriptCodeOrNull codeObj) {
     return codeObj.getCode().map([&](auto&& code) {
-        auto jsExpression = ExpressionInternalJs::create(
-            expCtx,
+        auto jsExpression = ExpressionFunction::create(
+            expCtx.get(),
             ExpressionArray::create(
-                expCtx,
+                expCtx.get(),
                 make_vector<boost::intrusive_ptr<Expression>>(
-                    ExpressionFieldPath::parse(expCtx, "$_id", expCtx->variablesParseState),
-                    ExpressionFieldPath::parse(expCtx, "$value", expCtx->variablesParseState))),
-            code);
+                    ExpressionFieldPath::parse(expCtx.get(), "$_id", expCtx->variablesParseState),
+                    ExpressionFieldPath::parse(
+                        expCtx.get(), "$value", expCtx->variablesParseState))),
+            code,
+            ExpressionFunction::kJavaScript);
         auto node = std::make_unique<projection_executor::InclusionNode>(
             ProjectionPolicies{ProjectionPolicies::DefaultIdPolicy::kIncludeId});
         node->addProjectionForPath(FieldPath{"_id"s});
@@ -163,7 +168,7 @@ auto translateFinalize(boost::intrusive_ptr<ExpressionContext> expCtx,
 
 auto translateOutReplace(boost::intrusive_ptr<ExpressionContext> expCtx,
                          NamespaceString targetNss) {
-    return DocumentSourceOut::createAndAllowDifferentDB(std::move(targetNss), expCtx);
+    return DocumentSourceOut::create(std::move(targetNss), expCtx);
 }
 
 auto translateOutMerge(boost::intrusive_ptr<ExpressionContext> expCtx,
@@ -187,23 +192,24 @@ auto translateOutReduce(boost::intrusive_ptr<ExpressionContext> expCtx,
     // Because of communication for sharding, $merge must hold on to a serializable BSON object
     // at the moment so we reparse here. Note that the reduce function signature expects 2
     // arguments, the first being the key and the second being the array of values to reduce.
-    auto reduceObj = BSON("args" << BSON_ARRAY("$_id" << BSON_ARRAY("$value"
-                                                                    << "$$new.value"))
-                                 << "eval" << reduceCode);
+    auto reduceObj =
+        BSON("args" << BSON_ARRAY("$_id" << BSON_ARRAY("$value"
+                                                       << "$$new.value"))
+                    << "body" << reduceCode << "lang" << ExpressionFunction::kJavaScript);
 
-    auto reduceSpec =
-        BSON(DocumentSourceProject::kStageName
-             << BSON("value" << BSON(ExpressionInternalJs::kExpressionName << reduceObj)));
+    auto reduceSpec = BSON(DocumentSourceProject::kStageName << BSON(
+                               "value" << BSON(ExpressionFunction::kExpressionName << reduceObj)));
     auto pipelineSpec = boost::make_optional(std::vector<BSONObj>{reduceSpec});
 
     // Build finalize $project stage if given.
     if (finalizeCode && finalizeCode->hasCode()) {
         auto finalizeObj = BSON("args" << BSON_ARRAY("$_id"
                                                      << "$value")
-                                       << "eval" << finalizeCode->getCode().get());
+                                       << "body" << finalizeCode->getCode().get() << "lang"
+                                       << ExpressionFunction::kJavaScript);
         auto finalizeSpec =
             BSON(DocumentSourceProject::kStageName
-                 << BSON("value" << BSON(ExpressionInternalJs::kExpressionName << finalizeObj)));
+                 << BSON("value" << BSON(ExpressionFunction::kExpressionName << finalizeObj)));
         pipelineSpec->emplace_back(std::move(finalizeSpec));
     }
 
@@ -262,7 +268,7 @@ auto translateOut(boost::intrusive_ptr<ExpressionContext> expCtx,
 OutputOptions parseOutputOptions(const std::string& dbname, const BSONObj& cmdObj) {
     OutputOptions outputOptions;
 
-    outputOptions.outNonAtomic = false;
+    outputOptions.outNonAtomic = true;
     if (cmdObj["out"].type() == String) {
         outputOptions.collectionName = cmdObj["out"].String();
         outputOptions.outType = OutputType::Replace;
@@ -300,15 +306,12 @@ OutputOptions parseOutputOptions(const std::string& dbname, const BSONObj& cmdOb
                           .isOnInternalDb()));
         }
         if (o.hasElement("nonAtomic")) {
-            outputOptions.outNonAtomic = o["nonAtomic"].Bool();
-            if (outputOptions.outNonAtomic) {
-                uassert(15895,
-                        "nonAtomic option cannot be used with this output type",
-                        (outputOptions.outType == OutputType::Reduce ||
-                         outputOptions.outType == OutputType::Merge));
-            } else if (nonAtomicDeprecationSampler.tick()) {
-                warning() << "Setting out.nonAtomic to false in MapReduce is deprecated.";
-            }
+            uassert(
+                15895,
+                str::stream()
+                    << "The nonAtomic:false option is no longer allowed in the mapReduce command. "
+                    << "Please omit or specify nonAtomic:true",
+                o["nonAtomic"].Bool());
         }
     } else {
         uasserted(13606, "'out' has to be a string or an object");
@@ -334,7 +337,8 @@ void addPrivilegesRequiredForMapReduce(const BasicCommand* commandTemplate,
 
     ResourcePattern inputResource(commandTemplate->parseResourcePattern(dbname, cmdObj));
     uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid input resource " << inputResource.toString(),
+            str::stream() << "Invalid input namespace " << inputResource.databaseToMatch() << "."
+                          << cmdObj["mapReduce"].String(),
             inputResource.isExactNamespacePattern());
     out->push_back(Privilege(inputResource, ActionType::find));
 
@@ -394,7 +398,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
     }
 
     try {
-        auto pipeline = uassertStatusOK(Pipeline::create(
+        auto pipeline = Pipeline::create(
             makeFlattenedList<boost::intrusive_ptr<DocumentSource>>(
                 parsedMr.getQuery().map(
                     [&](auto&& query) { return DocumentSourceMatch::create(query, expCtx); }),
@@ -412,7 +416,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> translateFromMR(
                              std::move(targetCollectionVersion),
                              parsedMr.getReduce().getCode(),
                              parsedMr.getFinalize())),
-            expCtx));
+            expCtx);
         pipeline->optimizePipeline();
         return pipeline;
     } catch (DBException& ex) {

@@ -3,6 +3,8 @@
 //
 
 /**
+ * Upgrade or downgrade replica sets.
+ *
  * @param options {Object} see ReplSetTest.start & MongoRunner.runMongod.
  * @param user {string} optional, user name for authentication.
  * @param pwd {string} optional, password for authentication. Must be set if user is set.
@@ -10,36 +12,61 @@
 ReplSetTest.prototype.upgradeSet = function(options, user, pwd) {
     let primary = this.getPrimary();
 
-    // Upgrade secondaries first.
-    this.upgradeSecondaries(primary, options, user, pwd);
+    this.upgradeSecondaries(primary, Object.assign({}, options), user, pwd);
+    this.upgradeArbiters(primary, Object.assign({}, options), user, pwd);
 
-    // Then upgrade the primary after stepping down.
-    this.upgradePrimary(primary, options, user, pwd);
+    // Upgrade the primary after stepping down.
+    this.upgradePrimary(primary, Object.assign({}, options), user, pwd);
 };
 
-ReplSetTest.prototype.upgradeSecondaries = function(primary, options, user, pwd) {
+function mergeNodeOptions(nodeOptions, options) {
+    for (let nodeName in nodeOptions) {
+        nodeOptions[nodeName] = Object.merge(nodeOptions[nodeName], options);
+    }
+    return nodeOptions;
+}
+
+ReplSetTest.prototype.upgradeMembers = function(primary, members, options, user, pwd) {
     const noDowntimePossible = this.nodes.length > 2;
 
     // Merge new options into node settings.
-    for (let nodeName in this.nodeOptions) {
-        this.nodeOptions[nodeName] = Object.merge(this.nodeOptions[nodeName], options);
-    }
+    this.nodeOptions = mergeNodeOptions(this.nodeOptions, options);
 
-    for (let secondary of this.getSecondaries()) {
-        this.upgradeNode(secondary, options, user, pwd);
+    for (let member of members) {
+        this.upgradeNode(member, options, user, pwd);
 
         if (noDowntimePossible)
             assert.eq(this.getPrimary(), primary);
     }
 };
 
+ReplSetTest.prototype.getNonArbiterSecondaries = function() {
+    let secs = this.getSecondaries();
+    let arbiters = this.getArbiters();
+    let nonArbiters = secs.filter(x => !arbiters.includes(x));
+    return nonArbiters;
+};
+
+ReplSetTest.prototype.upgradeSecondaries = function(primary, options, user, pwd) {
+    this.upgradeMembers(primary, this.getNonArbiterSecondaries(), options, user, pwd);
+};
+
+ReplSetTest.prototype.upgradeArbiters = function(primary, options, user, pwd) {
+    // We don't support downgrading data files for arbiters. We need to instead delete the dbpath.
+    const oldStartClean = {startClean: (options && !!options["startClean"])};
+    if (options && options.binVersion == "last-lts") {
+        options["startClean"] = true;
+    }
+    this.upgradeMembers(primary, this.getArbiters(), options, user, pwd);
+    // Make sure we don't set {startClean:true} on other nodes unless the user explicitly requested.
+    this.nodeOptions = mergeNodeOptions(this.nodeOptions, oldStartClean);
+};
+
 ReplSetTest.prototype.upgradePrimary = function(primary, options, user, pwd) {
     const noDowntimePossible = this.nodes.length > 2;
 
     // Merge new options into node settings.
-    for (let nodeName in this.nodeOptions) {
-        this.nodeOptions[nodeName] = Object.merge(this.nodeOptions[nodeName], options);
-    }
+    this.nodeOptions = mergeNodeOptions(this.nodeOptions, options);
 
     let oldPrimary = this.stepdown(primary);
     this.waitForState(oldPrimary, ReplSetTest.State.SECONDARY);
@@ -122,7 +149,6 @@ ReplSetTest.prototype.stepdown = function(nodeId) {
 ReplSetTest.prototype.reconnect = function(node) {
     var nodeId = this.getNodeId(node);
     this.nodes[nodeId] = new Mongo(node.host);
-    var except = {};
     for (var i in node) {
         if (typeof (node[i]) == "function")
             continue;

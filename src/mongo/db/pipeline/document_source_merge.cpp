@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -40,7 +40,7 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/document_path_support.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 using namespace fmt::literals;
@@ -283,6 +283,25 @@ DocumentSourceMergeSpec parseMergeSpecAndResolveTargetNamespace(const BSONElemen
 
     return mergeSpec;
 }
+
+/**
+ * Converts an array of field names into a set of FieldPath. Throws if 'fields' contains
+ * duplicate elements.
+ */
+boost::optional<std::set<FieldPath>> convertToFieldPaths(
+    const boost::optional<std::vector<std::string>>& fields) {
+
+    if (!fields)
+        return boost::none;
+
+    std::set<FieldPath> fieldPaths;
+
+    for (const auto& field : *fields) {
+        const auto res = fieldPaths.insert(FieldPath(field));
+        uassert(31465, str::stream() << "Found a duplicate field '" << field << "'", res.second);
+    }
+    return fieldPaths;
+}
 }  // namespace
 
 std::unique_ptr<DocumentSourceMerge::LiteParsed> DocumentSourceMerge::LiteParsed::parse(
@@ -309,19 +328,28 @@ std::unique_ptr<DocumentSourceMerge::LiteParsed> DocumentSourceMerge::LiteParsed
                                       MergeWhenMatchedMode_serializer(whenMatched),
                                       MergeWhenNotMatchedMode_serializer(whenNotMatched)),
             isSupportedMergeMode(whenMatched, whenNotMatched));
-
-    return std::make_unique<DocumentSourceMerge::LiteParsed>(
-        std::move(targetNss), whenMatched, whenNotMatched);
+    boost::optional<LiteParsedPipeline> liteParsedPipeline;
+    if (whenMatched == MergeWhenMatchedModeEnum::kPipeline) {
+        auto pipeline = mergeSpec.getWhenMatched()->pipeline;
+        invariant(pipeline);
+        liteParsedPipeline = LiteParsedPipeline(nss, *pipeline);
+    }
+    return std::make_unique<DocumentSourceMerge::LiteParsed>(spec.fieldName(),
+                                                             std::move(targetNss),
+                                                             whenMatched,
+                                                             whenNotMatched,
+                                                             std::move(liteParsedPipeline));
 }
 
 PrivilegeVector DocumentSourceMerge::LiteParsed::requiredPrivileges(
     bool isMongos, bool bypassDocumentValidation) const {
+    invariant(_foreignNss);
     auto actions = ActionSet{getDescriptors().at({_whenMatched, _whenNotMatched}).actions};
     if (bypassDocumentValidation) {
         actions.addAction(ActionType::bypassDocumentValidation);
     }
 
-    return {{ResourcePattern::forExactNamespace(_foreignNss), actions}};
+    return {{ResourcePattern::forExactNamespace(*_foreignNss), actions}};
 }
 
 DocumentSourceMerge::DocumentSourceMerge(NamespaceString outputNs,
@@ -342,11 +370,11 @@ DocumentSourceMerge::DocumentSourceMerge(NamespaceString outputNs,
 
         for (auto&& varElem : *letVariables) {
             const auto varName = varElem.fieldNameStringData();
-            Variables::uassertValidNameForUserWrite(varName);
+            Variables::validateNameForUserWrite(varName);
 
             _letVariables->emplace(
                 varName.toString(),
-                Expression::parseOperand(expCtx, varElem, expCtx->variablesParseState));
+                Expression::parseOperand(expCtx.get(), varElem, expCtx->variablesParseState));
         }
     }
 }
@@ -424,9 +452,10 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::createFromBson(
         mergeSpec.getWhenMatched() ? mergeSpec.getWhenMatched()->mode : kDefaultWhenMatched;
     auto whenNotMatched = mergeSpec.getWhenNotMatched().value_or(kDefaultWhenNotMatched);
     auto pipeline = mergeSpec.getWhenMatched() ? mergeSpec.getWhenMatched()->pipeline : boost::none;
+    auto fieldPaths = convertToFieldPaths(mergeSpec.getOn());
     auto [mergeOnFields, targetCollectionVersion] =
         expCtx->mongoProcessInterface->ensureFieldsUniqueOrResolveDocumentKey(
-            expCtx, mergeSpec.getOn(), mergeSpec.getTargetCollectionVersion(), targetNss);
+            expCtx, std::move(fieldPaths), mergeSpec.getTargetCollectionVersion(), targetNss);
 
     return DocumentSourceMerge::create(std::move(targetNss),
                                        expCtx,
@@ -436,6 +465,40 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceMerge::createFromBson(
                                        std::move(pipeline),
                                        std::move(mergeOnFields),
                                        targetCollectionVersion);
+}
+
+StageConstraints DocumentSourceMerge::constraints(Pipeline::SplitState pipeState) const {
+    // A $merge to an unsharded collection should merge on the primary shard to perform local
+    // writes. A $merge to a sharded collection has no requirement, since each shard can perform its
+    // own portion of the write. We use 'kAnyShard' to direct it to execute on one of the shards in
+    // case some of the writes happen to end up being local.
+    //
+    // Note that this decision is inherently racy and subject to become stale. This is okay because
+    // either choice will work correctly, we are simply applying a heuristic optimization.
+    return {StreamType::kStreaming,
+            PositionRequirement::kLast,
+            pExpCtx->inMongos &&
+                    pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _outputNs)
+                ? HostTypeRequirement::kAnyShard
+                : HostTypeRequirement::kPrimaryShard,
+            DiskUseRequirement::kWritesPersistentData,
+            FacetRequirement::kNotAllowed,
+            TransactionRequirement::kNotAllowed,
+            LookupRequirement::kNotAllowed,
+            UnionRequirement::kNotAllowed};
+}
+
+boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceMerge::distributedPlanLogic() {
+    // It should always be faster to avoid splitting the pipeline if the output collection is
+    // sharded. If we avoid splitting the pipeline then each shard can perform the writes to the
+    // target collection in parallel.
+    //
+    // Note that this decision is inherently racy and subject to become stale. This is okay because
+    // either choice will work correctly, we are simply applying a heuristic optimization.
+    if (pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _outputNs)) {
+        return boost::none;
+    }
+    return DocumentSourceWriter::distributedPlanLogic();
 }
 
 Value DocumentSourceMerge::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
@@ -481,14 +544,28 @@ std::pair<DocumentSourceMerge::BatchObject, int> DocumentSourceMerge::makeBatchO
     return {{std::move(mergeOnFields), std::move(mod), std::move(vars)}, modSize};
 }
 
+void DocumentSourceMerge::spill(BatchedObjects&& batch) try {
+    DocumentSourceWriteBlock writeBlock(pExpCtx->opCtx);
+    auto targetEpoch = _targetCollectionVersion
+        ? boost::optional<OID>(_targetCollectionVersion->epoch())
+        : boost::none;
+
+    _descriptor.strategy(pExpCtx, _outputNs, _writeConcern, targetEpoch, std::move(batch));
+} catch (const ExceptionFor<ErrorCodes::ImmutableField>& ex) {
+    uassertStatusOKWithContext(ex.toStatus(),
+                               "$merge failed to update the matching document, did you "
+                               "attempt to modify the _id or the shard key?");
+}
+
 void DocumentSourceMerge::waitWhileFailPointEnabled() {
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &hangWhileBuildingDocumentSourceMergeBatch,
         pExpCtx->opCtx,
         "hangWhileBuildingDocumentSourceMergeBatch",
         []() {
-            log() << "Hanging aggregation due to 'hangWhileBuildingDocumentSourceMergeBatch' "
-                  << "failpoint";
+            LOGV2(
+                20900,
+                "Hanging aggregation due to 'hangWhileBuildingDocumentSourceMergeBatch' failpoint");
         });
 }
 

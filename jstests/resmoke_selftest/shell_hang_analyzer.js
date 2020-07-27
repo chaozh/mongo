@@ -17,21 +17,37 @@ const anyLineMatches = function(lines, rex) {
  */
 
 const child = MongoRunner.runMongod();
-try {
-    clearRawMongoProgramOutput();
+clearRawMongoProgramOutput();
 
-    // drive-by test for enable(). Separate test for disable() below.
-    MongoRunner.runHangAnalyzer.disable();
-    MongoRunner.runHangAnalyzer.enable();
+// drive-by test for enable(). Separate test for disable() below.
+MongoRunner.runHangAnalyzer.disable();
+MongoRunner.runHangAnalyzer.enable();
 
-    MongoRunner.runHangAnalyzer([child.pid]);
+MongoRunner.runHangAnalyzer([child.pid]);
 
+if (TestData && TestData.inEvergreen) {
     assert.soon(() => {
-        const lines = rawMongoProgramOutput().split('\n');
-        return anyLineMatches(lines, /Dumping core/);
+        // Ensure the hang-analyzer has killed the process.
+        return !checkProgram(child.pid).alive;
     });
 
-} finally {
+    const lines = rawMongoProgramOutput().split('\n');
+    if (_isAddressSanitizerActive()) {
+        assert.soon(() => {
+            // On ASAN builds, we never dump the core during hang analyzer runs,
+            // nor should the output be empty (empty means it didn't run).
+            // If you're trying to debug why this test is failing, confirm that the
+            // hang_analyzer_dump_core expansion has not been set to true.
+            return !anyLineMatches(lines, /Dumping core/) && lines.length != 0;
+        });
+    } else {
+        assert.soon(() => {
+            // Outside of ASAN builds, we expect the core to be dumped.
+            return anyLineMatches(lines, /Dumping core/);
+        });
+    }
+} else {
+    // When running locally the hang-analyzer is not run.
     MongoRunner.stopMongod(child);
 }
 })();
@@ -56,6 +72,27 @@ clearRawMongoProgramOutput();
 
 MongoRunner.runHangAnalyzer.disable();
 MongoRunner.runHangAnalyzer([20200125]);
+
+const lines = rawMongoProgramOutput().split('\n');
+// Nothing should be executed, so there's no output.
+assert.eq(lines, ['']);
+})();
+
+(function() {
+/*
+ * Test that hang analyzer doesn't run when running resmoke locally
+ */
+clearRawMongoProgramOutput();
+
+const origInEvg = TestData.inEvergreen;
+
+try {
+    TestData.inEvergreen = false;
+    MongoRunner.runHangAnalyzer.enable();
+    MongoRunner.runHangAnalyzer(TestData.peerPids);
+} finally {
+    TestData.inEvergreen = origInEvg;
+}
 
 const lines = rawMongoProgramOutput().split('\n');
 // Nothing should be executed, so there's no output.

@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kExecutor
 
 #include "mongo/platform/basic.h"
 
@@ -37,10 +37,10 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -391,20 +391,28 @@ void Fetcher::_sendKillCursors(const CursorId id, const NamespaceString& nss) {
     if (id) {
         auto logKillCursorsResult = [](const RemoteCommandCallbackArgs& args) {
             if (!args.response.isOK()) {
-                warning() << "killCursors command task failed: " << redact(args.response.status);
+                LOGV2_WARNING(23918,
+                              "killCursors command task failed: {error}",
+                              "killCursors command task failed",
+                              "error"_attr = redact(args.response.status));
                 return;
             }
             auto status = getStatusFromCommandResult(args.response.data);
             if (!status.isOK()) {
-                warning() << "killCursors command failed: " << redact(status);
+                LOGV2_WARNING(23919,
+                              "killCursors command failed: {error}",
+                              "killCursors command failed",
+                              "error"_attr = redact(status));
             }
         };
         auto cmdObj = BSON("killCursors" << nss.coll() << "cursors" << BSON_ARRAY(id));
         auto scheduleResult = _executor->scheduleRemoteCommand(
             RemoteCommandRequest(_source, _dbname, cmdObj, nullptr), logKillCursorsResult);
         if (!scheduleResult.isOK()) {
-            warning() << "failed to schedule killCursors command: "
-                      << redact(scheduleResult.getStatus());
+            LOGV2_WARNING(23920,
+                          "Failed to schedule killCursors command: {error}",
+                          "Failed to schedule killCursors command",
+                          "error"_attr = redact(scheduleResult.getStatus()));
         }
     }
 }

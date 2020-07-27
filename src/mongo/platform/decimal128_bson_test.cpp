@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -42,10 +42,10 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
 #include "mongo/db/json.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 
 namespace {
 std::string initTestData();
@@ -94,7 +94,7 @@ TEST(Decimal128BSONTest, TestsConstructingDecimalWithBsonDump) {
             BSONElement extjson = b.getField("extjson");
             BSONElement canonical_extjson = b.getField("canonical_extjson");
 
-            log() << "Test - " << desc.str();
+            LOGV2(22609, "Test - {desc_str}", "desc_str"_attr = desc.str());
 
             StringData hexString = bson.valueStringData();
             BSONObj d = convertHexStringToBsonObj(hexString);
@@ -108,7 +108,7 @@ TEST(Decimal128BSONTest, TestsConstructingDecimalWithBsonDump) {
             }
 
             ASSERT_EQ(trimWhiteSpace(outputJson), trimWhiteSpace(expectedJson));
-            log() << "PASSED";
+            LOGV2(22610, "PASSED");
         }
     }
 }

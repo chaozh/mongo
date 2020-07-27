@@ -32,7 +32,6 @@
 #include "mongo/db/s/operation_sharding_state.h"
 
 #include "mongo/db/operation_context.h"
-#include "mongo/db/s/sharded_connection_info.h"
 
 namespace mongo {
 namespace {
@@ -48,7 +47,6 @@ const Milliseconds kMaxWaitForMovePrimaryCriticalSection = Minutes(5);
 
 // The name of the field in which the client attaches its database version.
 constexpr auto kDbVersionField = "databaseVersion"_sd;
-
 }  // namespace
 
 OperationShardingState::OperationShardingState() = default;
@@ -62,11 +60,7 @@ OperationShardingState& OperationShardingState::get(OperationContext* opCtx) {
 }
 
 bool OperationShardingState::isOperationVersioned(OperationContext* opCtx) {
-    const auto client = opCtx->getClient();
-
-    // Shard version information received from mongos may either be attached to the Client or
-    // directly to the OperationContext
-    return ShardedConnectionInfo::get(client, false) || get(opCtx).hasShardVersion();
+    return !(get(opCtx)._shardVersions.empty());
 }
 
 void OperationShardingState::setAllowImplicitCollectionCreation(
@@ -84,12 +78,9 @@ bool OperationShardingState::allowImplicitCollectionCreation() const {
 
 void OperationShardingState::initializeClientRoutingVersionsFromCommand(NamespaceString nss,
                                                                         const BSONObj& cmdObj) {
-    invariant(_shardVersions.empty());
-    invariant(_databaseVersions.empty());
-
+    // TODO SERVER-48618 Enforce that the nss shoud not be empty.
     boost::optional<ChunkVersion> shardVersion;
     boost::optional<DatabaseVersion> dbVersion;
-
     const auto shardVersionElem = cmdObj.getField(ChunkVersion::kShardVersionField);
     if (!shardVersionElem.eoo()) {
         shardVersion = uassertStatusOK(ChunkVersion::parseFromCommand(cmdObj));
@@ -113,30 +104,28 @@ void OperationShardingState::initializeClientRoutingVersions(
     NamespaceString nss,
     const boost::optional<ChunkVersion>& shardVersion,
     const boost::optional<DatabaseVersion>& dbVersion) {
-    invariant(_shardVersions.empty());
-    invariant(_databaseVersions.empty());
-
+    // TODO SERVER-48618 Enforce that the nss shoud not be empty. For now, all empty
+    // NamespaceStrings will be mapped under the empty string "".
     if (shardVersion) {
+        invariant(_shardVersionsChecked.find(nss.ns()) == _shardVersionsChecked.end(), nss.ns());
         _shardVersions[nss.ns()] = *shardVersion;
     }
     if (dbVersion) {
-        // Unforunately this is a bit ugly; it's because a command comes with a shardVersion or
-        // databaseVersion, and the assumption is that those versions are applied to whatever is
-        // returned by the Command's parseNs(), which can either be a full namespace or just a db.
-        _databaseVersions[nss.db().empty() ? nss.ns() : nss.db()] = *dbVersion;
+        invariant(_databaseVersions.find(nss.db()) == _databaseVersions.end());
+        _databaseVersions[nss.db()] = *dbVersion;
     }
 }
 
-bool OperationShardingState::hasShardVersion() const {
-    return _globalUnshardedShardVersion || !_shardVersions.empty();
+bool OperationShardingState::hasShardVersion(const NamespaceString& nss) const {
+    // TODO SERVER-48618 Enforce that the nss shoud not be empty. For now, all empty
+    // NamespaceStrings will be treated as the same namespace.
+    return _shardVersions.find(nss.ns()) != _shardVersions.end();
 }
 
-boost::optional<ChunkVersion> OperationShardingState::getShardVersion(
-    const NamespaceString& nss) const {
-    if (_globalUnshardedShardVersion) {
-        return ChunkVersion::UNSHARDED();
-    }
-
+boost::optional<ChunkVersion> OperationShardingState::getShardVersion(const NamespaceString& nss) {
+    // TODO SERVER-48618 Enforce that the nss shoud not be empty. For now, all empty
+    // NamespaceStrings will be treated as the same namespace.
+    _shardVersionsChecked.insert(nss.ns());
     const auto it = _shardVersions.find(nss.ns());
     if (it != _shardVersions.end()) {
         return it->second;
@@ -156,11 +145,6 @@ boost::optional<DatabaseVersion> OperationShardingState::getDbVersion(
         return boost::none;
     }
     return it->second;
-}
-
-void OperationShardingState::setGlobalUnshardedShardVersion() {
-    invariant(_shardVersions.empty());
-    _globalUnshardedShardVersion = true;
 }
 
 bool OperationShardingState::waitForMigrationCriticalSectionSignal(OperationContext* opCtx) {

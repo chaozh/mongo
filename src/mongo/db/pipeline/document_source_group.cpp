@@ -158,6 +158,17 @@ DocumentSource::GetNextResult DocumentSourceGroup::getNextSpilled() {
 
     _currentId = _firstPartOfNextGroup.first;
     const size_t numAccumulators = _accumulatedFields.size();
+
+    // Call startNewGroup on every accumulator.
+    Value expandedId = expandId(_currentId);
+    Document idDoc =
+        expandedId.getType() == BSONType::Object ? expandedId.getDocument() : Document();
+    for (size_t i = 0; i < numAccumulators; ++i) {
+        Value initializerValue =
+            _accumulatedFields[i].expr.initializer->evaluate(idDoc, &pExpCtx->variables);
+        _currentAccumulators[i]->startNewGroup(initializerValue);
+    }
+
     while (pExpCtx->getValueComparator().evaluate(_currentId == _firstPartOfNextGroup.first)) {
         // Inside of this loop, _firstPartOfNextGroup is the current data being processed.
         // At loop exit, it is the first value to be processed in the next group.
@@ -216,7 +227,8 @@ intrusive_ptr<DocumentSource> DocumentSourceGroup::optimize() {
     }
 
     for (auto&& accumulatedField : _accumulatedFields) {
-        accumulatedField.expression = accumulatedField.expression->optimize();
+        accumulatedField.expr.initializer = accumulatedField.expr.initializer->optimize();
+        accumulatedField.expr.argument = accumulatedField.expr.argument->optimize();
     }
 
     return this;
@@ -241,9 +253,11 @@ Value DocumentSourceGroup::serialize(boost::optional<ExplainOptions::Verbosity> 
 
     // Add the remaining fields.
     for (auto&& accumulatedField : _accumulatedFields) {
-        intrusive_ptr<Accumulator> accum = accumulatedField.makeAccumulator();
+        intrusive_ptr<AccumulatorState> accum = accumulatedField.makeAccumulator();
         insides[accumulatedField.fieldName] =
-            Value(accum->serialize(accumulatedField.expression, static_cast<bool>(explain)));
+            Value(accum->serialize(accumulatedField.expr.initializer,
+                                   accumulatedField.expr.argument,
+                                   static_cast<bool>(explain)));
     }
 
     if (_doingMerge) {
@@ -263,7 +277,8 @@ DepsTracker::State DocumentSourceGroup::getDependencies(DepsTracker* deps) const
 
     // add the rest
     for (auto&& accumulatedField : _accumulatedFields) {
-        accumulatedField.expression->addDependencies(deps);
+        accumulatedField.expr.argument->addDependencies(deps);
+        // Don't add initializer, because it doesn't refer to docs from the input stream.
     }
 
     return DepsTracker::State::EXHAUSTIVE_ALL;
@@ -357,23 +372,23 @@ intrusive_ptr<Expression> parseIdExpression(const intrusive_ptr<ExpressionContex
     if (groupField.type() == Object) {
         // {_id: {}} is treated as grouping on a constant, not an expression
         if (groupField.Obj().isEmpty()) {
-            return ExpressionConstant::create(expCtx, Value(groupField));
+            return ExpressionConstant::create(expCtx.get(), Value(groupField));
         }
 
         const BSONObj idKeyObj = groupField.Obj();
         if (idKeyObj.firstElementFieldName()[0] == '$') {
             // grouping on a $op expression
-            return Expression::parseObject(expCtx, idKeyObj, vps);
+            return Expression::parseObject(expCtx.get(), idKeyObj, vps);
         } else {
             for (auto&& field : idKeyObj) {
                 uassert(17390,
                         "$group does not support inclusion-style expressions",
                         !field.isNumber() && field.type() != Bool);
             }
-            return ExpressionObject::parse(expCtx, idKeyObj, vps);
+            return ExpressionObject::parse(expCtx.get(), idKeyObj, vps);
         }
     } else {
-        return Expression::parseOperand(expCtx, groupField, vps);
+        return Expression::parseOperand(expCtx.get(), groupField, vps);
     }
 }
 
@@ -422,7 +437,7 @@ intrusive_ptr<DocumentSource> DocumentSourceGroup::createFromBson(
         } else {
             // Any other field will be treated as an accumulator specification.
             pGroup->addAccumulator(
-                AccumulationStatement::parseAccumulationStatement(pExpCtx, groupField, vps));
+                AccumulationStatement::parseAccumulationStatement(pExpCtx.get(), groupField, vps));
         }
     }
 
@@ -468,7 +483,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
     GetNextResult input = pSource->getNext();
     for (; input.isAdvanced(); input = pSource->getNext()) {
         if (_memoryUsageBytes > _maxMemoryUsageBytes) {
-            uassert(16945,
+            uassert(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
                     "Exceeded memory limit for $group, but didn't allow external sort."
                     " Pass allowDiskUse:true to opt in.",
                     _allowDiskUse);
@@ -485,16 +500,23 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
         // accumulator. This is done in a somewhat odd way in order to avoid hashing 'id' and
         // looking it up in '_groups' multiple times.
         const size_t oldSize = _groups->size();
-        vector<intrusive_ptr<Accumulator>>& group = (*_groups)[id];
+        vector<intrusive_ptr<AccumulatorState>>& group = (*_groups)[id];
         const bool inserted = _groups->size() != oldSize;
 
         if (inserted) {
             _memoryUsageBytes += id.getApproximateSize();
 
-            // Add the accumulators
+            // Initialize and add the accumulators
+            Value expandedId = expandId(id);
+            Document idDoc =
+                expandedId.getType() == BSONType::Object ? expandedId.getDocument() : Document();
             group.reserve(numAccumulators);
             for (auto&& accumulatedField : _accumulatedFields) {
-                group.push_back(accumulatedField.makeAccumulator());
+                auto accum = accumulatedField.makeAccumulator();
+                Value initializerValue =
+                    accumulatedField.expr.initializer->evaluate(idDoc, &pExpCtx->variables);
+                accum->startNewGroup(initializerValue);
+                group.push_back(accum);
             }
         } else {
             for (auto&& groupObj : group) {
@@ -508,7 +530,7 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
 
         for (size_t i = 0; i < numAccumulators; i++) {
             group[i]->process(
-                _accumulatedFields[i].expression->evaluate(rootDocument, &pExpCtx->variables),
+                _accumulatedFields[i].expr.argument->evaluate(rootDocument, &pExpCtx->variables),
                 _doingMerge);
 
             _memoryUsageBytes += group[i]->memUsageForSorter();
@@ -685,7 +707,7 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceGroup::distr
 
     VariablesParseState vps = pExpCtx->variablesParseState;
     /* the merger will use the same grouping key */
-    mergingGroup->setIdExpression(ExpressionFieldPath::parse(pExpCtx, "$$ROOT._id", vps));
+    mergingGroup->setIdExpression(ExpressionFieldPath::parse(pExpCtx.get(), "$$ROOT._id", vps));
 
     for (auto&& accumulatedField : _accumulatedFields) {
         // The merger's output field names will be the same, as will the accumulator factories.
@@ -693,8 +715,8 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceGroup::distr
         // original accumulator may be collecting an expression based on a field expression or
         // constant.  Here, we accumulate the output of the same name from the prior group.
         auto copiedAccumulatedField = accumulatedField;
-        copiedAccumulatedField.expression =
-            ExpressionFieldPath::parse(pExpCtx, "$$ROOT." + copiedAccumulatedField.fieldName, vps);
+        copiedAccumulatedField.expr.argument = ExpressionFieldPath::parse(
+            pExpCtx.get(), "$$ROOT." + copiedAccumulatedField.fieldName, vps);
         mergingGroup->addAccumulator(copiedAccumulatedField);
     }
 
@@ -740,12 +762,11 @@ bool DocumentSourceGroup::canRunInParallelBeforeWriteStage(
 
 std::unique_ptr<GroupFromFirstDocumentTransformation>
 DocumentSourceGroup::rewriteGroupAsTransformOnFirstDocument() const {
-    if (!_idFieldNames.empty()) {
+    if (_idExpressions.size() != 1) {
         // This transformation is only intended for $group stages that group on a single field.
         return nullptr;
     }
 
-    invariant(_idExpressions.size() == 1);
     auto fieldPathExpr = dynamic_cast<ExpressionFieldPath*>(_idExpressions.front().get());
     if (!fieldPathExpr || !fieldPathExpr->isRootFieldPath()) {
         return nullptr;
@@ -772,10 +793,24 @@ DocumentSourceGroup::rewriteGroupAsTransformOnFirstDocument() const {
     }
 
     std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>> fields;
-    fields.push_back(std::make_pair("_id", ExpressionFieldPath::create(pExpCtx, groupId)));
+
+    boost::intrusive_ptr<Expression> idField;
+    // The _id field can be specified either as a fieldpath (ex. _id: "$a") or as a singleton
+    // object (ex. _id: {v: "$a"}).
+    if (_idFieldNames.empty()) {
+        idField = ExpressionFieldPath::create(pExpCtx.get(), groupId);
+    } else {
+        invariant(_idFieldNames.size() == 1);
+        idField = ExpressionObject::create(pExpCtx.get(),
+                                           {{_idFieldNames.front(), _idExpressions.front()}});
+    }
+    fields.push_back(std::make_pair("_id", idField));
 
     for (auto&& accumulator : _accumulatedFields) {
-        fields.push_back(std::make_pair(accumulator.fieldName, accumulator.expression));
+        fields.push_back(std::make_pair(accumulator.fieldName, accumulator.expr.argument));
+
+        // Since we don't attempt this transformation for non-$first accumulators,
+        // the initializer should always be trivial.
     }
 
     return GroupFromFirstDocumentTransformation::create(pExpCtx, groupId, std::move(fields));

@@ -70,6 +70,8 @@ enum StageType {
     STAGE_IXSCAN,
     STAGE_LIMIT,
 
+    STAGE_MOCK,
+
     // Implements iterating over one or more RecordStore::Cursor.
     STAGE_MULTI_ITERATOR,
 
@@ -81,17 +83,16 @@ enum StageType {
     STAGE_PROJECTION_COVERED,
     STAGE_PROJECTION_SIMPLE,
 
-    // Stages for running aggregation pipelines.
-    STAGE_CHANGE_STREAM_PROXY,
-    STAGE_PIPELINE_PROXY,
-
     STAGE_QUEUED_DATA,
     STAGE_RECORD_STORE_FAST_COUNT,
     STAGE_RETURN_KEY,
     STAGE_SHARDING_FILTER,
     STAGE_SKIP,
-    STAGE_SORT,
+
+    STAGE_SORT_DEFAULT,
+    STAGE_SORT_SIMPLE,
     STAGE_SORT_KEY_GENERATOR,
+
     STAGE_SORT_MERGE,
     STAGE_SUBPLAN,
 
@@ -107,5 +108,26 @@ enum StageType {
 
     STAGE_UPDATE,
 };
+
+inline bool isProjectionStageType(StageType stageType) {
+    switch (stageType) {
+        case STAGE_PROJECTION_COVERED:
+        case STAGE_PROJECTION_DEFAULT:
+        case STAGE_PROJECTION_SIMPLE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool isSortStageType(StageType stageType) {
+    switch (stageType) {
+        case STAGE_SORT_DEFAULT:
+        case STAGE_SORT_SIMPLE:
+            return true;
+        default:
+            return false;
+    }
+}
 
 }  // namespace mongo

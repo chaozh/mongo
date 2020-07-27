@@ -84,7 +84,7 @@ void appendMultikeyPathsAsBytes(BSONObj keyPattern,
 void parseMultikeyPathsFromBytes(BSONObj multikeyPathsObj, MultikeyPaths* multikeyPaths) {
     invariant(multikeyPaths);
     for (auto elem : multikeyPathsObj) {
-        std::set<size_t> multikeyComponents;
+        MultikeyComponents multikeyComponents;
         int len;
         const char* data = elem.binData(len);
         invariant(len > 0);
@@ -120,6 +120,26 @@ void BSONCollectionCatalogEntry::IndexMetaData::updateTTLSetting(long long newEx
     spec = b.obj();
 }
 
+
+void BSONCollectionCatalogEntry::IndexMetaData::updateHiddenSetting(bool hidden) {
+    // If hidden == false, we remove this field from catalog rather than add a field with false.
+    // or else, the old binary can't startup due to the unknown field.
+    BSONObjBuilder b;
+    for (BSONObjIterator bi(spec); bi.more();) {
+        BSONElement e = bi.next();
+        if (e.fieldNameStringData() == "hidden") {
+            continue;
+        }
+        b.append(e);
+    }
+
+    if (hidden) {
+        b.append("hidden", hidden);
+    }
+    spec = b.obj();
+}
+
+
 // --------------------------
 
 int BSONCollectionCatalogEntry::MetaData::findIndexOffset(StringData name) const {
@@ -138,32 +158,6 @@ bool BSONCollectionCatalogEntry::MetaData::eraseIndex(StringData name) {
 
     indexes.erase(indexes.begin() + indexOffset);
     return true;
-}
-
-void BSONCollectionCatalogEntry::MetaData::rename(StringData toNS) {
-    ns = toNS.toString();
-
-    // In FCV 4.4, the 'ns' field is not present. Only rename the 'ns' field for each index in
-    // FCV 4.2.
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-        return;
-    }
-
-    for (size_t i = 0; i < indexes.size(); i++) {
-        BSONObj spec = indexes[i].spec;
-        BSONObjBuilder b;
-        // Add the fields in the same order they were in the original specification.
-        for (auto&& elem : spec) {
-            if (elem.fieldNameStringData() == "ns") {
-                b.append("ns", toNS);
-            } else {
-                b.append(elem);
-            }
-        }
-        indexes[i].spec = b.obj();
-    }
 }
 
 KVPrefix BSONCollectionCatalogEntry::MetaData::getMaxPrefix() const {

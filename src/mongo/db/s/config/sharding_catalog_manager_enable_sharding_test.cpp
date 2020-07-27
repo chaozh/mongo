@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +36,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
@@ -43,10 +44,8 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/future.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -116,23 +115,67 @@ TEST_F(EnableShardingTest, dbExistsWithDifferentCase) {
 }
 
 TEST_F(EnableShardingTest, dbExists) {
-    ShardType shard;
-    shard.setName("shard0");
-    shard.setHost("shard0:12");
+    const std::string dbname = "db4";
+    ShardType shard{"shard0", "shard0:12"};
     setupShards({shard});
-    setupDatabase("db4", shard.getName(), false);
-    ShardingCatalogManager::get(operationContext())
-        ->enableSharding(operationContext(), "db4", ShardId());
+    setupDatabase(dbname, shard.getName(), false);
+
+    targeterFactory()->addTargeterToReturn(ConnectionString(HostAndPort{shard.getHost()}), [&] {
+        auto targeter = std::make_unique<RemoteCommandTargeterMock>();
+        targeter->setFindHostReturnValue(HostAndPort{shard.getHost()});
+        return targeter;
+    }());
+
+    // Prime the shard registry with information about the existing shard
+    shardRegistry()->reload(operationContext());
+
+    auto future = launchAsync([this, dbname] {
+        ThreadClient tc("Test", getServiceContext());
+        auto opCtx = tc->makeOperationContext();
+        ShardingCatalogManager::get(opCtx.get())->enableSharding(opCtx.get(), dbname, ShardId());
+    });
+
+    // Return OK for _flushDatabaseCacheUpdates
+    onCommand([&](const RemoteCommandRequest& request) {
+        std::string cmdName = request.cmdObj.firstElement().fieldName();
+        ASSERT_EQUALS("_flushDatabaseCacheUpdates", cmdName);
+
+        return BSON("ok" << 1);
+    });
+
+    future.default_timed_get();
 }
 
 TEST_F(EnableShardingTest, succeedsWhenTheDatabaseIsAlreadySharded) {
-    ShardType shard;
-    shard.setName("shard0");
-    shard.setHost("shard0:12");
+    const std::string dbname = "db5";
+    ShardType shard{"shard0", "shard0:12"};
     setupShards({shard});
-    setupDatabase("db5", shard.getName(), true);
-    ShardingCatalogManager::get(operationContext())
-        ->enableSharding(operationContext(), "db5", ShardId());
+    setupDatabase(dbname, shard.getName(), true);
+
+    targeterFactory()->addTargeterToReturn(ConnectionString(HostAndPort{shard.getHost()}), [&] {
+        auto targeter = std::make_unique<RemoteCommandTargeterMock>();
+        targeter->setFindHostReturnValue(HostAndPort{shard.getHost()});
+        return targeter;
+    }());
+
+    // Prime the shard registry with information about the existing shard
+    shardRegistry()->reload(operationContext());
+
+    auto future = launchAsync([this, dbname] {
+        ThreadClient tc("Test", getServiceContext());
+        auto opCtx = tc->makeOperationContext();
+        ShardingCatalogManager::get(opCtx.get())->enableSharding(opCtx.get(), dbname, ShardId());
+    });
+
+    // Return OK for _flushDatabaseCacheUpdates
+    onCommand([&](const RemoteCommandRequest& request) {
+        std::string cmdName = request.cmdObj.firstElement().fieldName();
+        ASSERT_EQUALS("_flushDatabaseCacheUpdates", cmdName);
+
+        return BSON("ok" << 1);
+    });
+
+    future.default_timed_get();
 }
 
 TEST_F(EnableShardingTest, dbExistsInvalidFormat) {

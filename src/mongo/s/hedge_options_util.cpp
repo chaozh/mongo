@@ -29,39 +29,37 @@
 
 #include "mongo/s/hedge_options_util.h"
 
-#include "mongo/client/read_preference.h"
-#include "mongo/db/query/query_request.h"
 #include "mongo/s/mongos_server_parameters_gen.h"
 
 namespace mongo {
 
+namespace {
+// Only hedge commands that cannot trigger writes.
+const std::set<std::string> supportedCmds{"collStats",
+                                          "count",
+                                          "dataSize",
+                                          "dbStats",
+                                          "distinct",
+                                          "filemd5",
+                                          "find",
+                                          "listCollections",
+                                          "listIndexes",
+                                          "planCacheListFilters"};
+}  // namespace
+
 boost::optional<executor::RemoteCommandRequestOnAny::HedgeOptions> extractHedgeOptions(
-    OperationContext* opCtx, const BSONObj& cmdObj) {
-    const auto hedgingMode = ReadPreferenceSetting::get(opCtx).hedgingMode;
-
-    if (gReadHedgingMode == kReadHedgingModeOn && hedgingMode && hedgingMode->getEnabled()) {
-        boost::optional<int> maxTimeMS;
-        if (auto cmdOptionMaxTimeMSField = cmdObj[QueryRequest::cmdOptionMaxTimeMS]) {
-            maxTimeMS = uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdOptionMaxTimeMSField));
-        }
-
-        // Check if the operation is worth hedging.
-        if (maxTimeMS && maxTimeMS > gMaxTimeMSThresholdForHedging) {
-            return boost::none;
-        }
-
-        // Compute the delay.
-        auto delay = Milliseconds{0};
-        bool shouldDelayHedging = hedgingMode->getDelay();
-
-        if (shouldDelayHedging) {
-            delay = maxTimeMS ? Milliseconds{gHedgingDelayPercentage * maxTimeMS.get() / 100}
-                              : Milliseconds{gDefaultHedgingDelayMS};
-        }
-
-        return executor::RemoteCommandRequestOnAny::HedgeOptions{1, delay};
+    const BSONObj& cmdObj, const ReadPreferenceSetting& readPref) {
+    if (!(gReadHedgingMode.load() == ReadHedgingMode::kOn && readPref.hedgingMode &&
+          readPref.hedgingMode->getEnabled())) {
+        return boost::none;
     }
 
+    auto cmdName(cmdObj.firstElement().fieldNameStringData().toString());
+
+    if (supportedCmds.count(cmdName)) {
+        return executor::RemoteCommandRequestOnAny::HedgeOptions{1,
+                                                                 gMaxTimeMSForHedgedReads.load()};
+    }
     return boost::none;
 }
 

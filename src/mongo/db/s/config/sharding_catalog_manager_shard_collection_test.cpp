@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -38,16 +38,15 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
 
@@ -108,7 +107,7 @@ protected:
 };
 
 TEST_F(CreateFirstChunksTest, Split_Disallowed_With_Both_SplitPoints_And_Zones) {
-    ShardsvrShardCollection request;
+    ShardsvrShardCollectionRequest request;
     std::vector<BSONObj> splitPoints = {BSONObj()};
     request.setInitialSplitPoints(splitPoints);
     std::vector<TagsType> tags = {
@@ -157,7 +156,7 @@ TEST_F(CreateFirstChunksTest, NonEmptyCollection_SplitPoints_FromSplitVector_Man
         ThreadClient tc("Test", getServiceContext());
         auto opCtx = cc().makeOperationContext();
 
-        ShardsvrShardCollection request;
+        ShardsvrShardCollectionRequest request;
         auto optimization =
             InitialSplitPolicy::calculateOptimizationStrategy(operationContext(),
                                                               kShardKeyPattern,
@@ -202,7 +201,7 @@ TEST_F(CreateFirstChunksTest, NonEmptyCollection_SplitPoints_FromClient_ManyChun
         std::vector<TagsType> zones{};
         bool collectionIsEmpty = false;
 
-        ShardsvrShardCollection request;
+        ShardsvrShardCollectionRequest request;
         request.setInitialSplitPoints(splitPoints);
         auto optimization = InitialSplitPolicy::calculateOptimizationStrategy(operationContext(),
                                                                               kShardKeyPattern,
@@ -236,7 +235,7 @@ TEST_F(CreateFirstChunksTest, NonEmptyCollection_WithZones_OneChunkToPrimary) {
                  ChunkRange(kShardKeyPattern.getKeyPattern().globalMin(), BSON("x" << 0)))};
     bool collectionIsEmpty = false;
 
-    ShardsvrShardCollection request;
+    ShardsvrShardCollectionRequest request;
     auto optimization = InitialSplitPolicy::calculateOptimizationStrategy(
         operationContext(), kShardKeyPattern, request, zones, 3 /* numShards */, collectionIsEmpty);
 
@@ -274,7 +273,7 @@ TEST_F(CreateFirstChunksTest, EmptyCollection_SplitPoints_FromClient_ManyChunksD
         std::vector<TagsType> zones{};
         bool collectionIsEmpty = true;
 
-        ShardsvrShardCollection request;
+        ShardsvrShardCollectionRequest request;
         request.setInitialSplitPoints(splitPoints);
         auto optimization = InitialSplitPolicy::calculateOptimizationStrategy(operationContext(),
                                                                               kShardKeyPattern,
@@ -321,7 +320,7 @@ TEST_F(CreateFirstChunksTest, EmptyCollection_NoSplitPoints_OneChunkToPrimary) {
         std::vector<TagsType> zones{};
         bool collectionIsEmpty = true;
 
-        ShardsvrShardCollection request;
+        ShardsvrShardCollectionRequest request;
         request.setInitialSplitPoints(splitPoints);
         auto optimization = InitialSplitPolicy::calculateOptimizationStrategy(operationContext(),
                                                                               kShardKeyPattern,
@@ -355,7 +354,7 @@ TEST_F(CreateFirstChunksTest, EmptyCollection_WithZones_ManyChunksOnFirstZoneSha
                  "TestZone",
                  ChunkRange(kShardKeyPattern.getKeyPattern().globalMin(), BSON("x" << 0)))};
     bool collectionIsEmpty = true;
-    ShardsvrShardCollection request;
+    ShardsvrShardCollectionRequest request;
     auto optimization = InitialSplitPolicy::calculateOptimizationStrategy(
         operationContext(), kShardKeyPattern, request, zones, 3 /* numShards */, collectionIsEmpty);
 

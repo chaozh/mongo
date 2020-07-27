@@ -27,13 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace moe = mongo::optionenvironment;
 
@@ -49,15 +49,24 @@ Status WiredTigerGlobalOptions::store(const moe::Environment& params) {
     }
 
     if (!wiredTigerGlobalOptions.engineConfig.empty()) {
-        log() << "Engine custom option: " << wiredTigerGlobalOptions.engineConfig;
+        LOGV2(22293,
+              "Engine custom option: {wiredTigerGlobalOptions_engineConfig}",
+              "Engine custom option",
+              "option"_attr = wiredTigerGlobalOptions.engineConfig);
     }
 
     if (!wiredTigerGlobalOptions.collectionConfig.empty()) {
-        log() << "Collection custom option: " << wiredTigerGlobalOptions.collectionConfig;
+        LOGV2(22294,
+              "Collection custom option: {wiredTigerGlobalOptions_collectionConfig}",
+              "Collection custom option",
+              "option"_attr = wiredTigerGlobalOptions.collectionConfig);
     }
 
     if (!wiredTigerGlobalOptions.indexConfig.empty()) {
-        log() << "Index custom option: " << wiredTigerGlobalOptions.indexConfig;
+        LOGV2(22295,
+              "Index custom option: {wiredTigerGlobalOptions_indexConfig}",
+              "Index custom option",
+              "option"_attr = wiredTigerGlobalOptions.indexConfig);
     }
 
     return Status::OK();
@@ -73,15 +82,6 @@ Status WiredTigerGlobalOptions::validateWiredTigerCompressor(const std::string& 
         !kZlib.equalCaseInsensitive(value) && !kZstd.equalCaseInsensitive(value)) {
         return {ErrorCodes::BadValue,
                 "Compression option must be one of: 'none', 'snappy', 'zlib', or 'zstd'"};
-    }
-
-    return Status::OK();
-}
-
-Status WiredTigerGlobalOptions::validateMaxCacheOverflowFileSizeGB(double value) {
-    if (value != 0.0 && value < 0.1) {
-        return {ErrorCodes::BadValue,
-                "MaxCacheOverflowFileSizeGB must be either 0 (unbounded) or greater than 0.1."};
     }
 
     return Status::OK();

@@ -27,95 +27,41 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
+#include "mongo/logv2/log.h"
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/write_ops/cluster_write.h"
 
-#include <algorithm>
-
-#include "mongo/base/status.h"
-#include "mongo/client/connpool.h"
-#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/write_concern_options.h"
-#include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/chunk_writes_tracker.h"
-#include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard_util.h"
 #include "mongo/s/write_ops/chunk_manager_targeter.h"
-#include "mongo/util/log.h"
-#include "mongo/util/str.h"
 
 namespace mongo {
-namespace {
-
-void toBatchError(const Status& status, BatchedCommandResponse* response) {
-    response->clear();
-    response->setStatus(status);
-    dassert(response->isValid(nullptr));
-}
-
-}  // namespace
 
 void ClusterWriter::write(OperationContext* opCtx,
                           const BatchedCommandRequest& request,
                           BatchWriteExecStats* stats,
                           BatchedCommandResponse* response,
                           boost::optional<OID> targetEpoch) {
-    const NamespaceString& nss = request.getNS();
-
     LastError::Disabled disableLastError(&LastError::get(opCtx->getClient()));
 
-    // Config writes and shard writes are done differently
-    if (nss.db() == NamespaceString::kAdminDb) {
+    ChunkManagerTargeter targeter(opCtx, request.getNS(), targetEpoch);
+
+    if (targeter.endpointIsConfigServer()) {
         Grid::get(opCtx)->catalogClient()->writeConfigServerDirect(opCtx, request, response);
-    } else {
-        {
-            ChunkManagerTargeter targeter(request.getNS(), targetEpoch);
-
-            Status targetInitStatus = targeter.init(opCtx);
-            if (!targetInitStatus.isOK()) {
-                toBatchError(targetInitStatus.withContext(
-                                 str::stream()
-                                 << "unable to initialize targeter for write op for collection "
-                                 << request.getNS().ns()),
-                             response);
-                return;
-            }
-
-            auto swEndpoints = targeter.targetCollection();
-            if (!swEndpoints.isOK()) {
-                toBatchError(swEndpoints.getStatus().withContext(
-                                 str::stream() << "unable to target write op for collection "
-                                               << request.getNS().ns()),
-                             response);
-                return;
-            }
-
-            const auto& endpoints = swEndpoints.getValue();
-
-            // Handle sharded config server writes differently.
-            if (std::any_of(endpoints.begin(), endpoints.end(), [](const auto& it) {
-                    return it.shardName == ShardRegistry::kConfigServerShardId;
-                })) {
-                // There should be no namespaces that partially target config servers.
-                invariant(endpoints.size() == 1);
-
-                // For config servers, we do direct writes.
-                Grid::get(opCtx)->catalogClient()->writeConfigServerDirect(
-                    opCtx, request, response);
-                return;
-            }
-
-            BatchWriteExec::executeBatch(opCtx, targeter, request, response, stats);
-        }
+        return;
     }
+
+    LOGV2_DEBUG_OPTIONS(
+        4817400, 2, {logv2::LogComponent::kShardMigrationPerf}, "Starting batch write");
+
+    BatchWriteExec::executeBatch(opCtx, targeter, request, response, stats);
+
+    LOGV2_DEBUG_OPTIONS(
+        4817401, 2, {logv2::LogComponent::kShardMigrationPerf}, "Finished batch write");
 }
 
 }  // namespace mongo

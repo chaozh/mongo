@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -42,7 +42,6 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/query/index_bounds_builder.h"
-#include "mongo/util/log.h"
 
 namespace {
 
@@ -60,15 +59,16 @@ namespace mongo {
 // static
 const char* IndexScan::kStageType = "IXSCAN";
 
-IndexScan::IndexScan(OperationContext* opCtx,
+IndexScan::IndexScan(ExpressionContext* expCtx,
+                     const Collection* collection,
                      IndexScanParams params,
                      WorkingSet* workingSet,
                      const MatchExpression* filter)
-    : RequiresIndexStage(kStageType, opCtx, params.indexDescriptor, workingSet),
+    : RequiresIndexStage(kStageType, expCtx, collection, params.indexDescriptor, workingSet),
       _workingSet(workingSet),
       _keyPattern(params.keyPattern.getOwned()),
       _bounds(std::move(params.bounds)),
-      _filter(filter),
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
       _direction(params.direction),
       _forward(params.direction == 1),
       _shouldDedup(params.shouldDedup),
@@ -90,7 +90,7 @@ IndexScan::IndexScan(OperationContext* opCtx,
 
 boost::optional<IndexKeyEntry> IndexScan::initIndexScan() {
     // Perform the possibly heavy-duty initialization of the underlying index cursor.
-    _indexCursor = indexAccessMethod()->newCursor(getOpCtx(), _forward);
+    _indexCursor = indexAccessMethod()->newCursor(opCtx(), _forward);
 
     // We always seek once to establish the cursor position.
     ++_specificStats.seeks;
@@ -220,10 +220,8 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
         }
     }
 
-    if (_filter) {
-        if (!Filter::passes(kv->key, _keyPattern, _filter)) {
-            return PlanStage::NEED_TIME;
-        }
+    if (!Filter::passes(kv->key, _keyPattern, _filter)) {
+        return PlanStage::NEED_TIME;
     }
 
     if (!kv->key.isOwned())
@@ -234,7 +232,7 @@ PlanStage::StageState IndexScan::doWork(WorkingSetID* out) {
     WorkingSetMember* member = _workingSet->get(id);
     member->recordId = kv->loc;
     member->keyData.push_back(IndexKeyDatum(
-        _keyPattern, kv->key, workingSetIndexId(), getOpCtx()->recoveryUnit()->getSnapshotId()));
+        _keyPattern, kv->key, workingSetIndexId(), opCtx()->recoveryUnit()->getSnapshotId()));
     _workingSet->transitionToRecordIdAndIdx(id);
 
     if (_addKeyMetadata) {
@@ -273,7 +271,7 @@ void IndexScan::doDetachFromOperationContext() {
 
 void IndexScan::doReattachToOperationContext() {
     if (_indexCursor)
-        _indexCursor->reattachToOperationContext(getOpCtx());
+        _indexCursor->reattachToOperationContext(opCtx());
 }
 
 std::unique_ptr<PlanStageStats> IndexScan::getStats() {

@@ -9,6 +9,7 @@ CFLAGS
 CPPFLAGS
 CPUs
 CRC
+CSV
 Cheng
 Christoph
 Collet's
@@ -106,6 +107,7 @@ WiredTigerPanicException
 WiredTigerRollbackException
 WiredTigerStat
 WiredTigerTestCase
+XRay
 Yann
 Za
 Zstd
@@ -261,6 +263,7 @@ freelist
 fsync
 ftruncate
 fvisibility
+fxray
 gcc
 gdbm
 ge
@@ -283,6 +286,7 @@ hugepage
 icount
 ie
 iflag
+incr
 indices
 init
 insn
@@ -316,6 +320,7 @@ libkvs
 libtool
 libwiredtiger
 lifecycle
+llvm
 lmin
 ln
 loadtext
@@ -428,6 +433,7 @@ putValue
 putValueString
 py
 qnx
+qqq
 rVv
 rdbms
 rdlock
@@ -480,6 +486,7 @@ startsync
 startuml
 statlog
 stderr
+stdout
 str
 strerror
 strftime
@@ -496,6 +503,7 @@ svg
 sys
 syscalls
 sz
+t2
 tRuE
 tablename
 tcl
@@ -556,6 +564,7 @@ wrlock
 wtperf
 wtstats
 xa
+xray
 yieldcpu
 zlib
 zseries

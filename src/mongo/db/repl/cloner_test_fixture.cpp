@@ -31,9 +31,11 @@
 
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/repl/cloner_test_fixture.h"
+#include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/storage/storage_engine_mock.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/logger/logger.h"
 #include "mongo/unittest/unittest.h"
@@ -55,8 +57,6 @@ BSONObj ClonerTestFixture::createCursorResponse(const std::string& nss, const BS
 
 void ClonerTestFixture::setUp() {
     unittest::Test::setUp();
-    logger::globalLogDomain()->setMinimumLoggedSeverity(
-        logger::LogComponent::kReplicationInitialSync, logger::LogSeverity::Debug(1));
     Client::initThread("ClonerTest");
     ThreadPool::Options options;
     options.minThreads = 1U;
@@ -69,19 +69,27 @@ void ClonerTestFixture::setUp() {
     const bool autoReconnect = true;
     _mockClient = std::unique_ptr<DBClientConnection>(
         new MockDBClientConnection(_mockServer.get(), autoReconnect));
-    _sharedData = std::make_unique<InitialSyncSharedData>(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44,
-        kInitialRollbackId,
-        Days(1),
-        &_clock);
+    _sharedData = std::make_unique<InitialSyncSharedData>(kInitialRollbackId, Days(1), &_clock);
+
+    // Required by CollectionCloner::listIndexesStage() and IndexBuildsCoordinator.
+    getServiceContext()->setStorageEngine(std::make_unique<StorageEngineMock>());
+
+    // Set the initial sync ID on the mock server.
+    _mockServer->insert(
+        ReplicationConsistencyMarkersImpl::kDefaultInitialSyncIdNamespace.toString(),
+        BSON("_id" << _initialSyncId));
 }
 
 void ClonerTestFixture::tearDown() {
     _dbWorkThreadPool.reset();
     Client::releaseCurrent();
-    logger::globalLogDomain()->setMinimumLoggedSeverity(
-        logger::LogComponent::kReplicationInitialSync, logger::LogSeverity::Debug(0));
     unittest::Test::tearDown();
+}
+
+void ClonerTestFixture::setInitialSyncId() {
+    stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
+    _sharedData->setSyncSourceWireVersion(lk, WireVersion::RESUMABLE_INITIAL_SYNC);
+    _sharedData->setInitialSyncSourceId(lk, _initialSyncId);
 }
 
 }  // namespace repl

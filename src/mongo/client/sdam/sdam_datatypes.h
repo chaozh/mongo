@@ -36,6 +36,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/rpc/topology_version_gen.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/net/hostandport.h"
 
 
 /**
@@ -54,6 +55,7 @@ enum class TopologyType {
 };
 const std::vector<TopologyType> allTopologyTypes();
 std::string toString(const TopologyType topologyType);
+StatusWith<TopologyType> parseTopologyType(StringData strTopologyType);
 std::ostream& operator<<(std::ostream& os, const TopologyType topologyType);
 
 enum class ServerType {
@@ -71,7 +73,6 @@ std::string toString(const ServerType serverType);
 StatusWith<ServerType> parseServerType(StringData strServerType);
 std::ostream& operator<<(std::ostream& os, const ServerType serverType);
 
-using ServerAddress = std::string;
 using IsMasterRTT = mongo::Nanoseconds;
 
 // The result of an attempt to call the "ismaster" command on a server.
@@ -79,8 +80,10 @@ class IsMasterOutcome {
     IsMasterOutcome() = delete;
 
 public:
-    // success constructor
-    IsMasterOutcome(ServerAddress server, BSONObj response, IsMasterRTT rtt)
+    // Success constructor.
+    IsMasterOutcome(HostAndPort server,
+                    BSONObj response,
+                    boost::optional<IsMasterRTT> rtt = boost::none)
         : _server(std::move(server)), _success(true), _response(response), _rtt(rtt) {
         const auto topologyVersionField = response.getField("topologyVersion");
         if (topologyVersionField) {
@@ -89,8 +92,8 @@ public:
         }
     }
 
-    // failure constructor
-    IsMasterOutcome(ServerAddress server, BSONObj response, std::string errorMsg)
+    // Failure constructor.
+    IsMasterOutcome(HostAndPort server, BSONObj response, std::string errorMsg)
         : _server(std::move(server)), _success(false), _errorMsg(errorMsg) {
         const auto topologyVersionField = response.getField("topologyVersion");
         if (topologyVersionField) {
@@ -99,25 +102,27 @@ public:
         }
     }
 
-    const ServerAddress& getServer() const;
+    const HostAndPort& getServer() const;
     bool isSuccess() const;
     const boost::optional<BSONObj>& getResponse() const;
     const boost::optional<IsMasterRTT>& getRtt() const;
     const boost::optional<TopologyVersion>& getTopologyVersion() const;
     const std::string& getErrorMsg() const;
+    BSONObj toBSON() const;
 
 private:
-    ServerAddress _server;
-    // indicating the success or failure of the attempt
+    HostAndPort _server;
+    // Indicates the success or failure of the attempt.
     bool _success;
-    // an error message in case of failure
+    // An error message in case of failure.
     std::string _errorMsg;
-    // a document containing the command response (or boost::none if it failed)
+    // A document containing the command response (or boost::none if it failed).
     boost::optional<BSONObj> _response;
-    // the round trip time to execute the command (or null if it failed)
+    // The round trip time to execute the command (or boost::none if it failed or is not the outcome
+    // from an initial handshake exchange).
     boost::optional<IsMasterRTT> _rtt;
-    // indicates how fresh the topology information in this reponse is (or boost::none if it failed
-    // or the response did not include this)
+    // Indicates how fresh the topology information in this reponse is (or boost::none if it failed
+    // or the response did not include this).
     boost::optional<TopologyVersion> _topologyVersion;
 };
 
@@ -126,4 +131,10 @@ using ServerDescriptionPtr = std::shared_ptr<ServerDescription>;
 
 class TopologyDescription;
 using TopologyDescriptionPtr = std::shared_ptr<TopologyDescription>;
+
+class TopologyManager;
+using TopologyManagerPtr = std::unique_ptr<TopologyManager>;
+
+class TopologyListener;
+using TopologyListenerPtr = std::shared_ptr<TopologyListener>;
 };  // namespace mongo::sdam

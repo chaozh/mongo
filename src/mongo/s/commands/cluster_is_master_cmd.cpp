@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -37,26 +37,21 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/repl/speculative_auth.h"
 #include "mongo/db/wire_version.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/topology_version_gen.h"
+#include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/transport/message_compressor_manager.h"
-#include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/version.h"
 
 namespace mongo {
 
+// Hangs in the beginning of each isMaster command when set.
 MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
-
-TopologyVersion mongosTopologyVersion;
-
-MONGO_INITIALIZER(GenerateMongosTopologyVersion)(InitializerContext*) {
-    mongosTopologyVersion = TopologyVersion(OID::gen(), 0);
-    return Status::OK();
-}
 
 namespace {
 
@@ -73,7 +68,7 @@ public:
     }
 
     std::string help() const override {
-        return "test if this is master half of a replica pair";
+        return "Status information for clients negotiating a connection with this server";
     }
 
     void addRequiredPrivileges(const std::string& dbname,
@@ -128,6 +123,7 @@ public:
         auto topologyVersionElement = cmdObj["topologyVersion"];
         auto maxAwaitTimeMSField = cmdObj["maxAwaitTimeMS"];
         boost::optional<TopologyVersion> clientTopologyVersion;
+        boost::optional<Date_t> deadline;
         if (topologyVersionElement && maxAwaitTimeMSField) {
             clientTopologyVersion = TopologyVersion::parse(IDLParserErrorContext("TopologyVersion"),
                                                            topologyVersionElement.Obj());
@@ -137,23 +133,16 @@ public:
 
             long long maxAwaitTimeMS;
             uassertStatusOK(bsonExtractIntegerField(cmdObj, "maxAwaitTimeMS", &maxAwaitTimeMS));
+
             uassert(51759, "maxAwaitTimeMS must be a non-negative integer", maxAwaitTimeMS >= 0);
 
-            LOG(3) << "Using maxAwaitTimeMS for awaitable isMaster protocol.";
+            deadline = opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                Milliseconds(maxAwaitTimeMS);
 
-            if (clientTopologyVersion->getProcessId() == mongosTopologyVersion.getProcessId()) {
-                uassert(51761,
-                        str::stream()
-                            << "Received a topology version with counter: "
-                            << clientTopologyVersion->getCounter()
-                            << " which is greater than the mongos topology version counter: "
-                            << mongosTopologyVersion.getCounter(),
-                        clientTopologyVersion->getCounter() == mongosTopologyVersion.getCounter());
+            LOGV2_DEBUG(23871, 3, "Using maxAwaitTimeMS for awaitable isMaster protocol.");
 
-                // The topologyVersion never changes on a running mongos process, so just sleep for
-                // maxAwaitTimeMS.
-                opCtx->sleepFor(Milliseconds(maxAwaitTimeMS));
-            }
+            // Awaitable isMaster commands have high latency by design. Ignore them.
+            opCtx->setShouldIncrementLatencyStats(false);
         } else {
             uassert(51760,
                     (topologyVersionElement
@@ -163,8 +152,15 @@ public:
         }
 
         auto result = replyBuilder->getBodyBuilder();
-        result.appendBool("ismaster", true);
-        result.append("msg", "isdbgrid");
+        const auto* mongosTopCoord = MongosTopologyCoordinator::get(opCtx);
+
+        auto mongosIsMasterResponse =
+            mongosTopCoord->awaitIsMasterResponse(opCtx, clientTopologyVersion, deadline);
+
+        mongosIsMasterResponse->appendToBuilder(&result);
+        // The isMaster response always includes a topologyVersion.
+        auto currentMongosTopologyVersion = mongosIsMasterResponse->getTopologyVersion();
+
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
         result.appendNumber("maxWriteBatchSize", write_ops::kMaxWriteBatchSize);
@@ -177,11 +173,12 @@ public:
         result.append("maxWireVersion", WireSpec::instance().incomingExternalClient.maxWireVersion);
         result.append("minWireVersion", WireSpec::instance().incomingExternalClient.minWireVersion);
 
-        const auto parameter = mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
-                                                  "automationServiceDescriptor",
-                                                  static_cast<ServerParameter*>(nullptr));
-        if (parameter)
-            parameter->append(opCtx, result, "automationServiceDescriptor");
+        {
+            const auto& serverParams = ServerParameterSet::getGlobal()->getMap();
+            auto iter = serverParams.find("automationServiceDescriptor");
+            if (iter != serverParams.end() && iter->second)
+                iter->second->append(opCtx, result, "automationServiceDescriptor");
+        }
 
         MessageCompressorManager::forSession(opCtx->getClient()->session())
             .serverNegotiate(cmdObj, &result);
@@ -189,19 +186,20 @@ public:
         auto& saslMechanismRegistry = SASLServerMechanismRegistry::get(opCtx->getServiceContext());
         saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
 
-        BSONObjBuilder topologyVersionBuilder(result.subobjStart("topologyVersion"));
-        mongosTopologyVersion.serialize(&topologyVersionBuilder);
-
         if (opCtx->isExhaust()) {
-            LOG(3) << "Using exhaust for isMaster protocol";
+            LOGV2_DEBUG(23872, 3, "Using exhaust for isMaster protocol");
 
             uassert(51763,
                     "An isMaster request with exhaust must specify 'maxAwaitTimeMS'",
                     maxAwaitTimeMSField);
             invariant(clientTopologyVersion);
 
-            if (clientTopologyVersion->getProcessId() == mongosTopologyVersion.getProcessId() &&
-                clientTopologyVersion->getCounter() == mongosTopologyVersion.getCounter()) {
+            InExhaustIsMaster::get(opCtx->getClient()->session().get())
+                ->setInExhaustIsMaster(true /* inExhaustIsMaster */);
+
+            if (clientTopologyVersion->getProcessId() ==
+                    currentMongosTopologyVersion.getProcessId() &&
+                clientTopologyVersion->getCounter() == currentMongosTopologyVersion.getCounter()) {
                 // Indicate that an exhaust message should be generated and the previous BSONObj
                 // command parameters should be reused as the next BSONObj command parameters.
                 replyBuilder->setNextInvocation(boost::none);
@@ -211,7 +209,7 @@ public:
                     if (elt.fieldNameStringData() == "topologyVersion"_sd) {
                         BSONObjBuilder topologyVersionBuilder(
                             nextInvocationBuilder.subobjStart("topologyVersion"));
-                        mongosTopologyVersion.serialize(&topologyVersionBuilder);
+                        currentMongosTopologyVersion.serialize(&topologyVersionBuilder);
                     } else {
                         nextInvocationBuilder.append(elt);
                     }
@@ -219,6 +217,8 @@ public:
                 replyBuilder->setNextInvocation(nextInvocationBuilder.obj());
             }
         }
+
+        handleIsMasterSpeculativeAuth(opCtx, cmdObj, &result);
 
         return true;
     }

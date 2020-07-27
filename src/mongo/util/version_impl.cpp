@@ -27,23 +27,22 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/version.h"
 
 #include "mongo/base/init.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
-#define MONGO_UTIL_VERSION_CONSTANTS_H_WHITELISTED
 #include "mongo/util/version_constants.h"
 
 namespace mongo {
 namespace {
 
-const class : public VersionInfoInterface {
+class InterpolatedVersionInfo : public VersionInfoInterface {
 public:
     int majorVersion() const noexcept final {
         return version::kMajorVersion;
@@ -70,7 +69,7 @@ public:
     }
 
     std::vector<StringData> modules() const final {
-        return version::kModulesList;
+        return version::modulesList();
     }
 
     StringData allocator() const noexcept final {
@@ -89,22 +88,22 @@ public:
 #error This targeted Windows version is not supported
 #endif  // NTDDI_VERSION
 #else
-        severe() << "VersionInfoInterface::targetMinOS is only available for Windows";
-        fassertFailed(40277);
+        LOGV2_FATAL(40277, "VersionInfoInterface::targetMinOS is only available for Windows");
 #endif
     }
 
-    std::vector<BuildInfoTuple> buildInfo() const final {
-        return version::kBuildEnvironment;
+    std::vector<BuildInfoField> buildInfo() const final {
+        return version::buildEnvironment();
     }
+};
 
-} kInterpolatedVersionInfo{};
+const InterpolatedVersionInfo interpolatedVersionInfo;
 
 MONGO_INITIALIZER_GENERAL(EnableVersionInfo,
                           MONGO_NO_PREREQUISITES,
                           ("BeginStartupOptionRegistration", "GlobalLogManager"))
 (InitializerContext*) {
-    VersionInfoInterface::enable(&kInterpolatedVersionInfo);
+    VersionInfoInterface::enable(&interpolatedVersionInfo);
     return Status::OK();
 }
 

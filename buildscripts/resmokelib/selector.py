@@ -7,18 +7,17 @@ on whether they apply to C++ unit tests, dbtests, or JS tests.
 import collections
 import errno
 import fnmatch
-import math
 import os.path
 import random
 import subprocess
 import sys
 
 import buildscripts.ciconfig.tags as _tags
-from . import config
-from . import errors
-from . import utils
-from .utils import globstar
-from .utils import jscomment
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.utils import globstar
+from buildscripts.resmokelib.utils import jscomment
 
 ########################
 #  Test file explorer  #
@@ -243,7 +242,8 @@ class _TestList(object):
         excluded = []
         for test in self._roots:
             if test in self._filtered:
-                if test not in tests:
+                if config.TEST_FILES or test not in tests:
+                    # Allow duplicate tests if the tests were explicitly duplicated on the CLI invocation or replay file.
                     tests.append(test)
             elif test not in excluded:
                 excluded.append(test)
@@ -694,6 +694,7 @@ _SELECTOR_REGISTRY = {
     "cpp_unit_test": (_CppTestSelectorConfig, _CppTestSelector),
     "benchmark_test": (_CppTestSelectorConfig, _CppTestSelector),
     "sdam_json_test": (_FileBasedSelectorConfig, _Selector),
+    "server_selection_json_test": (_FileBasedSelectorConfig, _Selector),
     "db_test": (_DbTestSelectorConfig, _DbTestSelector),
     "fsm_workload_test": (_JSTestSelectorConfig, _JSTestSelector),
     "parallel_fsm_workload_test": (_MultiJSTestSelectorConfig, _MultiJSTestSelector),
@@ -707,6 +708,7 @@ _SELECTOR_REGISTRY = {
     "genny_test": (_FileBasedSelectorConfig, _Selector),
     "gennylib_test": (_GennylibTestCaseSelectorConfig, _GennylibTestCaseSelector),
     "cpp_libfuzzer_test": (_CppTestSelectorConfig, _CppTestSelector),
+    "tla_plus_test": (_FileBasedSelectorConfig, _Selector),
 }
 
 

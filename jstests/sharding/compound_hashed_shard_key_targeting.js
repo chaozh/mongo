@@ -2,7 +2,10 @@
  * Test to verify that all the CRUD operations get routed to the correct shard when the shard key is
  * compound hashed.
  *
- * @tags: [requires_fcv_44, multiversion_incompatible, requires_majority_read_concern]
+ * @tags: [
+ *   multiversion_incompatible,
+ *   requires_majority_read_concern,
+ * ]
  */
 (function() {
 "use strict";
@@ -129,7 +132,7 @@ profilerHasZeroMatchingEntriesOrThrow(
 // Test to verify that the update operation can use query to route the operation. Also verify that
 // updating shard key value succeeds.
 let updateObj = {a: 22, b: {subObj: "str_0"}, c: "update", p: 1};
-let res = assert.commandWorked(coll.update({a: 26}, updateObj));
+let res = assert.commandWorked(coll.update({a: 26, b: {subObj: "str_0"}, c: 6}, updateObj));
 assert.eq(res.nModified, 1, res);
 assert.eq(coll.count(updateObj), 1);
 profilerHasSingleMatchingEntryOrThrow({profileDB: shard1DB, filter: {ns: ns, "op": "update"}});
@@ -142,7 +145,7 @@ updateObj = {
     $set: {a: -100, p: testName},
 };
 restartProfiling();
-res = assert.commandWorked(coll.update({a: 22}, updateObj));
+res = assert.commandWorked(coll.update({a: 22, b: {subObj: "str_0"}, c: "update"}, updateObj));
 assert.eq(res.nModified, 1, res);
 
 // Verify that the 'update' command gets targeted to 'shard1DB'.

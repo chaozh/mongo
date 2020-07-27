@@ -4,6 +4,7 @@
  */
 (function() {
 load("jstests/aggregation/extras/merge_helpers.js");  // For withEachMergeMode().
+load("jstests/libs/curop_helpers.js");                // For waitForCurOpByFailPoint().
 load("jstests/libs/fixture_helpers.js");              // For isMongos().
 load("jstests/libs/profiler.js");                     // For profilerHasSingleMatchingEntryOrThrow.
 
@@ -17,52 +18,44 @@ const nDocs = 10;
  */
 function insertDocs(coll) {
     for (let i = 0; i < nDocs; i++) {
-        assert.commandWorked(coll.insert({_id: i}));
+        assert.commandWorked(coll.insert({_id: i}, {writeConcern: {w: "majority"}}));
     }
 }
 
 /**
- * Wait until the server sets its CurOp "msg" to the failpoint name, indicating that it's
- * hanging.
- */
-function waitUntilServerHangsOnFailPoint(conn, fpName) {
-    // Be sure that the server is hanging on the failpoint.
-    assert.soon(function() {
-        const filter = {"msg": fpName};
-        const ops = conn.getDB("admin")
-                        .aggregate([{$currentOp: {allUsers: true}}, {$match: filter}])
-                        .toArray();
-        return ops.length == 1;
-    });
-}
-
-/**
- * Given a $merge parameters mongod connection, run a $out aggregation against 'conn' which
- * hangs on the given failpoint and ensure that the $out maxTimeMS expires.
+ * Given a $merge parameters mongod connection, run a $merge aggregation against 'conn'. Set the
+ * provided failpoint on the node specified by 'failPointConn' in order to hang during the
+ * aggregate. Ensure that the $merge maxTimeMS expires on the node specified by 'maxTimeMsConn'.
  */
 function forceAggregationToHangAndCheckMaxTimeMsExpires(
-    whenMatched, whenNotMatched, conn, failPointName) {
+    whenMatched, whenNotMatched, failPointName, conn, failPointConn, maxTimeMsConn) {
     // Use a short maxTimeMS so that the test completes in a reasonable amount of time. We will
     // use the 'maxTimeNeverTimeOut' failpoint to ensure that the operation does not
     // prematurely time out.
     const maxTimeMS = 1000 * 2;
 
-    // Enable a failPoint so that the write will hang.
-    let failpointCommand = {
+    // Enable a failPoint so that the write will hang. 'shouldCheckForInterrupt' is set to true
+    // so that maxTimeMS expiration can occur while the $merge operation's thread is hanging on
+    // this failpoiint.
+    const failpointCommand = {
         configureFailPoint: failPointName,
         mode: "alwaysOn",
-        data: {nss: kDBName + "." + kDestCollName}
+        data: {nss: kDBName + "." + kDestCollName, shouldCheckForInterrupt: true}
     };
 
-    assert.commandWorked(conn.getDB("admin").runCommand(failpointCommand));
+    assert.commandWorked(failPointConn.getDB("admin").runCommand(failpointCommand));
 
-    // Make sure we don't run out of time before the failpoint is hit.
+    // Make sure we don't run out of time on either of the involved nodes before the failpoint is
+    // hit.
     assert.commandWorked(conn.getDB("admin").runCommand(
+        {configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}));
+    assert.commandWorked(maxTimeMsConn.getDB("admin").runCommand(
         {configureFailPoint: "maxTimeNeverTimeOut", mode: "alwaysOn"}));
 
     // Build the parallel shell function.
-    let shellStr = `const sourceColl = db['${kSourceCollName}'];`;
-    shellStr += `const destColl = db['${kDestCollName}'];`;
+    let shellStr = `const testDB = db.getSiblingDB('${kDBName}');`;
+    shellStr += `const sourceColl = testDB['${kSourceCollName}'];`;
+    shellStr += `const destColl = testDB['${kDestCollName}'];`;
     shellStr += `const maxTimeMS = ${maxTimeMS};`;
     shellStr += `const whenMatched = ${tojson(whenMatched)};`;
     shellStr += `const whenNotMatched = '${whenNotMatched}';`;
@@ -71,16 +64,18 @@ function forceAggregationToHangAndCheckMaxTimeMsExpires(
             $merge:
                 {into: destColl.getName(), whenMatched: whenMatched, whenNotMatched: whenNotMatched}
         }];
-        const err = assert.throws(() => sourceColl.aggregate(pipeline, {maxTimeMS: maxTimeMS}));
+        const err = assert.throws(
+            () => sourceColl.aggregate(
+                pipeline, {maxTimeMS: maxTimeMS, $readPreference: {mode: "secondary"}}));
         assert.eq(err.code, ErrorCodes.MaxTimeMSExpired, "expected aggregation to fail");
     };
     shellStr += `(${runAggregate.toString()})();`;
     const awaitShell = startParallelShell(shellStr, conn.port);
 
-    waitUntilServerHangsOnFailPoint(conn, failPointName);
+    waitForCurOpByFailPointNoNS(failPointConn.getDB("admin"), failPointName, {}, {allUsers: true});
 
-    assert.commandWorked(
-        conn.getDB("admin").runCommand({configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}));
+    assert.commandWorked(maxTimeMsConn.getDB("admin").runCommand(
+        {configureFailPoint: "maxTimeNeverTimeOut", mode: "off"}));
 
     // The aggregation running in the parallel shell will hang on the failpoint, burning
     // its time. Wait until the maxTimeMS has definitely expired.
@@ -89,13 +84,19 @@ function forceAggregationToHangAndCheckMaxTimeMsExpires(
     // Now drop the failpoint, allowing the aggregation to proceed. It should hit an
     // interrupt check and terminate immediately.
     assert.commandWorked(
-        conn.getDB("admin").runCommand({configureFailPoint: failPointName, mode: "off"}));
+        failPointConn.getDB("admin").runCommand({configureFailPoint: failPointName, mode: "off"}));
 
     // Wait for the parallel shell to finish.
     assert.eq(awaitShell(), 0);
 }
 
-function runUnshardedTest(whenMatched, whenNotMatched, conn) {
+/**
+ * Run a $merge aggregate against the node specified by 'conn' with primary 'primaryConn' (these may
+ * be the same node). Verify that maxTimeMS properly times out the aggregate on the node specified
+ * by 'maxTimeMsConn' both while hanging on the insert/update on 'primaryConn' and while hanging on
+ * the batch being built on 'conn'.
+ */
+function runUnshardedTest(whenMatched, whenNotMatched, conn, primaryConn, maxTimeMsConn) {
     jsTestLog("Running unsharded test in whenMatched: " + whenMatched +
               " whenNotMatched: " + whenNotMatched);
     // The target collection will always be empty so we do not test the setting that will cause
@@ -105,7 +106,7 @@ function runUnshardedTest(whenMatched, whenNotMatched, conn) {
     }
 
     const sourceColl = conn.getDB(kDBName)[kSourceCollName];
-    const destColl = conn.getDB(kDBName)[kDestCollName];
+    const destColl = primaryConn.getDB(kDBName)[kDestCollName];
     assert.commandWorked(destColl.remove({}));
 
     // Be sure we're able to read from a cursor with a maxTimeMS set on it.
@@ -125,15 +126,15 @@ function runUnshardedTest(whenMatched, whenNotMatched, conn) {
     // depending on the mode. If 'whenMatched' is set to "fail" then the implementation will end
     // up issuing insert commands instead of updates.
     const kFailPointName =
-        whenMatched == "fail" ? "hangDuringBatchInsert" : "hangDuringBatchUpdate";
+        whenMatched === "fail" ? "hangDuringBatchInsert" : "hangDuringBatchUpdate";
     forceAggregationToHangAndCheckMaxTimeMsExpires(
-        whenMatched, whenNotMatched, conn, kFailPointName);
+        whenMatched, whenNotMatched, kFailPointName, conn, primaryConn, maxTimeMsConn);
 
     assert.commandWorked(destColl.remove({}));
 
     // Force the aggregation to hang while the batch is being built.
     forceAggregationToHangAndCheckMaxTimeMsExpires(
-        whenMatched, whenNotMatched, conn, "hangWhileBuildingDocumentSourceMergeBatch");
+        whenMatched, whenNotMatched, "hangWhileBuildingDocumentSourceMergeBatch", conn, conn, conn);
 }
 
 // Run on a standalone.
@@ -141,8 +142,29 @@ function runUnshardedTest(whenMatched, whenNotMatched, conn) {
 const conn = MongoRunner.runMongod({});
 assert.neq(null, conn, 'mongod was unable to start up');
 insertDocs(conn.getDB(kDBName)[kSourceCollName]);
-withEachMergeMode((mode) => runUnshardedTest(mode.whenMatchedMode, mode.whenNotMatchedMode, conn));
+withEachMergeMode(
+    (mode) => runUnshardedTest(mode.whenMatchedMode, mode.whenNotMatchedMode, conn, conn, conn));
 MongoRunner.stopMongod(conn);
+})();
+
+// Run on the primary and the secondary of a replica set.
+(function() {
+const replTest = new ReplSetTest({nodes: 2});
+replTest.startSet();
+replTest.initiate();
+replTest.awaitReplication();
+const primary = replTest.getPrimary();
+const secondary = replTest.getSecondary();
+insertDocs(primary.getDB(kDBName)[kSourceCollName]);
+withEachMergeMode(({whenMatchedMode, whenNotMatchedMode}) => {
+    // Run the $merge on the primary and test that the maxTimeMS times out on the primary.
+    runUnshardedTest(whenMatchedMode, whenNotMatchedMode, primary, primary, primary);
+    // Run the $merge on the secondary and test that the maxTimeMS times out on the primary.
+    runUnshardedTest(whenMatchedMode, whenNotMatchedMode, secondary, primary, primary);
+    // Run the $merge on the secondary and test that the maxTimeMS times out on the secondary.
+    runUnshardedTest(whenMatchedMode, whenNotMatchedMode, secondary, primary, secondary);
+});
+replTest.stopSet();
 })();
 
 // Runs a $merge against 'mongosConn' and verifies that the maxTimeMS value is included in the

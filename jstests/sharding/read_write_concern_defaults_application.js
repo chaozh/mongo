@@ -4,10 +4,12 @@
  * The following fields are required for each command that is not skipped:
  *
  * - setUp: [OPTIONAL] A function that does any set up (inserts, etc.) needed to check the command's
- *   results.
+ *   results. These operations will run with the default RWC set, so ensure they use appropriate
+ *   explicit RWC if necessary.
  * - command: The command to run, with all required options. If a function, is called with the
  *   connection as the argument, and the returned object is used. The readConcern/writeConcern
- *   fields may be appended to this object.
+ *   fields may be appended to this object. The command object cannot include its own explicit
+ *   readConcern/writeConcern fields.
  * - checkReadConcern: Boolean that controls whether to check the application of readConcern.
  * - checkWriteConcern: Boolean that controls whether to check the application of writeConcern.
  * - db: [OPTIONAL] The database to run the command against.
@@ -21,10 +23,8 @@
  *
  * @tags: [
  *   does_not_support_stepdowns,
- *   requires_fcv_44,
  *   requires_majority_read_concern,
  *   requires_profiling,
- *   requires_text_logs,
  *   uses_transactions,
  * ]
  */
@@ -32,6 +32,8 @@
 "use strict";
 
 load('jstests/libs/profiler.js');
+load("jstests/libs/logv2_helpers.js");
+load('jstests/sharding/libs/last_lts_mongod_commands.js');
 
 let db = "test";
 let coll = "foo";
@@ -83,7 +85,6 @@ let testCases = {
     _configsvrCommitChunkMigration: {skip: "internal command"},
     _configsvrCommitChunkSplit: {skip: "internal command"},
     _configsvrCommitMovePrimary: {skip: "internal command"},
-    _configsvrCreateCollection: {skip: "internal command"},
     _configsvrCreateDatabase: {skip: "internal command"},
     _configsvrDropCollection: {skip: "internal command"},
     _configsvrDropDatabase: {skip: "internal command"},
@@ -95,6 +96,7 @@ let testCases = {
     _configsvrRemoveShard: {skip: "internal command"},
     _configsvrRemoveShardFromZone: {skip: "internal command"},
     _configsvrRenameCollection: {skip: "internal command"},
+    _configsvrReshardCollection: {skip: "internal command"},
     _configsvrShardCollection: {skip: "internal command"},
     _configsvrUpdateZoneKeyRange: {skip: "internal command"},
     _flushDatabaseCacheUpdates: {skip: "internal command"},
@@ -117,10 +119,11 @@ let testCases = {
     _transferMods: {skip: "internal command"},
     abortTransaction: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll}));
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
             // Ensure that the dbVersion is known.
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
-            assert.eq(1, conn.getCollection(nss).findOne({x: 1}).x);
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
+            assert.eq(1,
+                      conn.getCollection(nss).find({x: 1}).readConcern("local").limit(1).next().x);
             // Start the transaction.
             assert.commandWorked(conn.getDB(db).runCommand({
                 insert: coll,
@@ -143,7 +146,7 @@ let testCases = {
     addShardToZone: {skip: "does not accept read or write concern"},
     aggregate: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
         },
         command: {aggregate: coll, pipeline: [{$match: {x: 1}}, {$out: "out"}], cursor: {}},
         checkReadConcern: true,
@@ -173,7 +176,7 @@ let testCases = {
     clone: {skip: "deprecated"},
     cloneCollectionAsCapped: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll}));
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
         },
         command: {cloneCollectionAsCapped: coll, toCollection: coll + "2", size: 10 * 1024 * 1024},
         checkReadConcern: false,
@@ -181,7 +184,7 @@ let testCases = {
     },
     collMod: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll}));
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
         },
         command: {collMod: coll, validator: {}},
         checkReadConcern: false,
@@ -190,10 +193,11 @@ let testCases = {
     collStats: {skip: "does not accept read or write concern"},
     commitTransaction: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll}));
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
             // Ensure that the dbVersion is known.
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
-            assert.eq(1, conn.getCollection(nss).findOne({x: 1}).x);
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
+            assert.eq(1,
+                      conn.getCollection(nss).find({x: 1}).readConcern("local").limit(1).next().x);
             // Start the transaction.
             assert.commandWorked(conn.getDB(db).runCommand({
                 insert: coll,
@@ -219,7 +223,7 @@ let testCases = {
     connectionStatus: {skip: "does not accept read or write concern"},
     convertToCapped: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll}));
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
         },
         command: {convertToCapped: coll, size: 10 * 1024 * 1024},
         checkReadConcern: false,
@@ -228,7 +232,7 @@ let testCases = {
     coordinateCommitTransaction: {skip: "internal command"},
     count: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
         },
         command: {count: coll, query: {x: 1}},
         checkReadConcern: true,
@@ -242,7 +246,7 @@ let testCases = {
     },
     createIndexes: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
         },
         command: {createIndexes: coll, indexes: [{key: {x: 1}, name: "foo"}]},
         checkReadConcern: false,
@@ -269,7 +273,7 @@ let testCases = {
     dbStats: {skip: "does not accept read or write concern"},
     delete: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
         },
         command: {delete: coll, deletes: [{q: {x: 1}, limit: 1}]},
         checkReadConcern: false,
@@ -280,16 +284,19 @@ let testCases = {
     },
     distinct: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
         },
         command: {distinct: coll, key: "x"},
         checkReadConcern: true,
         checkWriteConcern: false,
     },
+    donorForgetMigration: {skip: "does not accept read or write concern"},
+    donorStartMigration: {skip: "does not accept read or write concern"},
+    donorWaitForMigrationToCommit: {skip: "does not accept read or write concern"},
     driverOIDTest: {skip: "internal command"},
     drop: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll}));
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
         },
         command: {drop: coll},
         checkReadConcern: false,
@@ -297,8 +304,8 @@ let testCases = {
     },
     dropAllRolesFromDatabase: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "foo", privileges: [], roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createRole: "foo", privileges: [], roles: [], writeConcern: {w: 1}}));
         },
         command: {dropAllRolesFromDatabase: 1},
         checkReadConcern: false,
@@ -308,8 +315,8 @@ let testCases = {
     },
     dropAllUsersFromDatabase: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createUser: "foo", pwd: "bar", roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createUser: "foo", pwd: "bar", roles: [], writeConcern: {w: 1}}));
         },
         command: {dropAllUsersFromDatabase: 1},
         checkReadConcern: false,
@@ -321,9 +328,12 @@ let testCases = {
     dropDatabase: {skip: "not profiled or logged"},
     dropIndexes: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
-            assert.commandWorked(conn.getDB(db).runCommand(
-                {createIndexes: coll, indexes: [{key: {x: 1}, name: "foo"}]}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
+            assert.commandWorked(conn.getDB(db).runCommand({
+                createIndexes: coll,
+                indexes: [{key: {x: 1}, name: "foo"}],
+                writeConcern: {w: 1}
+            }));
         },
         command: {dropIndexes: coll, index: "foo"},
         checkReadConcern: false,
@@ -331,8 +341,8 @@ let testCases = {
     },
     dropRole: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "foo", privileges: [], roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createRole: "foo", privileges: [], roles: [], writeConcern: {w: 1}}));
         },
         command: {dropRole: "foo"},
         checkReadConcern: false,
@@ -342,8 +352,8 @@ let testCases = {
     },
     dropUser: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createUser: "foo", pwd: "bar", roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createUser: "foo", pwd: "bar", roles: [], writeConcern: {w: 1}}));
         },
         command: {dropUser: "foo"},
         checkReadConcern: false,
@@ -360,7 +370,7 @@ let testCases = {
     filemd5: {skip: "does not accept read or write concern"},
     find: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
         },
         command: {find: coll, filter: {x: 1}},
         checkReadConcern: true,
@@ -368,7 +378,7 @@ let testCases = {
     },
     findAndModify: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
         },
         command: {findAndModify: coll, query: {x: 1}, update: {$set: {x: 2}}},
         checkReadConcern: false,
@@ -380,8 +390,11 @@ let testCases = {
     fsyncUnlock: {skip: "does not accept read or write concern"},
     geoSearch: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getCollection(nss).createIndex({loc: "geoHaystack", foo: 1}, {bucketSize: 1}));
+            assert.commandWorked(conn.getDB(db).runCommand({
+                createIndexes: coll,
+                indexes: [{key: {loc: "geoHaystack", foo: 1}, bucketSize: 1, name: "foo"}],
+                writeConcern: {w: 1}
+            }));
         },
         command: {geoSearch: coll, search: {}, near: [0, 0], maxDistance: 1},
         checkReadConcern: true,
@@ -402,8 +415,8 @@ let testCases = {
     godinsert: {skip: "for testing only"},
     grantPrivilegesToRole: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "foo", privileges: [], roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createRole: "foo", privileges: [], roles: [], writeConcern: {w: 1}}));
         },
         command: {
             grantPrivilegesToRole: "foo",
@@ -416,10 +429,10 @@ let testCases = {
     },
     grantRolesToRole: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "foo", privileges: [], roles: []}));
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "bar", privileges: [], roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createRole: "foo", privileges: [], roles: [], writeConcern: {w: 1}}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createRole: "bar", privileges: [], roles: [], writeConcern: {w: 1}}));
         },
         command: {grantRolesToRole: "foo", roles: [{role: "bar", db: db}]},
         checkReadConcern: false,
@@ -429,10 +442,10 @@ let testCases = {
     },
     grantRolesToUser: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "foo", privileges: [], roles: []}));
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createUser: "foo", pwd: "bar", roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createRole: "foo", privileges: [], roles: [], writeConcern: {w: 1}}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createUser: "foo", pwd: "bar", roles: [], writeConcern: {w: 1}}));
         },
         command: {grantRolesToUser: "foo", roles: [{role: "foo", db: db}]},
         checkReadConcern: false,
@@ -445,7 +458,7 @@ let testCases = {
     httpClientRequest: {skip: "does not accept read or write concern"},
     insert: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll}));
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
         },
         command: {insert: coll, documents: [{_id: ObjectId()}]},
         checkReadConcern: false,
@@ -471,7 +484,6 @@ let testCases = {
     logout: {skip: "does not accept read or write concern"},
     makeSnapshot: {skip: "does not accept read or write concern"},
     mapReduce: {skip: "does not accept read or write concern"},
-    "mapreduce.shardedfinish": {skip: "internal command"},
     mergeChunks: {skip: "does not accept read or write concern"},
     moveChunk: {
         skip:
@@ -497,7 +509,7 @@ let testCases = {
     removeShardFromZone: {skip: "does not accept read or write concern"},
     renameCollection: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({create: coll}));
+            assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
         },
         command: {renameCollection: nss, to: nss + "2"},
         db: "admin",
@@ -520,16 +532,18 @@ let testCases = {
     replSetStepUp: {skip: "does not accept read or write concern"},
     replSetSyncFrom: {skip: "does not accept read or write concern"},
     replSetTest: {skip: "does not accept read or write concern"},
+    replSetTestEgress: {skip: "does not accept read or write concern"},
     replSetUpdatePosition: {skip: "does not accept read or write concern"},
     resetError: {skip: "does not accept read or write concern"},
-    restartCatalog: {skip: "internal command"},
+    reshardCollection: {skip: "does not accept read or write concern"},
     resync: {skip: "does not accept read or write concern"},
     revokePrivilegesFromRole: {
         setUp: function(conn) {
             assert.commandWorked(conn.getDB(db).runCommand({
                 createRole: "foo",
                 privileges: [{resource: {db: db, collection: coll}, actions: ["find"]}],
-                roles: []
+                roles: [],
+                writeConcern: {w: 1}
             }));
         },
         command: {
@@ -543,10 +557,14 @@ let testCases = {
     },
     revokeRolesFromRole: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "bar", privileges: [], roles: []}));
             assert.commandWorked(conn.getDB(db).runCommand(
-                {createRole: "foo", privileges: [], roles: [{role: "bar", db: db}]}));
+                {createRole: "bar", privileges: [], roles: [], writeConcern: {w: 1}}));
+            assert.commandWorked(conn.getDB(db).runCommand({
+                createRole: "foo",
+                privileges: [],
+                roles: [{role: "bar", db: db}],
+                writeConcern: {w: 1}
+            }));
         },
         command: {revokeRolesFromRole: "foo", roles: [{role: "foo", db: db}]},
         checkReadConcern: false,
@@ -556,10 +574,14 @@ let testCases = {
     },
     revokeRolesFromUser: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "foo", privileges: [], roles: []}));
             assert.commandWorked(conn.getDB(db).runCommand(
-                {createUser: "foo", pwd: "bar", roles: [{role: "foo", db: db}]}));
+                {createRole: "foo", privileges: [], roles: [], writeConcern: {w: 1}}));
+            assert.commandWorked(conn.getDB(db).runCommand({
+                createUser: "foo",
+                pwd: "bar",
+                roles: [{role: "foo", db: db}],
+                writeConcern: {w: 1}
+            }));
         },
         command: {revokeRolesFromUser: "foo", roles: [{role: "foo", db: db}]},
         checkReadConcern: false,
@@ -568,8 +590,10 @@ let testCases = {
         useLogs: true,
     },
     rolesInfo: {skip: "does not accept read or write concern"},
+    rotateCertificates: {skip: "does not accept read or write concern"},
     saslContinue: {skip: "does not accept read or write concern"},
     saslStart: {skip: "does not accept read or write concern"},
+    sbe: {skip: "internal command"},
     serverStatus: {skip: "does not accept read or write concern"},
     setCommittedSnapshot: {skip: "internal command"},
     setDefaultRWConcern: {skip: "special case (must run after all other commands)"},
@@ -594,7 +618,7 @@ let testCases = {
     unsetSharding: {skip: "internal command"},
     update: {
         setUp: function(conn) {
-            assert.commandWorked(conn.getCollection(nss).insert({x: 1}));
+            assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));
         },
         command: {update: coll, updates: [{q: {x: 1}, u: {x: 2}}]},
         checkReadConcern: false,
@@ -605,8 +629,8 @@ let testCases = {
     },
     updateRole: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createRole: "foo", privileges: [], roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createRole: "foo", privileges: [], roles: [], writeConcern: {w: 1}}));
         },
         command: {updateRole: "foo", privileges: []},
         checkReadConcern: false,
@@ -616,8 +640,8 @@ let testCases = {
     },
     updateUser: {
         setUp: function(conn) {
-            assert.commandWorked(
-                conn.getDB(db).runCommand({createUser: "foo", pwd: "bar", roles: []}));
+            assert.commandWorked(conn.getDB(db).runCommand(
+                {createUser: "foo", pwd: "bar", roles: [], writeConcern: {w: 1}}));
         },
         command: {updateUser: "foo", pwd: "bar2"},
         checkReadConcern: false,
@@ -634,6 +658,10 @@ let testCases = {
     whatsmysni: {skip: "does not accept read or write concern"},
     whatsmyuri: {skip: "internal command"},
 };
+
+commandsRemovedFromMongodSinceLastLTS.forEach(function(cmd) {
+    testCases[cmd] = {skip: "must define test coverage for 4.4 backwards compatibility"};
+});
 
 // Running setDefaultRWConcern in the middle of a scenario would define defaults when there
 // shouldn't be for subsequently-tested commands. Thus it is special-cased to be run at the end of
@@ -670,14 +698,29 @@ let setDefaultRWConcernActualTestCase = {
 //                                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 //      writeConcern:{ w: "majority", wtimeout: 1234567 } storage:{} protocol:op_msg 275ms
 //     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-function createLogLineRegularExpressionForTestCase(test, cmdName, targetId) {
+function createLogLineRegularExpressionForTestCase(test, cmdName, targetId, explicitRWC) {
+    let expectedProvenance = explicitRWC ? "clientSupplied" : "customDefault";
+    if (isJsonLogNoConn()) {
+        let pattern = `"command":{"${cmdName}"`;
+        pattern += `.*"comment":"${targetId}"`;
+        if (test.checkReadConcern) {
+            pattern += `.*"readConcern":{"level":"majority","provenance":"${expectedProvenance}"}`;
+        }
+        if (test.checkWriteConcern) {
+            pattern += `.*"writeConcern":{"w":"majority","wtimeout":1234567,"provenance":"${
+                expectedProvenance}"}`;
+        }
+        return new RegExp(pattern);
+    }
+
     let pattern = `command: ${cmdName} `;
     pattern += `.* comment: "${targetId}"`;
     if (test.checkReadConcern) {
-        pattern += '.* readConcern:{ level: "majority" }';
+        pattern += `.* readConcern:{ level: "majority", provenance: "${expectedProvenance}" }`;
     }
     if (test.checkWriteConcern) {
-        pattern += '.* writeConcern:{ w: "majority", wtimeout: 1234567 }';
+        pattern += `.* writeConcern:{ w: "majority", wtimeout: 1234567, provenance: "${
+            expectedProvenance}" }`;
     }
     return new RegExp(pattern);
 }
@@ -711,19 +754,31 @@ function createLogLineRegularExpressionForTestCase(test, cmdName, targetId) {
 //     "planSummary" : "COLLSCAN",
 //      ...
 // }
-function createProfileFilterForTestCase(test, targetId) {
-    let commandProfile = {"command.comment": targetId};
+function createProfileFilterForTestCase(test, targetId, explicitRWC) {
+    let expectedProvenance = explicitRWC ? "clientSupplied" : "customDefault";
+    let commandProfile = {
+        "command.comment": targetId,
+        /* Filter out failed operations */
+        errCode: {$exists: false}
+    };
     if (test.checkReadConcern) {
-        commandProfile = Object.extend({"readConcern.level": "majority"}, commandProfile);
+        commandProfile = Object.extend(
+            {"readConcern.level": "majority", "readConcern.provenance": expectedProvenance},
+            commandProfile);
     }
     if (test.checkWriteConcern) {
-        commandProfile = Object.extend(
-            {"writeConcern.w": "majority", "writeConcern.wtimeout": 1234567}, commandProfile);
+        commandProfile = Object.extend({
+            "writeConcern.w": "majority",
+            "writeConcern.wtimeout": 1234567,
+            "writeConcern.provenance": expectedProvenance
+        },
+                                       commandProfile);
     }
     return commandProfile;
 }
 
-function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitRWC) {
+function runScenario(
+    desc, conn, regularCheckConn, configSvrCheckConn, {explicitRWC, explicitProvenance = false}) {
     let runCommandTest = function(cmdName, test) {
         assert(test !== undefined,
                "coverage failure: must define a RWC defaults application test for " + cmdName);
@@ -766,13 +821,15 @@ function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitR
 
         // Do any test-specific setup.
         if (typeof (test.setUp) === "function") {
-            test.setUp(conn);
+            conn._runWithForcedReadMode("commands", test.setUp);
         }
 
         // Get the command from the test case.
         let actualCmd = (typeof (test.command) === "function")
             ? test.command(conn)
             : Object.assign({}, test.command, {});
+        assert.eq("undefined", typeof (actualCmd.readConcern));
+        assert.eq("undefined", typeof (actualCmd.writeConcern));
 
         // Add extra fields for RWC if necessary, and an identifying comment.
         // When sharded, the field order is: comment, readConcern, writeConcern.
@@ -785,11 +842,18 @@ function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitR
         }
         if (explicitRWC) {
             if (test.checkReadConcern) {
-                actualCmd = Object.extend(actualCmd, {readConcern: {level: 'majority'}});
+                let explicitRC = {level: 'majority'};
+                if (explicitProvenance) {
+                    explicitRC = Object.extend(explicitRC, {provenance: "clientSupplied"});
+                }
+                actualCmd = Object.extend(actualCmd, {readConcern: explicitRC});
             }
             if (test.checkWriteConcern) {
-                actualCmd =
-                    Object.extend(actualCmd, {writeConcern: {w: "majority", wtimeout: 1234567}});
+                let explicitWC = {w: "majority", wtimeout: 1234567};
+                if (explicitProvenance) {
+                    explicitWC = Object.extend(explicitWC, {provenance: "clientSupplied"});
+                }
+                actualCmd = Object.extend(actualCmd, {writeConcern: explicitWC});
             }
         }
         if (!sharded) {
@@ -802,14 +866,15 @@ function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitR
 
         // Check that the command applied the correct RWC.
         if (test.useLogs) {
-            let re = createLogLineRegularExpressionForTestCase(test, cmdName, targetId);
+            let re =
+                createLogLineRegularExpressionForTestCase(test, cmdName, targetId, explicitRWC);
             assert(checkLog.checkContainsOnce(checkConn, re),
                    "unable to find pattern " + re + " in logs on " + checkConn + " for test " +
                        thisTestDesc);
         } else {
             profilerHasSingleMatchingEntryOrThrow({
                 profileDB: checkConn.getDB(db),
-                filter: createProfileFilterForTestCase(test, targetId)
+                filter: createProfileFilterForTestCase(test, targetId, explicitRWC)
             });
         }
 
@@ -838,11 +903,16 @@ function runScenario(desc, conn, regularCheckConn, configSvrCheckConn, explicitR
 function runTests(conn, regularCheckConn, configSvrCheckConn) {
     // The target RWC is always {level: "majority"} and {w: "majority", wtimeout: 1234567}
 
-    runScenario("Scenario: RWC defaults never set, explicit RWC present",
+    runScenario("Scenario: RWC defaults never set, explicit RWC present, absent provenance",
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
-                true);
+                {explicitRWC: true, explicitProvenance: false});
+    runScenario("Scenario: RWC defaults never set, explicit RWC present, explicit provenance",
+                conn,
+                regularCheckConn,
+                configSvrCheckConn,
+                {explicitRWC: true, explicitProvenance: true});
 
     assert.commandWorked(conn.adminCommand({
         setDefaultRWConcern: 1,
@@ -853,26 +923,36 @@ function runTests(conn, regularCheckConn, configSvrCheckConn) {
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
-                false);
+                {explicitRWC: false});
 
     assert.commandWorked(conn.adminCommand({
         setDefaultRWConcern: 1,
         defaultReadConcern: {level: "local"},
         defaultWriteConcern: {w: 1, wtimeout: 7654321}
     }));
-    runScenario("Scenario: RWC defaults set, explicit RWC present",
+    runScenario("Scenario: RWC defaults set, explicit RWC present, absent provenance",
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
-                true);
+                {explicitRWC: true, explicitProvenance: false});
+    runScenario("Scenario: RWC defaults set, explicit RWC present, explicit provenance",
+                conn,
+                regularCheckConn,
+                configSvrCheckConn,
+                {explicitRWC: true, explicitProvenance: true});
 
     assert.commandWorked(conn.adminCommand(
         {setDefaultRWConcern: 1, defaultReadConcern: {}, defaultWriteConcern: {}}));
-    runScenario("Scenario: RWC defaults unset, explicit RWC present",
+    runScenario("Scenario: RWC defaults unset, explicit RWC present, absent provenance",
                 conn,
                 regularCheckConn,
                 configSvrCheckConn,
-                true);
+                {explicitRWC: true, explicitProvenance: false});
+    runScenario("Scenario: RWC defaults unset, explicit RWC present, explicit provenance",
+                conn,
+                regularCheckConn,
+                configSvrCheckConn,
+                {explicitRWC: true, explicitProvenance: true});
 }
 
 // TODO SERVER-45052: Move the main code into jstests/lib, and then call it from jstests/replsets

@@ -31,7 +31,9 @@
 
 #include <iostream>
 
-#include "mongo/logger/logstream_builder.h"
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
@@ -44,11 +46,25 @@ public:
     MemberId() : _id(kUninitializedMemberId) {}
 
     explicit MemberId(int id) {
-        if (id < 0 || id > 255) {
+        if (id < 0) {
             uasserted(ErrorCodes::BadValue,
-                      str::stream() << "_id field value of " << id << " is out of range.");
+                      str::stream()
+                          << "_id field value of " << id << " can't be a negative number");
         }
         _id = id;
+    }
+
+    static MemberId parseFromBSON(const BSONElement& element) {
+        if (!element.isNumber()) {
+            uasserted(ErrorCodes::TypeMismatch,
+                      str::stream()
+                          << "Element for MemberId was not a number: " << element.toString());
+        }
+        return MemberId(element.numberInt());
+    }
+
+    void serializeToBSON(StringData fieldName, BSONObjBuilder* builder) const {
+        builder->appendNumber(fieldName, _id);
     }
 
     int getData() const {
@@ -88,11 +104,6 @@ public:
     }
 
     friend std::ostream& operator<<(std::ostream& stream, const MemberId& id) {
-        return stream << id.toString();
-    }
-
-    friend logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream,
-                                                const MemberId& id) {
         return stream << id.toString();
     }
 

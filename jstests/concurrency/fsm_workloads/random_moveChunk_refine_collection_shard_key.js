@@ -5,7 +5,7 @@
  * includes multi=true updates and multi=false updates with exact _id queries.
  *
  * @tags: [requires_sharding, assumes_balancer_off, assumes_autosplit_off,
- * requires_non_retryable_writes, uses_transactions, requires_fcv_44];
+ * requires_non_retryable_writes, uses_transactions];
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');
 load('jstests/concurrency/fsm_workloads/random_moveChunk_base.js');
@@ -48,30 +48,27 @@ var $config = extendWorkload($config, function($config, $super) {
         return collName + '_' + latchNumber.toString();
     };
 
-    // A moveChunk may fail with a WriteConflict when clearing orphans on the destination shard
-    // if any of them are concurrently written to by a broadcast transaction operation. The
-    // error message and top-level code may be different depending on where the failure occurs.
-    //
-    // TODO SERVER-39141: Don't ignore WriteConflict error message once the range deleter
-    // retries on write conflict exceptions.
-    //
-    // Additionally, because updates don't have a shard filter stage, a migration may fail if a
+    // Because updates don't have a shard filter stage, a migration may fail if a
     // broadcast update is operating on orphans from a previous migration in the range being
     // migrated back in. The particular error code is replaced with a more generic one, so this
     // is identified by the failed migration's error message.
     $config.data.isMoveChunkErrorAcceptable = (err) => {
-        return err.message &&
-            (err.message.indexOf("WriteConflict") > -1 ||
-             err.message.indexOf("CommandFailed") > -1 ||
-             err.message.indexOf("Documents in target range may still be in use") > -1 ||
-             // This error will occur as a result of trying to move a chunk with a pre-refine
-             // collection epoch.
-             err.message.indexOf("collection may have been dropped") ||
-             // This error will occur if a moveChunk command has been sent with chunk boundaries
-             // that represent the pre-refine chunks, but the collection has already been changed
-             // to possess the post-refine chunk boundaries.
-             (err.message.indexOf("shard key bounds") > -1 &&
-              err.message.indexOf("are not valid for shard key pattern") > -1));
+        const codes = [ErrorCodes.LockBusy, ErrorCodes.ShardKeyNotFound, ErrorCodes.LockTimeout];
+        return (err.code && codes.includes(err.code)) ||
+            (err.message &&
+             (err.message.includes("CommandFailed") ||
+              err.message.includes("Documents in target range may still be in use") ||
+              // This error will occur as a result of trying to move a chunk with a pre-refine
+              // collection epoch.
+              err.message.includes("collection may have been dropped") ||
+              // This error will occur if a moveChunk command has been sent with chunk boundaries
+              // that represent the pre-refine chunks, but the collection has already been changed
+              // to possess the post-refine chunk boundaries.
+              (err.message.includes("shard key bounds") &&
+               err.message.includes("are not valid for shard key pattern")) ||
+              // This error will occur if another worker thread has already moved the chunk to the
+              // destination shard.
+              err.message.includes("Destination shard cannot be the same as source")));
     };
 
     $config.states.refineCollectionShardKey = function refineCollectionShardKey(
@@ -87,7 +84,11 @@ var $config = extendWorkload($config, function($config, $super) {
             // There is a race that could occur where two threads run refineCollectionShardKey
             // concurrently on the same collection. Since the epoch of the collection changes,
             // the later thread may receive a StaleEpoch error, which is an acceptable error.
-            if (e.code == ErrorCodes.StaleEpoch) {
+            //
+            // It is also possible to receive a LockBusy error if refineCollectionShardKey is unable
+            // to acquire the distlock before timing out due to ongoing migrations acquiring the
+            // distlock first.
+            if (e.code == ErrorCodes.StaleEpoch || e.code == ErrorCodes.LockBusy) {
                 print("Ignoring acceptable refineCollectionShardKey error: " + tojson(e));
                 return;
             }

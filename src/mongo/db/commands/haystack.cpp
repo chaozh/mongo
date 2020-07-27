@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+
 #include "mongo/platform/basic.h"
 
 #include <vector>
@@ -40,13 +42,17 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index/expression_keys_private.h"
 #include "mongo/db/index/haystack_access_method.h"
+#include "mongo/db/index/haystack_access_method_internal.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/find_common.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/logv2/log.h"
 
 /**
  * Examines all documents in a given radius of a given point.
@@ -57,7 +63,10 @@
  * Don't use when you want to find the closest open restaurants.
  */
 namespace mongo {
-
+namespace {
+Rarely geoSearchDeprecationSampler;  // Used to occasionally log deprecation messages.
+bool loggedStartupWarning = false;
+}  // namespace
 using std::string;
 using std::vector;
 
@@ -75,7 +84,12 @@ public:
 
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const final {
+        // geoSearch must support read concerns in order to be run in transactions.
         return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
     }
 
     ReadWriteType getReadWriteType() const {
@@ -94,11 +108,122 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
+    void searchHaystack(const HaystackAccessMethod* ham,
+                        OperationContext* opCtx,
+                        Collection* collection,
+                        const BSONObj& nearObj,
+                        double maxDistance,
+                        const BSONObj& search,
+                        BSONObjBuilder* result,
+                        unsigned limit) {
+        Timer t;
+
+        LOGV2_DEBUG(20680,
+                    1,
+                    "SEARCH near:{nearObj} maxDistance:{maxDistance} search: {search}",
+                    "nearObj"_attr = redact(nearObj),
+                    "maxDistance"_attr = maxDistance,
+                    "search"_attr = redact(search));
+        int x, y;
+        {
+            BSONObjIterator i(nearObj);
+            x = ExpressionKeysPrivate::hashHaystackElement(i.next(), ham->_bucketSize);
+            y = ExpressionKeysPrivate::hashHaystackElement(i.next(), ham->_bucketSize);
+        }
+        int scale = static_cast<int>(ceil(maxDistance / ham->_bucketSize));
+
+        GeoHaystackSearchHopper hopper(
+            opCtx, nearObj, maxDistance, limit, ham->_geoField, collection);
+
+        long long btreeMatches = 0;
+
+        for (int a = -scale; a <= scale && !hopper.limitReached(); ++a) {
+            for (int b = -scale; b <= scale && !hopper.limitReached(); ++b) {
+                BSONObjBuilder bb;
+                bb.append("", ExpressionKeysPrivate::makeHaystackString(x + a, y + b));
+
+                for (unsigned i = 0; i < ham->_otherFields.size(); i++) {
+                    // See if the non-geo field we're indexing on is in the provided search term.
+                    BSONElement e = dps::extractElementAtPath(search, ham->_otherFields[i]);
+                    if (e.eoo())
+                        bb.appendNull("");
+                    else
+                        bb.appendAs(e, "");
+                }
+
+                BSONObj key = bb.obj();
+
+                stdx::unordered_set<RecordId, RecordId::Hasher> thisPass;
+
+
+                auto exec = InternalPlanner::indexScan(opCtx,
+                                                       collection,
+                                                       ham->_descriptor,
+                                                       key,
+                                                       key,
+                                                       BoundInclusion::kIncludeBothStartAndEndKeys,
+                                                       PlanYieldPolicy::YieldPolicy::NO_YIELD);
+                PlanExecutor::ExecState state;
+                BSONObj obj;
+                RecordId loc;
+                while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &loc))) {
+                    if (hopper.limitReached()) {
+                        break;
+                    }
+                    pair<stdx::unordered_set<RecordId, RecordId::Hasher>::iterator, bool> p =
+                        thisPass.insert(loc);
+                    // If a new element was inserted (haven't seen the RecordId before), p.second
+                    // is true.
+                    if (p.second) {
+                        hopper.consider(loc);
+                        btreeMatches++;
+                    }
+                }
+
+                // Non-yielding collection scans from InternalPlanner will never error.
+                invariant(PlanExecutor::ADVANCED == state || PlanExecutor::IS_EOF == state);
+            }
+        }
+
+        BSONArrayBuilder arr(result->subarrayStart("results"));
+        int num = hopper.appendResultsTo(&arr);
+        arr.done();
+
+        {
+            BSONObjBuilder b(result->subobjStart("stats"));
+            b.append("time", t.millis());
+            b.appendNumber("btreeMatches", btreeMatches);
+            b.append("n", num);
+            b.done();
+        }
+    }
+
     bool errmsgRun(OperationContext* opCtx,
                    const string& dbname,
                    const BSONObj& cmdObj,
                    string& errmsg,
                    BSONObjBuilder& result) {
+        if (!loggedStartupWarning) {
+            LOGV2_OPTIONS(4670603,
+                          {logv2::LogTag::kStartupWarnings},
+                          "Support for geoSearch has been deprecated. Instead, create a 2d index "
+                          "and use $geoNear or $geoWithin. See "
+                          "https://dochub.mongodb.org/core/4.4-deprecate-geoHaystack");
+            loggedStartupWarning = true;
+            geoSearchDeprecationSampler.tick();
+        } else if (geoSearchDeprecationSampler.tick()) {
+            LOGV2_WARNING(4670604,
+                          "Support for geoSearch has been deprecated. Instead, create a 2d index "
+                          "and use $geoNear or $geoWithin. See "
+                          "https://dochub.mongodb.org/core/4.4-deprecate-geoHaystack");
+        }
+
+        uassert(ErrorCodes::InvalidOptions,
+                "read concern snapshot is not supported for geoSearch outside of transactions",
+                repl::ReadConcernArgs::get(opCtx).getLevel() !=
+                        repl::ReadConcernLevel::kSnapshotReadConcern ||
+                    opCtx->inMultiDocumentTransaction());
+
         const NamespaceString nss = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
 
         AutoGetCollectionForReadCommand ctx(opCtx, nss);
@@ -140,13 +265,14 @@ public:
         const IndexDescriptor* desc = idxs[0];
         auto ham = static_cast<const HaystackAccessMethod*>(
             collection->getIndexCatalog()->getEntry(desc)->accessMethod());
-        ham->searchCommand(opCtx,
-                           collection,
-                           nearElt.Obj(),
-                           maxDistance.numberDouble(),
-                           search.Obj(),
-                           &result,
-                           limit);
+        searchHaystack(ham,
+                       opCtx,
+                       collection,
+                       nearElt.Obj(),
+                       maxDistance.numberDouble(),
+                       search.Obj(),
+                       &result,
+                       limit);
         return 1;
     }
 } nameSearchCommand;

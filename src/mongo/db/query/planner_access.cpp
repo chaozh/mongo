@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -50,7 +50,7 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace {
@@ -124,10 +124,9 @@ std::vector<bool> canProvideSortWithMergeSort(
     const auto reverseSort = QueryPlannerCommon::reverseSortObj(requestedSort);
     for (auto&& node : nodes) {
         node->computeProperties();
-        auto sorts = node->getSort();
-        if (sorts.find(requestedSort) != sorts.end()) {
+        if (node->providedSorts().contains(requestedSort)) {
             shouldReverseScan.push_back(false);
-        } else if (sorts.find(reverseSort) != sorts.end()) {
+        } else if (node->providedSorts().contains(reverseSort)) {
             shouldReverseScan.push_back(true);
         } else {
             return {};
@@ -222,10 +221,10 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
         params.options & QueryPlannerParams::OPLOG_SCAN_WAIT_FOR_VISIBLE;
 
     // If the hint is {$natural: +-1} this changes the direction of the collection scan.
-    if (!query.getQueryRequest().getHint().isEmpty()) {
-        BSONElement natural =
-            dps::extractElementAtPath(query.getQueryRequest().getHint(), "$natural");
-        if (!natural.eoo()) {
+    const BSONObj& hint = query.getQueryRequest().getHint();
+    if (!hint.isEmpty()) {
+        BSONElement natural = hint[QueryRequest::kNaturalSortField];
+        if (natural) {
             csn->direction = natural.numberInt() >= 0 ? 1 : -1;
         }
     }
@@ -322,8 +321,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeLeafNode(
         // because expr might be inside an array operator that provides a path prefix.
         auto isn = std::make_unique<IndexScanNode>(index);
         isn->bounds.fields.resize(index.keyPattern.nFields());
-        isn->addKeyMetadata = query.getQueryRequest().returnKey() ||
-            query.metadataDeps()[DocumentMetadataFields::kIndexKey];
+        isn->addKeyMetadata = query.metadataDeps()[DocumentMetadataFields::kIndexKey];
         isn->queryCollator = query.getCollator();
 
         // Get the ixtag->pos-th element of the index key pattern.
@@ -1104,8 +1102,8 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
             // that one last.
             for (size_t i = 0; i < andResult->children.size(); ++i) {
                 andResult->children[i]->computeProperties();
-                const BSONObjSet& sorts = andResult->children[i]->getSort();
-                if (sorts.end() != sorts.find(query.getQueryRequest().getSort())) {
+                if (andResult->children[i]->providedSorts().contains(
+                        query.getQueryRequest().getSort())) {
                     std::swap(andResult->children[i], andResult->children.back());
                     break;
                 }
@@ -1113,8 +1111,10 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
         } else {
             // We can't use sort-based intersection, and hash-based intersection is disabled.
             // Clean up the index scans and bail out by returning NULL.
-            LOG(5) << "Can't build index intersection solution: "
-                   << "AND_SORTED is not possible and AND_HASH is disabled.";
+            LOGV2_DEBUG(20947,
+                        5,
+                        "Can't build index intersection solution: AND_SORTED is not possible and "
+                        "AND_HASH is disabled");
             return nullptr;
         }
     }
@@ -1181,7 +1181,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedOr(
     // when any of our children lack index tags.  If a node lacks an index tag it cannot
     // be answered via an index.
     if (!inArrayOperator && 0 != root->numChildren()) {
-        warning() << "planner OR error, non-indexed child of OR.";
+        LOGV2_WARNING(20948, "Planner OR error, non-indexed child of OR");
         // We won't enumerate an OR without indices for each child, so this isn't an issue, even
         // if we have an AND with an OR child -- we won't get here unless the OR is fully
         // indexed.
@@ -1200,7 +1200,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedOr(
     } else {
         std::vector<bool> shouldReverseScan;
 
-        if (!query.getQueryRequest().getSort().isEmpty()) {
+        if (query.getSortPattern()) {
             // If all ixscanNodes can provide the sort, shouldReverseScan is populated with which
             // scans to reverse.
             shouldReverseScan =
@@ -1342,8 +1342,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::scanWholeIndex(
 
     // Build an ixscan over the id index, use it, and return it.
     unique_ptr<IndexScanNode> isn = std::make_unique<IndexScanNode>(index);
-    isn->addKeyMetadata = query.getQueryRequest().returnKey() ||
-        query.metadataDeps()[DocumentMetadataFields::kIndexKey];
+    isn->addKeyMetadata = query.metadataDeps()[DocumentMetadataFields::kIndexKey];
     isn->queryCollator = query.getCollator();
 
     IndexBoundsBuilder::allValuesBounds(index.keyPattern, &isn->bounds);
@@ -1475,8 +1474,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeIndexScan(
     // Build an ixscan over the id index, use it, and return it.
     auto isn = std::make_unique<IndexScanNode>(index);
     isn->direction = 1;
-    isn->addKeyMetadata = query.getQueryRequest().returnKey() ||
-        query.metadataDeps()[DocumentMetadataFields::kIndexKey];
+    isn->addKeyMetadata = query.metadataDeps()[DocumentMetadataFields::kIndexKey];
     isn->bounds.isSimpleRange = true;
     isn->bounds.startKey = startKey;
     isn->bounds.endKey = endKey;

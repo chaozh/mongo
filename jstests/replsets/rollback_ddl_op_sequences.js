@@ -1,4 +1,4 @@
-/*
+/**
  * Basic test of a succesful replica set rollback for DDL operations.
  *
  * This tests sets up a 3 node set, data-bearing nodes A and B and an arbiter.
@@ -33,7 +33,14 @@ var checkFinalResults = function(db) {
 };
 
 var name = "rollback_ddl_op_sequences";
-var replTest = new ReplSetTest({name: name, nodes: 3, useBridge: true});
+// This test create indexes with majority of nodes not avialable for replication. So, disabling
+// index build commit quorum.
+var replTest = new ReplSetTest({
+    name: name,
+    nodes: 3,
+    useBridge: true,
+    nodeOptions: {setParameter: "enableIndexBuildCommitQuorum=false"}
+});
 var nodes = replTest.nodeList();
 
 var conns = replTest.startSet();

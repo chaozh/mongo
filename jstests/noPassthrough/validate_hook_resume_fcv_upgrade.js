@@ -3,6 +3,8 @@
  * server regardless of what state any previous upgrades or downgrades have left it in.
  */
 
+load("jstests/libs/logv2_helpers.js");
+
 // The global 'db' variable is used by the data consistency hooks.
 var db;
 
@@ -14,6 +16,13 @@ var db;
 TestData.skipCollectionAndIndexValidation = true;
 
 function makePatternForValidate(dbName, collName) {
+    if (isJsonLogNoConn()) {
+        return new RegExp(
+            `Slow query.*"ns":"${
+                dbName}\\.\\$cmd","appName":"MongoDB Shell","command":{"validate":"${collName}"`,
+            "g");
+    }
+
     return new RegExp("COMMAND.*command " + dbName +
                           "\\.\\$cmd appName: \"MongoDB Shell\" command: validate { validate: \"" +
                           collName + "\"",
@@ -21,10 +30,27 @@ function makePatternForValidate(dbName, collName) {
 }
 
 function makePatternForSetFCV(targetVersion) {
+    if (isJsonLogNoConn()) {
+        return new RegExp(
+            `Slow query.*"appName":"MongoDB Shell","command":{"setFeatureCompatibilityVersion":"${
+                targetVersion}"`,
+            "g");
+    }
     return new RegExp(
         "COMMAND.*command.*appName: \"MongoDB Shell\" command: setFeatureCompatibilityVersion" +
             " { setFeatureCompatibilityVersion: \"" + targetVersion + "\"",
         "g");
+}
+
+function makePatternForSetParameter(paramName) {
+    if (isJsonLogNoConn()) {
+        return new RegExp(
+            `Slow query.*"appName":"MongoDB Shell","command":{"setParameter":1\\.0,"${paramName}":`,
+            "g");
+    }
+    return new RegExp("COMMAND.*command.*appName: \"MongoDB Shell\" command: setParameter" +
+                          " { setParameter: 1\\.0, " + paramName + ":",
+                      "g");
 }
 
 function countMatches(pattern, output) {
@@ -57,7 +83,7 @@ function runValidateHook(testCase) {
 
 function testStandalone(additionalSetupFn, {
     expectedAtTeardownFCV,
-    expectedSetLastStableFCV: expectedSetLastStableFCV = 0,
+    expectedSetLastLTSFCV: expectedSetLastLTSFCV = 0,
     expectedSetLatestFCV: expectedSetLatestFCV = 0
 } = {}) {
     const conn =
@@ -80,22 +106,27 @@ function testStandalone(additionalSetupFn, {
         }
     });
 
-    const pattern = makePatternForValidate("test", "mycoll");
+    let pattern = makePatternForValidate("test", "mycoll");
     assert.eq(1,
               countMatches(pattern, output),
               "expected to find " + tojson(pattern) + " from mongod in the log output");
 
-    for (let [targetVersion, expectedCount] of [[lastStableFCV, expectedSetLastStableFCV],
+    for (let [targetVersion, expectedCount] of [[lastLTSFCV, expectedSetLastLTSFCV],
                                                 [latestFCV, expectedSetLatestFCV]]) {
         // Since the additionalSetupFn() function may run the setFeatureCompatibilityVersion
         // command and we don't have a guarantee those log messages were cleared when
-        // clearRawMongoProgramOutput() was called, we assert 'expectedSetLastStableFCV' and
+        // clearRawMongoProgramOutput() was called, we assert 'expectedSetLastLTSFCV' and
         // 'expectedSetLatestFCV' as lower bounds.
         const pattern = makePatternForSetFCV(targetVersion);
         assert.lte(expectedCount,
                    countMatches(pattern, output),
                    "expected to find " + tojson(pattern) + " from mongod in the log output");
     }
+
+    pattern = makePatternForSetParameter("transactionLifetimeLimitSeconds");
+    assert.eq(2,
+              countMatches(pattern, output),
+              "expected to find " + tojson(pattern) + " from mongod in the log output twice");
 }
 
 function forceInterruptedUpgradeOrDowngrade(conn, targetVersion) {
@@ -132,7 +163,7 @@ function forceInterruptedUpgradeOrDowngrade(conn, targetVersion) {
                 conn.adminCommand({getParameter: 1, featureCompatibilityVersion: 1}));
 
             if (res.featureCompatibilityVersion.hasOwnProperty("targetVersion")) {
-                checkFCV(conn.getDB("admin"), lastStableFCV, targetVersion);
+                checkFCV(conn.getDB("admin"), lastLTSFCV, targetVersion);
                 jsTest.log(`Reached partially downgraded state after ${attempts} attempts`);
                 return true;
             }
@@ -142,8 +173,8 @@ function forceInterruptedUpgradeOrDowngrade(conn, targetVersion) {
             // Note that we're using 'conn' rather than 'setFCVConn' to avoid the upgrade being
             // interrupted.
             assert.commandWorked(conn.adminCommand({
-                setFeatureCompatibilityVersion: targetVersion === lastStableFCV ? latestFCV
-                                                                                : lastStableFCV
+                setFeatureCompatibilityVersion: targetVersion === lastLTSFCV ? latestFCV
+                                                                             : lastLTSFCV
             }));
         },
         "failed to get featureCompatibilityVersion document into a partially downgraded" +
@@ -161,35 +192,23 @@ function forceInterruptedUpgradeOrDowngrade(conn, targetVersion) {
     }, {expectedAtTeardownFCV: latestFCV});
 })();
 
-(function testStandaloneInLastStableFCV() {
+(function testStandaloneInLastLTSFCV() {
     testStandalone(conn => {
-        assert.commandWorked(conn.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
-        checkFCV(conn.getDB("admin"), lastStableFCV);
-    }, {
-        expectedAtTeardownFCV: lastStableFCV,
-        expectedSetLastStableFCV: 1,
-        expectedSetLatestFCV: 1
-    });
+        assert.commandWorked(conn.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
+        checkFCV(conn.getDB("admin"), lastLTSFCV);
+    }, {expectedAtTeardownFCV: lastLTSFCV, expectedSetLastLTSFCV: 1, expectedSetLatestFCV: 1});
 })();
 
 (function testStandaloneWithInterruptedFCVDowngrade() {
     testStandalone(conn => {
-        forceInterruptedUpgradeOrDowngrade(conn, lastStableFCV);
-    }, {
-        expectedAtTeardownFCV: lastStableFCV,
-        expectedSetLastStableFCV: 2,
-        expectedSetLatestFCV: 1
-    });
+        forceInterruptedUpgradeOrDowngrade(conn, lastLTSFCV);
+    }, {expectedAtTeardownFCV: lastLTSFCV, expectedSetLastLTSFCV: 2, expectedSetLatestFCV: 1});
 })();
 
 (function testStandaloneWithInterruptedFCVUpgrade() {
     testStandalone(conn => {
-        assert.commandWorked(conn.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+        assert.commandWorked(conn.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
         forceInterruptedUpgradeOrDowngrade(conn, latestFCV);
-    }, {
-        expectedAtTeardownFCV: lastStableFCV,
-        expectedSetLastStableFCV: 1,
-        expectedSetLatestFCV: 1
-    });
+    }, {expectedAtTeardownFCV: lastLTSFCV, expectedSetLastLTSFCV: 1, expectedSetLatestFCV: 1});
 })();
 })();

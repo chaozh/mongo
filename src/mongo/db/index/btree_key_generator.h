@@ -68,8 +68,16 @@ public:
      * 'multikeyPaths' to have the same number of elements as the index key pattern and fills each
      * element with the prefixes of the indexed field that would cause this index to be multikey as
      * a result of inserting 'keys'.
+     *
+     * If the caller is certain that the current index is not multikey, and the insertion of 'obj'
+     * will not turn the index into a multikey, then the 'skipMultikey' parameter can be set to
+     * 'true' to be able to use an optimized algorithm for the index key generation. Otherwise,
+     * this parameter must be set to 'false'. In this case a generic algorithm will be used, which
+     * can handle both multikey and non-multikey indexes.
      */
-    void getKeys(const BSONObj& obj,
+    void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                 const BSONObj& obj,
+                 bool skipMultikey,
                  KeyStringSet* keys,
                  MultikeyPaths* multikeyPaths,
                  boost::optional<RecordId> id = boost::none) const;
@@ -139,15 +147,26 @@ private:
 
     /**
      * This recursive method does the heavy-lifting for getKeys().
+     * It will modify 'fieldNames' and 'fixed'.
      */
-    void _getKeysWithArray(std::vector<const char*> fieldNames,
-                           std::vector<BSONElement> fixed,
+    void _getKeysWithArray(std::vector<const char*>* fieldNames,
+                           std::vector<BSONElement>* fixed,
+                           SharedBufferFragmentBuilder& pooledBufferBuilder,
                            const BSONObj& obj,
-                           KeyStringSet* keys,
+                           KeyStringSet::sequence_type* keys,
                            unsigned numNotFound,
                            const std::vector<PositionalPathInfo>& positionalInfo,
                            MultikeyPaths* multikeyPaths,
                            boost::optional<RecordId> id) const;
+
+    /**
+     * An optimized version of the key generation algorithm to be used when it is known that 'obj'
+     * doesn't contain an array value in any of the fields in the key pattern.
+     */
+    void _getKeysWithoutArray(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                              const BSONObj& obj,
+                              boost::optional<RecordId> id,
+                              KeyStringSet* keys) const;
 
     /**
      * A call to _getKeysWithArray() begins by calling this for each field in the key pattern. It
@@ -190,12 +209,17 @@ private:
     /**
      * Sets extracted elements in 'fixed' for field paths that we have traversed to the end.
      *
+     * fieldNamesTemp and fixedTemp are temporary vectors that will be modified by this method
+     *
      * Then calls _getKeysWithArray() recursively.
      */
-    void _getKeysArrEltFixed(std::vector<const char*>* fieldNames,
-                             std::vector<BSONElement>* fixed,
+    void _getKeysArrEltFixed(const std::vector<const char*>& fieldNames,
+                             const std::vector<BSONElement>& fixed,
+                             std::vector<const char*>* fieldNamesTemp,
+                             std::vector<BSONElement>* fixedTemp,
+                             SharedBufferFragmentBuilder& pooledBufferBuilder,
                              const BSONElement& arrEntry,
-                             KeyStringSet* keys,
+                             KeyStringSet::sequence_type* keys,
                              unsigned numNotFound,
                              const BSONElement& arrObjElt,
                              const std::set<size_t>& arrIdxs,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2019 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -70,8 +70,6 @@ class test_prepare02(wttest.WiredTigerTestCase, suite_subprocess):
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.log_flush("sync=on"), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.log_printf("Printing to log file"), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.rebalance("table:mytable", None), msg)
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda: self.session.rename("table:mytable", "table:mynewtable", None), msg)
@@ -95,8 +93,6 @@ class test_prepare02(wttest.WiredTigerTestCase, suite_subprocess):
         self.assertTimestampsEqual(self.session.query_timestamp('get=prepare'), '2a')
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.session.checkpoint(), msg)
-        self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
-            lambda: self.session.snapshot("name=test"), msg)
         # WT_SESSION.transaction_pinned_range permitted, not supported in the Python API.
         self.assertRaisesWithMessage(wiredtiger.WiredTigerError,
             lambda:self.session.transaction_sync(), msg)

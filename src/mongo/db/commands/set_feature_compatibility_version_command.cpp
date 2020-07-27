@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -43,24 +43,24 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/active_migrations_registry.h"
-#include "mongo/db/s/active_shard_collection_registry.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -69,11 +69,10 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(featureCompatibilityDowngrade);
 MONGO_FAIL_POINT_DEFINE(featureCompatibilityUpgrade);
-MONGO_FAIL_POINT_DEFINE(pauseBeforeDowngradingConfigMetadata);  // TODO SERVER-44034: Remove.
-MONGO_FAIL_POINT_DEFINE(pauseBeforeUpgradingConfigMetadata);    // TODO SERVER-44034: Remove.
 MONGO_FAIL_POINT_DEFINE(failUpgrading);
+MONGO_FAIL_POINT_DEFINE(hangWhileUpgrading);
 MONGO_FAIL_POINT_DEFINE(failDowngrading);
-MONGO_FAIL_POINT_DEFINE(allowFCVDowngradeWithCompoundHashedShardKey);
+MONGO_FAIL_POINT_DEFINE(hangWhileDowngrading);
 
 /**
  * Deletes the persisted default read/write concern document.
@@ -94,8 +93,8 @@ void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
 }
 
 /**
- * Sets the minimum allowed version for the cluster. If it is 4.2, then the node should not use 4.4
- * features.
+ * Sets the minimum allowed version for the cluster. If it is 4.4, then the node should not
+ * use 4.5.1 features.
  *
  * Format:
  * {
@@ -122,11 +121,12 @@ public:
     std::string help() const override {
         using FCVP = FeatureCompatibilityVersionParser;
         std::stringstream h;
-        h << "Set the API version exposed by this node. If set to '" << FCVP::kVersion42
-          << "', then " << FCVP::kVersion44 << " features are disabled. If set to '"
-          << FCVP::kVersion44 << "', then " << FCVP::kVersion44
+        h << "Set the featureCompatibilityVersion exposed by this node. If set to '"
+          << FCVP::kVersion44 << "', then " << FCVP::kVersion451
+          << " features are disabled. If set to '" << FCVP::kVersion451 << "', then "
+          << FCVP::kVersion451
           << " features are enabled, and all nodes in the cluster must be binary version "
-          << FCVP::kVersion44 << ". See "
+          << FCVP::kVersion451 << ". See "
           << feature_compatibility_version_documentation::kCompatibilityLink << ".";
         return h.str();
     }
@@ -160,33 +160,39 @@ public:
             auto waitForWCStatus = waitForWriteConcern(
                 opCtx,
                 repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
-                WriteConcernOptions(
-                    WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, timeout),
+                WriteConcernOptions(repl::ReplSetConfig::kMajorityWriteConcernModeName,
+                                    WriteConcernOptions::SyncMode::UNSET,
+                                    timeout),
                 &res);
             CommandHelpers::appendCommandWCStatus(result, waitForWCStatus, res);
         });
 
+        {
+            // Acquire the global IX lock and then immediately release it to ensure this operation
+            // will be killed by the RstlKillOpThread during step-up or stepdown. Note that the
+            // RstlKillOpThread kills any operations on step-up or stepdown for which
+            // Locker::wasGlobalLockTakenInModeConflictingWithWrites() returns true.
+            Lock::GlobalLock lk(opCtx, MODE_IX);
+        }
+
         // Only allow one instance of setFeatureCompatibilityVersion to run at a time.
         invariant(!opCtx->lockState()->isLocked());
         Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
-
-        MigrationBlockingGuard lock(opCtx, ActiveMigrationsRegistry::get(opCtx));
 
         const auto requestedVersion = uassertStatusOK(
             FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(getName(), cmdObj));
         ServerGlobalParams::FeatureCompatibility::Version actualVersion =
             serverGlobalParams.featureCompatibility.getVersion();
 
-        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion44) {
+        if (requestedVersion == FeatureCompatibilityVersionParser::kVersion451) {
             uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate featureCompatibilityVersion upgrade to 4.4 while a previous "
-                    "featureCompatibilityVersion downgrade to 4.2 has not completed. Finish "
-                    "downgrade to 4.2, then upgrade to 4.4.",
+                    "cannot initiate featureCompatibilityVersion upgrade to 4.5.1 while a previous "
+                    "featureCompatibilityVersion downgrade to 4.4 has not completed. Finish "
+                    "downgrade to 4.4, then upgrade to 4.5.1.",
                     actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo42);
+                        ServerGlobalParams::FeatureCompatibility::Version::kDowngradingFrom451To44);
 
-            if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
+            if (actualVersion == ServerGlobalParams::FeatureCompatibility::Version::kVersion451) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -194,13 +200,14 @@ public:
                 return true;
             }
 
-            FeatureCompatibilityVersion::setTargetUpgrade(opCtx);
+            FeatureCompatibilityVersion::setTargetUpgradeFrom(
+                opCtx, ServerGlobalParams::FeatureCompatibility::kLastLTS);
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     upgrading to 4.4 FCV and act accordingly.
+                //     upgrading to 4.5.1 FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before upgrade procedures begin right after
                 //     this.
@@ -213,15 +220,9 @@ public:
             if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
                 const auto shardingState = ShardingState::get(opCtx);
                 if (shardingState->enabled()) {
-                    LOG(0) << "Upgrade: submitting orphaned ranges for cleanup";
+                    LOGV2(20500, "Upgrade: submitting orphaned ranges for cleanup");
                     migrationutil::submitOrphanRangesForCleanup(opCtx);
                 }
-
-                // The primary shard sharding a collection will write the initial chunks for a
-                // collection directly to the config server, so wait for all shard collections to
-                // complete to guarantee no chunks are missed by the update on the config server.
-                ActiveShardCollectionRegistry::get(opCtx).waitForActiveShardCollectionsToComplete(
-                    opCtx);
             }
 
             // Upgrade shards before config finishes its upgrade.
@@ -234,25 +235,20 @@ public:
                                 cmdObj,
                                 BSON(FeatureCompatibilityVersionCommandParser::kCommandName
                                      << requestedVersion)))));
-
-                if (MONGO_unlikely(pauseBeforeUpgradingConfigMetadata.shouldFail())) {
-                    log() << "Hit pauseBeforeUpgradingConfigMetadata";
-                    pauseBeforeUpgradingConfigMetadata.pauseWhileSet(opCtx);
-                }
-                ShardingCatalogManager::get(opCtx)->upgradeOrDowngradeChunksAndTags(
-                    opCtx, ShardingCatalogManager::ConfigUpgradeType::kUpgrade);
             }
 
-            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
-        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion42) {
+            hangWhileUpgrading.pauseWhileSet(opCtx);
+            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(
+                opCtx, FeatureCompatibilityVersionParser::parseVersion(requestedVersion));
+        } else if (requestedVersion == FeatureCompatibilityVersionParser::kVersion44) {
             uassert(ErrorCodes::IllegalOperation,
-                    "cannot initiate setting featureCompatibilityVersion to 4.2 while a previous "
-                    "featureCompatibilityVersion upgrade to 4.4 has not completed.",
+                    "cannot initiate setting featureCompatibilityVersion to 4.4 while a previous "
+                    "featureCompatibilityVersion upgrade to 4.5.1 has not completed.",
                     actualVersion !=
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo44);
+                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451);
 
             if (actualVersion ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo42) {
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for
                 // writeConcern.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
@@ -260,41 +256,39 @@ public:
                 return true;
             }
 
-            // Compound hashed shard keys are only allowed in 4.4. If the user tries to downgrade
-            // the cluster to FCV42, they must first drop all the collections with compound hashed
-            // shard key. If we find any existing collections, we uassert.
-            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                const auto grid = Grid::get(opCtx);
-                auto allDbs = uassertStatusOK(grid->catalogClient()->getAllDBs(
-                                                  opCtx, repl::ReadConcernLevel::kLocalReadConcern))
-                                  .value;
-                for (const auto& db : allDbs) {
-                    auto collections = uassertStatusOK(grid->catalogClient()->getCollections(
-                        opCtx, &db.getName(), nullptr, repl::ReadConcernLevel::kLocalReadConcern));
-                    for (const auto& coll : collections) {
-                        if (coll.getDropped()) {
-                            continue;
-                        }
-                        auto shardKeyPattern = coll.getKeyPattern().toBSON();
-                        uassert(31411,
-                                str::stream()
-                                    << "Cannot downgrade the cluster when there is an existing "
-                                       "collection with compound hashed shard key. Please drop the "
-                                       "collection "
-                                    << coll.getNs() << " and re-initiate the downgrade process",
-                                allowFCVDowngradeWithCompoundHashedShardKey.shouldFail() ||
-                                    !ShardKeyPattern::extractHashedField(shardKeyPattern) ||
-                                    shardKeyPattern.nFields() == 1);
-                    }
-                }
-            }
-            FeatureCompatibilityVersion::setTargetDowngrade(opCtx);
+            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+            const bool isReplSet =
+                replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+
+            uassert(ErrorCodes::ConflictingOperationInProgress,
+                    str::stream() << "Cannot downgrade the cluster when the replica set config "
+                                  << "contains 'newlyAdded' members; wait for those members to "
+                                  << "finish its initial sync procedure",
+                    !(isReplSet && replCoord->replSetContainsNewlyAddedMembers()));
+
+            // We should make sure the current config w/o 'newlyAdded' members got replicated
+            // to all nodes.
+            LOGV2(4637904, "Waiting for the current replica set config to propagate to all nodes.");
+            // If a write concern is given, we'll use its wTimeout. It's kNoTimeout by default.
+            WriteConcernOptions writeConcern(repl::ReplSetConfig::kConfigAllWriteConcernName,
+                                             WriteConcernOptions::SyncMode::NONE,
+                                             opCtx->getWriteConcern().wTimeout);
+            writeConcern.checkCondition = WriteConcernOptions::CheckCondition::Config;
+            repl::OpTime fakeOpTime(Timestamp(1, 1), replCoord->getTerm());
+            uassertStatusOKWithContext(
+                replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
+                "Failed to wait for the current replica set config to propagate to all "
+                "nodes");
+            LOGV2(4637905, "The current replica set config has been propagated to all nodes.");
+
+            FeatureCompatibilityVersion::setTargetDowngrade(
+                opCtx, FeatureCompatibilityVersionParser::parseVersion(requestedVersion));
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
                 //   - The global IX/X locked operation will start after the FCV change, see the
-                //     downgrading to 4.2 FCV and act accordingly.
+                //     downgrading to 4.4 FCV and act accordingly.
                 //   - The global IX/X locked operation began prior to the FCV change, is acting on
                 //     that assumption and will finish before downgrade procedures begin right after
                 //     this.
@@ -304,18 +298,9 @@ public:
             if (failDowngrading.shouldFail())
                 return false;
 
-            const bool isReplSet = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
-                repl::ReplicationCoordinator::modeReplSet;
-
             if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-                LOG(0) << "Downgrade: dropping config.rangeDeletions collection";
+                LOGV2(20502, "Downgrade: dropping config.rangeDeletions collection");
                 migrationutil::dropRangeDeletionsCollection(opCtx);
-
-                // The primary shard sharding a collection will write the initial chunks for a
-                // collection directly to the config server, so wait for all shard collections to
-                // complete to guarantee no chunks are missed by the update on the config server.
-                ActiveShardCollectionRegistry::get(opCtx).waitForActiveShardCollectionsToComplete(
-                    opCtx);
             } else if (isReplSet || serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
                 // The default rwc document should only be deleted on plain replica sets and the
                 // config server replica set, not on shards or standalones.
@@ -332,16 +317,11 @@ public:
                                 cmdObj,
                                 BSON(FeatureCompatibilityVersionCommandParser::kCommandName
                                      << requestedVersion)))));
-
-                if (MONGO_unlikely(pauseBeforeDowngradingConfigMetadata.shouldFail())) {
-                    log() << "Hit pauseBeforeDowngradingConfigMetadata";
-                    pauseBeforeDowngradingConfigMetadata.pauseWhileSet(opCtx);
-                }
-                ShardingCatalogManager::get(opCtx)->upgradeOrDowngradeChunksAndTags(
-                    opCtx, ShardingCatalogManager::ConfigUpgradeType::kDowngrade);
             }
 
-            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
+            hangWhileDowngrading.pauseWhileSet(opCtx);
+            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(
+                opCtx, FeatureCompatibilityVersionParser::parseVersion(requestedVersion));
         }
 
         return true;

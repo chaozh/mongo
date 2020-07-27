@@ -10,17 +10,16 @@ selector:
   exclude_files:
   # Disable inmem_full as per SERVER-27014
   - jstests/noPassthrough/inmem_full.js
-  # TODO(SERVER-45821): enable backup_cursor_format.js and incremental_backup_cursor.js
-  - src/mongo/db/modules/*/jstests/hot_backups/backup_cursor_format.js
-  - src/mongo/db/modules/*/jstests/hot_backups/incremental_backup_cursor.js
+  # Multiversion backup-restore tests must run in the multiversion suite.
+  - src/mongo/db/modules/*/jstests/hot_backups/*last_lts*.js
 
 # noPassthrough tests start their own mongod's.
 executor:
   archive:
     tests:
       - jstests/noPassthrough/backup*.js
-      - jstests/noPassthrough/rollback_wt_cache_full.js
       - jstests/noPassthrough/wt_unclean_shutdown.js
+      - src/mongo/db/modules/enterprise/jstests/hot_backups/*.js
   config:
     shell_options:
       nodb: ''

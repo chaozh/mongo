@@ -55,10 +55,11 @@ public:
     enum class Op { kInsert, kDelete };
 
     /**
-     * Indicates whether this interceptor will allow tracking of documents skipped due to key
-     * generation errors. When 'kTrack', a SkippedRecordTracker is created.
+     * Indicates whether to record duplicate keys that have been inserted into the index. When set
+     * to 'kNoTrack', inserted duplicate keys will be ignored. When set to 'kTrack', a subsequent
+     * call to checkDuplicateKeyConstraints is required.
      */
-    enum class TrackSkippedRecords { kNoTrack, kTrack };
+    enum class TrackDuplicates { kNoTrack, kTrack };
 
     static bool typeCanFastpathMultikeyUpdates(IndexType type);
 
@@ -67,17 +68,17 @@ public:
      * table to store any duplicate key constraint violations found during the build, if the index
      * being built has uniqueness constraints.
      *
-     * deleteTemporaryTable() must be called before destruction to delete the temporary tables.
+     * finalizeTemporaryTables() must be called before destruction to delete or keep the temporary
+     * tables.
      */
-    IndexBuildInterceptor(OperationContext* opCtx,
-                          IndexCatalogEntry* entry,
-                          TrackSkippedRecords trackSkippedRecords);
+    IndexBuildInterceptor(OperationContext* opCtx, IndexCatalogEntry* entry);
 
     /**
-     * Deletes the temporary side writes and duplicate key constraint violations tables. Must be
-     * called before object destruction.
+     * Deletes or keeps the temporary side writes and duplicate key constraint violations tables.
+     * Must be called before object destruction.
      */
-    void deleteTemporaryTables(OperationContext* opCtx);
+    void finalizeTemporaryTables(OperationContext* opCtx,
+                                 TemporaryRecordStore::FinalizationAction action);
 
     /**
      * Client writes that are concurrent with an index build will have their index updates written
@@ -87,7 +88,7 @@ public:
      * On success, `numKeysOut` if non-null will contain the number of keys added or removed.
      */
     Status sideWrite(OperationContext* opCtx,
-                     const std::vector<KeyString::Value>& keys,
+                     const KeyStringSet& keys,
                      const KeyStringSet& multikeyMetadataKeys,
                      const MultikeyPaths& multikeyPaths,
                      RecordId loc,
@@ -95,10 +96,10 @@ public:
                      int64_t* const numKeysOut);
 
     /**
-     * Given a set of duplicate keys, record the keys for later verification by a call to
+     * Given a duplicate key, record the key for later verification by a call to
      * checkDuplicateKeyConstraints();
      */
-    Status recordDuplicateKeys(OperationContext* opCtx, const std::vector<BSONObj>& keys);
+    Status recordDuplicateKey(OperationContext* opCtx, const KeyString::Value& key);
 
     /**
      * Returns Status::OK if all previously recorded duplicate key constraint violations have been
@@ -115,26 +116,19 @@ public:
      *
      * This is resumable, so subsequent calls will start the scan at the record immediately
      * following the last inserted record from a previous call to drainWritesIntoIndex.
-     *
-     * TODO (SERVER-40894): Implement draining while reading at a timestamp. The following comment
-     * does not apply.
-     * When 'readSource' is not kUnset, perform the drain by reading at the timestamp described by
-     * the ReadSource. This will always reset the ReadSource to its original value before returning.
-     * The drain otherwise reads at the pre-existing ReadSource on the RecoveryUnit. This may be
-     * necessary by callers that can only guarantee consistency of data up to a certain point in
-     * time.
      */
     Status drainWritesIntoIndex(OperationContext* opCtx,
+                                const Collection* coll,
                                 const InsertDeleteOptions& options,
-                                RecoveryUnit::ReadSource readSource,
+                                TrackDuplicates trackDups,
                                 DrainYieldPolicy drainYieldPolicy);
 
     SkippedRecordTracker* getSkippedRecordTracker() {
-        return _skippedRecordTracker.get();
+        return &_skippedRecordTracker;
     }
 
     const SkippedRecordTracker* getSkippedRecordTracker() const {
-        return _skippedRecordTracker.get();
+        return &_skippedRecordTracker;
     }
 
     /**
@@ -151,27 +145,28 @@ public:
     bool areAllWritesApplied(OperationContext* opCtx) const;
 
     /**
-     * Returns true if all recorded duplicate key constraint violations have been checked.
-     */
-    bool areAllConstraintsChecked(OperationContext* opCtx) const;
-
-
-    /**
      * When an index builder wants to commit, use this to retrieve any recorded multikey paths
      * that were tracked during the build.
      */
     boost::optional<MultikeyPaths> getMultikeyPaths() const;
 
-    const std::string& getSideWritesTableIdent() const;
+    std::string getSideWritesTableIdent() const {
+        return _sideWritesTable->rs()->getIdent();
+    }
 
-    const std::string& getConstraintViolationsTableIdent() const;
+    boost::optional<std::string> getDuplicateKeyTrackerTableIdent() const {
+        return _duplicateKeyTracker ? boost::make_optional(_duplicateKeyTracker->getTableIdent())
+                                    : boost::none;
+    }
 
 private:
     using SideWriteRecord = std::pair<RecordId, BSONObj>;
 
     Status _applyWrite(OperationContext* opCtx,
+                       const Collection* coll,
                        const BSONObj& doc,
                        const InsertDeleteOptions& options,
+                       TrackDuplicates trackDups,
                        int64_t* const keysInserted,
                        int64_t* const keysDeleted);
 
@@ -188,7 +183,7 @@ private:
     std::unique_ptr<TemporaryRecordStore> _sideWritesTable;
 
     // Records RecordIds that have been skipped due to indexing errors.
-    std::unique_ptr<SkippedRecordTracker> _skippedRecordTracker;
+    SkippedRecordTracker _skippedRecordTracker;
 
     std::unique_ptr<DuplicateKeyTracker> _duplicateKeyTracker;
 

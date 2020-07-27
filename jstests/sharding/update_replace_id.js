@@ -11,10 +11,17 @@
  * into its replacement, and in the case of an upsert will use the value of _id from the query
  * filter.
  *
- * @tags: [requires_find_command, uses_transactions, uses_multi_shard_transactions, requires_fcv_44]
+ * @tags: [
+ *   requires_find_command,
+ *   uses_multi_shard_transactions,
+ *   uses_transactions,
+ * ]
  */
 (function() {
 load("jstests/libs/profiler.js");  // For profilerHas*OrThrow helper functions.
+
+// Test deliberately inserts orphans outside of migrations.
+TestData.skipCheckOrphans = true;
 
 const st = new ShardingTest({shards: 2, mongos: 1, config: 1, other: {enableBalancer: false}});
 

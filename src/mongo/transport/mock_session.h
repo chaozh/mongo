@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/base/checked_cast.h"
+#include "mongo/config.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/util/net/hostandport.h"
@@ -122,6 +123,16 @@ public:
     bool isConnected() override {
         return true;
     }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() const override {
+        return nullptr;
+    }
+
+    const std::shared_ptr<SSLManagerInterface> getSSLManager() const override {
+        return nullptr;
+    }
+#endif
 
     explicit MockSession(TransportLayer* tl)
         : _tl(checked_cast<TransportLayerMock*>(tl)), _remote(), _local() {}

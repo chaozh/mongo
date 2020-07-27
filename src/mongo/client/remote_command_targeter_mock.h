@@ -31,9 +31,7 @@
 
 #include <set>
 
-#include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter.h"
-#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
@@ -75,6 +73,11 @@ public:
      * Adds host to a set of hosts marked down, otherwise a no-op.
      */
     void markHostUnreachable(const HostAndPort& host, const Status& status) override;
+
+    /**
+     * Adds host to a set of hosts marked down, otherwise a no-op.
+     */
+    void markHostShuttingDown(const HostAndPort& host, const Status& status) override;
 
     /**
      * Sets the return value for the next call to connectionString.

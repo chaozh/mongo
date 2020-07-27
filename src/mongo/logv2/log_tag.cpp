@@ -31,19 +31,18 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
 
 BSONArray LogTag::toBSONArray() {
     BSONArrayBuilder builder;
-    if (_value | kStartupWarnings) {
+    if (_value & kStartupWarnings) {
         builder.append("startupWarnings"_sd);
     }
-    if (_value | kPlainShell) {
+    if (_value & kPlainShell) {
         builder.append("plainShellOutput"_sd);
     }
 
     return builder.arr();
 }
-}  // namespace logv2
-}  // namespace mongo
+
+}  // namespace mongo::logv2

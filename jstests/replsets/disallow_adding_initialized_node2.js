@@ -17,7 +17,7 @@ var replSetA = new ReplSetTest({
     name: name,
     nodes: [
         {rsConfig: {_id: 10}},
-        {rsConfig: {_id: 11, arbiterOnly: true}},
+        {rsConfig: {_id: 11, priority: 0}},
     ]
 });
 replSetA.startSet({dbpath: "$set-A-$node"});
@@ -50,7 +50,9 @@ replSetB.stop(0);
 jsTestLog("Adding replica set B's primary " + primaryB.host + " to replica set A's config");
 configA.version++;
 configA.members.push({_id: 12, host: primaryB.host});
-assert.commandWorked(primaryA.adminCommand({replSetReconfig: configA}));
+// Use "force" reconfig to increase the config of replica set A by a large number, so that replica
+// set B will try to fetch the config with a higher version on hearing it via heartbeats.
+assert.commandWorked(primaryA.adminCommand({replSetReconfig: configA, force: true}));
 
 jsTestLog("Restarting B's primary " + primaryB.host);
 primaryB = replSetB.start(0, {dbpath: "$set-B-$node", restart: true});

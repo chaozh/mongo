@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -40,27 +40,21 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/json.h"
+#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/transport_layer_asio.h"
-#include "mongo/util/log.h"
 
-using namespace mongo::repl;
-
+namespace mongo {
+namespace repl {
 namespace ReplTests {
 
-using mongo::logger::globalLogDomain;
-using mongo::logger::LogComponent;
-using mongo::logger::LogSeverity;
-using std::endl;
 using std::string;
-using std::stringstream;
 using std::unique_ptr;
 using std::vector;
 
@@ -105,32 +99,30 @@ public:
     Base()
         : _client(&_opCtx),
           _defaultReplSettings(
-              ReplicationCoordinator::get(getGlobalServiceContext())->getSettings()) {
+              ReplicationCoordinator::get(_opCtx.getServiceContext())->getSettings()) {
+        auto* const sc = _opCtx.getServiceContext();
+
         transport::TransportLayerASIO::Options opts;
         opts.mode = transport::TransportLayerASIO::Options::kEgress;
-        auto sc = getGlobalServiceContext();
-
         sc->setTransportLayer(std::make_unique<transport::TransportLayerASIO>(opts, nullptr));
         ASSERT_OK(sc->getTransportLayer()->setup());
         ASSERT_OK(sc->getTransportLayer()->start());
 
         ReplSettings replSettings;
         replSettings.setReplSetString("rs0/host1");
-        ReplicationCoordinator::set(
-            getGlobalServiceContext(),
-            std::unique_ptr<repl::ReplicationCoordinator>(
-                new repl::ReplicationCoordinatorMock(_opCtx.getServiceContext(), replSettings)));
-        ASSERT_OK(ReplicationCoordinator::get(getGlobalServiceContext())
-                      ->setFollowerMode(MemberState::RS_PRIMARY));
+        ReplicationCoordinator::set(sc,
+                                    std::unique_ptr<repl::ReplicationCoordinator>(
+                                        new repl::ReplicationCoordinatorMock(sc, replSettings)));
+        ASSERT_OK(ReplicationCoordinator::get(sc)->setFollowerMode(MemberState::RS_PRIMARY));
 
         // Since the Client object persists across tests, even though the global
         // ReplicationCoordinator does not, we need to clear the last op associated with the client
         // to avoid the invariant in ReplClientInfo::setLastOp that the optime only goes forward.
         repl::ReplClientInfo::forClient(_opCtx.getClient()).clearLastOp_forTest();
 
-        getGlobalServiceContext()->setOpObserver(std::make_unique<OpObserverShardingImpl>());
+        sc->setOpObserver(std::make_unique<OpObserverImpl>());
 
-        setOplogCollectionName(getGlobalServiceContext());
+        setOplogCollectionName(sc);
         createOplog(&_opCtx);
 
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
@@ -149,26 +141,30 @@ public:
         // Start with a fresh oplog.
         deleteAll(cllNS());
     }
+
     ~Base() {
+        auto* const sc = _opCtx.getServiceContext();
         try {
             deleteAll(ns());
             deleteAll(cllNS());
             repl::ReplicationCoordinator::set(
-                getGlobalServiceContext(),
-                std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
-                    _opCtx.getServiceContext(), _defaultReplSettings)));
-            repl::ReplicationCoordinator::get(getGlobalServiceContext())
+                sc,
+                std::unique_ptr<repl::ReplicationCoordinator>(
+                    new repl::ReplicationCoordinatorMock(sc, _defaultReplSettings)));
+            repl::ReplicationCoordinator::get(sc)
                 ->setFollowerMode(repl::MemberState::RS_PRIMARY)
                 .ignore();
 
-            getGlobalServiceContext()->getTransportLayer()->shutdown();
-
+            sc->getTransportLayer()->shutdown();
         } catch (...) {
             FAIL("Exception while cleaning up test");
         }
     }
 
 protected:
+    virtual OplogApplication::Mode getOplogApplicationMode() {
+        return OplogApplication::Mode::kSecondary;
+    }
     static const char* ns() {
         return "unittests.repltests";
     }
@@ -193,8 +189,10 @@ protected:
     }
     void check(const BSONObj& expected, const BSONObj& got) const {
         if (expected.woCompare(got)) {
-            ::mongo::log() << "expected: " << expected.toString() << ", got: " << got.toString()
-                           << endl;
+            LOGV2(22500,
+                  "expected: {expected}, got: {got}",
+                  "expected"_attr = expected.toString(),
+                  "got"_attr = got.toString());
         }
         ASSERT_BSONOBJ_EQ(expected, got);
     }
@@ -243,12 +241,12 @@ protected:
             OldClientContext ctx(&_opCtx, ns());
             for (vector<BSONObj>::iterator i = ops.begin(); i != ops.end(); ++i) {
                 if (0) {
-                    mongo::unittest::log() << "op: " << *i << endl;
+                    LOGV2(22501, "op: {i}", "i"_attr = *i);
                 }
                 repl::UnreplicatedWritesBlock uwb(&_opCtx);
                 auto entry = uassertStatusOK(OplogEntry::parse(*i));
                 uassertStatusOK(applyOperation_inlock(
-                    &_opCtx, ctx.db(), &entry, false, OplogApplication::Mode::kSecondary));
+                    &_opCtx, ctx.db(), &entry, false, getOplogApplicationMode()));
             }
         }
     }
@@ -281,7 +279,7 @@ protected:
             coll = db->createCollection(&_opCtx, nss());
         }
 
-        auto lastApplied = repl::ReplicationCoordinator::get(getGlobalServiceContext())
+        auto lastApplied = repl::ReplicationCoordinator::get(_opCtx.getServiceContext())
                                ->getMyLastAppliedOpTime()
                                .getTimestamp();
         // The oplog collection may already have some oplog entries for writes prior to this insert.
@@ -362,7 +360,16 @@ protected:
     virtual void reset() const = 0;
 };
 
-class InsertTimestamp : public Base {
+// Some operations are only idempotent when in RECOVERING, not in SECONDARY.  This includes
+// duplicate inserts and deletes.
+class Recovering : public Base {
+protected:
+    virtual OplogApplication::Mode getOplogApplicationMode() {
+        return OplogApplication::Mode::kRecovering;
+    }
+};
+
+class InsertTimestamp : public Recovering {
 public:
     void doIt() const {
         BSONObjBuilder b;
@@ -384,7 +391,7 @@ private:
     mutable Date_t date_;
 };
 
-class InsertAutoId : public Base {
+class InsertAutoId : public Recovering {
 public:
     InsertAutoId() : o_(fromjson("{\"a\":\"b\"}")) {}
     void doIt() const {
@@ -412,7 +419,7 @@ public:
     }
 };
 
-class InsertTwo : public Base {
+class InsertTwo : public Recovering {
 public:
     InsertTwo() : o_(fromjson("{'_id':1,a:'b'}")), t_(fromjson("{'_id':2,c:'d'}")) {}
     void doIt() const {
@@ -435,7 +442,7 @@ private:
     BSONObj t_;
 };
 
-class InsertTwoIdentical : public Base {
+class InsertTwoIdentical : public Recovering {
 public:
     InsertTwoIdentical() : o_(fromjson("{\"a\":\"b\"}")) {}
     void doIt() const {
@@ -695,7 +702,7 @@ protected:
 };
 
 
-class UpsertInsertIdMod : public Base {
+class UpsertInsertIdMod : public Recovering {
 public:
     UpsertInsertIdMod()
         : q_(fromjson("{'_id':5,a:4}")),
@@ -716,7 +723,7 @@ protected:
     BSONObj q_, u_, ou_;
 };
 
-class UpsertInsertSet : public Base {
+class UpsertInsertSet : public Recovering {
 public:
     UpsertInsertSet()
         : q_(fromjson("{a:5}")), u_(fromjson("{$set:{a:7}}")), ou_(fromjson("{a:7}")) {}
@@ -736,7 +743,7 @@ protected:
     BSONObj o_, q_, u_, ou_;
 };
 
-class UpsertInsertInc : public Base {
+class UpsertInsertInc : public Recovering {
 public:
     UpsertInsertInc()
         : q_(fromjson("{a:5}")), u_(fromjson("{$inc:{a:3}}")), ou_(fromjson("{a:8}")) {}
@@ -755,10 +762,10 @@ protected:
     BSONObj o_, q_, u_, ou_;
 };
 
-class MultiInc : public Base {
+class MultiInc : public Recovering {
 public:
     string s() const {
-        stringstream ss;
+        StringBuilder ss;
         unique_ptr<DBClientCursor> cc =
             _client.query(NamespaceString(ns()), Query().sort(BSON("_id" << 1)));
         bool first = true;
@@ -821,7 +828,7 @@ protected:
     BSONObj o_, u_, ot_;
 };
 
-class Remove : public Base {
+class Remove : public Recovering {
 public:
     Remove()
         : o1_(f("{\"_id\":\"010101010101010101010101\",\"a\":\"b\"}")),
@@ -852,7 +859,7 @@ class RemoveOne : public Remove {
     }
 };
 
-class FailingUpdate : public Base {
+class FailingUpdate : public Recovering {
 public:
     FailingUpdate() : o_(fromjson("{'_id':1,a:'b'}")), u_(fromjson("{'_id':1,c:'d'}")) {}
     void doIt() const {
@@ -1372,3 +1379,5 @@ public:
 OldStyleSuiteInitializer<All> myall;
 
 }  // namespace ReplTests
+}  // namespace repl
+}  // namespace mongo

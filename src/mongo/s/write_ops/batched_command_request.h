@@ -36,6 +36,7 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/database_version_helpers.h"
+#include "mongo/util/visit_helper.h"
 
 namespace mongo {
 
@@ -133,20 +134,12 @@ public:
         return *_dbVersion;
     }
 
-    void setRuntimeConstants(RuntimeConstants runtimeConstants) {
-        invariant(_updateReq);
-        _updateReq->setRuntimeConstants(std::move(runtimeConstants));
-    }
+    void setRuntimeConstants(RuntimeConstants runtimeConstants);
 
-    bool hasRuntimeConstants() const {
-        invariant(_updateReq);
-        return _updateReq->getRuntimeConstants().has_value();
-    }
+    bool hasRuntimeConstants() const;
 
-    const boost::optional<RuntimeConstants>& getRuntimeConstants() const {
-        invariant(_updateReq);
-        return _updateReq->getRuntimeConstants();
-    }
+    const boost::optional<RuntimeConstants>& getRuntimeConstants() const;
+    const boost::optional<BSONObj>& getLet() const;
 
     const write_ops::WriteCommandBase& getWriteCommandBase() const;
     void setWriteCommandBase(write_ops::WriteCommandBase writeCommandBase);
@@ -167,6 +160,12 @@ public:
      * Generates a new request, the same as the old, but with insert _ids if required.
      */
     static BatchedCommandRequest cloneInsertWithIds(BatchedCommandRequest origCmdRequest);
+
+    /** These are used to return empty refs from Insert ops that don't carry runtimeConstants
+     * or let parameters in getLet and getRuntimeConstants.
+     */
+    const static boost::optional<RuntimeConstants> kEmptyRuntimeConstants;
+    const static boost::optional<BSONObj> kEmptyLet;
 
 private:
     template <typename Req, typename F, typename... As>
@@ -204,46 +203,43 @@ private:
 };
 
 /**
- * Similar to above, this class wraps the write items of a command request into a generically
- * usable type.  Very thin wrapper, does not own the write item itself.
- *
- * TODO: Use in BatchedCommandRequest above
+ * Similar to above, this class wraps the write items of a command request into a generically usable
+ * type. Very thin wrapper, does not own the write item itself.
  */
 class BatchItemRef {
 public:
-    BatchItemRef(const BatchedCommandRequest* request, int itemIndex)
-        : _request(request), _itemIndex(itemIndex) {}
+    BatchItemRef(const BatchedCommandRequest* request, int index);
 
-    const BatchedCommandRequest* getRequest() const {
-        return _request;
+    BatchedCommandRequest::BatchType getOpType() const {
+        return _request.getBatchType();
     }
 
     int getItemIndex() const {
-        return _itemIndex;
-    }
-
-    BatchedCommandRequest::BatchType getOpType() const {
-        return _request->getBatchType();
+        return _index;
     }
 
     const auto& getDocument() const {
-        dassert(_itemIndex < static_cast<int>(_request->sizeWriteOps()));
-        return _request->getInsertRequest().getDocuments().at(_itemIndex);
+        return _request.getInsertRequest().getDocuments()[_index];
     }
-
     const auto& getUpdate() const {
-        dassert(_itemIndex < static_cast<int>(_request->sizeWriteOps()));
-        return _request->getUpdateRequest().getUpdates().at(_itemIndex);
+        return _request.getUpdateRequest().getUpdates()[_index];
     }
 
     const auto& getDelete() const {
-        dassert(_itemIndex < static_cast<int>(_request->sizeWriteOps()));
-        return _request->getDeleteRequest().getDeletes().at(_itemIndex);
+        return _request.getDeleteRequest().getDeletes()[_index];
+    }
+
+    auto& getLet() const {
+        return _request.getLet();
+    }
+
+    auto& getRuntimeConstants() const {
+        return _request.getRuntimeConstants();
     }
 
 private:
-    const BatchedCommandRequest* _request;
-    const int _itemIndex;
+    const BatchedCommandRequest& _request;
+    const int _index;
 };
 
 }  // namespace mongo

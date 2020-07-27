@@ -51,7 +51,13 @@ class VoteRequester {
     VoteRequester& operator=(const VoteRequester&) = delete;
 
 public:
-    enum class Result { kSuccessfullyElected, kStaleTerm, kInsufficientVotes, kPrimaryRespondedNo };
+    enum class Result {
+        kSuccessfullyElected,
+        kStaleTerm,
+        kInsufficientVotes,
+        kPrimaryRespondedNo,
+        kCancelled
+    };
 
     class Algorithm : public ScatterGatherAlgorithm {
     public:
@@ -59,7 +65,7 @@ public:
                   long long candidateIndex,
                   long long term,
                   bool dryRun,
-                  OpTime lastDurableOpTime,
+                  OpTime lastAppliedOpTime,
                   int primaryIndex);
         virtual ~Algorithm();
         virtual std::vector<executor::RemoteCommandRequest> getRequests() const;
@@ -86,7 +92,7 @@ public:
         const long long _candidateIndex;
         const long long _term;
         bool _dryRun = false;  // this bool indicates this is a mock election when true
-        const OpTime _lastDurableOpTime;
+        const OpTime _lastAppliedOpTime;
         std::vector<HostAndPort> _targets;
         stdx::unordered_set<HostAndPort> _responders;
         bool _staleTerm = false;
@@ -113,7 +119,7 @@ public:
                                                           long long candidateIndex,
                                                           long long term,
                                                           bool dryRun,
-                                                          OpTime lastDurableOpTime,
+                                                          OpTime lastAppliedOpTime,
                                                           int primaryIndex);
 
     /**
@@ -127,7 +133,6 @@ public:
 private:
     std::shared_ptr<Algorithm> _algorithm;
     std::unique_ptr<ScatterGatherRunner> _runner;
-    bool _isCanceled = false;
 };
 
 }  // namespace repl

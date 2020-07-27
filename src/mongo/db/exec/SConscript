@@ -7,6 +7,7 @@ env = env.Clone()
 env.SConscript(
     dirs=[
         "document_value",
+        "sbe",
     ],
     exports=[
         "env",
@@ -77,6 +78,20 @@ env.Library(
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/index/index_access_methods",
         "$BUILD_DIR/mongo/db/query_exec",
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+    ],
+)
+
+env.Library(
+    target='sbe_cmd',
+    source=[
+        'sbe_cmd.cpp'
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/query_exec",
+        "sbe/query_sbe_parser",
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',

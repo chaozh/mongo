@@ -53,7 +53,9 @@ bool commandSpecifiesWriteConcern(const BSONObj& cmdObj);
  * Verifies that the writeConcern is of type Object (BSON type) and
  * that the resulting writeConcern is valid for this particular host.
  */
-StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx, const BSONObj& cmdObj);
+StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
+                                                    const BSONObj& cmdObj,
+                                                    bool isInternalClient);
 
 /**
  * Verifies that a WriteConcern is valid for this particular host.
@@ -71,18 +73,22 @@ struct WriteConcernResult {
         wTimedOut = false;
         wTime = -1;
         err = "";
+        wcUsed = WriteConcernOptions();
     }
 
-    void appendTo(const WriteConcernOptions& writeConcern, BSONObjBuilder* result) const;
+    void appendTo(BSONObjBuilder* result) const;
 
     int syncMillis;
-    int fsyncFiles;
-
     bool wTimedOut;
     int wTime;
     std::vector<HostAndPort> writtenTo;
+    WriteConcernOptions wcUsed;
 
     std::string err;  // this is the old err field, should deprecate
+
+    // This field has had a dummy value since MMAP went away. It is undocumented.
+    // Maintaining it so as not to cause unnecessary user pain across upgrades.
+    int fsyncFiles;
 };
 
 /**

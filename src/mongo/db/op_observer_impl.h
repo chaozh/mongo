@@ -41,6 +41,22 @@ public:
     OpObserverImpl() = default;
     virtual ~OpObserverImpl() = default;
 
+    class DocumentKey {
+    public:
+        DocumentKey(BSONObj id, boost::optional<BSONObj> _shardKey)
+            : _id(id.getOwned()), _shardKey(std::move(_shardKey)) {
+            invariant(!id.isEmpty());
+        }
+
+        BSONObj getId() const;
+
+        BSONObj getShardKeyAndId() const;
+
+    private:
+        BSONObj _id;
+        boost::optional<BSONObj> _shardKey;
+    };
+
     void onCreateIndex(OperationContext* opCtx,
                        const NamespaceString& nss,
                        CollectionUUID uuid,
@@ -102,7 +118,7 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) final;
+                   boost::optional<IndexCollModInfo> indexInfo) final;
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) final;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
@@ -141,7 +157,8 @@ public:
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid);
     void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       const std::vector<repl::ReplOperation>& statements) final;
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) final;
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
         OplogSlot commitOplogEntryOpTime,
@@ -149,15 +166,21 @@ public:
         const std::vector<repl::ReplOperation>& statements) noexcept final;
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) final;
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) final;
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) final;
     void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo) final;
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) final {}
 
-    // Contains the fields of the document that are in the collection's shard key, and "_id".
-    static BSONObj getDocumentKey(OperationContext* opCtx,
-                                  NamespaceString const& nss,
-                                  BSONObj const& doc);
+    /**
+     * Returns a DocumentKey constructed from the shard key fields, if the collection is sharded,
+     * and the _id field, of the given document.
+     */
+    static DocumentKey getDocumentKey(OperationContext* opCtx,
+                                      NamespaceString const& nss,
+                                      BSONObj const& doc);
 
 private:
     virtual void shardObserveAboutToDelete(OperationContext* opCtx,

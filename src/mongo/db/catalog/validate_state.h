@@ -55,25 +55,39 @@ class ValidateState {
     ValidateState& operator=(const ValidateState&) = delete;
 
 public:
+    /**
+     * 'turnOnExtraLoggingForTest' turns on extra logging for test debugging. This parameter is for
+     * unit testing only.
+     */
     ValidateState(OperationContext* opCtx,
                   const NamespaceString& nss,
-                  bool background,
-                  ValidateOptions options);
+                  ValidateMode mode,
+                  RepairMode repairMode,
+                  bool turnOnExtraLoggingForTest = false);
 
     const NamespaceString& nss() const {
         return _nss;
     }
 
     bool isBackground() const {
-        return _background;
+        return _mode == ValidateMode::kBackground;
     }
 
-    bool isFullCollectionValidation() const {
-        return (_options & ValidateOptions::kFullRecordStoreValidation);
+    bool shouldEnforceFastCount() const {
+        return _mode == ValidateMode::kForegroundFullEnforceFastCount && !_nss.isOplog();
+    }
+
+    bool isFullValidation() const {
+        return _mode == ValidateMode::kForegroundFull ||
+            _mode == ValidateMode::kForegroundFullEnforceFastCount;
     }
 
     bool isFullIndexValidation() const {
-        return (_options & ValidateOptions::kFullIndexValidation);
+        return isFullValidation() || _mode == ValidateMode::kForegroundFullIndexOnly;
+    }
+
+    bool shouldRunRepair() const {
+        return _repairMode == RepairMode::kRepair;
     }
 
     const UUID uuid() const {
@@ -132,12 +146,25 @@ public:
      */
     void initializeCursors(OperationContext* opCtx);
 
+    /**
+     * Indicates whether extra logging should occur during validation.
+     *
+     * This is for unit testing only. Intended to improve diagnosibility.
+     */
+    bool extraLoggingForTest() {
+        return _extraLoggingForTest;
+    }
+
+    boost::optional<Timestamp> getValidateTimestamp() {
+        return _validateTs;
+    }
+
 private:
     ValidateState() = delete;
 
     /**
      * Re-locks the database and collection with the appropriate locks for background validation.
-     * This should only be called when '_background' is set to true.
+     * This should only be called when '_mode' is set to 'kBackground'.
      */
     void _relockDatabaseAndCollection(OperationContext* opCtx);
 
@@ -168,10 +195,11 @@ private:
     void _yieldCursors(OperationContext* opCtx);
 
     NamespaceString _nss;
-    bool _background;
-    ValidateOptions _options;
+    ValidateMode _mode;
+    RepairMode _repairMode;
     OptionalCollectionUUID _uuid;
 
+    boost::optional<Lock::GlobalLock> _globalLock;
     boost::optional<AutoGetDb> _databaseLock;
     boost::optional<Lock::CollectionLock> _collectionLock;
 
@@ -195,6 +223,11 @@ private:
 
     // Used to detect when the catalog is re-opened while yielding locks.
     uint64_t _catalogGeneration;
+
+    // Can be set by unit tests to obtain better insight into what validate sees/does.
+    bool _extraLoggingForTest;
+
+    boost::optional<Timestamp> _validateTs = boost::none;
 };
 
 }  // namespace CollectionValidation

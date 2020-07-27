@@ -10,7 +10,7 @@ import unittest
 import requests
 import yaml
 from mock import patch, MagicMock
-from shrub.config import Configuration
+from shrub.v2 import BuildVariant, ShrubProject
 from shrub.variant import DisplayTaskDefinition
 
 from buildscripts.util.teststats import TestRuntime
@@ -78,6 +78,7 @@ class TestAcceptance(unittest.TestCase):
             "project": "mongodb-mongo-master",
             "task_id": "task314",
             "task_name": "some_task_gen",
+            "max_sub_suites": 100,
         }
 
     @staticmethod
@@ -334,6 +335,13 @@ class TestConfigOptions(unittest.TestCase):
 
         self.assertEqual(config["build_id"], config_options.run_tests_build_id)
 
+    def test_create_misc_suite(self):
+        config = {}
+
+        config_options = under_test.ConfigOptions(config)
+
+        self.assertTrue(config_options.create_misc_suite)
+
     def test_item_with_format_function_works(self):
         config = {"number": "1"}
         formats = {"number": int}
@@ -342,17 +350,6 @@ class TestConfigOptions(unittest.TestCase):
 
         self.assertEqual(1, config_options.number)
         self.assertIsInstance(config_options.number, int)
-
-    def test_generate_display_task(self):
-        config = {"task_name": "my_task"}
-
-        config_options = under_test.ConfigOptions(config)
-        display_task = config_options.generate_display_task(["task_1", "task_2"])
-
-        self.assertEqual("my_task", display_task._name)
-        self.assertIn(config_options.task + "_gen", display_task.to_map()["execution_tasks"])
-        self.assertIn("task_1", display_task.to_map()["execution_tasks"])
-        self.assertIn("task_2", display_task.to_map()["execution_tasks"])
 
 
 class DivideRemainingTestsAmongSuitesTest(unittest.TestCase):
@@ -600,13 +597,15 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         return options
 
     def test_evg_config_is_created(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         suites = self.generate_mock_suites(3)
+        build_variant = BuildVariant("variant")
 
-        config = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                     MagicMock()).generate_config().to_map()
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
 
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
         self.assertEqual(len(config["tasks"]), len(suites) + 1)
         command1 = config["tasks"][0]["commands"][2]
         self.assertIn(options.resmoke_args, command1["vars"]["resmoke_args"])
@@ -615,33 +614,38 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         self.assertEqual("run generated tests", command1["func"])
 
     def test_evg_config_is_created_with_diff_task_and_suite(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         options.task = "task"
+        options.display_task_name = "display task"
         options.generate_display_task.return_value = DisplayTaskDefinition("task")
         suites = self.generate_mock_suites(3)
+        build_variant = BuildVariant("variant")
 
-        config = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                     MagicMock()).generate_config().to_map()
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
 
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
         self.assertEqual(len(config["tasks"]), len(suites) + 1)
         display_task = config["buildvariants"][0]["display_tasks"][0]
-        self.assertEqual(options.task, display_task["name"])
+        self.assertEqual(options.display_task_name, display_task["name"])
 
         task = config["tasks"][0]
         self.assertIn(options.variant, task["name"])
         self.assertIn(options.suite, task["commands"][2]["vars"]["resmoke_args"])
 
     def test_evg_config_can_use_large_distro(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         options.use_large_distro = "true"
         options.large_distro_name = "large distro name"
-
         suites = self.generate_mock_suites(3)
+        build_variant = BuildVariant("variant")
 
-        config = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                     MagicMock()).generate_config().to_map()
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
+
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
 
         self.assertEqual(len(config["tasks"]), len(suites) + 1)
         self.assertEqual(options.large_distro_name,
@@ -658,12 +662,10 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         self.assertTrue(is_task_dependency("sharding", "sharding_misc"))
 
     def test_get_tasks_depends_on(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         suites = self.generate_mock_suites(3)
 
-        cfg_generator = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                            MagicMock())
+        cfg_generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
         cfg_generator.build_tasks = [
             MagicMock(display_name="sharding_gen"),
             MagicMock(display_name="sharding_0"),
@@ -681,14 +683,12 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         self.assertIn("sharding_misc", dependent_tasks)
 
     def test_specified_dependencies_are_added(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         options.depends_on = ["sharding"]
         options.is_patch = False
         suites = self.generate_mock_suites(3)
 
-        cfg_generator = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                            MagicMock())
+        cfg_generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
         cfg_generator.build_tasks = [
             MagicMock(display_name="sharding_gen"),
             MagicMock(display_name="sharding_0"),
@@ -699,19 +699,20 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
             MagicMock(display_name="sharding_misc"),
         ]
 
-        cfg_mock = MagicMock()
-        cfg_generator._add_dependencies(cfg_mock)
-        self.assertEqual(4, cfg_mock.dependency.call_count)
+        dependencies = cfg_generator._get_dependencies()
+        self.assertEqual(4, len(dependencies))
 
     def test_evg_config_has_timeouts_for_repeated_suites(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         options.repeat_suites = 5
         suites = self.generate_mock_suites(3)
+        build_variant = BuildVariant("variant")
 
-        config = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                     MagicMock()).generate_config().to_map()
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
 
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
         self.assertEqual(len(config["tasks"]), len(suites) + 1)
         command1 = config["tasks"][0]["commands"][2]
         self.assertIn(" --repeatSuites=5 ", command1["vars"]["resmoke_args"])
@@ -724,63 +725,86 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         self.assertEqual(expected_exec_timeout, timeout_cmd["params"]["exec_timeout_secs"])
 
     def test_evg_config_has_fails_if_timeout_too_high(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         options.repeat_suites = under_test.MAX_EXPECTED_TIMEOUT
         suites = self.generate_mock_suites(3)
 
         with self.assertRaises(ValueError):
-            under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                MagicMock()).generate_config()
+            generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+            generator.generate_config(MagicMock())
+
+    def test_evg_config_does_not_fails_if_timeout_too_high_on_mainline(self):
+        options = self.generate_mock_options()
+        options.is_patch = False
+        options.repeat_suites = under_test.MAX_EXPECTED_TIMEOUT
+        suites = self.generate_mock_suites(3)
+        build_variant = BuildVariant("variant")
+
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
+
+        config = build_variant.as_dict()
+        self.assertEqual(len(config["tasks"]), len(suites) + 1)
 
     def test_evg_config_does_not_overwrite_repeatSuites_resmoke_arg_with_repeatSuites_default(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         options.resmoke_args = "resmoke_args --repeatSuites=5"
         suites = self.generate_mock_suites(1)
 
-        config = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                     MagicMock()).generate_config().to_map()
+        build_variant = BuildVariant("variant")
+
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
+
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
         command1 = config["tasks"][0]["commands"][2]
         self.assertIn("--repeatSuites=5", command1["vars"]["resmoke_args"])
         self.assertNotIn("--repeatSuites=1", command1["vars"]["resmoke_args"])
 
     def test_evg_config_does_not_overwrite_repeat_resmoke_arg_with_repeatSuites_default(self):
-        shrub_config = Configuration()
         options = self.generate_mock_options()
         options.resmoke_args = "resmoke_args --repeat=5"
         suites = self.generate_mock_suites(1)
+        build_variant = BuildVariant("variant")
 
-        config = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                     MagicMock()).generate_config().to_map()
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
+
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
         command1 = config["tasks"][0]["commands"][2]
         self.assertIn("--repeat=5", command1["vars"]["resmoke_args"])
         self.assertNotIn("--repeatSuites=1", command1["vars"]["resmoke_args"])
 
     def test_suites_without_enough_info_should_not_include_timeouts(self):
-        shrub_config = Configuration()
         suite_without_timing_info = 1
         options = self.generate_mock_options()
         suites = self.generate_mock_suites(3)
         suites[suite_without_timing_info].should_overwrite_timeout.return_value = False
+        build_variant = BuildVariant("variant")
 
-        config = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                     MagicMock()).generate_config().to_map()
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
 
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
         timeout_cmd = config["tasks"][suite_without_timing_info]["commands"][0]
         self.assertNotIn("command", timeout_cmd)
         self.assertEqual("do setup", timeout_cmd["func"])
 
     def test_timeout_info_not_included_if_use_default_timeouts_set(self):
-        shrub_config = Configuration()
         suite_without_timing_info = 1
         options = self.generate_mock_options()
         suites = self.generate_mock_suites(3)
         options.use_default_timeouts = True
+        build_variant = BuildVariant("variant")
 
-        config = under_test.EvergreenConfigGenerator(shrub_config, suites, options,
-                                                     MagicMock()).generate_config().to_map()
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        generator.generate_config(build_variant)
 
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
         timeout_cmd = config["tasks"][suite_without_timing_info]["commands"][0]
         self.assertNotIn("command", timeout_cmd)
         self.assertEqual("do setup", timeout_cmd["func"])
@@ -788,11 +812,12 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
 
 class GenerateSubSuitesTest(unittest.TestCase):
     @staticmethod
-    def get_mock_options():
+    def get_mock_options(n_fallback=2, max_sub_suites=100):
         options = MagicMock()
         options.target_resmoke_time = 10
-        options.fallback_num_sub_suites = 2
+        options.fallback_num_sub_suites = n_fallback
         options.max_tests_per_suite = None
+        options.max_sub_suites = max_sub_suites
         return options
 
     @staticmethod
@@ -823,17 +848,53 @@ class GenerateSubSuitesTest(unittest.TestCase):
 
     def test_calculate_suites_fallback(self):
         n_tests = 100
+        n_fallback = 2
         evg = mock_test_stats_unavailable(MagicMock())
-        config_options = self.get_mock_options()
+        config_options = self.get_mock_options(n_fallback=n_fallback)
 
         gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
         gen_sub_suites.list_tests = MagicMock(return_value=self.get_test_list(n_tests))
 
         suites = gen_sub_suites.calculate_suites(_DATE, _DATE)
 
-        self.assertEqual(gen_sub_suites.config_options.fallback_num_sub_suites, len(suites))
+        self.assertEqual(n_fallback, len(suites))
         for suite in suites:
-            self.assertEqual(50, len(suite.tests))
+            self.assertEqual(n_tests / n_fallback, len(suite.tests))
+
+        self.assertEqual(n_tests, len(gen_sub_suites.test_list))
+
+    def test_max_sub_suites_overrides_fallback(self):
+        n_tests = 100
+        n_fallback = 5
+        max_sub_suites = 1
+        evg = mock_test_stats_unavailable(MagicMock())
+        config_options = self.get_mock_options(n_fallback=n_fallback, max_sub_suites=max_sub_suites)
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+        gen_sub_suites.list_tests = MagicMock(return_value=self.get_test_list(n_tests))
+
+        suites = gen_sub_suites.calculate_suites(_DATE, _DATE)
+
+        self.assertEqual(max_sub_suites, len(suites))
+        for suite in suites:
+            self.assertEqual(n_tests, len(suite.tests))
+
+        self.assertEqual(n_tests, len(gen_sub_suites.test_list))
+
+    def test_calculate_suites_more_fallback_suites_than_tests(self):
+        n_tests = 5
+        n_fallback = 10
+        evg = mock_test_stats_unavailable(MagicMock())
+        config_options = self.get_mock_options(n_fallback=n_fallback)
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+        gen_sub_suites.list_tests = MagicMock(return_value=self.get_test_list(n_tests))
+
+        suites = gen_sub_suites.calculate_suites(_DATE, _DATE)
+
+        self.assertEqual(n_tests, len(suites))
+        for suite in suites:
+            self.assertEqual(1, len(suite.tests))
 
         self.assertEqual(n_tests, len(gen_sub_suites.test_list))
 
@@ -934,7 +995,8 @@ class GenerateSubSuitesTest(unittest.TestCase):
             self.assertIn(tests_runtimes[2], filtered_list)
             self.assertIn(tests_runtimes[1], filtered_list)
 
-    def test_filter_blacklist_files(self):
+    @patch(ns('_parser.set_run_options'))
+    def test_filter_blacklist_files(self, set_run_options_mock):
         tests_runtimes = [
             TestRuntime(test_name="dir1/file1.js", runtime=20.32),
             TestRuntime(test_name="dir2/file2.js", runtime=24.32),
@@ -958,7 +1020,8 @@ class GenerateSubSuitesTest(unittest.TestCase):
             self.assertIn(tests_runtimes[2], filtered_list)
             self.assertIn(tests_runtimes[0], filtered_list)
 
-    def test_filter_blacklist_files_for_windows(self):
+    @patch(ns('_parser.set_run_options'))
+    def test_filter_blacklist_files_for_windows(self, set_run_options_mock):
         tests_runtimes = [
             TestRuntime(test_name="dir1/file1.js", runtime=20.32),
             TestRuntime(test_name="dir2/file2.js", runtime=24.32),

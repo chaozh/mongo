@@ -48,14 +48,16 @@ class RecordCursor;
 class IDHackStage final : public RequiresIndexStage {
 public:
     /** Takes ownership of all the arguments -collection. */
-    IDHackStage(OperationContext* opCtx,
+    IDHackStage(ExpressionContext* expCtx,
                 CanonicalQuery* query,
                 WorkingSet* ws,
+                const Collection* collection,
                 const IndexDescriptor* descriptor);
 
-    IDHackStage(OperationContext* opCtx,
+    IDHackStage(ExpressionContext* expCtx,
                 const BSONObj& key,
                 WorkingSet* ws,
+                const Collection* collection,
                 const IndexDescriptor* descriptor);
 
     ~IDHackStage();
@@ -65,11 +67,6 @@ public:
 
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
-
-    /**
-     * ID Hack has a very strict criteria for the queries it supports.
-     */
-    static bool supportsQuery(Collection* collection, const CanonicalQuery& query);
 
     StageType stageType() const final {
         return STAGE_IDHACK;

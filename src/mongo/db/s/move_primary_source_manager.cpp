@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -41,15 +41,18 @@
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/sharding_statistics.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_shard_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangInCloneStage);
+MONGO_FAIL_POINT_DEFINE(hangInCleanStaleDataStage);
 
 using namespace shardmetadatautil;
 
@@ -74,15 +77,24 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
     invariant(_state == kCreated);
     auto scopedGuard = makeGuard([&] { cleanupOnError(opCtx); });
 
-    log() << "Moving " << _dbname << " primary from: " << _fromShard << " to: " << _toShard;
+    LOGV2(22042,
+          "Moving {db} primary from: {fromShard} to: {toShard}",
+          "Moving primary for database",
+          "db"_attr = _dbname,
+          "fromShard"_attr = _fromShard,
+          "toShard"_attr = _toShard);
 
     // Record start in changelog
-    uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
+    auto logChangeCheckedStatus = ShardingLogging::get(opCtx)->logChangeChecked(
         opCtx,
         "movePrimary.start",
         _dbname.toString(),
         _buildMoveLogEntry(_dbname.toString(), _fromShard.toString(), _toShard.toString()),
-        ShardingCatalogClient::kMajorityWriteConcern));
+        ShardingCatalogClient::kMajorityWriteConcern);
+
+    if (!logChangeCheckedStatus.isOK()) {
+        return logChangeCheckedStatus;
+    }
 
     {
         // We use AutoGetOrCreateDb the first time just in case movePrimary was called before any
@@ -96,6 +108,11 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
     }
 
     _state = kCloning;
+
+    if (MONGO_unlikely(hangInCloneStage.shouldFail())) {
+        LOGV2(4908700, "Hit hangInCloneStage");
+        hangInCloneStage.pauseWhileSet(opCtx);
+    }
 
     auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto fromShardObj = uassertStatusOK(shardRegistry->getShard(opCtx, _fromShard));
@@ -111,29 +128,12 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
         ReadPreferenceSetting(ReadPreference::PrimaryOnly),
         "admin",
         CommandHelpers::appendMajorityWriteConcern(cloneCatalogDataCommandBuilder.obj()),
-        Shard::RetryPolicy::kIdempotent);
+        Shard::RetryPolicy::kNotIdempotent);
 
     auto cloneCommandStatus = Shard::CommandResponse::getEffectiveStatus(cloneCommandResponse);
-
-    // If the `toShard` is on v4.2 or earlier, it will not recognize the command name
-    // _shardsvrCloneCatalogData. We will retry the command with the old name _cloneCatalogData.
-    if (cloneCommandStatus == ErrorCodes::CommandNotFound) {
-        BSONObjBuilder legacyCloneCatalogDataCommandBuilder;
-        legacyCloneCatalogDataCommandBuilder << "_cloneCatalogData" << _dbname << "from"
-                                             << fromShardObj->getConnString().toString();
-
-
-        cloneCommandResponse = toShardObj->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
-            CommandHelpers::appendMajorityWriteConcern(legacyCloneCatalogDataCommandBuilder.obj()),
-            Shard::RetryPolicy::kIdempotent);
-
-        cloneCommandStatus = Shard::CommandResponse::getEffectiveStatus(cloneCommandResponse);
+    if (!cloneCommandStatus.isOK()) {
+        return cloneCommandStatus;
     }
-
-    uassertStatusOK(cloneCommandStatus);
 
     auto clonedCollsArray = cloneCommandResponse.getValue().response["clonedColls"];
     for (const auto& elem : clonedCollsArray.Obj()) {
@@ -153,7 +153,10 @@ Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
     auto scopedGuard = makeGuard([&] { cleanupOnError(opCtx); });
 
     // Mark the shard as running a critical operation that requires recovery on crash.
-    uassertStatusOK(ShardingStateRecovery::startMetadataOp(opCtx));
+    auto startMetadataOpStatus = ShardingStateRecovery::startMetadataOp(opCtx);
+    if (!startMetadataOpStatus.isOK()) {
+        return startMetadataOpStatus;
+    }
 
     {
         // The critical section must be entered with the database X lock in order to ensure there
@@ -195,9 +198,10 @@ Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
                           << signalStatus.toString()};
     }
 
-    log() << "movePrimary successfully entered critical section";
+    LOGV2(22043, "movePrimary successfully entered critical section");
 
     scopedGuard.dismiss();
+
     return Status::OK();
 }
 
@@ -244,9 +248,12 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
         // Need to get the latest optime in case the refresh request goes to a secondary --
         // otherwise the read won't wait for the write that _configsvrCommitMovePrimary may have
         // done
-        log() << "Error occurred while committing the movePrimary. Performing a majority write "
-                 "against the config server to obtain its latest optime"
-              << causedBy(redact(commitStatus));
+        LOGV2(22044,
+              "Error occurred while committing the movePrimary. Performing a majority write "
+              "against the config server to obtain its latest optime: {error}",
+              "Error occurred while committing the movePrimary. Performing a majority write "
+              "against the config server to obtain its latest optime",
+              "error"_attr = redact(commitStatus));
 
         Status validateStatus = ShardingLogging::get(opCtx)->logChangeChecked(
             opCtx,
@@ -330,6 +337,11 @@ Status MovePrimarySourceManager::cleanStaleData(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(_state == kNeedCleanStaleData);
 
+    if (MONGO_unlikely(hangInCleanStaleDataStage.shouldFail())) {
+        LOGV2(4908701, "Hit hangInCleanStaleDataStage");
+        hangInCleanStaleDataStage.pauseWhileSet(opCtx);
+    }
+
     // Only drop the cloned (unsharded) collections.
     DBDirectClient client(opCtx);
     for (auto& coll : _clonedColls) {
@@ -337,7 +349,11 @@ Status MovePrimarySourceManager::cleanStaleData(OperationContext* opCtx) {
         client.runCommand(_dbname.toString(), BSON("drop" << coll.coll()), dropCollResult);
         Status dropStatus = getStatusFromCommandResult(dropCollResult);
         if (!dropStatus.isOK()) {
-            log() << "failed to drop cloned collection " << coll << causedBy(redact(dropStatus));
+            LOGV2(22045,
+                  "Failed to drop cloned collection {namespace} in movePrimary: {error}",
+                  "Failed to drop cloned collection in movePrimary",
+                  "namespace"_attr = coll,
+                  "error"_attr = redact(dropStatus));
         }
     }
 
@@ -363,8 +379,12 @@ void MovePrimarySourceManager::cleanupOnError(OperationContext* opCtx) {
     } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
         BSONObjBuilder requestArgsBSON;
         _requestArgs.serialize(&requestArgsBSON);
-        warning() << "Failed to clean up movePrimary: " << redact(requestArgsBSON.obj())
-                  << "due to: " << redact(ex);
+        LOGV2_WARNING(22046,
+                      "Failed to clean up movePrimary with request parameters {request} due to: "
+                      "{error}",
+                      "Failed to clean up movePrimary",
+                      "request"_attr = redact(requestArgsBSON.obj()),
+                      "error"_attr = redact(ex));
     }
 }
 

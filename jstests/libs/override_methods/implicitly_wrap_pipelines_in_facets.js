@@ -24,12 +24,6 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
 
     var originalPipeline = cmdObj.pipeline;
 
-    if (originalPipeline.length === 0) {
-        // Empty pipelines are disallowed within a $facet stage.
-        print('Not wrapping empty pipeline in a $facet stage');
-        return originalRunCommand.apply(this, arguments);
-    }
-
     const stagesDisallowedInsideFacet = [
         '$changeStream',
         '$collStats',
@@ -38,7 +32,6 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
         '$indexStats',
         '$merge',
         '$out',
-        '$internalOutToDifferentDB'
     ];
     for (let stageSpec of originalPipeline) {
         // Skip wrapping the pipeline in a $facet stage if it has an invalid stage

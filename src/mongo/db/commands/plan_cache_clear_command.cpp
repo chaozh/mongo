@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -42,7 +42,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/plan_ranker.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -79,17 +79,29 @@ Status clear(OperationContext* opCtx,
         Status result = planCache->remove(*cq);
         if (!result.isOK()) {
             invariant(result.code() == ErrorCodes::NoSuchKey);
-            LOG(1) << ns << ": query shape doesn't exist in PlanCache - "
-                   << redact(cq->getQueryObj()) << "(sort: " << cq->getQueryRequest().getSort()
-                   << "; projection: " << cq->getQueryRequest().getProj()
-                   << "; collation: " << cq->getQueryRequest().getCollation() << ")";
+            LOGV2_DEBUG(23906,
+                        1,
+                        "{namespace}: Query shape doesn't exist in PlanCache - {query}"
+                        "(sort: {sort}; projection: {projection}; collation: {collation})",
+                        "Query shape doesn't exist in PlanCache",
+                        "namespace"_attr = ns,
+                        "query"_attr = redact(cq->getQueryObj()),
+                        "sort"_attr = cq->getQueryRequest().getSort(),
+                        "projection"_attr = cq->getQueryRequest().getProj(),
+                        "collation"_attr = cq->getQueryRequest().getCollation());
             return Status::OK();
         }
 
-        LOG(1) << ns << ": removed plan cache entry - " << redact(cq->getQueryObj())
-               << "(sort: " << cq->getQueryRequest().getSort()
-               << "; projection: " << cq->getQueryRequest().getProj()
-               << "; collation: " << cq->getQueryRequest().getCollation() << ")";
+        LOGV2_DEBUG(23907,
+                    1,
+                    "{namespace}: Removed plan cache entry - {query}"
+                    "(sort: {sort}; projection: {projection}; collation: {collation})",
+                    "Removed plan cache entry",
+                    "namespace"_attr = ns,
+                    "query"_attr = redact(cq->getQueryObj()),
+                    "sort"_attr = cq->getQueryRequest().getSort(),
+                    "projection"_attr = cq->getQueryRequest().getProj(),
+                    "collation"_attr = cq->getQueryRequest().getCollation());
 
         return Status::OK();
     }
@@ -104,7 +116,8 @@ Status clear(OperationContext* opCtx,
 
     planCache->clear();
 
-    LOG(1) << ns << ": cleared plan cache";
+    LOGV2_DEBUG(
+        23908, 1, "{namespace}: Cleared plan cache", "Cleared plan cache", "namespace"_attr = ns);
 
     return Status::OK();
 }

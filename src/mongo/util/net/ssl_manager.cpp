@@ -28,7 +28,7 @@
  */
 
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -42,11 +42,11 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/overflow_arithmetic.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/icu.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_parameters_gen.h"
 #include "mongo/util/str.h"
@@ -55,7 +55,7 @@
 
 namespace mongo {
 
-SSLManagerInterface* theSSLManager = nullptr;
+SSLManagerCoordinator* theSSLManagerCoordinator;
 
 namespace {
 
@@ -336,6 +336,19 @@ boost::optional<std::vector<SSLX509Name::Entry>> getClusterMemberDNOverrideParam
 }
 }  // namespace
 
+SSLManagerCoordinator* SSLManagerCoordinator::get() {
+    return theSSLManagerCoordinator;
+}
+
+std::shared_ptr<SSLManagerInterface> SSLManagerCoordinator::getSSLManager() {
+    return *_manager;
+}
+
+void SSLManagerCoordinator::rotate() {}
+
+SSLManagerCoordinator::SSLManagerCoordinator()
+    : _manager(SSLManagerInterface::create(sslGlobalParams, isSSLServer)) {}
+
 void ClusterMemberDNOverride::append(OperationContext* opCtx,
                                      BSONObjBuilder& b,
                                      const std::string& name) {
@@ -551,13 +564,25 @@ TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLogManager"))
 (InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        const auto& config = theSSLManager->getSSLConfiguration();
+        const auto& config = SSLManagerCoordinator::get()->getSSLManager()->getSSLConfiguration();
         if (!config.clientSubjectName.empty()) {
-            LOG(1) << "Client Certificate Name: " << config.clientSubjectName;
+            LOGV2_DEBUG(23214,
+                        1,
+                        "Client Certificate Name: {name}",
+                        "Client certificate name",
+                        "name"_attr = config.clientSubjectName);
         }
         if (!config.serverSubjectName().empty()) {
-            LOG(1) << "Server Certificate Name: " << config.serverSubjectName();
-            LOG(1) << "Server Certificate Expiration: " << config.serverCertificateExpirationDate;
+            LOGV2_DEBUG(23215,
+                        1,
+                        "Server Certificate Name: {name}",
+                        "Server certificate name",
+                        "name"_attr = config.serverSubjectName());
+            LOGV2_DEBUG(23216,
+                        1,
+                        "Server Certificate Expiration: {expiration}",
+                        "Server certificate expiration",
+                        "expiration"_attr = config.serverCertificateExpirationDate);
         }
     }
 
@@ -594,8 +619,13 @@ Status SSLX509Name::normalizeStrings() {
                     break;
                 }
                 default:
-                    LOG(1) << "Certificate subject name contains unknown string type: "
-                           << entry.type << " (string value is \"" << entry.value << "\")";
+                    LOGV2_DEBUG(23217,
+                                1,
+                                "Certificate subject name contains unknown string type: "
+                                "{entryType} (string value is \"{entryValue}\")",
+                                "Certificate subject name contains unknown string type",
+                                "entryType"_attr = entry.type,
+                                "entryValue"_attr = entry.value);
                     break;
             }
         }
@@ -677,13 +707,19 @@ bool SSLConfiguration::isClusterMember(SSLX509Name subject) const {
 bool SSLConfiguration::isClusterMember(StringData subjectName) const {
     auto swClient = parseDN(subjectName);
     if (!swClient.isOK()) {
-        warning() << "Unable to parse client subject name: " << swClient.getStatus();
+        LOGV2_WARNING(23219,
+                      "Unable to parse client subject name: {error}",
+                      "Unable to parse client subject name",
+                      "error"_attr = swClient.getStatus());
         return false;
     }
     auto& client = swClient.getValue();
     auto status = client.normalizeStrings();
     if (!status.isOK()) {
-        warning() << "Unable to normalize client subject name: " << status;
+        LOGV2_WARNING(23220,
+                      "Unable to normalize client subject name: {error}",
+                      "Unable to normalize client subject name",
+                      "error"_attr = status);
         return false;
     }
 
@@ -692,12 +728,10 @@ bool SSLConfiguration::isClusterMember(StringData subjectName) const {
     return !canonicalClient.empty() && (canonicalClient == _canonicalServerSubjectName);
 }
 
-BSONObj SSLConfiguration::getServerStatusBSON() const {
-    BSONObjBuilder security;
-    security.append("SSLServerSubjectName", _serverSubjectName.toString());
-    security.appendBool("SSLServerHasCertificateAuthority", hasCA);
-    security.appendDate("SSLServerCertificateExpirationDate", serverCertificateExpirationDate);
-    return security.obj();
+void SSLConfiguration::getServerStatusBSON(BSONObjBuilder* security) const {
+    security->append("SSLServerSubjectName", _serverSubjectName.toString());
+    security->appendBool("SSLServerHasCertificateAuthority", hasCA);
+    security->appendDate("SSLServerCertificateExpirationDate", serverCertificateExpirationDate);
 }
 
 SSLManagerInterface::~SSLManagerInterface() {}
@@ -715,6 +749,9 @@ enum class DERType : char {
     // Primitive, not supported by the parser
     // Only exists when BER indefinite form is used which is not valid DER.
     EndOfContent = 0,
+
+    // Primitive
+    INTEGER = 2,
 
     // Primitive
     UTF8String = 12,
@@ -769,6 +806,16 @@ public:
     std::string readUtf8String() {
         invariant(_type == DERType::UTF8String);
         return std::string(_data, _length);
+    }
+
+    /**
+     * Get a vector representation for the value of this DER INTEGER
+     */
+    DERInteger readInt() {
+        invariant(_type == DERType::INTEGER);
+        DERInteger out(_length);
+        std::copy(_data, _data + _length, out.begin());
+        return out;
     }
 
     /**
@@ -837,6 +884,23 @@ StatusWith<std::string> readDERString(ConstDataRangeCursor& cdc) {
     return derString.readUtf8String();
 }
 
+StatusWith<DERInteger> readDERInt(ConstDataRangeCursor& cdc) {
+    auto swInt = cdc.readAndAdvanceNoThrow<DERToken>();
+    if (!swInt.isOK()) {
+        return swInt.getStatus();
+    }
+
+    auto derInt = swInt.getValue();
+
+    if (derInt.getType() != DERType::INTEGER) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Unexpected DER Tag, Got "
+                                    << static_cast<char>(derInt.getType()) << ", Expected INTEGER");
+    }
+
+    return derInt.readInt();
+}
+
 
 StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
     const size_t kTagLength = 1;
@@ -867,6 +931,11 @@ StatusWith<DERToken> DERToken::parse(ConstDataRange cdr, size_t* outLength) {
     // Validate the 6th bit is correct, and it is a known type
     switch (static_cast<DERType>(tag)) {
         case DERType::UTF8String:
+            if (!primitive) {
+                return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
+            }
+            break;
+        case DERType::INTEGER:
             if (!primitive) {
                 return Status(ErrorCodes::InvalidSSLConfiguration, "Unknown DER tag");
             }
@@ -1012,6 +1081,39 @@ StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExten
     return roles;
 }
 
+StatusWith<std::vector<DERInteger>> parseTLSFeature(ConstDataRange cdrExtension) {
+    std::vector<DERInteger> features;
+    ConstDataRangeCursor cdcExtension(cdrExtension);
+
+    /**
+     * FEATURES ::= SEQUENCE OF INTEGER
+     */
+    auto swSeq = cdcExtension.readAndAdvanceNoThrow<DERToken>();
+    if (!swSeq.isOK()) {
+        return swSeq.getStatus();
+    }
+
+    if (swSeq.getValue().getType() != DERType::SEQUENCE) {
+        return Status(ErrorCodes::InvalidSSLConfiguration,
+                      str::stream() << "Unexpected DER Tag, Got "
+                                    << static_cast<char>(swSeq.getValue().getType())
+                                    << ", Expected SEQUENCE");
+    }
+
+    ConstDataRangeCursor cdcSeq(swSeq.getValue().getSequenceRange());
+
+    while (!cdcSeq.empty()) {
+        auto swDERInt = readDERInt(cdcSeq);
+        if (!swDERInt.isOK()) {
+            return swDERInt.getStatus();
+        }
+
+        features.emplace_back(swDERInt.getValue());
+    }
+
+    return std::move(features);
+}
+
 std::string removeFQDNRoot(std::string name) {
     if (name.back() == '.') {
         name.pop_back();
@@ -1112,13 +1214,12 @@ void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
     }
 
     if (!versionString.empty()) {
-        log() << "Accepted connection with TLS Version " << versionString << " from connection "
-              << hostForLogging;
+        LOGV2(23218,
+              "Accepted connection with TLS Version {tlsVersion} from connection {remoteHost}",
+              "Accepted connection with TLS",
+              "tlsVersion"_attr = versionString,
+              "remoteHost"_attr = hostForLogging);
     }
-}
-
-SSLManagerInterface* getSSLManager() {
-    return theSSLManager;
 }
 
 // TODO SERVER-11601 Use NFC Unicode canonicalization
@@ -1141,11 +1242,18 @@ bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certH
 }
 
 void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer) {
-    warning() << "Peer certificate '" << peer << "' expires soon";
+    LOGV2_WARNING(23221,
+                  "Peer certificate '{peerSubjectName}' expires soon",
+                  "Peer certificate expires soon",
+                  "peerSubjectName"_attr = peer);
 }
 
 void tlsEmitWarningExpiringClientCertificate(const SSLX509Name& peer, Days days) {
-    warning() << "Peer certificate '" << peer << "' expires in " << days;
+    LOGV2_WARNING(23222,
+                  "Peer certificate '{peerSubjectName}' expires in {days}",
+                  "Peer certificate expiration information",
+                  "peerSubjectName"_attr = peer,
+                  "days"_attr = days);
 }
 
 }  // namespace mongo

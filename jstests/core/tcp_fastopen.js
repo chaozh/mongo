@@ -1,7 +1,10 @@
 // Attempt to verify that connections can make use of TCP_FASTOPEN
+// @tags: [multiversion_incompatible, does_not_support_stepdowns]
 
 (function() {
 'use strict';
+
+load("jstests/libs/netstat.js");
 
 // Does it make sense to expect TFO support?
 try {
@@ -17,18 +20,42 @@ try {
     return;
 }
 
-const tcpFastOpen = db.serverStatus().network.tcpFastOpen;
-printjson(tcpFastOpen);
+const initial = db.serverStatus().network.tcpFastOpen;
+printjson(initial);
+print("/proc/net/netstat:");
+const initialObj = getNetStatObj();
+printjson(initialObj);
 
-const confused = "proc file suggests this kernel is capable, but setsockopt failed";
-assert.eq(true, tcpFastOpen.serverSupported, confused);
-assert.eq(true, tcpFastOpen.clientSupported, confused);
+// If TCPFastOpenBlackhole is 0 or not present, try to run the test. Otherwise,
+// we've seen an event, and should skip the test.
+if (initialObj.TcpExt.TCPFastOpenBlackhole) {
+    print("==Skipping test, host OS has observed a TCPFastOpenBlackhole event");
+    return;
+}
 
-const countBefore = tcpFastOpen.accepted;
+if (!initial.serverSupported || !initial.clientSupported) {
+    print("==Skipping test, one or both setsockopt() calls failed");
+    return;
+}
 
-const netConn = runMongoProgram('mongo', '--port', myPort(), '--eval', ';');
-assert.eq(0, netConn);
+function tryShell() {
+    const conn = runMongoProgram('mongo', '--port', myPort(), '--eval', ';');
+    print("/proc/net/netstat:");
+    print(cat("/proc/net/netstat"));
+    assert.eq(0, conn);
+}
 
-const countAfter = db.serverStatus().network.tcpFastOpen.accepted;
-assert.gt(countAfter, countBefore, "Second connection did not trigger TFO");
+// Initial connect to be sure a TFO cookie is requested and received.
+tryShell();
+
+const first = db.serverStatus().network.tcpFastOpen;
+printjson(first);
+
+// Second connect using the TFO cookie.
+tryShell();
+
+const second = db.serverStatus().network.tcpFastOpen;
+printjson(second);
+
+assert.gt(second.accepted, first.accepted, "Second connection did not trigger TFO");
 })();

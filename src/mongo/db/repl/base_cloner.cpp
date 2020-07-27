@@ -27,12 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationInitialSync
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/base_cloner.h"
-#include "mongo/util/log.h"
+#include "mongo/db/repl/replication_consistency_markers_gen.h"
+#include "mongo/db/repl/replication_consistency_markers_impl.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -91,8 +93,11 @@ Status BaseCloner::run() {
     }
     stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
     if (!_sharedData->getInitialSyncStatus(lk).isOK()) {
-        log() << "Failing data clone because initial sync failed outside data clone: "
-              << _sharedData->getInitialSyncStatus(lk);
+        LOGV2(21065,
+              "Failing data clone because initial sync failed outside data clone: "
+              "{error}",
+              "Failing data clone because initial sync failed outside data clone",
+              "error"_attr = _sharedData->getInitialSyncStatus(lk));
     }
     return _sharedData->getInitialSyncStatus(lk);
 }
@@ -116,13 +121,15 @@ void BaseCloner::pauseForFuzzer(BaseClonerStage* stage) {
             // nb: This log message is specifically checked for in
             // initial_sync_test_fixture_test.js, so if you change it here you will need to change
             // it there.
-            log() << "Collection Cloner scheduled a remote command on the "
-                  << describeForFuzzer(stage);
-            log() << "initialSyncFuzzerSynchronizationPoint1 fail point enabled.";
+            LOGV2(21066,
+                  "Collection Cloner scheduled a remote command on the {stage}",
+                  "Collection Cloner scheduled a remote command",
+                  "stage"_attr = describeForFuzzer(stage));
+            LOGV2(21067, "initialSyncFuzzerSynchronizationPoint1 fail point enabled");
             initialSyncFuzzerSynchronizationPoint1.pauseWhileSet();
 
             if (MONGO_unlikely(initialSyncFuzzerSynchronizationPoint2.shouldFail())) {
-                log() << "initialSyncFuzzerSynchronizationPoint2 fail point enabled.";
+                LOGV2(21068, "initialSyncFuzzerSynchronizationPoint2 fail point enabled");
                 initialSyncFuzzerSynchronizationPoint2.pauseWhileSet();
             }
         }
@@ -130,15 +137,23 @@ void BaseCloner::pauseForFuzzer(BaseClonerStage* stage) {
 }
 
 BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
-    LOG(1) << "Cloner " << getClonerName() << " running stage " << stage->getName();
+    LOGV2_DEBUG(21069,
+                1,
+                "Cloner {cloner} running stage {stage}",
+                "Cloner running stage",
+                "cloner"_attr = getClonerName(),
+                "stage"_attr = stage->getName());
     pauseForFuzzer(stage);
     auto isThisStageFailPoint = [this, stage](const BSONObj& data) {
         return data["stage"].str() == stage->getName() && isMyFailPoint(data);
     };
     hangBeforeClonerStage.executeIf(
         [&](const BSONObj& data) {
-            log() << "Cloner " << getClonerName() << " hanging before running stage "
-                  << stage->getName();
+            LOGV2(21070,
+                  "Cloner {cloner} hanging before running stage {stage}",
+                  "Cloner hanging before running stage",
+                  "cloner"_attr = getClonerName(),
+                  "stage"_attr = stage->getName());
             while (!mustExit() && hangBeforeClonerStage.shouldFail(isThisStageFailPoint)) {
                 sleepmillis(100);
             }
@@ -147,19 +162,75 @@ BaseCloner::AfterStageBehavior BaseCloner::runStage(BaseClonerStage* stage) {
     auto afterStageBehavior = runStageWithRetries(stage);
     hangAfterClonerStage.executeIf(
         [&](const BSONObj& data) {
-            log() << "Cloner " << getClonerName() << " hanging after running stage "
-                  << stage->getName();
+            LOGV2(21071,
+                  "Cloner {cloner} hanging after running stage {stage}",
+                  "Cloner hanging after running stage",
+                  "cloner"_attr = getClonerName(),
+                  "stage"_attr = stage->getName());
             while (!mustExit() && hangAfterClonerStage.shouldFail(isThisStageFailPoint)) {
                 sleepmillis(100);
             }
         },
         isThisStageFailPoint);
-    LOG(1) << "Cloner " << getClonerName() << " finished running stage " << stage->getName();
+    LOGV2_DEBUG(21072,
+                1,
+                "Cloner {cloner} finished running stage {stage}",
+                "Cloner finished running stage",
+                "cloner"_attr = getClonerName(),
+                "stage"_attr = stage->getName());
     return afterStageBehavior;
 }
 
 void BaseCloner::clearRetryingState() {
     _retryableOp = boost::none;
+}
+
+Status BaseCloner::checkSyncSourceIsStillValid() {
+    WireVersion wireVersion;
+    {
+        stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
+        auto wireVersionOpt = _sharedData->getSyncSourceWireVersion(lk);
+        // The wire version should always have been set by the time this is called.
+        invariant(wireVersionOpt);
+        wireVersion = *wireVersionOpt;
+    }
+    if (wireVersion >= WireVersion::RESUMABLE_INITIAL_SYNC) {
+        auto status = checkInitialSyncIdIsUnchanged();
+        if (!status.isOK())
+            return status;
+    }
+    return checkRollBackIdIsUnchanged();
+}
+
+Status BaseCloner::checkInitialSyncIdIsUnchanged() {
+    uassert(ErrorCodes::InitialSyncFailure,
+            "Sync source was downgraded and no longer supports resumable initial sync",
+            getClient()->getMaxWireVersion() >= WireVersion::RESUMABLE_INITIAL_SYNC);
+    BSONObj initialSyncId;
+    try {
+        initialSyncId = getClient()->findOne(
+            ReplicationConsistencyMarkersImpl::kDefaultInitialSyncIdNamespace.toString(), Query());
+    } catch (DBException& e) {
+        if (ErrorCodes::isRetriableError(e)) {
+            auto status = e.toStatus().withContext(
+                ": failed while attempting to retrieve initial sync ID after re-connect");
+            LOGV2_DEBUG(
+                4608505, 1, "Retrieving Initial Sync ID retriable error", "error"_attr = status);
+            return status;
+        }
+        throw;
+    }
+    uassert(ErrorCodes::InitialSyncFailure,
+            "Cannot retrieve sync source initial sync ID",
+            !initialSyncId.isEmpty());
+    InitialSyncIdDocument initialSyncIdDoc =
+        InitialSyncIdDocument::parse(IDLParserErrorContext("initialSyncId"), initialSyncId);
+
+    stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
+    uassert(ErrorCodes::InitialSyncFailure,
+            "Sync source has been resynced since we started syncing from it",
+            _sharedData->getInitialSyncSourceId(lk) == initialSyncIdDoc.get_id());
+    return Status::OK();
 }
 
 Status BaseCloner::checkRollBackIdIsUnchanged() {
@@ -168,10 +239,10 @@ Status BaseCloner::checkRollBackIdIsUnchanged() {
         getClient()->simpleCommand("admin", &info, "replSetGetRBID");
     } catch (DBException& e) {
         if (ErrorCodes::isRetriableError(e)) {
-            auto status = e.toStatus().withContext(
-                ": failed while attempting to retrieve rollBackId after re-connect");
-            LOG(1) << status;
-            return status;
+            static constexpr char errorMsg[] =
+                "Failed while attempting to retrieve rollBackId after re-connect";
+            LOGV2_DEBUG(21073, 1, errorMsg, "error"_attr = e);
+            return e.toStatus().withContext(errorMsg);
         }
         throw;
     }
@@ -200,16 +271,24 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
                 // If lastError is set, this is a retry.
                 hangBeforeRetryingClonerStage.executeIf(
                     [&](const BSONObj& data) {
-                        log() << "Cloner " << getClonerName() << " hanging before retrying stage "
-                              << stage->getName();
+                        LOGV2(21074,
+                              "Cloner {cloner} hanging before retrying stage {stage}",
+                              "Cloner hanging before retrying stage",
+                              "cloner"_attr = getClonerName(),
+                              "stage"_attr = stage->getName());
                         while (!mustExit() &&
                                hangBeforeRetryingClonerStage.shouldFail(isThisStageFailPoint)) {
                             sleepmillis(100);
                         }
                     },
                     isThisStageFailPoint);
-                log() << "Initial Sync retrying " << getClonerName() << " stage "
-                      << stage->getName() << " due to " << lastError;
+                LOGV2(21075,
+                      "Initial Sync retrying {cloner} stage {stage} due to "
+                      "{error}",
+                      "Initial Sync retrying cloner stage due to error",
+                      "cloner"_attr = getClonerName(),
+                      "stage"_attr = stage->getName(),
+                      "error"_attr = lastError);
                 bool shouldRetry = [&] {
                     stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
                     return _sharedData->shouldRetryOperation(lk, &_retryableOp);
@@ -225,9 +304,12 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
                 }
                 hangBeforeCheckingRollBackIdClonerStage.executeIf(
                     [&](const BSONObj& data) {
-                        log() << "Cloner " << getClonerName()
-                              << " hanging before checking rollBackId for stage "
-                              << stage->getName();
+                        LOGV2(21076,
+                              "Cloner {cloner} hanging before checking rollBackId for stage "
+                              "{stage}",
+                              "Cloner hanging before checking rollBackId",
+                              "cloner"_attr = getClonerName(),
+                              "stage"_attr = stage->getName());
                         while (!mustExit() &&
                                hangBeforeCheckingRollBackIdClonerStage.shouldFail(
                                    isThisStageFailPoint)) {
@@ -235,12 +317,13 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
                         }
                     },
                     isThisStageFailPoint);
-                if (stage->checkRollBackIdOnRetry()) {
-                    // If checkRollBackIdIsUnchanged fails without throwing, it means a network
+                if (stage->checkSyncSourceValidityOnRetry()) {
+                    // If checkSyncSourceIsStillValid fails without throwing, it means a network
                     // error occurred and it's safe to continue (which will cause another retry).
-                    if (!checkRollBackIdIsUnchanged().isOK())
+                    if (!checkSyncSourceIsStillValid().isOK())
                         continue;
-                    // After successfully checking the rollback ID, the client should always be OK.
+                    // After successfully checking the sync source validity, the client should
+                    // always be OK.
                     invariant(!getClient()->isFailed());
                 }
             }
@@ -248,12 +331,23 @@ BaseCloner::AfterStageBehavior BaseCloner::runStageWithRetries(BaseClonerStage* 
         } catch (DBException& e) {
             lastError = e.toStatus();
             if (!stage->isTransientError(lastError)) {
-                log() << "Non-retryable error occured during cloner " << getClonerName()
-                      << " stage " + stage->getName() << ": " << lastError;
+                LOGV2(21077,
+                      "Non-retryable error occurred during cloner "
+                      "{cloner} stage {stage}: {error}",
+                      "Non-retryable error occurred during cloner stage",
+                      "cloner"_attr = getClonerName(),
+                      "stage"_attr = stage->getName(),
+                      "error"_attr = lastError);
                 throw;
             }
-            LOG(1) << "Transient error occured during cloner " << getClonerName()
-                   << " stage " + stage->getName() << ": " << lastError;
+            LOGV2_DEBUG(21078,
+                        1,
+                        "Transient error occurred during cloner "
+                        "{cloner} stage {stage}: {error}",
+                        "Transient error occurred during cloner stage",
+                        "cloner"_attr = getClonerName(),
+                        "stage"_attr = stage->getName(),
+                        "error"_attr = lastError);
         }
     }
 }

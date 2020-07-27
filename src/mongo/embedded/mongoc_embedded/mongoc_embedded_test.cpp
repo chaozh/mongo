@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -43,9 +43,9 @@
 #include "mongo/db/server_options.h"
 #include "mongo/embedded/mongo_embedded/mongo_embedded.h"
 #include "mongo/embedded/mongoc_embedded/mongoc_embedded_test_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/options_parser/environment.h"
 #include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/options_parser/options_parser.h"
@@ -56,6 +56,7 @@ namespace moe = mongo::optionenvironment;
 
 mongo_embedded_v1_lib* global_lib_handle;
 
+namespace mongo {
 namespace {
 
 std::unique_ptr<mongo::unittest::TempDir> globalTempDir;
@@ -87,7 +88,7 @@ bool insert_data(mongoc_collection_t* collection) {
     bool ret = mongoc_bulk_operation_execute(bulk, NULL, &error);
 
     if (!ret) {
-        ::mongo::log() << "Error inserting data: " << error.message;
+        LOGV2(22556, "Error inserting data: {error_message}", "error_message"_attr = error.message);
     }
 
     mongoc_bulk_operation_destroy(bulk);
@@ -118,7 +119,7 @@ bool explain(mongoc_collection_t* collection) {
                        "}");
     res = mongoc_collection_command_simple(collection, command, NULL, &reply, &error);
     if (!res) {
-        ::mongo::log() << "Error with explain: " << error.message;
+        LOGV2(22557, "Error with explain: {error_message}", "error_message"_attr = error.message);
         goto explain_cleanup;
     }
 
@@ -252,17 +253,17 @@ struct StatusDestroy {
 };
 using StatusPtr = std::unique_ptr<mongo_embedded_v1_status, StatusDestroy>;
 }  // namespace
+}  // namespace mongo
 
 // Define main function as an entry to these tests.
 // These test functions cannot use the main() defined for unittests because they
 // call runGlobalInitializers(). The embedded C API calls mongoDbMain() which
 // calls runGlobalInitializers().
-int main(int argc, char** argv, char** envp) {
+int main(int argc, char** argv) {
 
     moe::OptionsParser parser;
     moe::Environment environment;
     moe::OptionSection options;
-    std::map<std::string, std::string> env;
 
     auto ret = mongo::embedded::addMongocEmbeddedTestOptions(&options);
     if (!ret.isOK()) {
@@ -270,8 +271,7 @@ int main(int argc, char** argv, char** envp) {
         return EXIT_FAILURE;
     }
 
-    std::vector<std::string> argVector(argv, argv + argc);
-    ret = parser.run(options, argVector, env, &environment);
+    ret = parser.run(options, std::vector<std::string>(argv, argv + argc), &environment);
     if (!ret.isOK()) {
         std::cerr << options.helpString();
         return EXIT_FAILURE;
@@ -285,8 +285,7 @@ int main(int argc, char** argv, char** envp) {
     ::mongo::serverGlobalParams.noUnixSocket = true;
 
     // See comment by the same code block in mongo_embedded_test.cpp
-    const char* null_argv[1] = {nullptr};
-    ret = mongo::runGlobalInitializers(0, null_argv, nullptr);
+    ret = mongo::runGlobalInitializers(std::vector<std::string>{});
     if (!ret.isOK()) {
         std::cerr << "Global initilization failed";
         return EXIT_FAILURE;
@@ -298,7 +297,7 @@ int main(int argc, char** argv, char** envp) {
         return EXIT_FAILURE;
     }
 
-    StatusPtr status(mongo_embedded_v1_status_create());
+    mongo::StatusPtr status(mongo_embedded_v1_status_create());
     mongoc_init();
 
     mongo_embedded_v1_init_params params;
@@ -320,6 +319,6 @@ int main(int argc, char** argv, char** envp) {
     }
 
     mongoc_cleanup();
-    globalTempDir.reset();
+    mongo::globalTempDir.reset();
     mongo::quickExit(result);
 }

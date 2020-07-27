@@ -4,13 +4,12 @@ import sys
 import time
 from collections import namedtuple
 
-from . import queue_element
-from . import testcases
-from .. import config
-from .. import errors
-from ..testing.hooks import stepdown
-from ..testing.testcases import fixture as _fixture
-from ..utils import queue as _queue
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib.testing import testcases
+from buildscripts.resmokelib.testing.hooks import stepdown
+from buildscripts.resmokelib.testing.testcases import fixture as _fixture
+from buildscripts.resmokelib.utils import queue as _queue
 
 
 class Job(object):  # pylint: disable=too-many-instance-attributes
@@ -168,6 +167,9 @@ class Job(object):  # pylint: disable=too-many-instance-attributes
 
         test(self.report)
         try:
+            if test.propagate_error is not None:
+                raise test.propagate_error
+
             # We are intentionally only checking the individual 'test' status and not calling
             # report.wasSuccessful() here. It is possible that a thread running in the background as
             # part of a hook has added a failed test case to 'self.report'. Checking the individual

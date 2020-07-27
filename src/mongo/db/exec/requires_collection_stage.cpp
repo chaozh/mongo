@@ -31,8 +31,6 @@
 
 #include "mongo/db/exec/requires_collection_stage.h"
 
-#include "mongo/db/catalog/collection_catalog.h"
-
 namespace mongo {
 
 template <typename CollectionT>
@@ -49,10 +47,10 @@ void RequiresCollectionStageBase<CollectionT>::doRestoreState() {
 
     // We should be holding a lock associated with the name of the collection prior to yielding,
     // even if the collection was renamed during yield.
-    dassert(getOpCtx()->lockState()->isCollectionLockedForMode(_nss, MODE_IS));
+    dassert(opCtx()->lockState()->isCollectionLockedForMode(_nss, MODE_IS));
 
-    const CollectionCatalog& catalog = CollectionCatalog::get(getOpCtx());
-    auto newNss = catalog.lookupNSSByUUID(getOpCtx(), _collectionUUID);
+    const CollectionCatalog& catalog = CollectionCatalog::get(opCtx());
+    auto newNss = catalog.lookupNSSByUUID(opCtx(), _collectionUUID);
     uassert(ErrorCodes::QueryPlanKilled,
             str::stream() << "collection dropped. UUID " << _collectionUUID,
             newNss);
@@ -68,13 +66,12 @@ void RequiresCollectionStageBase<CollectionT>::doRestoreState() {
     // restored locks on the correct name. It is now safe to restore the Collection pointer. The
     // collection must exist, since we already successfully looked up the namespace string by UUID
     // under the correct lock manager locks.
-    _collection = catalog.lookupCollectionByUUID(getOpCtx(), _collectionUUID);
+    _collection = catalog.lookupCollectionByUUID(opCtx(), _collectionUUID);
     invariant(_collection);
 
     uassert(ErrorCodes::QueryPlanKilled,
-            str::stream()
-                << "Database epoch changed due to a database-level event such as 'restartCatalog'.",
-            getDatabaseEpoch(_collection) == _databaseEpoch);
+            str::stream() << "The catalog was closed and reopened",
+            getCatalogEpoch() == _catalogEpoch);
 
     doRestoreStateRequiresCollection();
 }

@@ -27,18 +27,17 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/json.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -67,8 +66,8 @@ void assertChunkVectorsAreEqual(const std::vector<ChunkType>& expected,
     for (auto expectedIt = expected.begin(), actualIt = actual.begin();
          expectedIt != expected.end() && actualIt != actual.end();
          ++expectedIt, ++actualIt) {
-        ASSERT_BSONOBJ_EQ((*expectedIt).toShardBSON().removeField("lastmod"),
-                          (*actualIt).toShardBSON().removeField("lastmod"));
+        ASSERT_BSONOBJ_EQ((*expectedIt).toShardBSON().removeField("lastmod").removeField("history"),
+                          (*actualIt).toShardBSON().removeField("lastmod").removeField("history"));
     }
 }
 

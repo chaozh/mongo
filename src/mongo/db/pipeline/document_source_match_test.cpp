@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include <string>
@@ -40,6 +42,7 @@
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -59,7 +62,7 @@ TEST_F(DocumentSourceMatchTest, RedactSafePortion) {
             auto match = DocumentSourceMatch::create(fromjson(input), expCtx);
             ASSERT_BSONOBJ_EQ(match->redactSafePortion(), fromjson(safePortion));
         } catch (...) {
-            unittest::log() << "Problem with redactSafePortion() of: " << input;
+            LOGV2(20899, "Problem with redactSafePortion() of: {input}", "input"_attr = input);
             throw;
         }
     };
@@ -484,7 +487,8 @@ TEST_F(DocumentSourceMatchTest, ShouldPropagatePauses) {
                                            Document{{"a", 2}},
                                            Document{{"a", 2}},
                                            DocumentSource::GetNextResult::makePauseExecution(),
-                                           Document{{"a", 1}}});
+                                           Document{{"a", 1}}},
+                                          getExpCtx());
     match->setSource(mock.get());
 
     ASSERT_TRUE(match->getNext().isPaused());
@@ -508,7 +512,8 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyJoinWithSubsequentMatch) {
     const auto mock = DocumentSourceMock::createForTest({Document{{"a", 1}, {"b", 1}},
                                                          Document{{"a", 2}, {"b", 1}},
                                                          Document{{"a", 1}, {"b", 2}},
-                                                         Document{{"a", 2}, {"b", 2}}});
+                                                         Document{{"a", 2}, {"b", 2}}},
+                                                        getExpCtx());
 
     match->setSource(mock.get());
 
@@ -523,9 +528,9 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyJoinWithSubsequentMatch) {
     ASSERT_TRUE(match->getNext().isEOF());
 }
 
-DEATH_TEST_F(DocumentSourceMatchTest,
-             ShouldFailToDescendExpressionOnPathThatIsNotACommonPrefix,
-             "Invariant failure expression::isPathPrefixOf") {
+DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
+                   ShouldFailToDescendExpressionOnPathThatIsNotACommonPrefix,
+                   "Invariant failure.*expression::isPathPrefixOf") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a.b" << 1 << "b.c" << 1);
     const auto matchExpression =
@@ -533,9 +538,9 @@ DEATH_TEST_F(DocumentSourceMatchTest,
     DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
-DEATH_TEST_F(DocumentSourceMatchTest,
-             ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithObject,
-             "Invariant failure node->matchType()") {
+DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
+                   ShouldFailToDescendExpressionOnPathThatContainsElemMatchWithObject,
+                   R"#(Invariant failure.*node->matchType\(\))#") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("a.b" << 1)));
     const auto matchExpression =
@@ -570,8 +575,8 @@ TEST_F(DocumentSourceMatchTest, ShouldMatchCorrectlyAfterDescendingMatch) {
         {Document{{"b", 1}, {"c", 1}, {"d", 1}},
          Document{{"b", 1}, {"a", Document{{"c", 1}}}, {"d", 1}},
          Document{{"a", Document{{"b", 1}}}, {"a", Document{{"c", 1}}}, {"d", 1}},
-         Document{
-             {"a", Document{{"b", 1}}}, {"a", Document{{"c", 1}}}, {"a", Document{{"d", 1}}}}});
+         Document{{"a", Document{{"b", 1}}}, {"a", Document{{"c", 1}}}, {"a", Document{{"d", 1}}}}},
+        getExpCtx());
     descendedMatch->setSource(mock.get());
 
     auto next = descendedMatch->getNext();
@@ -590,7 +595,8 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyEvaluateElemMatchPredicate) {
     const std::vector<Document> matchingVector = {Document{{"b", 0}}, Document{{"b", 1}}};
     const std::vector<Document> nonMatchingVector = {Document{{"b", 0}}, Document{{"b", 2}}};
     const auto mock = DocumentSourceMock::createForTest(
-        {Document{{"a", matchingVector}}, Document{{"a", nonMatchingVector}}, Document{{"a", 1}}});
+        {Document{{"a", matchingVector}}, Document{{"a", nonMatchingVector}}, Document{{"a", 1}}},
+        getExpCtx());
 
     match->setSource(mock.get());
 
@@ -610,7 +616,8 @@ TEST_F(DocumentSourceMatchTest, ShouldCorrectlyEvaluateJSONSchemaPredicate) {
         fromjson("{$jsonSchema: {properties: {a: {type: 'number'}}}}"), getExpCtx());
 
     const auto mock = DocumentSourceMock::createForTest(
-        {Document{{"a", 1}}, Document{{"a", "str"_sd}}, Document{{"a", {Document{{nullptr, 1}}}}}});
+        {Document{{"a", 1}}, Document{{"a", "str"_sd}}, Document{{"a", {Document{{nullptr, 1}}}}}},
+        getExpCtx());
 
     match->setSource(mock.get());
 

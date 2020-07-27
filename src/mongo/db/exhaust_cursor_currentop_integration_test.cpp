@@ -27,11 +27,14 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/db/query/cursor_response.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/future.h"
 #include "mongo/unittest/integration_test.h"
@@ -114,9 +117,12 @@ bool confirmCurrentOpContents(DBClientBase* conn,
         sleepFor(intervalMS);
     }
     auto currentOp = BSON("currentOp" << BSON("idleCursors" << true));
-    unittest::log()
-        << "confirmCurrentOpContents fails with curOpMatch: " << curOpMatch << " currentOp: "
-        << conn->runCommand(OpMsgRequest::fromDBAndBody("admin", currentOp))->getCommandReply();
+    LOGV2(20606,
+          "confirmCurrentOpContents fails with curOpMatch: {curOpMatch} currentOp: "
+          "{conn_runCommand_OpMsgRequest_fromDBAndBody_admin_currentOp_getCommandReply}",
+          "curOpMatch"_attr = curOpMatch,
+          "conn_runCommand_OpMsgRequest_fromDBAndBody_admin_currentOp_getCommandReply"_attr =
+              conn->runCommand(OpMsgRequest::fromDBAndBody("admin", currentOp))->getCommandReply());
     return false;
 }
 
@@ -167,17 +173,20 @@ auto startExhaustQuery(
         sleepFor(Milliseconds(10));
     }
     ASSERT(queryCursor);
-    unittest::log() << "Started exhaust query with cursorId: " << queryCursor->getCursorId();
+    LOGV2(20607,
+          "Started exhaust query with cursorId: {queryCursor_getCursorId}",
+          "queryCursor_getCursorId"_attr = queryCursor->getCursorId());
     return queryThread;
 }
 
 void runOneGetMore(DBClientBase* conn,
                    const std::unique_ptr<DBClientCursor>& queryCursor,
                    int nDocsReturned) {
-    const auto curOpMatch = BSON("command.collection" << testNSS.coll() << "command.getMore"
-                                                      << queryCursor->getCursorId() << "msg"
-                                                      << "waitWithPinnedCursorDuringGetMoreBatch"
-                                                      << "cursor.nDocsReturned" << nDocsReturned);
+    const auto curOpMatch =
+        BSON("command.collection" << testNSS.coll() << "command.getMore"
+                                  << queryCursor->getCursorId() << "failpointMsg"
+                                  << "waitWithPinnedCursorDuringGetMoreBatch"
+                                  << "cursor.nDocsReturned" << nDocsReturned);
     // Confirm that the initial getMore appears in the $currentOp output.
     ASSERT(confirmCurrentOpContents(conn, curOpMatch));
 
@@ -188,17 +197,12 @@ void runOneGetMore(DBClientBase* conn,
     // Confirm that the getMore completed its batch and hit the post-getMore failpoint.
     ASSERT(confirmCurrentOpContents(
         conn,
-        BSON("command.getMore" << queryCursor->getCursorId() << "msg"
+        BSON("command.getMore" << queryCursor->getCursorId() << "failpointMsg"
                                << "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch")));
 
     // Re-enable the original failpoint to catch the next getMore, and release the current one.
     setWaitWithPinnedCursorDuringGetMoreBatchFailpoint(conn, true);
     setWaitBeforeUnpinningOrDeletingCursorAfterGetMoreBatchFailpoint(conn, false);
-
-    ASSERT(queryCursor->more());
-    // Assuming documents start with {a: 0}, the (nDocsReturned+1)-th document should have {a:
-    // nDocsReturned}. See initTestCollection().
-    ASSERT_BSONOBJ_EQ(queryCursor->nextSafe(), BSON("a" << nDocsReturned));
 }
 }  // namespace
 
@@ -274,7 +278,7 @@ void testClientDisconnect(bool disconnectAfterGetMoreBatch) {
     // The next getMore will be an exhaust getMore. Confirm that the exhaust getMore appears in the
     // $currentOp output.
     auto curOpMatch = BSON("command.collection" << testNSS.coll() << "command.getMore"
-                                                << queryCursor->getCursorId() << "msg"
+                                                << queryCursor->getCursorId() << "failpointMsg"
                                                 << "waitWithPinnedCursorDuringGetMoreBatch"
                                                 << "cursor.nDocsReturned" << 3);
     ASSERT(confirmCurrentOpContents(conn.get(), curOpMatch));
@@ -285,13 +289,13 @@ void testClientDisconnect(bool disconnectAfterGetMoreBatch) {
         setWaitWithPinnedCursorDuringGetMoreBatchFailpoint(conn.get(), false);
         ASSERT(confirmCurrentOpContents(conn.get(),
                                         BSON("command.getMore"
-                                             << queryCursor->getCursorId() << "msg"
+                                             << queryCursor->getCursorId() << "failpointMsg"
                                              << "waitAfterCommandFinishesExecution")));
     }
 
     // Kill the client connection while the exhaust getMore is blocked on the failpoint.
     queryConnection->shutdownAndDisallowReconnect();
-    unittest::log() << "Killed exhaust connection.";
+    LOGV2(20608, "Killed exhaust connection.");
 
     if (disconnectAfterGetMoreBatch) {
         // Disable the failpoint to allow the exhaust getMore to continue sending out the response

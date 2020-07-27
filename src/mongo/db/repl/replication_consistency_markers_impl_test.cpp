@@ -45,23 +45,19 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
+namespace mongo {
 namespace {
 
-using namespace mongo;
 using namespace mongo::repl;
 
-/**
- * Generates a unique namespace from the test registration agent.
- */
-template <typename T>
-NamespaceString makeNamespace(const T& t, const std::string& suffix = "") {
-    return NamespaceString(std::string("local." + t.getSuiteName() + "_" + t.getTestName()) +
-                           suffix);
-}
+NamespaceString kMinValidNss("local", "replset.minvalid");
+NamespaceString kOplogTruncateAfterPointNss("local", "replset.oplogTruncateAfterPoint");
+NamespaceString kInitialSyncIdNss("local", "replset.initialSyncId");
 
 /**
  * Returns min valid document.
@@ -76,26 +72,6 @@ BSONObj getMinValidDocument(OperationContext* opCtx, const NamespaceString& minV
         }
         return mv;
     });
-}
-
-/**
- * Returns oplog truncate after point document.
- */
-BSONObj getOplogTruncateAfterPointDocument(OperationContext* opCtx,
-                                           const NamespaceString& oplogTruncateAfterPointNss) {
-    return writeConflictRetry(
-        opCtx,
-        "getOplogTruncateAfterPointDocument",
-        oplogTruncateAfterPointNss.ns(),
-        [opCtx, oplogTruncateAfterPointNss] {
-            Lock::DBLock dblk(opCtx, oplogTruncateAfterPointNss.db(), MODE_IS);
-            Lock::CollectionLock lk(opCtx, oplogTruncateAfterPointNss, MODE_IS);
-            BSONObj mv;
-            if (Helpers::getSingleton(opCtx, oplogTruncateAfterPointNss.ns().c_str(), mv)) {
-                return mv;
-            }
-            return mv;
-        });
 }
 
 class ReplicationConsistencyMarkersTest : public ServiceContextMongoDTest {
@@ -146,11 +122,8 @@ bool RecoveryUnitWithDurabilityTracking::waitUntilDurable(OperationContext* opCt
 }
 
 TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {
-    auto minValidNss = makeNamespace(_agent, "minValid");
-    auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
+        getStorageInterface(), kMinValidNss, kOplogTruncateAfterPointNss, kInitialSyncIdNss);
     auto opCtx = getOperationContext();
     ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
@@ -163,7 +136,7 @@ TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {
     ASSERT_TRUE(consistencyMarkers.getInitialSyncFlag(opCtx));
 
     // Check min valid document using storage engine interface.
-    auto minValidDocument = getMinValidDocument(opCtx, minValidNss);
+    auto minValidDocument = getMinValidDocument(opCtx, kMinValidNss);
     ASSERT_TRUE(minValidDocument.hasField(MinValidDocument::kInitialSyncFlagFieldName));
     ASSERT_TRUE(minValidDocument.getBoolField(MinValidDocument::kInitialSyncFlagFieldName));
 
@@ -173,11 +146,8 @@ TEST_F(ReplicationConsistencyMarkersTest, InitialSyncFlag) {
 }
 
 TEST_F(ReplicationConsistencyMarkersTest, GetMinValidAfterSettingInitialSyncFlagWorks) {
-    auto minValidNss = makeNamespace(_agent, "minValid");
-    auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
+        getStorageInterface(), kMinValidNss, kOplogTruncateAfterPointNss, kInitialSyncIdNss);
     auto opCtx = getOperationContext();
     ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
@@ -195,11 +165,8 @@ TEST_F(ReplicationConsistencyMarkersTest, GetMinValidAfterSettingInitialSyncFlag
 }
 
 TEST_F(ReplicationConsistencyMarkersTest, ClearInitialSyncFlagResetsOplogTruncateAfterPoint) {
-    auto minValidNss = makeNamespace(_agent, "minValid");
-    auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
+        getStorageInterface(), kMinValidNss, kOplogTruncateAfterPointNss, kInitialSyncIdNss);
     auto opCtx = getOperationContext();
     ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
@@ -221,11 +188,8 @@ TEST_F(ReplicationConsistencyMarkersTest, ClearInitialSyncFlagResetsOplogTruncat
 }
 
 TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
-    auto minValidNss = makeNamespace(_agent, "minValid");
-    auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
-
     ReplicationConsistencyMarkersImpl consistencyMarkers(
-        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss);
+        getStorageInterface(), kMinValidNss, kOplogTruncateAfterPointNss, kInitialSyncIdNss);
     auto opCtx = getOperationContext();
     ASSERT(consistencyMarkers.createInternalCollections(opCtx).isOK());
     consistencyMarkers.initializeMinValidDocument(opCtx);
@@ -255,7 +219,7 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     ASSERT_EQ(consistencyMarkers.getMinValid(opCtx), endOpTime);
 
     // Check min valid document using storage engine interface.
-    auto minValidDocument = getMinValidDocument(opCtx, minValidNss);
+    auto minValidDocument = getMinValidDocument(opCtx, kMinValidNss);
     ASSERT_TRUE(minValidDocument.hasField(MinValidDocument::kAppliedThroughFieldName));
     ASSERT_TRUE(minValidDocument[MinValidDocument::kAppliedThroughFieldName].isABSONObj());
     ASSERT_EQUALS(startOpTime,
@@ -264,25 +228,60 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     ASSERT_EQUALS(endOpTime, unittest::assertGet(OpTime::parseFromOplogEntry(minValidDocument)));
 
     // Check oplog truncate after point document.
-    auto oplogTruncateAfterPointDocument =
-        getOplogTruncateAfterPointDocument(opCtx, oplogTruncateAfterPointNss);
-    ASSERT_EQUALS(endOpTime.getTimestamp(),
-                  oplogTruncateAfterPointDocument
-                      [OplogTruncateAfterPointDocument::kOplogTruncateAfterPointFieldName]
-                          .timestamp());
+    ASSERT_EQUALS(endOpTime.getTimestamp(), consistencyMarkers.getOplogTruncateAfterPoint(opCtx));
 
-    // Recovery unit will be owned by "opCtx".
-    RecoveryUnitWithDurabilityTracking* recoveryUnit = new RecoveryUnitWithDurabilityTracking();
-    opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(recoveryUnit),
-                           WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+    // SERVER-49685: We can't use a RecoveryUnitNoop with ephemeralForTest
+    //// Recovery unit will be owned by "opCtx".
+    // RecoveryUnitWithDurabilityTracking* recoveryUnit = new RecoveryUnitWithDurabilityTracking();
+    // opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(recoveryUnit),
+    //                       WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
-    // Set min valid without waiting for the changes to be durable.
-    OpTime endOpTime2({Seconds(789), 0}, 1LL);
-    consistencyMarkers.setMinValid(opCtx, endOpTime2);
-    consistencyMarkers.clearAppliedThrough(opCtx, {});
-    ASSERT_EQUALS(consistencyMarkers.getAppliedThrough(opCtx), OpTime());
-    ASSERT_EQUALS(consistencyMarkers.getMinValid(opCtx), endOpTime2);
-    ASSERT_FALSE(recoveryUnit->waitUntilDurableCalled);
+    //// Set min valid without waiting for the changes to be durable.
+    // OpTime endOpTime2({Seconds(789), 0}, 1LL);
+    // consistencyMarkers.setMinValid(opCtx, endOpTime2);
+    // consistencyMarkers.clearAppliedThrough(opCtx, {});
+    // ASSERT_EQUALS(consistencyMarkers.getAppliedThrough(opCtx), OpTime());
+    // ASSERT_EQUALS(consistencyMarkers.getMinValid(opCtx), endOpTime2);
+    // ASSERT_FALSE(recoveryUnit->waitUntilDurableCalled);
+}
+
+TEST_F(ReplicationConsistencyMarkersTest, InitialSyncId) {
+    ReplicationConsistencyMarkersImpl consistencyMarkers(
+        getStorageInterface(), kMinValidNss, kOplogTruncateAfterPointNss, kInitialSyncIdNss);
+    auto opCtx = getOperationContext();
+
+    // Initially, initialSyncId should be unset.
+    auto initialSyncIdShouldBeUnset = consistencyMarkers.getInitialSyncId(opCtx);
+    ASSERT(initialSyncIdShouldBeUnset.isEmpty()) << initialSyncIdShouldBeUnset;
+
+    // Clearing an already-clear initialSyncId should be OK.
+    consistencyMarkers.clearInitialSyncId(opCtx);
+    initialSyncIdShouldBeUnset = consistencyMarkers.getInitialSyncId(opCtx);
+    ASSERT(initialSyncIdShouldBeUnset.isEmpty()) << initialSyncIdShouldBeUnset;
+
+    consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
+    auto firstInitialSyncIdBson = consistencyMarkers.getInitialSyncId(opCtx);
+    ASSERT_FALSE(firstInitialSyncIdBson.isEmpty());
+    InitialSyncIdDocument firstInitialSyncIdDoc = InitialSyncIdDocument::parse(
+        IDLParserErrorContext("initialSyncId"), firstInitialSyncIdBson);
+
+    // Setting it twice should change nothing.
+    consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
+    ASSERT_BSONOBJ_EQ(firstInitialSyncIdBson, consistencyMarkers.getInitialSyncId(opCtx));
+
+    // Clear it; should return to empty.
+    consistencyMarkers.clearInitialSyncId(opCtx);
+    initialSyncIdShouldBeUnset = consistencyMarkers.getInitialSyncId(opCtx);
+    ASSERT(initialSyncIdShouldBeUnset.isEmpty()) << initialSyncIdShouldBeUnset;
+
+    // Set it; it should have a different UUID.
+    consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
+    auto secondInitialSyncIdBson = consistencyMarkers.getInitialSyncId(opCtx);
+    ASSERT_FALSE(secondInitialSyncIdBson.isEmpty());
+    InitialSyncIdDocument secondInitialSyncIdDoc = InitialSyncIdDocument::parse(
+        IDLParserErrorContext("initialSyncId"), secondInitialSyncIdBson);
+    ASSERT_NE(firstInitialSyncIdDoc.get_id(), secondInitialSyncIdDoc.get_id());
 }
 
 }  // namespace
+}  // namespace mongo

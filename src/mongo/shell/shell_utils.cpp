@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -51,6 +51,7 @@
 #include "mongo/client/dbclient_base.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/hasher.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 #include "mongo/scripting/engine.h"
@@ -59,7 +60,6 @@
 #include "mongo/shell/shell_utils_extended.h"
 #include "mongo/shell/shell_utils_launcher.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/text.h"
@@ -413,7 +413,7 @@ BSONObj replMonitorStats(const BSONObj& a, void* data) {
             a.nFields() == 1 && a.firstElement().type() == String);
 
     auto name = a.firstElement().valuestrsafe();
-    ReplicaSetMonitorPtr rsm = ReplicaSetMonitor::get(name);
+    auto rsm = ReplicaSetMonitor::get(name);
     if (!rsm) {
         return BSON(""
                     << "no ReplSetMonitor exists by that name");
@@ -475,11 +475,8 @@ void installShellUtils(Scope& scope) {
     scope.injectNative("fileExists", fileExistsJS);
     scope.injectNative("isInteractive", isInteractive);
 
-#ifndef MONGO_SAFE_SHELL
-    // can't launch programs
     installShellUtilsLauncher(scope);
     installShellUtilsExtended(scope);
-#endif
 }
 
 void setEnterpriseShellCallback(EnterpriseShellCallback* callback) {
@@ -541,12 +538,11 @@ bool Prompter::confirm() {
 
 ConnectionRegistry::ConnectionRegistry() = default;
 
-void ConnectionRegistry::registerConnection(DBClientBase& client) {
+void ConnectionRegistry::registerConnection(DBClientBase& client, StringData uri) {
     BSONObj info;
     if (client.runCommand("admin", BSON("whatsmyuri" << 1), info)) {
-        std::string connstr = client.getServerAddress();
         stdx::lock_guard<Latch> lk(_mutex);
-        _connectionUris[connstr].insert(info["you"].str());
+        _connectionUris[uri.toString()].insert(info["you"].str());
     }
 }
 
@@ -554,15 +550,10 @@ void ConnectionRegistry::killOperationsOnAllConnections(bool withPrompt) const {
     Prompter prompter("do you want to kill the current op(s) on the server?");
     stdx::lock_guard<Latch> lk(_mutex);
     for (auto& connection : _connectionUris) {
-        auto status = ConnectionString::parse(connection.first);
-        if (!status.isOK()) {
-            continue;
-        }
-
-        const ConnectionString cs(status.getValue());
-
         std::string errmsg;
-        std::unique_ptr<DBClientBase> conn(cs.connect("MongoDB Shell", errmsg));
+
+        auto uri = uassertStatusOK(MongoURI::parse(connection.first));
+        std::unique_ptr<DBClientBase> conn(uri.connect("MongoDB Shell", errmsg));
         if (!conn) {
             continue;
         }
@@ -582,20 +573,20 @@ void ConnectionRegistry::killOperationsOnAllConnections(bool withPrompt) const {
             if (auto elem = op["client"]) {
                 // mongod currentOp client
                 if (elem.type() != String) {
-                    warning() << "Ignoring operation " << op["opid"].toString(false)
+                    std::cout << "Ignoring operation " << op["opid"].toString(false)
                               << "; expected 'client' field in currentOp response to have type "
                                  "string, but found "
-                              << typeName(elem.type());
+                              << typeName(elem.type()) << std::endl;
                     continue;
                 }
                 client = elem.str();
             } else if (auto elem = op["client_s"]) {
                 // mongos currentOp client
                 if (elem.type() != String) {
-                    warning() << "Ignoring operation " << op["opid"].toString(false)
+                    std::cout << "Ignoring operation " << op["opid"].toString(false)
                               << "; expected 'client_s' field in currentOp response to have type "
                                  "string, but found "
-                              << typeName(elem.type());
+                              << typeName(elem.type()) << std::endl;
                     continue;
                 }
                 client = elem.str();
@@ -620,7 +611,7 @@ void ConnectionRegistry::killOperationsOnAllConnections(bool withPrompt) const {
 
 ConnectionRegistry connectionRegistry;
 
-void onConnect(DBClientBase& c) {
+void onConnect(DBClientBase& c, StringData uri) {
     if (shellGlobalParams.nokillop) {
         return;
     }
@@ -630,7 +621,7 @@ void onConnect(DBClientBase& c) {
         c.setClientRPCProtocols(*shellGlobalParams.rpcProtocols);
     }
 
-    connectionRegistry.registerConnection(c);
+    connectionRegistry.registerConnection(c, uri);
 }
 
 bool fileExists(const std::string& file) {

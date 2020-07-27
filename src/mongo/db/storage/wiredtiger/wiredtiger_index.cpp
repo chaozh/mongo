@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -51,25 +51,28 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
 
 #define TRACING_ENABLED 0
 
-#if TRACING_ENABLED
-#define TRACE_CURSOR log() << "WT index (" << (const void*)&_idx << ") "
-#define TRACE_INDEX log() << "WT index (" << (const void*)this << ") "
-#else
-#define TRACE_CURSOR \
-    if (0)           \
-    log()
-#define TRACE_INDEX \
-    if (0)          \
-    log()
-#endif
+#define LOGV2_TRACE_CURSOR(ID, NAME, ...)                   \
+    if (TRACING_ENABLED)                                    \
+    LOGV2(ID,                                               \
+          "WT index ({index}) " #NAME,                      \
+          "index"_attr = reinterpret_cast<uint64_t>(&_idx), \
+          ##__VA_ARGS__)
+
+#define LOGV2_TRACE_INDEX(ID, NAME, ...)                   \
+    if (TRACING_ENABLED)                                   \
+    LOGV2(ID,                                              \
+          "WT index ({index}) " #NAME,                     \
+          "index"_attr = reinterpret_cast<uint64_t>(this), \
+          ##__VA_ARGS__)
 
 namespace mongo {
 namespace {
@@ -155,11 +158,13 @@ std::string WiredTigerIndex::generateAppMetadataString(const IndexDescriptor& de
 }
 
 // static
-StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string& engineName,
-                                                              const std::string& sysIndexConfig,
-                                                              const std::string& collIndexConfig,
-                                                              const IndexDescriptor& desc,
-                                                              bool isPrefixed) {
+StatusWith<std::string> WiredTigerIndex::generateCreateString(
+    const std::string& engineName,
+    const std::string& sysIndexConfig,
+    const std::string& collIndexConfig,
+    const NamespaceString& collectionNamespace,
+    const IndexDescriptor& desc,
+    bool isPrefixed) {
     str::stream ss;
 
     // Separate out a prefix and suffix in the default string. User configuration will override
@@ -173,7 +178,7 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
 
     ss << "block_compressor=" << wiredTigerGlobalOptions.indexBlockCompressor << ",";
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
-              ->getTableCreateConfig(desc.parentNS().ns());
+              ->getTableCreateConfig(collectionNamespace.ns());
     ss << sysIndexConfig << ",";
     ss << collIndexConfig << ",";
 
@@ -210,13 +215,13 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
 
     bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
         repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
-    if (WiredTigerUtil::useTableLogging(NamespaceString(desc.parentNS()), replicatedWrites)) {
+    if (WiredTigerUtil::useTableLogging(collectionNamespace, replicatedWrites)) {
         ss << "log=(enabled=true)";
     } else {
         ss << "log=(enabled=false)";
     }
 
-    LOG(3) << "index create string: " << ss.ss.str();
+    LOGV2_DEBUG(51779, 3, "index create string", "str"_attr = ss.ss.str());
     return StatusWith<std::string>(ss);
 }
 
@@ -226,7 +231,8 @@ int WiredTigerIndex::Create(OperationContext* opCtx,
     // Don't use the session from the recovery unit: create should not be used in a transaction
     WiredTigerSession session(WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn());
     WT_SESSION* s = session.getSession();
-    LOG(1) << "create uri: " << uri << " config: " << config;
+    LOGV2_DEBUG(
+        51780, 1, "create uri: {uri} config: {config}", "uri"_attr = uri, "config"_attr = config);
     return s->create(s, uri.c_str(), config.c_str());
 }
 
@@ -239,11 +245,16 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
                           Ordering::make(desc->keyPattern())),
       _uri(uri),
       _tableId(WiredTigerSession::genTableId()),
-      _collectionNamespace(desc->parentNS()),
+      _desc(desc),
       _indexName(desc->indexName()),
       _keyPattern(desc->keyPattern()),
+      _collation(desc->collation()),
       _prefix(prefix),
       _isIdIndex(desc->isIdIndex()) {}
+
+NamespaceString WiredTigerIndex::getCollectionNamespace(OperationContext* opCtx) const {
+    return _desc->getEntry()->getNSSFromCatalog(opCtx);
+}
 
 Status WiredTigerIndex::insert(OperationContext* opCtx,
                                const KeyString::Value& keyString,
@@ -251,7 +262,7 @@ Status WiredTigerIndex::insert(OperationContext* opCtx,
     dassert(opCtx->lockState()->isWriteLocked());
     dassert(KeyString::decodeRecordIdAtEnd(keyString.getBuffer(), keyString.getSize()).isValid());
 
-    TRACE_INDEX << " KeyString: " << keyString;
+    LOGV2_TRACE_INDEX(20093, "KeyString: {keyString}", "keyString"_attr = keyString);
 
     WiredTigerCursor curwrap(_uri, _tableId, false, opCtx);
     curwrap.assertInActiveTxn();
@@ -286,14 +297,20 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
                 << "This is a transient issue as the collection was actively "
                    "in use by other operations.";
 
-            warning() << msg;
+            LOGV2_WARNING(51781,
+                          "Could not complete validation. This is a transient issue as "
+                          "the collection was actively in use by other operations",
+                          "uri"_attr = _uri);
             fullResults->warnings.push_back(msg);
         } else if (err) {
             std::string msg = str::stream()
                 << "verify() returned " << wiredtiger_strerror(err) << ". "
                 << "This indicates structural damage. "
                 << "Not examining individual index entries.";
-            error() << msg;
+            LOGV2_ERROR(51782,
+                        "verify() returned an error. This indicates structural damage. Not "
+                        "examining individual index entries.",
+                        "error"_attr = wiredtiger_strerror(err));
             fullResults->errors.push_back(msg);
             fullResults->valid = false;
             return;
@@ -302,7 +319,7 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
 
     auto cursor = newCursor(opCtx);
     long long count = 0;
-    TRACE_INDEX << " fullValidate";
+    LOGV2_TRACE_INDEX(20094, "fullValidate");
 
     const auto requestedInfo = TRACING_ENABLED ? Cursor::kKeyAndLoc : Cursor::kJustExistance;
 
@@ -315,7 +332,7 @@ void WiredTigerIndex::fullValidate(OperationContext* opCtx,
         );
 
     for (auto kv = cursor->seek(keyStringForSeek, requestedInfo); kv; kv = cursor->next()) {
-        TRACE_INDEX << "\t" << kv->key << ' ' << kv->loc;
+        LOGV2_TRACE_INDEX(20095, "fullValidate {kv}", "kv"_attr = kv);
         count++;
     }
     if (numKeysOut) {
@@ -369,9 +386,11 @@ Status WiredTigerIndex::dupKeyCheck(OperationContext* opCtx, const KeyString::Va
     WiredTigerCursor curwrap(_uri, _tableId, false, opCtx);
     WT_CURSOR* c = curwrap.get();
 
-    if (isDup(opCtx, c, key))
-        return buildDupKeyErrorStatus(
-            key, _collectionNamespace, _indexName, _keyPattern, _ordering);
+    if (isDup(opCtx, c, key)) {
+        auto entry = _desc->getEntry();
+        auto nss = entry ? entry->getNSSFromCatalog(opCtx) : NamespaceString();
+        return buildDupKeyErrorStatus(key, nss, _indexName, _keyPattern, _collation, _ordering);
+    }
     return Status::OK();
 }
 
@@ -481,10 +500,6 @@ Status WiredTigerIndex::compact(OperationContext* opCtx) {
     if (!cache->isEphemeral()) {
         WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
         opCtx->recoveryUnit()->abandonSnapshot();
-        // WT compact prompts WT to take checkpoints, so we need to take the checkpoint lock around
-        // WT compact calls.
-        auto checkpointLock =
-            opCtx->getServiceContext()->getStorageEngine()->getCheckpointLock(opCtx);
         int ret = s->compact(s, uri().c_str(), "timeout=0");
         invariantWTOK(ret);
     }
@@ -498,38 +513,36 @@ KeyString::Version WiredTigerIndex::_handleVersionInfo(OperationContext* ctx,
     auto version = WiredTigerUtil::checkApplicationMetadataFormatVersion(
         ctx, uri, kMinimumIndexVersion, kMaximumIndexVersion);
     if (!version.isOK()) {
+        auto collectionNamespace = desc->getEntry()->getNSSFromCatalog(ctx);
         Status versionStatus = version.getStatus();
         Status indexVersionStatus(ErrorCodes::UnsupportedFormat,
                                   str::stream()
                                       << versionStatus.reason() << " Index: {name: "
-                                      << desc->indexName() << ", ns: " << desc->parentNS()
+                                      << desc->indexName() << ", ns: " << collectionNamespace
                                       << "} - version either too old or too new for this mongod.");
         fassertFailedWithStatusNoTrace(28579, indexVersionStatus);
     }
     _dataFormatVersion = version.getValue();
 
-    if (!desc->isIdIndex() && desc->unique()) {
-        Status versionStatus = _dataFormatVersion == kDataFormatV3KeyStringV0UniqueIndexVersionV1 ||
-                _dataFormatVersion == kDataFormatV4KeyStringV1UniqueIndexVersionV2
-            ? Status::OK()
-            : Status(ErrorCodes::UnsupportedFormat,
-                     str::stream()
-                         << "Index: {name: " << desc->indexName() << ", ns: " << desc->parentNS()
-                         << "} has incompatible format version: " << _dataFormatVersion
-                         << ". MongoDB 4.2 onwards, WT secondary unique indexes use "
-                            "either format version 11 or 12. See "
-                            "https://dochub.mongodb.org/core/upgrade-4.2-procedures for "
-                            "detailed instructions on upgrading the index format.");
-        fassertNoTrace(31179, versionStatus);
+    if (!desc->isIdIndex() && desc->unique() &&
+        _dataFormatVersion != kDataFormatV3KeyStringV0UniqueIndexVersionV1 &&
+        _dataFormatVersion != kDataFormatV4KeyStringV1UniqueIndexVersionV2) {
+        auto collectionNamespace = desc->getEntry()->getNSSFromCatalog(ctx);
+        Status versionStatus(ErrorCodes::UnsupportedFormat,
+                             str::stream()
+                                 << "Index: {name: " << desc->indexName()
+                                 << ", ns: " << collectionNamespace
+                                 << "} has incompatible format version: " << _dataFormatVersion);
+        fassertFailedWithStatusNoTrace(31179, versionStatus);
     }
 
     if (!isReadOnly) {
         bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
             repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
-        uassertStatusOK(WiredTigerUtil::setTableLogging(
-            ctx,
-            uri,
-            WiredTigerUtil::useTableLogging(NamespaceString(desc->parentNS()), replicatedWrites)));
+        bool useTableLogging = !replicatedWrites ||
+            WiredTigerUtil::useTableLogging(desc->getEntry()->getNSSFromCatalog(ctx),
+                                            replicatedWrites);
+        uassertStatusOK(WiredTigerUtil::setTableLogging(ctx, uri, useTableLogging));
     }
 
     /*
@@ -579,8 +592,12 @@ protected:
         if (!err)
             return cursor;
 
-        warning() << "failed to create WiredTiger bulk cursor: " << wiredtiger_strerror(err);
-        warning() << "falling back to non-bulk cursor for index " << idx->uri();
+        LOGV2_WARNING(51783,
+                      "failed to create WiredTiger bulk cursor: {error} falling back to non-bulk "
+                      "cursor for index {index}",
+                      "Failed to create WiredTiger bulk cursor, falling back to non-bulk",
+                      "error"_attr = wiredtiger_strerror(err),
+                      "index"_attr = idx->uri());
 
         invariantWTOK(session->open_cursor(session, idx->uri().c_str(), nullptr, nullptr, &cursor));
         return cursor;
@@ -685,8 +702,13 @@ private:
             if (cmp == 0) {
                 // Duplicate found!
                 auto newKey = KeyString::toBson(newKeyString, _idx->_ordering);
-                return buildDupKeyErrorStatus(
-                    newKey, _idx->collectionNamespace(), _idx->indexName(), _idx->keyPattern());
+                auto entry = _idx->_desc->getEntry();
+                return buildDupKeyErrorStatus(newKey,
+                                              entry ? entry->getNSSFromCatalog(_opCtx)
+                                                    : NamespaceString(),
+                                              _idx->indexName(),
+                                              _idx->keyPattern(),
+                                              _idx->_collation);
             } else {
                 /*
                  * _previousKeyString.isEmpty() is only true on the first call to addKey().
@@ -730,8 +752,11 @@ private:
             // Dup found!
             if (!_dupsAllowed) {
                 auto newKey = KeyString::toBson(newKeyString, _idx->_ordering);
-                return buildDupKeyErrorStatus(
-                    newKey, _idx->collectionNamespace(), _idx->indexName(), _idx->keyPattern());
+                return buildDupKeyErrorStatus(newKey,
+                                              _idx->_desc->getEntry()->getNSSFromCatalog(_opCtx),
+                                              _idx->indexName(),
+                                              _idx->keyPattern(),
+                                              _idx->_collation);
             }
 
             // If we get here, we are in the weird mode where dups are allowed on a unique
@@ -819,7 +844,10 @@ public:
     }
 
     void setEndPosition(const BSONObj& key, bool inclusive) override {
-        TRACE_CURSOR << "setEndPosition inclusive: " << inclusive << ' ' << key;
+        LOGV2_TRACE_CURSOR(20098,
+                           "setEndPosition inclusive: {inclusive} {key}",
+                           "inclusive"_attr = inclusive,
+                           "key"_attr = key);
         if (key.isEmpty()) {
             // This means scan to end of index.
             _endPosition.reset();
@@ -938,7 +966,9 @@ public:
             // Unique indexes can have both kinds of KeyStrings, ie with or without the record id.
             // Restore for unique indexes gets handled separately in it's own implementation.
             _lastMoveSkippedKey = !seekWTCursor(_key.getValueCopy());
-            TRACE_CURSOR << "restore _lastMoveSkippedKey:" << _lastMoveSkippedKey;
+            LOGV2_TRACE_CURSOR(20099,
+                               "restore _lastMoveSkippedKey: {lastMoveSkippedKey}",
+                               "lastMoveSkippedKey"_attr = _lastMoveSkippedKey);
         }
     }
 
@@ -1011,7 +1041,7 @@ protected:
             bson =
                 KeyString::toBson(_key.getBuffer(), _key.getSize(), _idx.getOrdering(), _typeBits);
 
-            TRACE_CURSOR << " returning " << bson << ' ' << _id;
+            LOGV2_TRACE_CURSOR(20000, "returning {bson} {id}", "bson"_attr = bson, "id"_attr = _id);
         }
 
         return {{std::move(bson), _id}};
@@ -1058,6 +1088,9 @@ protected:
 
     // Seeks to query. Returns true on exact match.
     bool seekWTCursor(const KeyString::Value& query) {
+        // Ensure an active transaction is open.
+        WiredTigerRecoveryUnit::get(_opCtx)->getSession();
+
         WT_CURSOR* c = _cursor->get();
 
         int cmp = -1;
@@ -1067,13 +1100,13 @@ protected:
         int ret = wiredTigerPrepareConflictRetry(_opCtx, [&] { return c->search_near(c, &cmp); });
         if (ret == WT_NOTFOUND) {
             _cursorAtEof = true;
-            TRACE_CURSOR << "\t not found";
+            LOGV2_TRACE_CURSOR(20088, "not found");
             return false;
         }
         invariantWTOK(ret);
         _cursorAtEof = false;
 
-        TRACE_CURSOR << "\t cmp: " << cmp;
+        LOGV2_TRACE_CURSOR(20089, "cmp: {cmp}", "cmp"_attr = cmp);
 
         if (cmp == 0) {
             // Found it!
@@ -1116,18 +1149,21 @@ protected:
             bool nextNotIncreasing = cmp > 0 || (cmp == 0 && _key.getSize() > item.size);
 
             if (MONGO_unlikely(WTEmulateOutOfOrderNextIndexKey.shouldFail())) {
-                log() << "WTIndex::updatePosition simulating next key not increasing.";
+                LOGV2(51789, "WTIndex::updatePosition simulating next key not increasing.");
                 nextNotIncreasing = true;
             }
 
             if (nextNotIncreasing) {
                 // Our new key is less than the old key which means the next call moved to !next.
-                log() << "WTIndex::updatePosition -- the new key ( "
-                      << redact(toHex(item.data, item.size)) << ") is less than the previous key ("
-                      << redact(_key.toString()) << "), which is a bug.";
+                LOGV2(51790,
+                      "WTIndex::updatePosition -- the new key ({newKey}) is less than the previous "
+                      "key ({prevKey}), which is a bug.",
+                      "WTIndex::updatePosition -- new key is less than previous key",
+                      "newKey"_attr = redact(toHex(item.data, item.size)),
+                      "prevKey"_attr = redact(_key.toString()));
 
-                // Crash when test commands are enabled.
-                invariant(!getTestCommandsEnabled());
+                // Crash when testing diagnostics are enabled.
+                invariant(!TestingProctor::instance().isEnabled());
 
                 // Force a retry of the operation from our last known position by acting as-if
                 // we received a WT_ROLLBACK error.
@@ -1151,6 +1187,10 @@ protected:
         if (_eof) {
             return false;
         }
+
+        // Ensure an active transaction is open.
+        WiredTigerRecoveryUnit::get(_opCtx)->getSession();
+
         if (!_lastMoveSkippedKey) {
             advanceWTCursor();
         }
@@ -1173,12 +1213,16 @@ protected:
             keyWithRecordId.appendRecordId(_id);
             keyWithRecordId.setTypeBits(_typeBits);
 
-            TRACE_CURSOR << " returning " << keyWithRecordId << ' ' << _id;
+            LOGV2_TRACE_CURSOR(20090,
+                               "returning {keyWithRecordId} {id}",
+                               "keyWithRecordId"_attr = keyWithRecordId,
+                               "id"_attr = _id);
             return KeyStringEntry(keyWithRecordId.getValueCopy(), _id);
         }
 
         _key.setTypeBits(_typeBits);
-        TRACE_CURSOR << " returning " << _key << ' ' << _id;
+
+        LOGV2_TRACE_CURSOR(20091, "returning {key} {id}", "key"_attr = _key, "id"_attr = _id);
         return KeyStringEntry(_key.getValueCopy(), _id);
     }
 
@@ -1223,7 +1267,8 @@ public:
     // Must not throw WriteConflictException, throwing a WriteConflictException will retry the
     // operation effectively skipping over this key.
     void updateIdAndTypeBits() override {
-        TRACE_INDEX << "Unique Index KeyString: [" << _key.toString() << "]";
+        LOGV2_TRACE_INDEX(
+            20096, "Unique Index KeyString: [{keyString}]", "keyString"_attr = _key.toString());
 
         // After a rolling upgrade an index can have keys from both timestamp unsafe (old) and
         // timestamp safe (new) unique indexes. Detect correct index key format by checking key's
@@ -1279,7 +1324,7 @@ public:
             // the keys with size greater than or equal to that of the _key.
             if (item.size >= keySize && std::memcmp(_key.getBuffer(), item.data, keySize) == 0) {
                 _lastMoveSkippedKey = false;
-                TRACE_CURSOR << "restore _lastMoveSkippedKey changed to false.";
+                LOGV2_TRACE_CURSOR(20092, "restore _lastMoveSkippedKey changed to false.");
             }
         }
     }
@@ -1305,10 +1350,14 @@ private:
         _typeBits.resetFromBuffer(&br);
 
         if (!br.atEof()) {
-            severe() << "Unique index cursor seeing multiple records for key "
-                     << redact(curr(kWantKey)->key) << " in index " << _idx.indexName() << " ("
-                     << _idx.uri() << ") belonging to collection " << _idx.collectionNamespace();
-            fassertFailed(28608);
+            LOGV2_FATAL(28608,
+                        "Unique index cursor seeing multiple records for key {key} in index "
+                        "{index} ({uri}) belonging to collection {collection}",
+                        "Unique index cursor seeing multiple records for key in index",
+                        "key"_attr = redact(curr(kWantKey)->key),
+                        "index"_attr = _idx.indexName(),
+                        "uri"_attr = _idx.uri(),
+                        "collection"_attr = _idx.getCollectionNamespace(_opCtx));
         }
     }
 };
@@ -1490,7 +1539,8 @@ Status WiredTigerIndexUnique::_insertTimestampUnsafe(OperationContext* opCtx,
 
     if (!dupsAllowed) {
         auto key = KeyString::toBson(keyString, _ordering);
-        return buildDupKeyErrorStatus(key, _collectionNamespace, _indexName, _keyPattern);
+        return buildDupKeyErrorStatus(
+            key, _desc->getEntry()->getNSSFromCatalog(opCtx), _indexName, _keyPattern, _collation);
     }
 
     if (!insertedId) {
@@ -1513,7 +1563,8 @@ Status WiredTigerIndexUnique::_insertTimestampSafe(OperationContext* opCtx,
                                                    WT_CURSOR* c,
                                                    const KeyString::Value& keyString,
                                                    bool dupsAllowed) {
-    TRACE_INDEX << "Timestamp safe unique idx KeyString: " << keyString;
+    LOGV2_TRACE_INDEX(
+        20097, "Timestamp safe unique idx KeyString: {keyString}", "keyString"_attr = keyString);
 
     int ret;
 
@@ -1535,7 +1586,11 @@ Status WiredTigerIndexUnique::_insertTimestampSafe(OperationContext* opCtx,
         if (ret == WT_DUPLICATE_KEY) {
             auto key = KeyString::toBson(
                 keyString.getBuffer(), sizeWithoutRecordId, _ordering, keyString.getTypeBits());
-            return buildDupKeyErrorStatus(key, _collectionNamespace, _indexName, _keyPattern);
+            return buildDupKeyErrorStatus(key,
+                                          _desc->getEntry()->getNSSFromCatalog(opCtx),
+                                          _indexName,
+                                          _keyPattern,
+                                          _collation);
         }
         invariantWTOK(ret);
 
@@ -1550,7 +1605,13 @@ Status WiredTigerIndexUnique::_insertTimestampSafe(OperationContext* opCtx,
         if (_keyExists(opCtx, c, keyString.getBuffer(), sizeWithoutRecordId)) {
             auto key = KeyString::toBson(
                 keyString.getBuffer(), sizeWithoutRecordId, _ordering, keyString.getTypeBits());
-            return buildDupKeyErrorStatus(key, _collectionNamespace, _indexName, _keyPattern);
+            auto entry = _desc->getEntry();
+            return buildDupKeyErrorStatus(key,
+                                          entry ? entry->getNSSFromCatalog(opCtx)
+                                                : NamespaceString(),
+                                          _indexName,
+                                          _keyPattern,
+                                          _collation);
         }
     }
 
@@ -1672,7 +1733,15 @@ void WiredTigerIndexUnique::_unindexTimestampUnsafe(OperationContext* opCtx,
 
     if (!foundId) {
         auto key = KeyString::toBson(keyString, _ordering);
-        warning().stream() << id << " not found in the index for key " << redact(key);
+        LOGV2_WARNING(
+            51797,
+            "{recordId} not found in collection {collection} on index {index} with key {key} while "
+            "attempting to remove the index entry",
+            "Associated record not found in collection while removing index entry",
+            "collection"_attr = getCollectionNamespace(opCtx),
+            "index"_attr = _indexName,
+            "key"_attr = redact(key),
+            "recordId"_attr = id);
         return;  // nothing to do
     }
 

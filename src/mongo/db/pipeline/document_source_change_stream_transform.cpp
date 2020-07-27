@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -56,7 +56,6 @@
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -92,6 +91,10 @@ DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
     auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
                                                       _changeStreamSpec);
 
+    // If the change stream spec requested a pre-image, make sure that we supply one.
+    _includePreImageOptime =
+        (spec.getFullDocumentBeforeChange() != FullDocumentBeforeChangeModeEnum::kOff);
+
     // If the change stream spec includes a resumeToken with a shard key, populate the document key
     // cache with the field paths.
     auto resumeAfter = spec.getResumeAfter();
@@ -112,7 +115,7 @@ DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
 
             // If the document key from the resume token has more than one field, that means it
             // includes the shard key and thus should never change.
-            auto isFinal = docKey.size() > 1;
+            const bool isFinal = docKeyFields.size() > 1;
 
             _documentKeyCache[tokenData.uuid.get()] =
                 DocumentKeyCacheEntry({docKeyFields, isFinal});
@@ -129,6 +132,7 @@ StageConstraints DocumentSourceChangeStreamTransform::constraints(
                                  FacetRequirement::kNotAllowed,
                                  TransactionRequirement::kNotAllowed,
                                  LookupRequirement::kNotAllowed,
+                                 UnionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage);
 
     // This transformation could be part of a 'collectionless' change stream on an entire
@@ -187,6 +191,7 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
     Value ns = input[repl::OplogEntry::kNssFieldName];
     checkValueType(ns, repl::OplogEntry::kNssFieldName, BSONType::String);
     Value uuid = input[repl::OplogEntry::kUuidFieldName];
+    Value preImageOpTime = input[repl::OplogEntry::kPreImageOpTimeFieldName];
     std::vector<FieldPath> documentKeyFields;
 
     // Deal with CRUD operations and commands.
@@ -337,7 +342,13 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         return doc.freeze();
     }
 
+    // Add the post-image, pre-image, namespace, documentKey and other fields as appropriate.
     doc.addField(DocumentSourceChangeStream::kFullDocumentField, fullDocument);
+    if (_includePreImageOptime) {
+        // Set 'kFullDocumentBeforeChangeField' to the pre-image optime. The DSCSLookupPreImage
+        // stage will replace this optime with the actual pre-image taken from the oplog.
+        doc.addField(DocumentSourceChangeStream::kFullDocumentBeforeChangeField, preImageOpTime);
+    }
     doc.addField(DocumentSourceChangeStream::kNamespaceField,
                  operationType == DocumentSourceChangeStream::kDropDatabaseOpType
                      ? Value(Document{{"db", nss.db()}})
@@ -383,6 +394,9 @@ DepsTracker::State DocumentSourceChangeStreamTransform::getDependencies(DepsTrac
     deps->fields.insert(repl::OplogEntry::kSessionIdFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kTermFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kTxnNumberFieldName.toString());
+    if (_includePreImageOptime) {
+        deps->fields.insert(repl::OplogEntry::kPreImageOpTimeFieldName.toString());
+    }
     return DepsTracker::State::EXHAUSTIVE_ALL;
 }
 

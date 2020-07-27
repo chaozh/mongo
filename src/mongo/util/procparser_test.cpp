@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +38,8 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -96,6 +96,11 @@ StringMap toNestedStringMap(BSONObj& obj) {
     ASSERT_OK(procparser::parseProcDiskStats(_disks, _x, &builder)); \
     auto obj = builder.obj();                                        \
     auto stringMap = toNestedStringMap(obj);
+#define ASSERT_PARSE_VMSTAT(_keys, _x)                           \
+    BSONObjBuilder builder;                                      \
+    ASSERT_OK(procparser::parseProcVMStat(_keys, _x, &builder)); \
+    auto obj = builder.obj();                                    \
+    auto stringMap = toStringMap(obj);
 
 TEST(FTDCProcStat, TestStat) {
 
@@ -222,7 +227,7 @@ TEST(FTDCProcStat, TestLocalStat) {
 
     BSONObj obj = builder.obj();
     auto stringMap = toStringMap(obj);
-    log() << "OBJ:" << obj;
+    LOGV2(23364, "OBJ:{obj}", "obj"_attr = obj);
     ASSERT_KEY("user_ms");
     ASSERT_KEY("nice_ms");
     ASSERT_KEY("idle_ms");
@@ -335,7 +340,7 @@ TEST(FTDCProcMemInfo, TestLocalMemInfo) {
 
     BSONObj obj = builder.obj();
     auto stringMap = toStringMap(obj);
-    log() << "OBJ:" << obj;
+    LOGV2(23365, "OBJ:{obj}", "obj"_attr = obj);
     ASSERT_KEY("MemTotal_kb");
     ASSERT_KEY("MemFree_kb");
     // Needs in 3.15+ - ASSERT_KEY("MemAvailable_kb");
@@ -474,7 +479,7 @@ TEST(FTDCProcNetstat, TestLocalNetstat) {
 
     BSONObj obj = builder.obj();
     auto stringMap = toStringMap(obj);
-    log() << "OBJ:" << obj;
+    LOGV2(23366, "OBJ:{obj}", "obj"_attr = obj);
     ASSERT_KEY("TcpExt:TCPTimeouts");
     ASSERT_KEY("TcpExt:TCPPureAcks");
     ASSERT_KEY("TcpExt:TCPAbortOnTimeout");
@@ -498,7 +503,7 @@ TEST(FTDCProcNetstat, TestLocalNetSnmp) {
 
     BSONObj obj = builder.obj();
     auto stringMap = toStringMap(obj);
-    log() << "OBJ:" << obj;
+    LOGV2(23367, "OBJ:{obj}", "obj"_attr = obj);
     ASSERT_KEY("Ip:InReceives");
     ASSERT_KEY("Ip:OutRequests");
     ASSERT_KEY("Tcp:InSegs");
@@ -612,7 +617,7 @@ TEST(FTDCProcDiskStats, TestLocalDiskStats) {
 
     std::vector<StringData> disks2;
     for (const auto& disk : disks) {
-        log() << "DISK:" << disk;
+        LOGV2(23368, "DISK:{disk}", "disk"_attr = disk);
         disks2.emplace_back(disk);
     }
 
@@ -624,7 +629,7 @@ TEST(FTDCProcDiskStats, TestLocalDiskStats) {
 
     BSONObj obj = builder.obj();
     auto stringMap = toNestedStringMap(obj);
-    log() << "OBJ:" << obj;
+    LOGV2(23369, "OBJ:{obj}", "obj"_attr = obj);
 
     bool foundDisk = false;
 
@@ -647,6 +652,74 @@ TEST(FTDCProcDiskStats, TestLocalDiskStats) {
     if (!foundDisk) {
         FAIL("Did not find any interesting disks on this machine.");
     }
+}
+
+
+TEST(FTDCProcVMStat, TestVMStat) {
+
+    std::vector<StringData> keys{"Key1", "Key2", "Key3"};
+
+    // Normal case
+    {
+        ASSERT_PARSE_VMSTAT(keys, "Key1 123\nKey2 456");
+        ASSERT_KEY_AND_VALUE("Key1", 123UL);
+        ASSERT_KEY_AND_VALUE("Key2", 456UL);
+    }
+
+    // No newline
+    {
+        ASSERT_PARSE_VMSTAT(keys, "Key1 123 Key2 456");
+        ASSERT_KEY_AND_VALUE("Key1", 123UL);
+        ASSERT_NO_KEY("Key2");
+    }
+
+    // Key without value
+    {
+        ASSERT_PARSE_VMSTAT(keys, "Key1 123\nKey2");
+        ASSERT_KEY_AND_VALUE("Key1", 123UL);
+        ASSERT_NO_KEY("Key2");
+    }
+
+    // Empty string
+    {
+        BSONObjBuilder builder;
+        ASSERT_NOT_OK(procparser::parseProcVMStat(keys, "", &builder));
+    }
+}
+
+// Test we can parse the /proc/vmstat on this machine. Also assert we have the expected fields
+// This tests is designed to exercise our parsing code on various Linuxes and fail
+// Normally when run in the FTDC loop we return a non-fatal error so we may not notice the failure
+// otherwise.
+TEST(FTDCProcVMStat, TestLocalVMStat) {
+    std::vector<StringData> keys{
+        "balloon_deflate"_sd,
+        "balloon_inflate"_sd,
+        "nr_mlock"_sd,
+        "pgfault"_sd,
+        "pgmajfault"_sd,
+        "pswpin"_sd,
+        "pswpout"_sd,
+    };
+
+    BSONObjBuilder builder;
+
+    ASSERT_OK(procparser::parseProcVMStatFile("/proc/vmstat", keys, &builder));
+
+    BSONObj obj = builder.obj();
+    auto stringMap = toStringMap(obj);
+    ASSERT_KEY("nr_mlock");
+    ASSERT_KEY("pgmajfault");
+    ASSERT_KEY("pswpin");
+    ASSERT_KEY("pswpout");
+}
+
+
+TEST(FTDCProcVMStat, TestLocalNonExistentVMStat) {
+    std::vector<StringData> keys{};
+    BSONObjBuilder builder;
+
+    ASSERT_NOT_OK(procparser::parseProcVMStatFile("/proc/does_not_exist", keys, &builder));
 }
 
 }  // namespace

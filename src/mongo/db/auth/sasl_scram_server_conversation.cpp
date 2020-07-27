@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/sasl_scram_server_conversation.h"
@@ -47,7 +45,6 @@
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
 #include "mongo/util/sequence_util.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"

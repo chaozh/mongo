@@ -46,7 +46,6 @@
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_recovery_unit.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/util/clock_source_mock.h"
@@ -137,9 +136,9 @@ TEST_F(AuthOpObserverTest, MultipleAboutToDeleteAndOnDelete) {
     AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
     WriteUnitOfWork wunit(opCtx.get());
     opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
-    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, boost::none);
     opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
-    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, boost::none);
 }
 
 DEATH_TEST_F(AuthOpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") {
@@ -147,7 +146,7 @@ DEATH_TEST_F(AuthOpObserverTest, AboutToDeleteMustPreceedOnDelete, "invariant") 
     auto opCtx = cc().makeOperationContext();
     cc().swapLockState(std::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, boost::none);
 }
 
 DEATH_TEST_F(AuthOpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant") {
@@ -156,8 +155,8 @@ DEATH_TEST_F(AuthOpObserverTest, EachOnDeleteRequiresAboutToDelete, "invariant")
     cc().swapLockState(std::make_unique<LockerNoop>());
     NamespaceString nss = {"test", "coll"};
     opObserver.aboutToDelete(opCtx.get(), nss, {});
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, boost::none);
+    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, boost::none);
 }
 
 }  // namespace

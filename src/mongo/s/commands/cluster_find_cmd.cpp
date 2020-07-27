@@ -69,7 +69,7 @@ std::unique_ptr<QueryRequest> parseCmdObjectToQueryRequest(OperationContext* opC
             // operation in a transaction, or not running in a transaction, then use the readConcern
             // from the opCtx (which may be a cluster-wide default).
             const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-            qr->setReadConcern(readConcernArgs.toBSON()["readConcern"].Obj());
+            qr->setReadConcern(readConcernArgs.toBSONInner());
         }
     }
     uassert(
@@ -176,11 +176,7 @@ public:
 
                 auto bodyBuilder = result->getBodyBuilder();
                 uassertStatusOK(ClusterExplain::buildExplainResult(
-                    opCtx,
-                    ClusterExplain::downconvert(opCtx, shardResponses),
-                    mongosStageName,
-                    millisElapsed,
-                    &bodyBuilder));
+                    opCtx, shardResponses, mongosStageName, millisElapsed, &bodyBuilder));
 
             } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
                 auto bodyBuilder = result->getBodyBuilder();
@@ -207,6 +203,11 @@ public:
             // We count find command as a query op.
             globalOpCounters.gotQuery();
 
+            ON_BLOCK_EXIT([opCtx] {
+                Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
+                    opCtx, mongo::LogicalOp::opQuery);
+            });
+
             const bool isExplain = false;
             auto qr = parseCmdObjectToQueryRequest(opCtx, ns(), _request.body, isExplain);
 
@@ -229,6 +230,10 @@ public:
                 // Build the response document.
                 CursorResponseBuilder::Options options;
                 options.isInitialResponse = true;
+                if (!opCtx->inMultiDocumentTransaction()) {
+                    options.atClusterTime =
+                        repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+                }
                 CursorResponseBuilder firstBatch(result, options);
                 for (const auto& obj : batch) {
                     firstBatch.append(obj);

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include <kms_message/kms_message.h>
 
@@ -43,7 +43,6 @@
 #include "mongo/shell/kms_gen.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/kms_message_support.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -62,7 +61,7 @@ namespace {
 class AWSConnection {
 public:
     AWSConnection(SSLManagerInterface* ssl)
-        : _sslManager(ssl), _socket(std::make_unique<Socket>(10, logger::LogSeverity::Log())) {}
+        : _sslManager(ssl), _socket(std::make_unique<Socket>(10, logv2::LogSeverity::Info())) {}
 
     UniqueKmsResponse makeOneRequest(const HostAndPort& host, ConstDataRange request);
 

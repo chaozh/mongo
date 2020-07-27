@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kGeo
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kGeo
 
 #include "mongo/db/geo/geoparser.h"
 
@@ -39,7 +39,6 @@
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/geo/shapes.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 #include "third_party/s2/s2polygonbuilder.h"

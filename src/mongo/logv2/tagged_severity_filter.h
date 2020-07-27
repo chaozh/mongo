@@ -37,8 +37,7 @@
 #include "mongo/logv2/log_severity.h"
 #include "mongo/logv2/log_tag.h"
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
 
 // Boost::log filter that enables logging if Tag exists with Severity over threshold
 class TaggedSeverityFilter : public DomainFilter<TaggedSeverityFilter> {
@@ -51,7 +50,7 @@ public:
         using boost::log::extract;
 
         return _tag.has(extract<LogTag>(attributes::tags(), attrs).get()) &&
-            extract<LogSeverity>(attributes::severity(), attrs).get() <= _severity;
+            extract<LogSeverity>(attributes::severity(), attrs).get() >= _severity;
     }
 
 private:
@@ -59,5 +58,4 @@ private:
     LogSeverity _severity;
 };
 
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

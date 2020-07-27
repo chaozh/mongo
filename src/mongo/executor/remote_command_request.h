@@ -44,15 +44,14 @@ namespace executor {
 
 struct RemoteCommandRequestBase {
     struct HedgeOptions {
-        size_t count;
-        Milliseconds delay;
+        size_t count = 0;
+        int maxTimeMSForHedgedReads = 0;
     };
+
+    enum FireAndForgetMode { kOn, kOff };
 
     // Indicates that there is no timeout for the request to complete
     static constexpr Milliseconds kNoTimeout{-1};
-
-    // Indicates that there is no expiration time by when the request needs to complete
-    static constexpr Date_t kNoExpirationDate{Date_t::max()};
 
     // Type to represent the internal id of this request
     typedef uint64_t RequestId;
@@ -64,7 +63,8 @@ struct RemoteCommandRequestBase {
                              const BSONObj& metadataObj,
                              OperationContext* opCtx,
                              Milliseconds timeoutMillis,
-                             boost::optional<HedgeOptions> hedgeOptions);
+                             boost::optional<HedgeOptions> hedgeOptions,
+                             FireAndForgetMode fireAndForgetMode);
 
     // Internal id of this request. Not interpreted and used for tracing purposes only.
     RequestId id;
@@ -84,10 +84,14 @@ struct RemoteCommandRequestBase {
 
     boost::optional<HedgeOptions> hedgeOptions;
 
+    boost::optional<UUID> operationKey;
+
+    FireAndForgetMode fireAndForgetMode;
+
     Milliseconds timeout = kNoTimeout;
 
-    // Deadline by when the request must be completed
-    Date_t expirationDate = kNoExpirationDate;
+    // Time when the request was scheduled.
+    boost::optional<Date_t> dateScheduled;
 
     transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
 
@@ -120,50 +124,51 @@ struct RemoteCommandRequestImpl : RemoteCommandRequestBase {
                              const BSONObj& theCmdObj,
                              const BSONObj& metadataObj,
                              OperationContext* opCtx,
-                             Milliseconds timeoutMillis,
-                             boost::optional<HedgeOptions> hedgeOptions);
-
-    RemoteCommandRequestImpl(RequestId requestId,
-                             const Target& theTarget,
-                             const std::string& theDbName,
-                             const BSONObj& theCmdObj,
-                             const BSONObj& metadataObj,
-                             OperationContext* opCtx,
-                             Milliseconds timeoutMillis);
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff);
 
     RemoteCommandRequestImpl(const Target& theTarget,
                              const std::string& theDbName,
                              const BSONObj& theCmdObj,
                              const BSONObj& metadataObj,
                              OperationContext* opCtx,
-                             Milliseconds timeoutMillis,
-                             boost::optional<HedgeOptions> hedgeOptions);
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff);
 
     RemoteCommandRequestImpl(const Target& theTarget,
                              const std::string& theDbName,
                              const BSONObj& theCmdObj,
                              const BSONObj& metadataObj,
                              OperationContext* opCtx,
-                             Milliseconds timeoutMillis = kNoTimeout)
-        : RemoteCommandRequestImpl(
-              theTarget, theDbName, theCmdObj, metadataObj, opCtx, timeoutMillis, boost::none) {}
+                             boost::optional<HedgeOptions> hedgeOptions,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff)
+        : RemoteCommandRequestImpl(theTarget,
+                                   theDbName,
+                                   theCmdObj,
+                                   metadataObj,
+                                   opCtx,
+                                   kNoTimeout,
+                                   hedgeOptions,
+                                   fireAndForgetMode) {}
+
 
     RemoteCommandRequestImpl(const Target& theTarget,
                              const std::string& theDbName,
                              const BSONObj& theCmdObj,
-                             const BSONObj& metadataObj,
                              OperationContext* opCtx,
-                             boost::optional<HedgeOptions> hedgeOptions)
-        : RemoteCommandRequestImpl(
-              theTarget, theDbName, theCmdObj, metadataObj, opCtx, kNoTimeout, hedgeOptions) {}
-
-    RemoteCommandRequestImpl(const Target& theTarget,
-                             const std::string& theDbName,
-                             const BSONObj& theCmdObj,
-                             OperationContext* opCtx,
-                             Milliseconds timeoutMillis = kNoTimeout)
-        : RemoteCommandRequestImpl(
-              theTarget, theDbName, theCmdObj, rpc::makeEmptyMetadata(), opCtx, timeoutMillis) {}
+                             Milliseconds timeoutMillis = kNoTimeout,
+                             boost::optional<HedgeOptions> hedgeOptions = boost::none,
+                             FireAndForgetMode fireAndForgetMode = FireAndForgetMode::kOff)
+        : RemoteCommandRequestImpl(theTarget,
+                                   theDbName,
+                                   theCmdObj,
+                                   rpc::makeEmptyMetadata(),
+                                   opCtx,
+                                   timeoutMillis,
+                                   hedgeOptions,
+                                   fireAndForgetMode) {}
 
     std::string toString() const;
 

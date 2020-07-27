@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -178,7 +178,7 @@ __config_merge_scan(
         cp->entries[cp->entries_next].strip = strip;
         ++cp->entries_next;
     }
-    WT_ERR_NOTFOUND_OK(ret);
+    WT_ERR_NOTFOUND_OK(ret, false);
 
 err:
     __wt_scr_free(session, &kb);

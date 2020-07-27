@@ -40,6 +40,7 @@
 #include "mongo/db/create_indexes_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 
@@ -56,11 +57,9 @@ constexpr size_t kMaxBatchSize = 1000;
 
 // Used to refresh or remove items from the session collection with write
 // concern majority
-const BSONObj kMajorityWriteConcern =
-    WriteConcernOptions(WriteConcernOptions::kMajority,
-                        WriteConcernOptions::SyncMode::UNSET,
-                        WriteConcernOptions::kWriteConcernTimeoutSystem)
-        .toBSON();
+const WriteConcernOptions kMajorityWriteConcern{WriteConcernOptions::kMajority,
+                                                WriteConcernOptions::SyncMode::UNSET,
+                                                WriteConcernOptions::kWriteConcernTimeoutSystem};
 
 
 BSONObj lsidQuery(const LogicalSessionId& lsid) {
@@ -198,7 +197,7 @@ void SessionsCollection::_doRefresh(const NamespaceString& ns,
         batch->append("update", ns.coll());
         batch->append("ordered", false);
         batch->append("allowImplicitCollectionCreation", false);
-        batch->append(WriteConcernOptions::kWriteConcernField, kMajorityWriteConcern);
+        batch->append(WriteConcernOptions::kWriteConcernField, kMajorityWriteConcern.toBSON());
     };
 
     auto add = [](BSONArrayBuilder* entries, const LogicalSessionRecord& record) {
@@ -215,7 +214,7 @@ void SessionsCollection::_doRemove(const NamespaceString& ns,
     auto init = [ns](BSONObjBuilder* batch) {
         batch->append("delete", ns.coll());
         batch->append("ordered", false);
-        batch->append(WriteConcernOptions::kWriteConcernField, kMajorityWriteConcern);
+        batch->append(WriteConcernOptions::kWriteConcernField, kMajorityWriteConcern.toBSON());
     };
 
     auto add = [](BSONArrayBuilder* builder, const LogicalSessionId& lsid) {
@@ -236,7 +235,10 @@ LogicalSessionIdSet SessionsCollection::_doFindRemoved(
     LogicalSessionIdSet removed{sessions.begin(), sessions.end()};
 
     auto wrappedSend = [&](BSONObj batch) {
-        auto swBatchResult = send(batch);
+        BSONObjBuilder batchWithReadConcernLocal(batch);
+        batchWithReadConcernLocal.append(repl::ReadConcernArgs::kReadConcernFieldName,
+                                         repl::ReadConcernArgs::kImplicitDefault);
+        auto swBatchResult = send(batchWithReadConcernLocal.obj());
 
         auto result =
             SessionsCollectionFetchResult::parse("SessionsCollectionFetchResult"_sd, swBatchResult);
@@ -281,7 +283,9 @@ BSONObj SessionsCollection::generateCreateIndexesCmd() {
     createIndexes.setCreateIndexes(NamespaceString::kLogicalSessionsNamespace.coll());
     createIndexes.setIndexes(std::move(indexes));
 
-    return createIndexes.toBSON();
+    return BSONObjBuilder(createIndexes.toBSON())
+        .append(WriteConcernOptions::kWriteConcernField, WriteConcernOptions::kImplicitDefault)
+        .obj();
 }
 
 BSONObj SessionsCollection::generateCollModCmd() {
@@ -294,6 +298,8 @@ BSONObj SessionsCollection::generateCollModCmd() {
     indexBuilder << "expireAfterSeconds" << localLogicalSessionTimeoutMinutes * 60;
 
     indexBuilder.done();
+    collModCmdBuilder.append(WriteConcernOptions::kWriteConcernField,
+                             WriteConcernOptions::kImplicitDefault);
     collModCmdBuilder.done();
 
     return collModCmdBuilder.obj();

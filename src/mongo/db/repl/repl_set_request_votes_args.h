@@ -32,6 +32,7 @@
 #include <string>
 
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
 
 namespace mongo {
 
@@ -48,7 +49,8 @@ public:
     long long getCandidateIndex() const;
     long long getConfigVersion() const;
     long long getConfigTerm() const;
-    OpTime getLastDurableOpTime() const;
+    ConfigVersionAndTerm getConfigVersionAndTerm() const;
+    OpTime getLastAppliedOpTime() const;
     bool isADryRun() const;
 
     void addToBSON(BSONObjBuilder* builder) const;
@@ -62,7 +64,7 @@ private:
     long long _cfgVer = -1;  // replSet config version known to the command issuer.
     // replSet config term known to the command issuer.
     long long _cfgTerm = OpTime::kUninitializedTerm;
-    OpTime _lastDurableOpTime;  // The last known durable op of the command issuer.
+    OpTime _lastAppliedOpTime;  // The OpTime of the last known applied op of the command issuer.
     bool _dryRun = false;       // Indicates this is a pre-election check when true.
 };
 

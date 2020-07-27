@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -45,8 +45,8 @@
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
-#include "mongo/db/pipeline/mongos_process_interface.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/process_interface/mongos_process_interface.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
@@ -76,7 +76,6 @@
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
@@ -117,12 +116,14 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
 
     // Create the expression context, and set 'inMongos' to true. We explicitly do *not* set
     // mergeCtx->tempDir.
-    auto mergeCtx = new ExpressionContext(opCtx,
-                                          request,
-                                          std::move(collation),
-                                          std::make_shared<MongoSInterface>(),
-                                          std::move(resolvedNamespaces),
-                                          uuid);
+    auto mergeCtx = make_intrusive<ExpressionContext>(
+        opCtx,
+        request,
+        std::move(collation),
+        std::make_shared<MongosProcessInterface>(
+            Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor()),
+        std::move(resolvedNamespaces),
+        uuid);
 
     mergeCtx->inMongos = true;
     return mergeCtx;
@@ -266,7 +267,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
             opCtx, request, collationObj, uuid, resolveInvolvedNamespaces(involvedNamespaces));
 
         // Parse and optimize the full pipeline.
-        auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), expCtx));
+        auto pipeline = Pipeline::parse(request.getPipeline(), expCtx);
         pipeline->optimizePipeline();
         return pipeline;
     };
@@ -286,7 +287,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         // passthrough, we only need a bare minimum expression context anyway.
         invariant(targeter.policy ==
                   cluster_aggregation_planner::AggregationTargeter::kPassthrough);
-        expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr);
+        expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, namespaces.executionNss);
     }
 
     if (request.getExplain()) {
@@ -331,6 +332,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
             case cluster_aggregation_planner::AggregationTargeter::TargetingPolicy::kAnyShard: {
                 return cluster_aggregation_planner::dispatchPipelineAndMerge(
                     opCtx,
+                    expCtx->mongoProcessInterface->taskExecutor,
                     std::move(targeter),
                     request.serializeToCommandObj(),
                     request.getBatchSize(),
@@ -345,9 +347,11 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         MONGO_UNREACHABLE;
     }();
 
-    if (status.isOK())
+    if (status.isOK()) {
         updateHostsTargetedMetrics(opCtx, namespaces.executionNss, routingInfo, involvedNamespaces);
-
+        // Report usage statistics for each stage in the pipeline.
+        liteParsedPipeline.tickGlobalStageCounters();
+    }
     return status;
 }
 

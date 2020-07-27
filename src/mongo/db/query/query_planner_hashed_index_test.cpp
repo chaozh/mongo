@@ -560,6 +560,11 @@ TEST_F(QueryPlannerHashedTest, SortWhenHashedFieldIsPrefix) {
                   << "hashed"
                   << "y" << -1 << "z" << 1));
 
+    // Verify that sort on a hashed field results in collection scan.
+    runQueryAsCommand(fromjson("{filter: {}, sort: {x: 1}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists("{sort: {pattern: {x: 1}, limit: 0, node: {cscan: {dir: 1}} }}");
+
     // Verify that a list of exact match predicates on hashed field (prefix) and sort with an
     // immediate range field can use 'SORT_MERGE'.
     runQueryAsCommand(fromjson("{filter: {x: {$in: [1, 2]}}, sort: {y: 1}}"));
@@ -573,31 +578,47 @@ TEST_F(QueryPlannerHashedTest, SortWhenHashedFieldIsPrefix) {
         getHashedBound(2) +
         "], y: [['MinKey','MaxKey',true,true]], z: [['MaxKey','MinKey',true,true]]}}}]}}}}");
 
-    // Verify that an exact match predicate on hashed field (prefix) and sort with an immediate
-    // range field can use 'SORT_MERGE'.
-    runQueryAsCommand(fromjson("{filter: {x: 1}, sort: {y: -1}}"));
+    // Verify that an equality predicate on hashed field (prefix) and sort with an immediate
+    // range field can be sorted by the index.
+    runQueryAsCommand(fromjson("{filter: {x: 1}, sort: {y: 1, z: -1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{fetch: {filter: {x: {$eq: 1}}, node: {mergeSort: {nodes: [{ixscan: {pattern: {x: "
-        "'hashed', y: -1, z: 1}, bounds: {x: [" +
+        "{fetch: {filter: {x: {$eq: 1}}, node: {ixscan: {pattern: {x: "
+        "'hashed', y: -1, z: 1}, dir: -1, bounds: {x: [" +
         getHashedBound(1) +
-        "], y: [['MaxKey','MinKey',true,true]], z: [['MinKey','MaxKey',true,true]] }}}] }}}}");
+        "], y: [['MinKey','MaxKey',true,true]], z: [['MaxKey','MinKey',true,true]] } }} }}");
+
+    // {$exists: false} is treated as a point-interval in BSONNULL. Hence index can provide the
+    // sort.
+    runQueryAsCommand(fromjson("{filter: {x: {$exists: false}}, sort: {y: 1, z: -1}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {x: {$exists: false}}, node: {ixscan: {pattern: {x: 'hashed', y: -1, z: "
+        "1}, dir: -1, bounds: {x: [" +
+        getHashedBound(BSONNULL) +
+        "], y: [['MinKey','MaxKey',true,true]], z: [['MaxKey','MinKey',true,true]] } }} }}");
 
     // Sort on any index field other than the one immediately following the hashed field will use a
     // blocking sort.
     runQueryAsCommand(fromjson("{filter: {x: 3}, sort: {z: 1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {z:1}, limit: 0, node: {sortKeyGen: {node: {fetch: {filter: {x: {$eq: "
+        "{sort: {pattern: {z:1}, limit: 0, type: 'simple', node: {fetch: {filter: {x: {$eq: "
         "3}}, node: {ixscan: {pattern: {x: 'hashed', y: -1, z: 1}, bounds: {x: [" +
         getHashedBound(3) +
-        "], y: [['MaxKey','MinKey',true,true]], z: [['MinKey','MaxKey',true,true]]} }} }} }} }}");
+        "], y: [['MaxKey','MinKey',true,true]], z: [['MinKey','MaxKey',true,true]]} }} }} }}");
 }
 
 TEST_F(QueryPlannerHashedTest, SortWhenNonHashedFieldIsPrefix) {
     addIndex(BSON("x" << 1 << "y" << -1 << "z"
                       << "hashed"
                       << "a" << 1));
+
+    // Verify that sort on a hashed field results in collection scan.
+    runQueryAsCommand(fromjson("{filter: {}, sort: {x: 1, y: -1, z: 1}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{sort: {pattern: {x: 1, y: -1, z: 1}, limit: 0, node: {cscan: {dir: 1}} }}");
 
     // Verify that a list of exact match predicates on range field (prefix) and sort with an
     // immediate range field can use 'SORT_MERGE'.
@@ -619,7 +640,7 @@ TEST_F(QueryPlannerHashedTest, SortWhenNonHashedFieldIsPrefix) {
     assertNumSolutions(1U);
     assertSolutionExists(
         "{proj: {spec: {_id: 0, a: 1}, node: {ixscan: {pattern: {x: "
-        "1, y: -1, z: 'hashed', a: 1}, bounds: {x: [[1,1,true,true]], y: "
+        "1, y: -1, z: 'hashed', a: 1}, dir: 1, bounds: {x: [[1,1,true,true]], y: "
         "[['MaxKey','MinKey',true,true]], z: [['MinKey','MaxKey',true,true]], a: "
         "[['MinKey','MaxKey',true,true]]}}}}}");
 
@@ -629,19 +650,60 @@ TEST_F(QueryPlannerHashedTest, SortWhenNonHashedFieldIsPrefix) {
     runQueryAsCommand(fromjson("{filter: {x: 3}, sort: {a: 1}, projection: {_id: 0, y: 1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{proj: {spec: {_id: 0, y: 1}, node: {sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen: "
-        "{node: {ixscan: {pattern: {x: 1, y: -1, z: 'hashed', a: 1}, bounds: {x: "
+        "{proj: {spec: {_id: 0, y: 1}, node: "
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'default', node: "
+        "{ixscan: {pattern: {x: 1, y: -1, z: 'hashed', a: 1}, bounds: {x: "
         "[[3,3,true,true]], y: [['MaxKey','MinKey',true,true]], z: "
-        "[['MinKey','MaxKey',true,true]], a: [['MinKey','MaxKey',true,true]]} }} }} }} }} ");
+        "[['MinKey','MaxKey',true,true]], a: [['MinKey','MaxKey',true,true]]} }} }} }}");
 
     //  Verify that sort on a hashed field requires a fetch and a blocking sort stage.
     runQueryAsCommand(fromjson("{filter: {x: 3}, sort: {z: 1}, projection: {_id: 0, y: 1}}"));
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{proj: {spec: {_id: 0, y: 1}, node: {sort: {pattern: {z:1}, limit: 0, node: {sortKeyGen: "
-        "{node: {fetch: {filter: null, node: {ixscan: {pattern: {x: 1, y: -1, z: 'hashed', a: 1}, "
+        "{proj: {spec: {_id: 0, y: 1}, node: "
+        "{sort: {pattern: {z:1}, limit: 0, type: 'simple', node: "
+        "{fetch: {filter: null, node: {ixscan: {pattern: {x: 1, y: -1, z: 'hashed', a: 1}, "
         "bounds: {x: [[3,3,true,true]], y: [['MaxKey','MinKey',true,true]], z: "
-        "[['MinKey','MaxKey',true,true]], a: [['MinKey','MaxKey',true,true]]} }} }} }} }} }}");
+        "[['MinKey','MaxKey',true,true]], a: [['MinKey','MaxKey',true,true]]} }} }} }} }}");
+}
+
+TEST_F(QueryPlannerHashedTest, SortWithMissingOrIrrelevantQueryPredicate) {
+    addIndex(BSON("x" << 1 << "y" << -1 << "z"
+                      << "hashed"
+                      << "a" << 1));
+
+    // Verify that a sort on non-hashed fields doesn't require any additional sort stages. The
+    // entire operation can be answered by the index. Also verify that if the projection only
+    // includes non-hashed index fields, plan does not use a fetch stage.
+    runQueryAsCommand(
+        fromjson("{filter: {}, sort: {x: 1, y: -1}, projection: {_id: 0, x: 1, y: 1, a: 1}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, x: 1, y: 1, a: 1}, node: {ixscan: {pattern: {x: 1, y: -1, z: "
+        "'hashed', a: 1}, bounds: {x: [['MinKey','MaxKey',true,true]], y: "
+        "[['MaxKey','MinKey',true,true]], z: [['MinKey','MaxKey',true,true]], a: "
+        "[['MinKey','MaxKey',true,true]]} }} }}");
+
+    // Verify that a sort on non-hashed fields with a query predicate on fields irrelevant to the
+    // index, doesn't require any additional sort stages.
+    runQueryAsCommand(fromjson("{filter: {p: 5}, sort: {x: 1, y: -1}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{fetch: {filter: {p: {$eq: 5}}, node: {ixscan: {pattern: {x: 1, y: -1, z: 'hashed', a: "
+        "1}, bounds: {x: [['MinKey','MaxKey',true,true]], y: [['MaxKey','MinKey',true,true]], z: "
+        "[['MinKey','MaxKey',true,true]], a: [['MinKey','MaxKey',true,true]]} }} }}");
+
+    // Verify that a sort on non-hashed fields doesn't require any additional sort stages. The
+    // entire operation can be answered by the index. Also verify that if the projection includes
+    // hashed fields, the operation will require a fetch stage.
+    runQueryAsCommand(
+        fromjson("{filter: {}, sort: {x: 1, y: -1}, projection: {_id: 0, x: 1, z: 1}}"));
+    assertNumSolutions(1U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, x: 1, z: 1}, node: {fetch: {filter: null, node: {ixscan: "
+        "{pattern: {x: 1, y: -1, z: 'hashed', a: 1}, bounds: {x: [['MinKey','MaxKey',true,true]], "
+        "y: [['MaxKey','MinKey',true,true]], z: [['MinKey','MaxKey',true,true]], a: "
+        "[['MinKey','MaxKey',true,true]]} }} }} }}");
 }
 
 //
@@ -916,7 +978,6 @@ TEST_F(QueryPlannerHashedTest, MinMaxParameter) {
     assertSolutionExists(
         "{fetch: {filter: {x: {$eq: 5}}, node: {ixscan: {filter: null, pattern: {x: 'hashed', y: "
         "1} }}}}");
-
 
     addIndex(BSON("x" << 1 << "y"
                       << "hashed"));

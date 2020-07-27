@@ -31,7 +31,6 @@
 
 #include "mongo/base/status.h"
 #include "mongo/logger/appender.h"
-#include "mongo/logger/log_version_util.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logv2/log_component.h"
 #include "mongo/logv2/log_detail.h"
@@ -47,7 +46,6 @@ namespace {
 
 auto findTeeTag(StringData teeName) {
     static constexpr std::pair<StringData, logv2::LogTag::Value> kTees[] = {
-        {"rs"_sd, logv2::LogTag::kRS},
         {"startupWarnings"_sd, logv2::LogTag::kStartupWarnings},
     };
     if (teeName.empty())
@@ -88,7 +86,7 @@ public:
                 0,
                 logv2::LogSeverity::cast(event.getSeverity().toInt()),
                 logv2::LogOptions{
-                    logComponentV1toV2(event.getComponent()),
+                    event.getComponent(),
                     _domain,
                     logv2::LogTag{static_cast<logv2::LogTag::Value>(
                         static_cast<std::underlying_type_t<logv2::LogTag::Value>>(logTagValue) |
@@ -107,11 +105,14 @@ public:
             // Similarly, we need to transcode the options. They don't offer a cast
             // operator, so we need to do some metaprogramming on the types.
             logv2::LogOptions{
-                logComponentV1toV2(event.getComponent()),
+                event.getComponent(),
                 _domain,
                 logv2::LogTag{static_cast<logv2::LogTag::Value>(
                     static_cast<std::underlying_type_t<logv2::LogTag::Value>>(logTagValue) |
-                    static_cast<std::underlying_type_t<logv2::LogTag::Value>>(_tag))}},
+                    static_cast<std::underlying_type_t<logv2::LogTag::Value>>(_tag))},
+                event.isTruncatable() ? logv2::LogTruncation::Enabled
+                                      : logv2::LogTruncation::Disabled,
+                logv2::FatalMode::kContinue},
 
             "{}",
             "message"_attr = message);

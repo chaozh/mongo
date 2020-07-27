@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,13 +36,16 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/logical_clock.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
@@ -59,7 +62,6 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/chunk_manager_targeter.h"
 #include "mongo/s/write_ops/cluster_write.h"
-#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -206,7 +208,7 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
     boost::optional<BSONObj> upsertedId;
     if (isRetryableWrite) {
         if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
-            log() << "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint";
+            LOGV2(22759, "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
             hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
         }
         RouterOperationContextSession routerSession(opCtx);
@@ -358,39 +360,29 @@ private:
      *
      * Does *not* retry or retarget if the metadata is stale.
      */
-    static Status _commandOpWrite(OperationContext* opCtx,
-                                  const std::string& dbName,
-                                  const BSONObj& command,
-                                  BatchItemRef targetingBatchItem,
-                                  std::vector<Strategy::CommandResult>* results) {
-        // Note that this implementation will not handle targeting retries and does not completely
-        // emulate write behavior
-        ChunkManagerTargeter targeter(targetingBatchItem.getRequest()->getNS());
-        Status status = targeter.init(opCtx);
-        if (!status.isOK())
-            return status;
+    static void _commandOpWrite(OperationContext* opCtx,
+                                const NamespaceString& nss,
+                                const BSONObj& command,
+                                BatchItemRef targetingBatchItem,
+                                std::vector<AsyncRequestsSender::Response>* results) {
+        auto endpoints = [&] {
+            // Note that this implementation will not handle targeting retries and does not
+            // completely emulate write behavior
+            ChunkManagerTargeter targeter(opCtx, nss);
 
-        auto swEndpoints = [&]() -> StatusWith<std::vector<ShardEndpoint>> {
             if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Insert) {
-                auto swEndpoint = targeter.targetInsert(opCtx, targetingBatchItem.getDocument());
-                if (!swEndpoint.isOK())
-                    return swEndpoint.getStatus();
-                return std::vector<ShardEndpoint>{std::move(swEndpoint.getValue())};
+                return std::vector{targeter.targetInsert(opCtx, targetingBatchItem.getDocument())};
             } else if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Update) {
-                return targeter.targetUpdate(opCtx, targetingBatchItem.getUpdate());
+                return targeter.targetUpdate(opCtx, targetingBatchItem);
             } else if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Delete) {
-                return targeter.targetDelete(opCtx, targetingBatchItem.getDelete());
-            } else {
-                MONGO_UNREACHABLE;
+                return targeter.targetDelete(opCtx, targetingBatchItem);
             }
+            MONGO_UNREACHABLE;
         }();
-
-        if (!swEndpoints.isOK())
-            return swEndpoints.getStatus();
 
         // Assemble requests
         std::vector<AsyncRequestsSender::Request> requests;
-        for (const auto& endpoint : swEndpoints.getValue()) {
+        for (const auto& endpoint : endpoints) {
             BSONObj cmdObjWithVersions = BSONObj(command);
             if (endpoint.databaseVersion) {
                 cmdObjWithVersions =
@@ -406,36 +398,20 @@ private:
         MultiStatementTransactionRequestsSender ars(
             opCtx,
             Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-            dbName,
+            nss.db(),
             requests,
             readPref,
             Shard::RetryPolicy::kNoRetry);
 
-        // Receive the responses.
-
-        Status dispatchStatus = Status::OK();
         while (!ars.done()) {
             // Block until a response is available.
             auto response = ars.next();
-
-            if (!response.swResponse.isOK()) {
-                dispatchStatus = std::move(response.swResponse.getStatus());
-                break;
-            }
-
-            Strategy::CommandResult result;
+            uassertStatusOK(response.swResponse);
 
             // If the response status was OK, the response must contain which host was targeted.
             invariant(response.shardHostAndPort);
-            result.target = ConnectionString(std::move(*response.shardHostAndPort));
-
-            result.shardTargetId = std::move(response.shardId);
-            result.result = std::move(response.swResponse.getValue().data);
-
-            results->push_back(result);
+            results->push_back(response);
         }
-
-        return dispatchStatus;
     }
 };
 
@@ -443,11 +419,13 @@ class ClusterWriteCmd::InvocationBase : public CommandInvocation {
 public:
     InvocationBase(const ClusterWriteCmd* command,
                    const OpMsgRequest& request,
-                   BatchedCommandRequest batchedRequest)
+                   BatchedCommandRequest batchedRequest,
+                   UpdateMetrics* updateMetrics = nullptr)
         : CommandInvocation(command),
           _bypass{shouldBypassDocumentValidationForCommand(request.body)},
           _request{&request},
-          _batchedRequest{std::move(batchedRequest)} {}
+          _batchedRequest{std::move(batchedRequest)},
+          _updateMetrics{updateMetrics} {}
 
     const BatchedCommandRequest& getBatchedRequest() const {
         return _batchedRequest;
@@ -466,6 +444,30 @@ private:
                  BSONObjBuilder& result) const {
         BatchWriteExecStats stats;
         BatchedCommandResponse response;
+
+        // The batched request will only have WC if it was supplied by the client. Otherwise, the
+        // batched request should use the WC from the opCtx.
+        if (!batchedRequest.hasWriteConcern()) {
+            if (opCtx->getWriteConcern().usedDefault) {
+                // Pass writeConcern: {}, rather than {w: 1, wtimeout: 0}, so as to not override the
+                // configsvr w:majority upconvert.
+                batchedRequest.setWriteConcern(BSONObj());
+            } else {
+                batchedRequest.setWriteConcern(opCtx->getWriteConcern().toBSON());
+            }
+        }
+
+        // Write ops are never allowed to have writeConcern inside transactions. Normally
+        // disallowing WC on non-terminal commands in a transaction is handled earlier, during
+        // command dispatch. However, if this is a regular write operation being automatically
+        // retried inside a transaction (such as changing a document's shard key across shards),
+        // then batchedRequest will have a writeConcern (added by the if() above) from when it was
+        // initially run outside a transaction. Thus it's necessary to unconditionally clear the
+        // writeConcern when in a transaction.
+        if (TransactionRouter::get(opCtx)) {
+            batchedRequest.unsetWriteConcern();
+        }
+
         ClusterWriter::write(opCtx, batchedRequest, &stats, &response);
 
         bool updatedShardKey = false;
@@ -491,26 +493,51 @@ private:
 
         // TODO: increase opcounters by more than one
         auto& debug = CurOp::get(opCtx)->debug();
+        auto catalogCache = Grid::get(opCtx)->catalogCache();
         switch (_batchedRequest.getBatchType()) {
             case BatchedCommandRequest::BatchType_Insert:
                 for (size_t i = 0; i < numAttempts; ++i) {
                     globalOpCounters.gotInsert();
                 }
+                catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
+                                                                      mongo::LogicalOp::opInsert);
                 debug.additiveMetrics.ninserted = response.getN();
                 break;
             case BatchedCommandRequest::BatchType_Update:
                 for (size_t i = 0; i < numAttempts; ++i) {
                     globalOpCounters.gotUpdate();
                 }
+                catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
+                                                                      mongo::LogicalOp::opUpdate);
                 debug.upsert = response.isUpsertDetailsSet();
                 debug.additiveMetrics.nMatched =
                     response.getN() - (debug.upsert ? response.sizeUpsertDetails() : 0);
                 debug.additiveMetrics.nModified = response.getNModified();
+
+                invariant(_updateMetrics);
+                for (auto&& update : _batchedRequest.getUpdateRequest().getUpdates()) {
+                    // If this was a pipeline style update, record that pipeline-style was used and
+                    // which stages were being used.
+                    auto updateMod = update.getU();
+                    if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
+                        auto pipeline = LiteParsedPipeline(_batchedRequest.getNS(),
+                                                           updateMod.getUpdatePipeline());
+                        pipeline.tickGlobalStageCounters();
+                        _updateMetrics->incrementExecutedWithAggregationPipeline();
+                    }
+
+                    // If this command had arrayFilters option, record that it was used.
+                    if (update.getArrayFilters()) {
+                        _updateMetrics->incrementExecutedWithArrayFilters();
+                    }
+                }
                 break;
             case BatchedCommandRequest::BatchType_Delete:
                 for (size_t i = 0; i < numAttempts; ++i) {
                     globalOpCounters.gotDelete();
                 }
+                catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
+                                                                      mongo::LogicalOp::opDelete);
                 debug.additiveMetrics.ndeleted = response.getN();
                 break;
         }
@@ -561,15 +588,12 @@ private:
 
         // Target the command to the shards based on the singleton batch item.
         BatchItemRef targetingBatchItem(&_batchedRequest, 0);
-        std::vector<Strategy::CommandResult> shardResults;
-        uassertStatusOK(_commandOpWrite(opCtx,
-                                        _request->getDatabase().toString(),
-                                        explainCmd,
-                                        targetingBatchItem,
-                                        &shardResults));
+        std::vector<AsyncRequestsSender::Response> shardResponses;
+        _commandOpWrite(
+            opCtx, _batchedRequest.getNS(), explainCmd, targetingBatchItem, &shardResponses);
         auto bodyBuilder = result->getBodyBuilder();
         uassertStatusOK(ClusterExplain::buildExplainResult(
-            opCtx, shardResults, ClusterExplain::kWriteOnShards, timer.millis(), &bodyBuilder));
+            opCtx, shardResponses, ClusterExplain::kWriteOnShards, timer.millis(), &bodyBuilder));
     }
 
     NamespaceString ns() const override {
@@ -600,6 +624,9 @@ private:
     bool _bypass;
     const OpMsgRequest* _request;
     BatchedCommandRequest _batchedRequest;
+
+    // Update related command execution metrics.
+    UpdateMetrics* const _updateMetrics;
 };
 
 class ClusterInsertCmd final : public ClusterWriteCmd {
@@ -637,7 +664,7 @@ private:
 
 class ClusterUpdateCmd final : public ClusterWriteCmd {
 public:
-    ClusterUpdateCmd() : ClusterWriteCmd("update") {}
+    ClusterUpdateCmd() : ClusterWriteCmd("update"), _updateMetrics{"update"} {}
 
 private:
     class Invocation final : public InvocationBase {
@@ -658,7 +685,8 @@ private:
                 "Cannot specify runtime constants option to a mongos",
                 !parsedRequest.hasRuntimeConstants());
         parsedRequest.setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
-        return std::make_unique<Invocation>(this, request, std::move(parsedRequest));
+        return std::make_unique<Invocation>(
+            this, request, std::move(parsedRequest), &_updateMetrics);
     }
 
     std::string help() const override {
@@ -668,6 +696,9 @@ private:
     LogicalOp getLogicalOp() const override {
         return LogicalOp::opUpdate;
     }
+
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } clusterUpdateCmd;
 
 class ClusterDeleteCmd final : public ClusterWriteCmd {

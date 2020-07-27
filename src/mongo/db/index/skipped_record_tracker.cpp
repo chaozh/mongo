@@ -27,23 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/skipped_record_tracker.h"
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
 static constexpr StringData kRecordIdField = "recordId"_sd;
 }
 
-void SkippedRecordTracker::deleteTemporaryTable(OperationContext* opCtx) {
+void SkippedRecordTracker::finalizeTemporaryTable(OperationContext* opCtx,
+                                                  TemporaryRecordStore::FinalizationAction action) {
     if (_skippedRecordsTable) {
-        _skippedRecordsTable->deleteTemporaryTable(opCtx);
+        _skippedRecordsTable->finalizeTemporaryTable(opCtx, action);
     }
 }
 
@@ -55,10 +56,14 @@ void SkippedRecordTracker::record(OperationContext* opCtx, const RecordId& recor
         _skippedRecordsTable =
             opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx);
     }
+    // A WriteUnitOfWork may not already be active if the originating operation was part of an
+    // insert into the external sorter.
+    WriteUnitOfWork wuow(opCtx);
     uassertStatusOK(
         _skippedRecordsTable->rs()
             ->insertRecord(opCtx, toInsert.objdata(), toInsert.objsize(), Timestamp::min())
             .getStatus());
+    wuow.commit();
 }
 
 bool SkippedRecordTracker::areAllRecordsApplied(OperationContext* opCtx) const {
@@ -84,7 +89,10 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
 
     InsertDeleteOptions options;
     collection->getIndexCatalog()->prepareInsertDeleteOptions(
-        opCtx, _indexCatalogEntry->descriptor(), &options);
+        opCtx,
+        _indexCatalogEntry->getNSSFromCatalog(opCtx),
+        _indexCatalogEntry->descriptor(),
+        &options);
     options.fromIndexBuilder = true;
 
     // This should only be called when constraints are being enforced, on a primary. It does not
@@ -115,15 +123,18 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
         auto skippedRecord = collCursor->seekExact(skippedRecordId);
         if (skippedRecord) {
             const auto skippedDoc = skippedRecord->data.toBson();
-            LOG(2) << "reapplying skipped RecordID " << skippedRecordId << ": " << skippedDoc;
+            LOGV2_DEBUG(23882,
+                        2,
+                        "reapplying skipped RecordID {skippedRecordId}: {skippedDoc}",
+                        "skippedRecordId"_attr = skippedRecordId,
+                        "skippedDoc"_attr = skippedDoc);
 
             try {
                 // Because constraint enforcement is set, this will throw if there are any indexing
                 // errors, instead of writing back to the skipped records table, which would
                 // normally happen if constraints were relaxed.
-                InsertResult result;
                 auto status = _indexCatalogEntry->accessMethod()->insert(
-                    opCtx, skippedDoc, skippedRecordId, options, &result);
+                    opCtx, collection, skippedDoc, skippedRecordId, options, nullptr, nullptr);
                 if (!status.isOK()) {
                     return status;
                 }
@@ -145,8 +156,13 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
     progress->finished();
 
     int logLevel = (resolved > 0) ? 0 : 1;
-    LOG(logLevel) << "index build: reapplied " << resolved << " skipped records for index: "
-                  << _indexCatalogEntry->descriptor()->indexName();
+    LOGV2_DEBUG(23883,
+                logLevel,
+                "index build: reapplied {resolved} skipped records for index: "
+                "{indexCatalogEntry_descriptor_indexName}",
+                "resolved"_attr = resolved,
+                "indexCatalogEntry_descriptor_indexName"_attr =
+                    _indexCatalogEntry->descriptor()->indexName());
     return Status::OK();
 }
 

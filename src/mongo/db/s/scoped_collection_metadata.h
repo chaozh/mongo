@@ -34,11 +34,12 @@
 namespace mongo {
 
 /**
- * Acts like a shared pointer and exposes sharding filtering metadata to be used by server
- * operations. It is allowed to be referenced outside of collection lock, but all implementations
- * must be able to outlive the object from which they were obtained.
+ * Contains the parts of the sharding state for a particular collection, which do not change due to
+ * chunk move, split and merge. The implementation is allowed to be tighly coupled with the
+ * CollectionShardingState from which it was derived and because of this it must not be accessed
+ * outside of a collection lock.
  */
-class ScopedCollectionMetadata {
+class ScopedCollectionDescription {
 public:
     class Impl {
     public:
@@ -50,50 +51,58 @@ public:
         Impl() = default;
     };
 
-    ScopedCollectionMetadata(std::shared_ptr<Impl> impl) : _impl(std::move(impl)) {}
-
-    const auto& get() const {
-        return _impl->get();
-    }
-
-    const auto* operator-> () const {
-        return &get();
-    }
-
-    const auto& operator*() const {
-        return get();
-    }
+    ScopedCollectionDescription(std::shared_ptr<Impl> impl) : _impl(std::move(impl)) {}
 
     bool isSharded() const {
         return _impl->get().isSharded();
+    }
+
+    bool isValidKey(const BSONObj& key) const {
+        return _impl->get().isValidKey(key);
     }
 
     const BSONObj& getKeyPattern() const {
         return _impl->get().getKeyPattern();
     }
 
-    const BSONObj extractShardKeyFromDoc(const BSONObj& doc) const {
-        return _impl->get().getChunkManager()->getShardKeyPattern().extractShardKeyFromDoc(doc);
+    const std::vector<std::unique_ptr<FieldRef>>& getKeyPatternFields() const {
+        return _impl->get().getKeyPatternFields();
+    }
+
+    BSONObj getMinKey() const {
+        return _impl->get().getMinKey();
+    }
+
+    BSONObj getMaxKey() const {
+        return _impl->get().getMaxKey();
+    }
+
+    BSONObj extractDocumentKey(const BSONObj& doc) const {
+        return _impl->get().extractDocumentKey(doc);
+    }
+
+    bool uuidMatches(UUID uuid) const {
+        return _impl->get().uuidMatches(uuid);
     }
 
 protected:
     std::shared_ptr<Impl> _impl;
 };
 
-class ScopedCollectionFilter : public ScopedCollectionMetadata {
+/**
+ * Contains the parts of the sharding state for a particular collection, which can change due to
+ * chunk move, split and merge and represents a snapshot in time of these parts, specifically the
+ * chunk ownership. The implementation is allowed to be tightly coupled with the
+ * CollectionShardingState from which it was derived, but it must be allowed to be accessed outside
+ * of collection lock.
+ */
+class ScopedCollectionFilter : public ScopedCollectionDescription {
 public:
     ScopedCollectionFilter(std::shared_ptr<Impl> impl)
-        : ScopedCollectionMetadata(std::move(impl)) {}
-
-    ScopedCollectionFilter(ScopedCollectionMetadata&& scopedMetadata)
-        : ScopedCollectionMetadata(std::move(scopedMetadata)) {}
+        : ScopedCollectionDescription(std::move(impl)) {}
 
     bool keyBelongsToMe(const BSONObj& key) const {
         return _impl->get().keyBelongsToMe(key);
-    }
-
-    Chunk findIntersectingChunkWithSimpleCollation(const BSONObj& shardKey) const {
-        return _impl->get().getChunkManager()->findIntersectingChunkWithSimpleCollation(shardKey);
     }
 };
 

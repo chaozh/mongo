@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +38,8 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -122,16 +122,15 @@ public:
         }
 
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        bool background = cmdObj["background"].trueValue();
 
-        const bool background = cmdObj["background"].trueValue();
-
-        // Background validation requires the storage engine to support checkpoints because it
-        // performs the validation on a checkpoint using checkpoint cursors.
-        if (background && !opCtx->getServiceContext()->getStorageEngine()->supportsCheckpoints()) {
-            uasserted(ErrorCodes::CommandNotSupported,
-                      str::stream() << "Running validate on collection " << nss
-                                    << " with { background: true } is not supported on the "
-                                    << storageGlobalParams.engine << " storage engine");
+        // Background validation is not supported on the ephemeralForTest storage engine due to its
+        // lack of support for timestamps. Switch the mode to foreground validation instead.
+        if (background && storageGlobalParams.engine == "ephemeralForTest") {
+            LOGV2(4775400,
+                  "ephemeralForTest does not support background validation, switching to "
+                  "foreground validation");
+            background = false;
         }
 
         const bool fullValidate = cmdObj["full"].trueValue();
@@ -141,9 +140,20 @@ public:
                                     << " and { full: true } is not supported.");
         }
 
+        const bool enforceFastCount = cmdObj["enforceFastCount"].trueValue();
+        if (background && enforceFastCount) {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Running the validate command with both { background: true }"
+                                    << " and { enforceFastCount: true } is not supported.");
+        }
+
         if (!serverGlobalParams.quiet.load()) {
-            LOG(0) << "CMD: validate " << nss.ns() << (background ? ", background:true" : "")
-                   << (fullValidate ? ", full:true" : "");
+            LOGV2(20514,
+                  "CMD: validate",
+                  "namespace"_attr = nss,
+                  "background"_attr = background,
+                  "full"_attr = fullValidate,
+                  "enforceFastCount"_attr = enforceFastCount);
         }
 
         // Only one validation per collection can be in progress, the rest wait.
@@ -170,21 +180,47 @@ public:
             _validationNotifier.notify_all();
         });
 
-        auto options = (fullValidate) ? CollectionValidation::ValidateOptions::kFullValidation
-                                      : CollectionValidation::ValidateOptions::kNoFullValidation;
+        auto mode = [&] {
+            if (background)
+                return CollectionValidation::ValidateMode::kBackground;
+            if (enforceFastCount)
+                return CollectionValidation::ValidateMode::kForegroundFullEnforceFastCount;
+            if (fullValidate)
+                return CollectionValidation::ValidateMode::kForegroundFull;
+            return CollectionValidation::ValidateMode::kForeground;
+        }();
 
+        // External users cannot run validate with repair as there is no way yet for users to invoke
+        // it. It is only to be used by startup repair.
+        auto repairMode = CollectionValidation::RepairMode::kNone;
         ValidateResults validateResults;
-        Status status = CollectionValidation::validate(
-            opCtx, nss, options, background, &validateResults, &result);
+        Status status =
+            CollectionValidation::validate(opCtx, nss, mode, repairMode, &validateResults, &result);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
 
         result.appendBool("valid", validateResults.valid);
+        result.appendBool("repaired", validateResults.repaired);
+        if (validateResults.readTimestamp) {
+            result.append("readTimestamp", validateResults.readTimestamp.get());
+        }
         result.append("warnings", validateResults.warnings);
         result.append("errors", validateResults.errors);
         result.append("extraIndexEntries", validateResults.extraIndexEntries);
         result.append("missingIndexEntries", validateResults.missingIndexEntries);
+
+        // Need to convert RecordId to int64_t to append to BSONObjBuilder
+        BSONArrayBuilder builder;
+        for (RecordId corruptRecord : validateResults.corruptRecords) {
+            builder.append(corruptRecord.repr());
+        }
+        result.append("corruptRecords", builder.done());
+
+        if (validateResults.repaired) {
+            result.appendNumber("numRemovedCorruptRecords",
+                                validateResults.numRemovedCorruptRecords);
+        }
 
         if (!validateResults.valid) {
             result.append("advice",

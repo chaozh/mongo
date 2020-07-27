@@ -26,19 +26,19 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/commands/document_shard_key_update_util.h"
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -78,7 +78,7 @@ bool executeOperationsAsPartOfShardKeyUpdate(OperationContext* opCtx,
     }
 
     if (MONGO_unlikely(hangBeforeInsertOnUpdateShardKey.shouldFail())) {
-        log() << "Hit hangBeforeInsertOnUpdateShardKey failpoint";
+        LOGV2(22760, "Hit hangBeforeInsertOnUpdateShardKey failpoint");
         hangBeforeInsertOnUpdateShardKey.pauseWhileSet(opCtx);
     }
 

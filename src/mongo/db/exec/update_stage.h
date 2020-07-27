@@ -81,7 +81,7 @@ class UpdateStage : public RequiresMutableCollectionStage {
     UpdateStage& operator=(const UpdateStage&) = delete;
 
 public:
-    UpdateStage(OperationContext* opCtx,
+    UpdateStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
                 Collection* collection,
@@ -126,7 +126,7 @@ public:
                                                  const DuplicateKeyErrorInfo& errorInfo);
 
 protected:
-    UpdateStage(OperationContext* opCtx,
+    UpdateStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
                 Collection* collection);
@@ -147,11 +147,9 @@ protected:
     // Stats
     UpdateStats _specificStats;
 
-    // True if the request should be checked for an update to the shard key.
-    bool _shouldCheckForShardKeyUpdate;
-
-    // True if updated documents should be validated with storage_validation::storageValid().
-    bool _enforceOkForStorage;
+    // A user-initiated write is one which is not caused by oplog application and is not part of a
+    // chunk migration
+    bool _isUserInitiatedWrite;
 
     // These get reused for each update.
     mutablebson::Document& _doc;
@@ -190,8 +188,7 @@ private:
      * If the update changes shard key fields but the new shard key remains on the same node,
      * returns true. If the update does not change shard key fields, returns false.
      */
-    bool checkUpdateChangesShardKeyFields(ScopedCollectionMetadata metadata,
-                                          const Snapshotted<BSONObj>& oldObj);
+    bool checkUpdateChangesShardKeyFields(const Snapshotted<BSONObj>& oldObj);
 
     // If not WorkingSet::INVALID_ID, we use this rather than asking our child what to do next.
     WorkingSetID _idRetrying;

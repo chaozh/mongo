@@ -4,6 +4,7 @@
  */
 (function() {
 'use strict';
+
 let tests = [
     {
         callback: function() {
@@ -96,9 +97,9 @@ tests.forEach(function(t) {
             }
         }
         assert(matchShellExp);
-        assertMatch(/^\s*$/, lines.pop());
+        assertMatch(/\s*/, lines.pop());
         assertMatch(/exiting with code/, lines.pop());
-        assertMatch(new RegExp("\\\[js\\\] " + t.match + "$"), lines.shift());
+        assertMatch(new RegExp(t.match), lines.shift());
 
         if (t.stack == true) {
             assert.eq(lines.length,

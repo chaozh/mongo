@@ -1,7 +1,6 @@
 /**
  * Tests that initial sync will abort an attempt if the sync source is removed during cloning.
  * This test will timeout if the attempt is not aborted.
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
@@ -9,8 +8,7 @@
 load("jstests/libs/fail_point_util.js");
 
 const testName = "initial_sync_fails_when_source_removed";
-const rst =
-    new ReplSetTest({name: testName, nodes: [{}, {rsConfig: {priority: 0}}], allowChaining: true});
+const rst = new ReplSetTest({name: testName, nodes: [{}, {rsConfig: {priority: 0}}]});
 const nodes = rst.startSet();
 rst.initiate();
 
@@ -24,7 +22,7 @@ rst.awaitReplication();
 
 jsTest.log("Adding the initial sync destination node to the replica set");
 const initialSyncNode = rst.add({
-    rsConfig: {priority: 0},
+    rsConfig: {priority: 0, votes: 0},
     setParameter: {
         'failpoint.initialSyncHangBeforeCopyingDatabases': tojson({mode: 'alwaysOn'}),
         'numInitialSyncAttempts': 1,

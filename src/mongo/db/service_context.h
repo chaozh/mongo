@@ -321,6 +321,23 @@ public:
                                     ConstructorAction constructor,
                                     DestructorAction destructor = {});
 
+        /**
+         * This constructor registers a constructor and optional destructor with the given
+         * "name", a list of names of prerequisites, "prereqs", and a list of names of dependents,
+         * "dependents".
+         *
+         * The named constructor will run after all of its prereqs successfully complete,
+         * and the corresponding destructor, if provided, will run before any of its
+         * prerequisites execute. The dependents will run after this constructor and
+         * the corresponding destructor, if provided, will run after any of its
+         * dependents execute.
+         */
+        ConstructorActionRegisterer(std::string name,
+                                    std::vector<std::string> prereqs,
+                                    std::vector<std::string> dependents,
+                                    ConstructorAction constructor,
+                                    DestructorAction destructor = {});
+
     private:
         using ConstructorActionListIterator = std::list<ConstructorDestructorActions>::iterator;
         ConstructorActionListIterator _iter;
@@ -412,6 +429,19 @@ public:
     void killOperation(WithLock,
                        OperationContext* opCtx,
                        ErrorCodes::Error killCode = ErrorCodes::Interrupted);
+
+    /**
+     * Kills the operation "opCtx" with the code "killCode", if opCtx has not already been killed,
+     * and delists the operation by removing it from "_clientByOperationId" and its client. Both
+     * "opCtx->getClient()->getServiceContext()" and "this" must point to the same instance of
+     * service context. Also, "opCtx" should never be deleted before this method returns. Finally,
+     * the thread invoking this method must not hold (own) the client and the service context locks.
+     * It is highly recommended to use "ErrorCodes::OperationIsKilledAndDelisted" as the error code
+     * to facilitate debugging.
+     */
+    void killAndDelistOperation(
+        OperationContext* opCtx,
+        ErrorCodes::Error killError = ErrorCodes::OperationIsKilledAndDelisted) noexcept;
 
     /**
      * Registers a listener to be notified each time an op is killed.
@@ -590,6 +620,14 @@ private:
     private:
         std::unique_ptr<ClientObserver> _observer;
     };
+
+    /**
+     * Removes the operation from its client and the `_clientByOperationId` of its service context.
+     * It will acquire both client and service context locks, and should only be used internally by
+     * other ServiceContext methods. To ensure delisted operations are shortly deleted, this method
+     * should only be called after killing an operation or in its destructor.
+     */
+    void _delistOperation(OperationContext* opCtx) noexcept;
 
     Mutex _mutex = MONGO_MAKE_LATCH(/*HierarchicalAcquisitionLevel(2), */ "ServiceContext::_mutex");
 

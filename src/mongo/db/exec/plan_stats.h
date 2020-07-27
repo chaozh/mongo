@@ -68,7 +68,6 @@ struct CommonStats {
           advanced(0),
           needTime(0),
           needYield(0),
-          executionTimeMillis(0),
           failed(false),
           isEOF(false) {}
 
@@ -92,8 +91,13 @@ struct CommonStats {
     // is no filter affixed, then 'filter' should be an empty BSONObj.
     BSONObj filter;
 
-    // Time elapsed while working inside this stage.
-    long long executionTimeMillis;
+    // Time elapsed while working inside this stage. When this field is set to boost::none,
+    // timing info will not be collected during query execution.
+    //
+    // The field must be populated when running explain or when running with the profiler on. It
+    // must also be populated when multi planning, in order to gather stats stored in the plan
+    // cache.
+    boost::optional<long long> executionTimeMillis;
 
     // TODO: have some way of tracking WSM sizes (or really any series of #s).  We can measure
     // the size of our inputs and the size of our outputs.  We can do a lot with the WS here.
@@ -108,14 +112,15 @@ struct CommonStats {
 };
 
 // The universal container for a stage's stats.
-struct PlanStageStats {
-    PlanStageStats(const CommonStats& c, StageType t) : stageType(t), common(c) {}
+template <typename C, typename T = void*>
+struct BasePlanStageStats {
+    BasePlanStageStats(const C& c, T t = {}) : stageType(t), common(c) {}
 
     /**
      * Make a deep copy.
      */
-    PlanStageStats* clone() const {
-        PlanStageStats* stats = new PlanStageStats(common, stageType);
+    BasePlanStageStats<C, T>* clone() const {
+        auto stats = new BasePlanStageStats<C, T>(common, stageType);
         if (specific.get()) {
             stats->specific.reset(specific->clone());
         }
@@ -140,22 +145,23 @@ struct PlanStageStats {
             sizeof(*this);
     }
 
-    // See query/stage_type.h
-    StageType stageType;
+    T stageType;
 
     // Stats exported by implementing the PlanStage interface.
-    CommonStats common;
+    C common;
 
     // Per-stage place to stash additional information
     std::unique_ptr<SpecificStats> specific;
 
     // The stats of the node's children.
-    std::vector<std::unique_ptr<PlanStageStats>> children;
+    std::vector<std::unique_ptr<BasePlanStageStats<C, T>>> children;
 
 private:
-    PlanStageStats(const PlanStageStats&) = delete;
-    PlanStageStats& operator=(const PlanStageStats&) = delete;
+    BasePlanStageStats(const BasePlanStageStats<C, T>&) = delete;
+    BasePlanStageStats& operator=(const BasePlanStageStats<C, T>&) = delete;
 };
+
+using PlanStageStats = BasePlanStageStats<CommonStats, StageType>;
 
 struct AndHashStats : public SpecificStats {
     AndHashStats() = default;

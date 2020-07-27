@@ -89,8 +89,7 @@ print("adding shard w/out auth " + shardName);
 logout(adminUser);
 
 var result = s.getDB("admin").runCommand({addShard: shardName});
-printjson(result);
-assert.eq(result.code, 13);
+assert.commandFailedWithCode(result, ErrorCodes.Unauthorized);
 
 login(adminUser);
 
@@ -116,7 +115,7 @@ var master = d1.getPrimary();
 print("adding shard w/auth " + shardName);
 
 result = s.getDB("admin").runCommand({addShard: shardName});
-assert.eq(result.ok, 1, tojson(result));
+assert.commandWorked(result);
 
 s.getDB("admin").runCommand({enableSharding: "test"});
 s.getDB("admin").runCommand({shardCollection: "test.foo", key: {x: 1}});
@@ -167,6 +166,7 @@ print("adding shard " + shardName);
 login(adminUser);
 print("logged in");
 result = s.getDB("admin").runCommand({addShard: shardName});
+assert.commandWorked(result);
 
 awaitRSClientHosts(s.s, d1.nodes, {ok: true});
 awaitRSClientHosts(s.s, d2.nodes, {ok: true});
@@ -309,7 +309,7 @@ assert.commandWorked(readOnlyDB.runCommand({count: "foo"}));
 
 print("make sure currentOp/killOp fail");
 assert.commandFailed(readOnlyDB.currentOp());
-assert.commandFailed(readOnlyDB.killOp(123));
+assert.commandFailed(readOnlyDB.killOp(2000000000));
 
 // fsyncUnlock doesn't work in mongos anyway, so no need check authorization for it
 /*
@@ -328,7 +328,7 @@ assert.commandWorked(readOnlyDB.runCommand({logout: 1}));
 
 print("make sure currentOp/killOp fail again");
 assert.commandFailed(readOnlyDB.currentOp());
-assert.commandFailed(readOnlyDB.killOp(123));
+assert.commandFailed(readOnlyDB.killOp(2000000000));
 
 s.stop();
 d1.stopSet();

@@ -9,12 +9,24 @@ var kCommandsSupportingReadConcern = new Set([
     "geoSearch",
 ]);
 
-var kCommandsOnlySupportingReadConcernSnapshot = new Set([
+/**
+ * Write commands supporting snapshot readConcern in a transaction.
+ */
+var kWriteCommandsSupportingSnapshotInTransaction = new Set([
     "delete",
     "findAndModify",
     "findandmodify",
     "insert",
     "update",
+]);
+
+/**
+ * Commands supporting snapshot readConcern outside of transactions.
+ */
+var kCommandsSupportingSnapshot = new Set([
+    "aggregate",
+    "distinct",
+    "find",
 ]);
 
 var kCommandsSupportingWriteConcern = new Set([
@@ -67,7 +79,6 @@ var kCommandsSupportingWriteConcern = new Set([
     "insert",
     "mapReduce",
     "mapreduce",
-    "mapreduce.shardedfinish",
     "moveChunk",
     "renameCollection",
     "revokePrivilegesFromRole",

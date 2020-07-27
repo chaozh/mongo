@@ -37,7 +37,6 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops_parsers.h"
-#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
@@ -301,8 +300,6 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
     TargetedBatchMap batchMap;
     std::set<ShardId> targetedShards;
 
-    int numTargetErrors = 0;
-
     const size_t numWriteOps = _clientRequest.sizeWriteOps();
 
     for (size_t i = 0; i < numWriteOps; ++i) {
@@ -320,7 +317,12 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
         OwnedPointerVector<TargetedWrite> writesOwned;
         vector<TargetedWrite*>& writes = writesOwned.mutableVector();
 
-        Status targetStatus = writeOp.targetWrites(_opCtx, targeter, &writes);
+        Status targetStatus = Status::OK();
+        try {
+            writeOp.targetWrites(_opCtx, targeter, &writes);
+        } catch (const DBException& ex) {
+            targetStatus = ex.toStatus();
+        }
 
         if (!targetStatus.isOK()) {
             WriteErrorDetail targetError;
@@ -328,7 +330,6 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
 
             if (TransactionRouter::get(_opCtx)) {
                 writeOp.setOpError(targetError);
-                ++numTargetErrors;
 
                 // Cleanup all the writes we have targetted in this call so far since we are going
                 // to abort the entire transaction.
@@ -343,7 +344,6 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
                 // Record an error for this batch
 
                 writeOp.setOpError(targetError);
-                ++numTargetErrors;
 
                 if (ordered)
                     return Status::OK();
@@ -372,13 +372,27 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
             }
         }
 
-        // Account the array overhead once for the actual updates array and once for the statement
-        // ids array, if retryable writes are used
+        // If retryable writes are used, MongoS needs to send an additional array of stmtId(s)
+        // corresponding to the statements that got routed to each individual shard, so they need to
+        // be accounted in the potential request size so it does not exceed the max BSON size.
+        //
+        // The constant 4 is chosen as the size of the BSON representation of the stmtId.
         const int writeSizeBytes = getWriteSizeBytes(writeOp) +
             write_ops::kWriteCommandBSONArrayPerElementOverheadBytes +
             (_batchTxnNum ? write_ops::kWriteCommandBSONArrayPerElementOverheadBytes + 4 : 0);
 
-        if (wouldMakeBatchesTooBig(writes, writeSizeBytes, batchMap)) {
+        // For unordered writes, the router must return an entry for each failed write. This
+        // constant is a pessimistic attempt to ensure that if a request to a shard hits
+        // StaleShardVersion and has to return number of errors equivalent to the number of writes
+        // in the batch, the response size will not exceed the max BSON size.
+        //
+        // The constant of 256 is chosen as an approximation of the size of the BSON representataion
+        // of the StaleConfigInfo (which contains the shard id) and the adjacent error message.
+        const int errorResponsePotentialSizeBytes =
+            ordered ? 0 : write_ops::kWriteCommandBSONArrayPerElementOverheadBytes + 256;
+
+        if (wouldMakeBatchesTooBig(
+                writes, std::max(writeSizeBytes, errorResponsePotentialSizeBytes), batchMap)) {
             invariant(!batchMap.empty());
             writeOp.cancelWrites(nullptr);
             break;
@@ -403,7 +417,7 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
             }
 
             TargetedWriteBatch* batch = batchIt->second;
-            batch->addWrite(write, writeSizeBytes);
+            batch->addWrite(write, std::max(writeSizeBytes, errorResponsePotentialSizeBytes));
         }
 
         // Relinquish ownership of TargetedWrites, now the TargetedBatches own them
@@ -424,7 +438,6 @@ Status BatchWriteOp::targetBatch(const NSTargeter& targeter,
 
     for (TargetedBatchMap::iterator it = batchMap.begin(); it != batchMap.end(); ++it) {
         TargetedWriteBatch* batch = it->second;
-
         if (batch->getWrites().empty())
             continue;
 
@@ -498,8 +511,10 @@ BatchedCommandRequest BatchWriteOp::buildBatchRequest(
                 return BatchedCommandRequest([&] {
                     write_ops::Update updateOp(_clientRequest.getNS());
                     updateOp.setUpdates(std::move(*updates));
-                    // Each child batch inherits its runtime constants from the parent batch.
+                    // Each child batch inherits its let params/runtime constants from the parent
+                    // batch.
                     updateOp.setRuntimeConstants(_clientRequest.getRuntimeConstants());
+                    updateOp.setLet(_clientRequest.getLet());
                     return updateOp;
                 }());
             }
@@ -507,6 +522,9 @@ BatchedCommandRequest BatchWriteOp::buildBatchRequest(
                 return BatchedCommandRequest([&] {
                     write_ops::Delete deleteOp(_clientRequest.getNS());
                     deleteOp.setDeletes(std::move(*deletes));
+                    // Each child batch inherits its let params from the parent batch.
+                    deleteOp.setLet(_clientRequest.getLet());
+                    deleteOp.setRuntimeConstants(_clientRequest.getRuntimeConstants());
                     return deleteOp;
                 }());
         }

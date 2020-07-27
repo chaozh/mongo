@@ -32,13 +32,13 @@
 #include "mongo/bson/json.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/config_server_test_fixture.h"
 
 namespace mongo {
 namespace {
@@ -252,19 +252,24 @@ TEST_F(AssignKeyRangeToZoneTestFixture, RemoveZoneWithDollarPrefixedShardKeysSho
     updateBuilder.append(TagsType::max(), zoneWithDollarKeys.getMax());
     updateBuilder.append(TagsType::tag(), "TestZone");
 
-    ASSERT_OK(Grid::get(operationContext())
-                  ->catalogClient()
-                  ->updateConfigDocument(
-                      operationContext(),
-                      TagsType::ConfigNS,
-                      updateQuery,
-                      updateBuilder.obj(),
-                      true,
-                      WriteConcernOptions(1, WriteConcernOptions::SyncMode::UNSET, Seconds(0))));
+    auto opCtx = operationContext();
+    {
+        // Using UnreplicatedWritesBlock to disable opCtx validation so that we can create a
+        // situation, which resembles an upgrade from an old version with a corrupted zone
+        // information
+        repl::UnreplicatedWritesBlock uwb(opCtx);
+        ASSERT_OK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+            opCtx,
+            TagsType::ConfigNS,
+            updateQuery,
+            updateBuilder.obj(),
+            true,
+            WriteConcernOptions(1, WriteConcernOptions::SyncMode::UNSET, Seconds(0))));
+    }
     assertOnlyZone(shardedNS(), zoneWithDollarKeys, "TestZone");
 
-    ASSERT_OK(ShardingCatalogManager::get(operationContext())
-                  ->removeKeyRangeFromZone(operationContext(), shardedNS(), zoneWithDollarKeys));
+    ASSERT_OK(ShardingCatalogManager::get(opCtx)->removeKeyRangeFromZone(
+        opCtx, shardedNS(), zoneWithDollarKeys));
     assertNoZoneDoc();
 }
 

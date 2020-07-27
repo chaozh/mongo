@@ -40,7 +40,7 @@
 #include "mongo/db/commands/map_reduce_agg.h"
 #include "mongo/db/commands/map_reduce_gen.h"
 #include "mongo/db/commands/mr_common.h"
-#include "mongo/db/pipeline/mongos_process_interface.h"
+#include "mongo/db/pipeline/process_interface/mongos_process_interface.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
@@ -86,6 +86,7 @@ auto makeExpressionContext(OperationContext* opCtx,
     if (parsedMr.getScope()) {
         runtimeConstants.setJsScope(parsedMr.getScope()->getObj());
     }
+    runtimeConstants.setIsMapReduce(true);
     auto expCtx = make_intrusive<ExpressionContext>(
         opCtx,
         verbosity,
@@ -93,12 +94,17 @@ auto makeExpressionContext(OperationContext* opCtx,
         false,  // needsmerge
         true,   // allowDiskUse
         parsedMr.getBypassDocumentValidation().get_value_or(false),
+        true,  // isMapReduceCommand
         nss,
         runtimeConstants,
         std::move(resolvedCollator),
-        std::make_shared<MongoSInterface>(),
+        std::make_shared<MongosProcessInterface>(
+            Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor()),
         std::move(resolvedNamespaces),
-        boost::none);  // uuid
+        boost::none,  // uuid
+        boost::none,
+        false  // mayDbProfile: false because mongos has no profile collection.
+    );
     expCtx->inMongos = true;
     return expCtx;
 }
@@ -112,8 +118,9 @@ Document serializeToCommand(BSONObj originalCmd, const MapReduce& parsedMr, Pipe
         Value(Document{{"batchSize", std::numeric_limits<long long>::max()}});
     translatedCmd[AggregationRequest::kAllowDiskUseName] = Value(true);
     translatedCmd[AggregationRequest::kFromMongosName] = Value(true);
-    translatedCmd[AggregationRequest::kRuntimeConstants] =
+    translatedCmd[AggregationRequest::kRuntimeConstantsName] =
         Value(pipeline->getContext()->getRuntimeConstants().toBSON());
+    translatedCmd[AggregationRequest::kIsMapReduceCommandName] = Value(true);
 
     if (shouldBypassDocumentValidationForCommand(originalCmd)) {
         translatedCmd[bypassDocumentValidationCommandOption()] = Value(true);
@@ -123,11 +130,6 @@ Document serializeToCommand(BSONObj originalCmd, const MapReduce& parsedMr, Pipe
         translatedCmd[AggregationRequest::kCollationName] =
             Value(originalCmd[AggregationRequest::kCollationName]);
     }
-
-    // TODO SERVER-44884: We set this flag to indicate that the shards should always use the new
-    // upsert mechanism when executing relevant $merge modes. After branching for 4.5, supported
-    // upgrade versions will all use the new mechanism, and we can remove this flag.
-    translatedCmd[AggregationRequest::kUseNewUpsert] = Value(true);
 
     // Append generic command options.
     for (const auto& elem : CommandHelpers::appendPassthroughFields(originalCmd, BSONObj())) {
@@ -213,6 +215,7 @@ bool runAggregationMapReduce(OperationContext* opCtx,
                 // a pointer to the constructed ExpressionContext.
                 uassertStatusOK(cluster_aggregation_planner::dispatchPipelineAndMerge(
                     opCtx,
+                    expCtx->mongoProcessInterface->taskExecutor,
                     std::move(targeter),
                     std::move(serialized),
                     std::numeric_limits<long long>::max(),

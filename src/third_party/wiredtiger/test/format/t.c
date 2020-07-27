@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2019 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -31,7 +31,6 @@
 GLOBAL g;
 
 static void format_die(void);
-static void startup(void);
 static void usage(void) WT_GCC_FUNC_DECL_ATTRIBUTE((noreturn));
 
 extern int __wt_optind;
@@ -99,6 +98,40 @@ set_alarm(u_int seconds)
 }
 
 /*
+ * format_process_env --
+ *     Set up the format process environment.
+ */
+static void
+format_process_env(void)
+{
+/*
+ * Windows and Linux support different sets of signals, be conservative about installing handlers.
+ * If we time out unexpectedly, we want a core dump, otherwise, just exit.
+ */
+#ifdef SIGALRM
+    (void)signal(SIGALRM, signal_timer);
+#endif
+#ifdef SIGHUP
+    (void)signal(SIGHUP, signal_handler);
+#endif
+#ifdef SIGTERM
+    (void)signal(SIGTERM, signal_handler);
+#endif
+
+    /* Initialize lock to ensure single threading during failure handling */
+    testutil_check(pthread_rwlock_init(&g.death_lock, NULL));
+
+#if 0
+    /* Configure the GNU malloc for debugging. */
+    (void)setenv("MALLOC_CHECK_", "2", 1);
+#endif
+#if 0
+    /* Configure the FreeBSD malloc for debugging. */
+    (void)setenv("MALLOC_OPTIONS", "AJ", 1);
+#endif
+}
+
+/*
  * TIMED_MAJOR_OP --
  *	Set a timer and perform a major operation (for example, verify or salvage).
  */
@@ -116,8 +149,9 @@ main(int argc, char *argv[])
 {
     uint64_t now, start;
     u_int ops_seconds;
-    int ch, onerun, reps;
+    int ch, reps;
     const char *config, *home;
+    bool one_flag, quiet_flag;
 
     custom_die = format_die; /* Local death handler. */
 
@@ -125,122 +159,90 @@ main(int argc, char *argv[])
 
     (void)testutil_set_progname(argv);
 
-/*
- * Windows and Linux support different sets of signals, be conservative about installing handlers.
- * If we time out unexpectedly, we want a core dump, otherwise, just exit.
- */
-#ifdef SIGALRM
-    (void)signal(SIGALRM, signal_timer);
-#endif
-#ifdef SIGHUP
-    (void)signal(SIGHUP, signal_handler);
-#endif
-#ifdef SIGTERM
-    (void)signal(SIGTERM, signal_handler);
-#endif
+    /* The monitoring program looks for this line in the log file, push it out quickly. */
+    printf("%s: process %" PRIdMAX " running\n", progname, (intmax_t)getpid());
+    fflush(stdout);
 
-#if 0
-	/* Configure the GNU malloc for debugging. */
-	(void)setenv("MALLOC_CHECK_", "2", 1);
-#endif
-#if 0
-	/* Configure the FreeBSD malloc for debugging. */
-	(void)setenv("MALLOC_OPTIONS", "AJ", 1);
-#endif
-
-    /* Track progress unless we're re-directing output to a file. */
-    g.c_quiet = isatty(1) ? 0 : 1;
+    format_process_env();
 
     /* Set values from the command line. */
     home = NULL;
-    onerun = 0;
-    while ((ch = __wt_getopt(progname, argc, argv, "1C:c:h:lqrt:")) != EOF)
+    one_flag = quiet_flag = false;
+    while ((ch = __wt_getopt(progname, argc, argv, "1BC:c:h:qRrT:t")) != EOF)
         switch (ch) {
-        case '1': /* One run */
-            onerun = 1;
+        case '1': /* One run and quit */
+            one_flag = true;
+            break;
+        case 'B': /* Backward compatibility */
+            g.backward_compatible = true;
             break;
         case 'C': /* wiredtiger_open config */
             g.config_open = __wt_optarg;
             break;
-        case 'c': /* Configuration from a file */
+        case 'c': /* Read configuration from a file */
             config = __wt_optarg;
             break;
         case 'h':
             home = __wt_optarg;
             break;
-        case 'l': /* Log operations to a file */
-            g.logging = true;
-            break;
         case 'q': /* Quiet */
-            g.c_quiet = 1;
+            quiet_flag = true;
             break;
-        case 'r': /* Replay a run */
-            g.replay = true;
+        case 'R': /* Reopen (start running on an existing database) */
+            g.reopen = true;
+            break;
+        case 'T': /* Trace specifics. */
+            if (trace_config(__wt_optarg) != 0) {
+                fprintf(stderr, "unexpected trace configuration \"%s\"\n", __wt_optarg);
+                usage();
+            }
+        /* FALLTHROUGH */
+        case 't': /* Trace  */
+            g.trace = true;
             break;
         default:
             usage();
         }
     argv += __wt_optind;
 
-    /* Initialize the global RNG. */
-    __wt_random_init_seed(NULL, &g.rnd);
-
     /* Set up paths. */
     path_setup(home);
 
-    /* If it's a replay, use the home directory's CONFIG file. */
-    if (g.replay) {
+    /*
+     * If it's a reopen, use the already existing home directory's CONFIG file.
+     *
+     * If we weren't given a configuration file, set values from "CONFIG", if it exists. Small hack
+     * to ignore any CONFIG file named ".", that just makes it possible to ignore any local CONFIG
+     * file, used when running checks.
+     */
+    if (g.reopen) {
         if (config != NULL)
-            testutil_die(EINVAL, "-c incompatible with -r");
+            testutil_die(EINVAL, "-c incompatible with -R");
         if (access(g.home_config, R_OK) != 0)
             testutil_die(ENOENT, "%s", g.home_config);
         config = g.home_config;
     }
-
-    /*
-     * If we weren't given a configuration file, set values from "CONFIG", if it exists.
-     *
-     * Small hack to ignore any CONFIG file named ".", that just makes it possible to ignore any
-     * local CONFIG file, used when running checks.
-     */
     if (config == NULL && access("CONFIG", R_OK) == 0)
         config = "CONFIG";
     if (config != NULL && strcmp(config, ".") != 0)
         config_file(config);
 
     /*
-     * The rest of the arguments are individual configurations that modify the base configuration.
+     * Remaining arguments are individual configurations that modify the base configuration. Note
+     * there's no restriction on command-line arguments when re-playing or re-opening a database,
+     * which can lead to a lot of hurt if you're not careful.
      */
     for (; *argv != NULL; ++argv)
         config_single(*argv, true);
 
     /*
-     * Multithreaded runs can be replayed: it's useful and we'll get the configuration correct.
-     * Obviously the order of operations changes, warn the user.
+     * Let the command line -1 and -q flags override values configured from other sources.
+     * Regardless, don't go all verbose if we're not talking to a terminal.
      */
-    if (g.replay && !SINGLETHREADED)
-        printf("Warning: replaying a threaded run\n");
-
-    /*
-     * Single-threaded runs historically exited after a single replay, which makes sense when you're
-     * debugging, leave that semantic in place.
-     */
-    if (g.replay && SINGLETHREADED)
+    if (one_flag)
         g.c_runs = 1;
-
-    /*
-     * Let the command line -1 flag override runs configured from other sources.
-     */
-    if (onerun)
-        g.c_runs = 1;
-
-    /*
-     * Initialize locks to single-thread named checkpoints and backups, last last-record updates,
-     * and failures.
-     */
-    testutil_check(pthread_rwlock_init(&g.backup_lock, NULL));
-    testutil_check(pthread_rwlock_init(&g.death_lock, NULL));
-    testutil_check(pthread_rwlock_init(&g.ts_lock, NULL));
+    if (quiet_flag || !isatty(1))
+        g.c_quiet = 1;
 
     /*
      * Calculate how long each operations loop should run. Take any timer value and convert it to
@@ -254,30 +256,36 @@ main(int argc, char *argv[])
      */
     ops_seconds = g.c_timer == 0 ? 0 : ((g.c_timer * 60) - 15) / FORMAT_OPERATION_REPS;
 
-    printf("%s: process %" PRIdMAX " running\n", progname, (intmax_t)getpid());
-    fflush(stdout);
+    __wt_random_init_seed(NULL, &g.rnd); /* Initialize the RNG. */
+
+    testutil_check(__wt_thread_str(g.tidbuf, sizeof(g.tidbuf)));
+
     while (++g.run_cnt <= g.c_runs || g.c_runs == 0) {
         __wt_seconds(NULL, &start);
-
-        startup();           /* Start a run */
-        config_setup();      /* Run configuration */
-        config_print(false); /* Dump run configuration */
-        key_init();          /* Setup keys/values */
-        val_init();
-
         track("starting up", 0ULL, NULL);
 
-        wts_open(g.home, true, &g.wts_conn);
-        wts_init();
+        config_run();
 
-        /* Load and verify initial records */
-        TIMED_MAJOR_OP(wts_load());
-        TIMED_MAJOR_OP(wts_verify("post-bulk verify"));
+        if (g.reopen) {
+            config_final();
+            wts_open(g.home, &g.wts_conn, &g.wts_session, true);
+        } else {
+            wts_create(g.home);
+            config_final();
+            wts_open(g.home, &g.wts_conn, &g.wts_session, true);
+            trace_init();
+
+            TIMED_MAJOR_OP(wts_load()); /* Load and verify initial records */
+            TIMED_MAJOR_OP(wts_verify(g.wts_conn, "post-bulk verify"));
+        }
+
         TIMED_MAJOR_OP(wts_read_scan());
+
+        wts_checkpoints();
 
         /* Operations. */
         for (reps = 1; reps <= FORMAT_OPERATION_REPS; ++reps)
-            wts_ops(ops_seconds, reps == FORMAT_OPERATION_REPS);
+            operations(ops_seconds, reps == FORMAT_OPERATION_REPS);
 
         /* Copy out the run's statistics. */
         TIMED_MAJOR_OP(wts_stats());
@@ -286,10 +294,10 @@ main(int argc, char *argv[])
          * Verify the objects. Verify closes the underlying handle and discards the statistics, read
          * them first.
          */
-        TIMED_MAJOR_OP(wts_verify("post-ops verify"));
+        TIMED_MAJOR_OP(wts_verify(g.wts_conn, "post-ops verify"));
 
         track("shutting down", 0ULL, NULL);
-        wts_close();
+        wts_close(&g.wts_conn, &g.wts_session);
 
         /*
          * Rebalance testing.
@@ -301,6 +309,8 @@ main(int argc, char *argv[])
          */
         TIMED_MAJOR_OP(wts_salvage());
 
+        trace_teardown();
+
         /* Overwrite the progress line with a completion line. */
         if (!g.c_quiet)
             printf("\r%78s\r", " ");
@@ -310,15 +320,7 @@ main(int argc, char *argv[])
         fflush(stdout);
     }
 
-    /* Flush/close any logging information. */
-    fclose_and_clear(&g.logfp);
-    fclose_and_clear(&g.randfp);
-
     config_print(false);
-
-    testutil_check(pthread_rwlock_destroy(&g.backup_lock));
-    testutil_check(pthread_rwlock_destroy(&g.death_lock));
-    testutil_check(pthread_rwlock_destroy(&g.ts_lock));
 
     config_clear();
 
@@ -328,61 +330,60 @@ main(int argc, char *argv[])
 }
 
 /*
- * startup --
- *     Initialize for a run.
- */
-static void
-startup(void)
-{
-    WT_DECL_RET;
-
-    /* Flush/close any logging information. */
-    fclose_and_clear(&g.logfp);
-    fclose_and_clear(&g.randfp);
-
-    /* Create or initialize the home and data-source directories. */
-    if ((ret = system(g.home_init)) != 0)
-        testutil_die(ret, "home directory initialization failed");
-
-    /* Open/truncate the logging file. */
-    if (g.logging && (g.logfp = fopen(g.home_log, "w")) == NULL)
-        testutil_die(errno, "fopen: %s", g.home_log);
-
-    /* Open/truncate the random number logging file. */
-    if ((g.randfp = fopen(g.home_rand, g.replay ? "r" : "w")) == NULL)
-        testutil_die(errno, "%s", g.home_rand);
-}
-
-/*
  * die --
  *     Report an error, dumping the configuration.
  */
 static void
 format_die(void)
 {
-
     /*
-     * Turn off tracking and logging so we don't obscure the error message. The lock we're about to
-     * acquire will act as a barrier to flush the writes. This is really a "best effort" more than a
-     * guarantee, there's too much stuff in flight to be sure.
+     * Turn off progress reports so we don't obscure the error message. The lock we're about to
+     * acquire will act as a barrier to schedule the write. This is really a "best effort" more than
+     * a guarantee, there's too much stuff in flight to be sure.
      */
     g.c_quiet = 1;
-    g.logging = false;
 
     /*
      * Single-thread error handling, our caller exits after calling us (we never release the lock).
      */
     (void)pthread_rwlock_wrlock(&g.death_lock);
 
-    /* Flush/close any logging information. */
-    fclose_and_clear(&g.logfp);
-    fclose_and_clear(&g.randfp);
-
+    /* Write a failure message so format.sh knows we failed. */
     fprintf(stderr, "\n%s: run FAILED\n", progname);
+    fflush(stderr);
+    fflush(stdout);
+
+    /* Flush the logs, they may contain debugging information. */
+    trace_teardown();
+    if (g.c_logging && g.wts_session != NULL)
+        testutil_check(g.wts_session->log_flush(g.wts_session, "sync=off"));
 
     /* Display the configuration that failed. */
     if (g.run_cnt)
         config_print(true);
+
+#ifdef HAVE_DIAGNOSTIC
+    /*
+     * We have a mismatch, optionally dump WiredTiger datastore pages. In doing so, we are calling
+     * into the debug code directly which does not take locks, so it's possible we will simply drop
+     * core. Turn off core dumps, those core files aren't interesting.
+     *
+     * The most important information is the key/value mismatch information. Then try to dump out
+     * additional information. We dump the entire history store table including what is on disk,
+     * which can potentially be very large. If it becomes a problem, this can be modified to just
+     * dump out the page this key is on.
+     */
+    if (g.c_verify_failure_dump && g.page_dump_cursor != NULL) {
+        set_core_off();
+
+        fprintf(stderr, "snapshot-isolation error: Dumping page to %s\n", g.home_pagedump);
+        testutil_check(__wt_debug_cursor_page(g.page_dump_cursor, g.home_pagedump));
+        fprintf(stderr, "snapshot-isolation error: Dumping HS to %s\n", g.home_hsdump);
+#if WIREDTIGER_VERSION_MAJOR >= 10
+        testutil_check(__wt_debug_cursor_tree_hs(g.page_dump_cursor, g.home_hsdump));
+#endif
+    }
+#endif
 }
 
 /*
@@ -393,17 +394,19 @@ static void
 usage(void)
 {
     fprintf(stderr,
-      "usage: %s [-1lqr] [-C wiredtiger-config]\n    "
-      "[-c config-file] [-h home] [name=value ...]\n",
+      "usage: %s [-1BqRt] [-C wiredtiger-config]\n    "
+      "[-c config-file] [-h home] [-T trace-options] [name=value ...]\n",
       progname);
     fprintf(stderr, "%s",
-      "\t-1 run once\n"
+      "\t-1 run once then quit\n"
+      "\t-B maintain 3.3 release log and configuration option compatibility\n"
       "\t-C specify wiredtiger_open configuration arguments\n"
-      "\t-c read test program configuration from a file\n"
-      "\t-h home (default 'RUNDIR')\n"
-      "\t-l log operations to a file\n"
+      "\t-c read test program configuration from a file (default 'CONFIG')\n"
+      "\t-h home directory (default 'RUNDIR')\n"
       "\t-q run quietly\n"
-      "\t-r replay the last run\n");
+      "\t-R run on an existing database\n"
+      "\t-T all|local\n"
+      "\t-t trace operations\n");
 
     config_error();
     exit(EXIT_FAILURE);

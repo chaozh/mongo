@@ -48,9 +48,7 @@
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rs_rollback.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/logger/log_component.h"
-#include "mongo/logger/logger.h"
-#include "mongo/util/log_global_settings.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -89,6 +87,8 @@ public:
 }  // namespace
 
 void RollbackTest::setUp() {
+    ServiceContextMongoDTest::setUp();
+
     _storageInterface = new StorageInterfaceRollback();
     auto serviceContext = getServiceContext();
     auto consistencyMarkers = std::make_unique<ReplicationConsistencyMarkersMock>();
@@ -109,10 +109,6 @@ void RollbackTest::setUp() {
     _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(_opCtx.get(), {});
     _replicationProcess->getConsistencyMarkers()->setMinValid(_opCtx.get(), OpTime{});
     _replicationProcess->initializeRollbackID(_opCtx.get()).transitional_ignore();
-
-    // Increase rollback log component verbosity for unit tests.
-    setMinimumLoggedSeverity(logger::LogComponent::kReplicationRollback,
-                             logger::LogSeverity::Debug(2));
 
     auto observerRegistry = checked_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
     observerRegistry->addObserver(std::make_unique<RollbackTestOpObserver>());
@@ -141,9 +137,9 @@ Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerMode(
     return ReplicationCoordinatorMock::setFollowerMode(newState);
 }
 
-Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerModeStrict(
-    OperationContext* opCtx, const MemberState& newState) {
-    return setFollowerMode(newState);
+Status RollbackTest::ReplicationCoordinatorRollbackMock::setFollowerModeRollback(
+    OperationContext* opCtx) {
+    return setFollowerMode(MemberState::RS_ROLLBACK);
 }
 
 std::pair<BSONObj, RecordId> RollbackTest::makeCRUDOp(OpTypeEnum opType,
@@ -233,6 +229,23 @@ Collection* RollbackTest::_createCollection(OperationContext* opCtx,
     return _createCollection(opCtx, NamespaceString(nss), options);
 }
 
+void RollbackTest::_insertDocument(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   const BSONObj& doc) {
+
+    AutoGetCollection autoColl(opCtx, nss, MODE_X);
+    auto collection = autoColl.getCollection();
+    if (!collection) {
+        CollectionOptions options;
+        options.uuid = UUID::gen();
+        collection = _createCollection(opCtx, nss, options);
+    }
+    WriteUnitOfWork wuow(opCtx);
+    OpDebug* const opDebug = nullptr;
+    ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug));
+    wuow.commit();
+}
+
 Status RollbackTest::_insertOplogEntry(const BSONObj& doc) {
     TimestampedBSONObj obj;
     obj.obj = doc;
@@ -271,9 +284,6 @@ std::pair<BSONObj, NamespaceString> RollbackSourceMock::findOneByUUID(const std:
                                                                       const BSONObj& filter) const {
     return {BSONObj(), NamespaceString()};
 }
-
-void RollbackSourceMock::copyCollectionFromRemote(OperationContext* opCtx,
-                                                  const NamespaceString& nss) const {}
 
 StatusWith<BSONObj> RollbackSourceMock::getCollectionInfo(const NamespaceString& nss) const {
     return BSON("name" << nss.ns() << "options" << BSONObj());

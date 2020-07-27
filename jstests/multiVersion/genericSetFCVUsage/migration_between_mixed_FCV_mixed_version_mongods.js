@@ -8,8 +8,15 @@
 
 // TODO: SERVER-43881 Make migration_between_mixed_FCV_mixed_version_mongods.js start shards as
 // replica sets.
+
+// Test is not replSet so cannot clean up migration coordinator docs properly.
+// Making it replSet will also make the moveChunk get stuck forever because the migration
+// coordinator will retry forever and never succeeds because recipient shard has incompatible
+// version.
+TestData.skipCheckOrphans = true;
+
 let st = new ShardingTest({
-    shards: [{binVersion: "latest"}, {binVersion: "last-stable"}],
+    shards: [{binVersion: "latest"}, {binVersion: "last-lts"}],
     mongos: {binVersion: "latest"},
     other: {shardAsReplicaSet: false},
 });
@@ -25,16 +32,22 @@ assert.commandWorked(st.s.adminCommand({shardCollection: testDB.coll.getFullName
 // featureCompatibilityVersion cannot be set to latestFCV on shard 1, but it will set the
 // featureCompatibilityVersion to latestFCV on shard 0.
 assert.commandFailed(st.s.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
-checkFCV(st.configRS.getPrimary().getDB("admin"), lastStableFCV, latestFCV);
+checkFCV(st.configRS.getPrimary().getDB("admin"), lastLTSFCV, latestFCV);
 checkFCV(st.shard0.getDB("admin"), latestFCV);
-checkFCV(st.shard1.getDB("admin"), lastStableFCV);
+checkFCV(st.shard1.getDB("admin"), lastLTSFCV);
 
-// It is not possible to move a chunk from a latestFCV shard to a last-stable binary version
-// shard.
-assert.commandFailedWithCode(
-    st.s.adminCommand(
-        {moveChunk: testDB.coll.getFullName(), find: {a: 1}, to: st.shard1.shardName}),
-    ErrorCodes.IncompatibleServerVersion);
+// It is not possible to move a chunk from a latestFCV shard to a last-lts binary version
+// shard. Pass explicit writeConcern (which requires secondaryThrottle: true) to avoid problems
+// if the last-lts doesn't automatically include writeConcern when running _recvChunkStart on the
+// newer shard.
+assert.commandFailedWithCode(st.s.adminCommand({
+    moveChunk: testDB.coll.getFullName(),
+    find: {a: 1},
+    to: st.shard1.shardName,
+    secondaryThrottle: true,
+    writeConcern: {w: 1}
+}),
+                             ErrorCodes.IncompatibleServerVersion);
 
 st.stop();
 })();

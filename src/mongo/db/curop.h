@@ -30,16 +30,22 @@
 
 #pragma once
 
+#include "mongo/config.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/logv2/attribute_storage.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/platform/atomic_word.h"
-#include "mongo/util/diagnostic_info.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/time_support.h"
+
+#ifndef MONGO_CONFIG_USE_RAW_LATCHES
+#include "mongo/util/diagnostic_info.h"
+#endif
 
 namespace mongo {
 
@@ -116,6 +122,9 @@ public:
          * the format: "<field1>:<value1> <field2>:<value2> ...".
          */
         std::string report() const;
+        BSONObj reportBSON() const;
+
+        void report(logv2::DynamicAttributes* pAttrs) const;
 
         boost::optional<long long> keysExamined;
         boost::optional<long long> docsExamined;
@@ -146,6 +155,10 @@ public:
 
     std::string report(OperationContext* opCtx, const SingleThreadedLockStats* lockStats) const;
 
+    void report(OperationContext* opCtx,
+                const SingleThreadedLockStats* lockStats,
+                logv2::DynamicAttributes* pAttrs) const;
+
     /**
      * Appends information about the current operation to "builder"
      *
@@ -168,9 +181,9 @@ public:
     BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats) const;
 
     /**
-     * Make object from $searchBeta stats with non-populated values omitted.
+     * Make object from $search stats with non-populated values omitted.
      */
-    BSONObj makeSearchBetaObject() const;
+    BSONObj makeMongotDebugStatsObject() const;
 
     // -------------------
 
@@ -189,7 +202,7 @@ public:
     long long ntoskip{-1};
     bool exhaust{false};
 
-    // For searchBeta.
+    // For search using mongot.
     boost::optional<long long> mongotCursorId{boost::none};
     boost::optional<long long> msWaitingForMongot{boost::none};
 
@@ -220,7 +233,7 @@ public:
     Status errInfo = Status::OK();
 
     // response info
-    long long executionTimeMicros{0};
+    Microseconds executionTime{0};
     long long nreturned{-1};
     int responseLength{-1};
 
@@ -233,6 +246,9 @@ public:
     // Stores the amount of the data processed by the throttle cursors in MB/sec.
     boost::optional<float> dataThroughputLastSecond;
     boost::optional<float> dataThroughputAverage;
+
+    // Used to track the amount of time spent waiting for a response from remote operations.
+    boost::optional<Microseconds> remoteOpWaitTime;
 
     // Stores additive metrics.
     AdditiveMetrics additiveMetrics;
@@ -247,7 +263,7 @@ public:
     boost::optional<WriteConcernOptions> writeConcern;
 
     // Whether this is an oplog getMore operation for replication oplog fetching.
-    bool isReplOplogFetching{false};
+    bool isReplOplogGetMore{false};
 };
 
 /**
@@ -324,7 +340,7 @@ public:
      * operation should also be profiled.
      */
     bool completeAndLogOperation(OperationContext* opCtx,
-                                 logger::LogComponent logComponent,
+                                 logv2::LogComponent logComponent,
                                  boost::optional<size_t> responseLength = boost::none,
                                  boost::optional<long long> slowMsOverride = boost::none,
                                  bool forceLog = false);
@@ -349,7 +365,7 @@ public:
         return _originatingCommand;
     }
 
-    void enter_inlock(const char* ns, boost::optional<int> dbProfileLevel);
+    void enter_inlock(const char* ns, int dbProfileLevel);
 
     /**
      * Sets the type of the current network operation.
@@ -414,6 +430,10 @@ public:
      */
     void raiseDbProfileLevel(int dbProfileLevel);
 
+    int dbProfileLevel() const {
+        return _dbprofile;
+    }
+
     /**
      * Gets the network operation type. No lock is required if called by the thread executing
      * the operation, but the lock must be held if called from another thread.
@@ -453,15 +473,14 @@ public:
     bool isStarted() const {
         return _start > 0;
     }
-    long long startTime() {  // micros
-        ensureStarted();
-        return _start;
-    }
     void done() {
-        _end = curTimeMicros64();
+        _end = _tickSource->getTicks();
     }
     bool isDone() const {
         return _end > 0;
+    }
+    bool isPaused() {
+        return _lastPauseTime != 0;
     }
 
     /**
@@ -474,7 +493,7 @@ public:
     void pauseTimer() {
         invariant(isStarted());
         invariant(_lastPauseTime == 0);
-        _lastPauseTime = curTimeMicros64();
+        _lastPauseTime = _tickSource->getTicks();
     }
 
     /**
@@ -485,8 +504,62 @@ public:
         invariant(isStarted());
         invariant(_lastPauseTime > 0);
         _totalPausedDuration +=
-            Microseconds{static_cast<long long>(curTimeMicros64()) - _lastPauseTime};
+            _tickSource->ticksTo<Microseconds>(_tickSource->getTicks() - _lastPauseTime);
         _lastPauseTime = 0;
+    }
+
+    /**
+     * Ensures that remoteOpWait will be recorded in the OpDebug.
+     *
+     * This method is separate from startRemoteOpWait because operation types that do record
+     * remoteOpWait, such as a getMore of a sharded aggregation, should always include the
+     * remoteOpWait field even if its value is zero. An operation should call
+     * enableRecordRemoteOpWait() to declare that it wants to report remoteOpWait, and call
+     * startRemoteOpWaitTimer()/stopRemoteOpWaitTimer() to measure the time.
+     *
+     * This timer uses the same clock source as elapsedTimeTotal().
+     */
+    void enableRecordRemoteOpWait() {
+        if (!_debug.remoteOpWaitTime) {
+            _debug.remoteOpWaitTime.emplace(0);
+        }
+    }
+
+    /**
+     * Starts the remoteOpWait timer.
+     *
+     * Does nothing if enableRecordRemoteOpWait() was not called.
+     */
+    void startRemoteOpWaitTimer() {
+        invariant(isStarted());
+        invariant(!isDone());
+        invariant(!isPaused());
+        invariant(!_remoteOpStartTime);
+        if (_debug.remoteOpWaitTime) {
+            _remoteOpStartTime.emplace(elapsedTimeTotal());
+        }
+    }
+
+    /**
+     * Stops the remoteOpWait timer.
+     *
+     * Does nothing if enableRecordRemoteOpWait() was not called.
+     */
+    void stopRemoteOpWaitTimer() {
+        invariant(isStarted());
+        invariant(!isDone());
+        invariant(!isPaused());
+        if (_debug.remoteOpWaitTime) {
+            Microseconds end = elapsedTimeTotal();
+            invariant(_remoteOpStartTime);
+            // On most systems a monotonic clock source will be used to measure time. When a
+            // monotonic clock is not available we fallback to using the realtime system clock. When
+            // used, a backward shift of the realtime system clock could lead to a negative delta.
+            Microseconds delta = std::max((end - *_remoteOpStartTime), Microseconds{0});
+            *_debug.remoteOpWaitTime += delta;
+            _remoteOpStartTime = boost::none;
+        }
+        invariant(!_remoteOpStartTime);
     }
 
     /**
@@ -503,9 +576,9 @@ public:
         }
 
         if (!_end) {
-            return Microseconds{static_cast<long long>(curTimeMicros64() - startTime())};
+            return _tickSource->ticksTo<Microseconds>(_tickSource->getTicks() - startTime());
         } else {
-            return Microseconds{static_cast<long long>(_end - startTime())};
+            return _tickSource->ticksTo<Microseconds>(_end - startTime());
         }
     }
 
@@ -565,6 +638,13 @@ public:
     void reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool truncateOps = false);
 
     /**
+     * Sets the message for FailPoints used.
+     */
+    void setFailPointMessage_inlock(StringData message) {
+        _failPointMessage = message.toString();
+    }
+
+    /**
      * Sets the message for this CurOp.
      */
     void setMessage_inlock(StringData message);
@@ -579,6 +659,14 @@ public:
     ProgressMeter& setProgress_inlock(StringData name,
                                       unsigned long long progressMeterTotal = 0,
                                       int secondsBetween = 3);
+
+    /*
+     * Gets the message for FailPoints used.
+     */
+    const std::string& getFailPointMessage() const {
+        return _failPointMessage;
+    }
+
     /**
      * Gets the message for this CurOp.
      */
@@ -632,8 +720,17 @@ public:
         return _lockStatsBase;
     }
 
+    void setTickSource_forTest(TickSource* tickSource) {
+        _tickSource = tickSource;
+    }
+
 private:
     class CurOpStack;
+
+    TickSource::Tick startTime() {
+        ensureStarted();
+        return _start;
+    }
 
     static const OperationContext::Decoration<CurOpStack> _curopStack;
 
@@ -644,17 +741,21 @@ private:
     const Command* _command{nullptr};
 
     // The time at which this CurOp instance was marked as started.
-    long long _start{0};
+    TickSource::Tick _start{0};
 
     // The time at which this CurOp instance was marked as done.
-    long long _end{0};
+    TickSource::Tick _end{0};
 
     // The time at which this CurOp instance had its timer paused, or 0 if the timer is not
     // currently paused.
-    long long _lastPauseTime{0};
+    TickSource::Tick _lastPauseTime{0};
 
     // The cumulative duration for which the timer has been paused.
     Microseconds _totalPausedDuration{0};
+
+    // The elapsedTimeTotal() value at which the remoteOpWait timer was started, or empty if the
+    // remoteOpWait timer is not currently running.
+    boost::optional<Microseconds> _remoteOpStartTime;
 
     // _networkOp represents the network-level op code: OP_QUERY, OP_GET_MORE, OP_MSG, etc.
     NetworkOp _networkOp{opInvalid};  // only set this through setNetworkOp_inlock() to keep synced
@@ -669,6 +770,7 @@ private:
     BSONObj _opDescription;
     BSONObj _originatingCommand;  // Used by getMore to display original command.
     OpDebug _debug;
+    std::string _failPointMessage;  // Used to store FailPoint information.
     std::string _message;
     ProgressMeter _progressMeter;
     int _numYields{0};
@@ -678,6 +780,8 @@ private:
     std::string _planSummary;
     boost::optional<SingleThreadedLockStats>
         _lockStatsBase;  // This is the snapshot of lock stats taken when curOp is constructed.
+
+    TickSource* _tickSource = nullptr;
 };
 
 /**

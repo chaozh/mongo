@@ -49,6 +49,13 @@
     DEATH_TEST_DEFINE_(SUITE_NAME, TEST_NAME, MATCH_EXPR, ::mongo::unittest::Test)
 
 /**
+ * See DEATH_TEST for details.
+ * Validates output is a partial match using a PCRE regular expression instead of a string match.
+ */
+#define DEATH_TEST_REGEX(SUITE_NAME, TEST_NAME, REGEX_EXPR) \
+    DEATH_TEST_DEFINE_REGEX_(SUITE_NAME, TEST_NAME, REGEX_EXPR, ::mongo::unittest::Test)
+
+/**
  * Constructs a single test named TEST_NAME that has access to a common fixture
  * named `FIXTURE_NAME`, which will be used as the Suite name.
  *
@@ -57,18 +64,44 @@
 #define DEATH_TEST_F(FIXTURE_NAME, TEST_NAME, MATCH_EXPR) \
     DEATH_TEST_DEFINE_(FIXTURE_NAME, TEST_NAME, MATCH_EXPR, FIXTURE_NAME)
 
+#define DEATH_TEST_REGEX_F(FIXTURE_NAME, TEST_NAME, REGEX_EXPR) \
+    DEATH_TEST_DEFINE_REGEX_(FIXTURE_NAME, TEST_NAME, REGEX_EXPR, FIXTURE_NAME)
+
 #define DEATH_TEST_DEFINE_(SUITE_NAME, TEST_NAME, MATCH_EXPR, TEST_BASE)                 \
     DEATH_TEST_DEFINE_PRIMITIVE_(SUITE_NAME,                                             \
                                  TEST_NAME,                                              \
                                  MATCH_EXPR,                                             \
+                                 false,                                                  \
                                  UNIT_TEST_DETAIL_TEST_TYPE_NAME(SUITE_NAME, TEST_NAME), \
                                  TEST_BASE)
 
-#define DEATH_TEST_DEFINE_PRIMITIVE_(SUITE_NAME, TEST_NAME, MATCH_EXPR, TEST_TYPE, TEST_BASE)  \
+#define DEATH_TEST_DEFINE_REGEX_(SUITE_NAME, TEST_NAME, REGEX_EXPR, TEST_BASE)           \
+    DEATH_TEST_DEFINE_PRIMITIVE_(SUITE_NAME,                                             \
+                                 TEST_NAME,                                              \
+                                 REGEX_EXPR,                                             \
+                                 true,                                                   \
+                                 UNIT_TEST_DETAIL_TEST_TYPE_NAME(SUITE_NAME, TEST_NAME), \
+                                 TEST_BASE)
+
+
+#define DEATH_TEST_DEFINE_PRIMITIVE_(                                                          \
+    SUITE_NAME, TEST_NAME, MATCH_EXPR, IS_REGEX, TEST_TYPE, TEST_BASE)                         \
     class TEST_TYPE : public TEST_BASE {                                                       \
     public:                                                                                    \
         static std::string getPattern() {                                                      \
             return MATCH_EXPR;                                                                 \
+        }                                                                                      \
+                                                                                               \
+        static bool isRegex() {                                                                \
+            return IS_REGEX;                                                                   \
+        }                                                                                      \
+                                                                                               \
+        static int getLine() {                                                                 \
+            return __LINE__;                                                                   \
+        }                                                                                      \
+                                                                                               \
+        static std::string getFile() {                                                         \
+            return __FILE__;                                                                   \
         }                                                                                      \
                                                                                                \
     private:                                                                                   \
@@ -77,6 +110,7 @@
             #SUITE_NAME, #TEST_NAME, __FILE__};                                                \
     };                                                                                         \
     void TEST_TYPE::_doTest()
+
 
 namespace mongo::unittest {
 
@@ -91,6 +125,9 @@ private:
     // Customization points for derived DeathTest classes.
     virtual std::unique_ptr<Test> _doMakeTest() = 0;
     virtual std::string _doGetPattern() = 0;
+    virtual bool _isRegex() = 0;
+    virtual int _getLine() = 0;
+    virtual std::string _getFile() = 0;
 };
 
 template <typename T>
@@ -103,6 +140,18 @@ public:
 private:
     std::string _doGetPattern() override {
         return T::getPattern();
+    }
+
+    bool _isRegex() override {
+        return T::isRegex();
+    }
+
+    int _getLine() override {
+        return T::getLine();
+    }
+
+    std::string _getFile() override {
+        return T::getFile();
     }
 
     std::unique_ptr<Test> _doMakeTest() override {

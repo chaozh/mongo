@@ -88,7 +88,7 @@ private:
 
 class DocumentSourceGroup final : public DocumentSource {
 public:
-    using Accumulators = std::vector<boost::intrusive_ptr<Accumulator>>;
+    using Accumulators = std::vector<boost::intrusive_ptr<AccumulatorState>>;
     using GroupsMap = ValueUnorderedMap<Accumulators>;
 
     static constexpr StringData kStageName = "$group"_sd;
@@ -125,7 +125,8 @@ public:
                                      DiskUseRequirement::kWritesTmpData,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
         constraints.canSwapWithMatch = true;
         return constraints;
     }

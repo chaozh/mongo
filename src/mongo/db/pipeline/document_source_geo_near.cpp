@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +36,7 @@
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -94,6 +94,10 @@ intrusive_ptr<DocumentSource> DocumentSourceGeoNear::createFromBson(
     intrusive_ptr<DocumentSourceGeoNear> out = new DocumentSourceGeoNear(pCtx);
     out->parseOptions(elem.embeddedObjectUserCheck());
     return out;
+}
+
+bool DocumentSourceGeoNear::hasQuery() const {
+    return true;
 }
 
 void DocumentSourceGeoNear::parseOptions(BSONObj options) {
@@ -171,7 +175,7 @@ void DocumentSourceGeoNear::parseOptions(BSONObj options) {
     }
 
     if (options.hasField("uniqueDocs"))
-        warning() << "ignoring deprecated uniqueDocs option in $geoNear aggregation stage";
+        LOGV2_WARNING(23758, "ignoring deprecated uniqueDocs option in $geoNear aggregation stage");
 
     if (auto keyElt = options[kKeyFieldName]) {
         uassert(ErrorCodes::TypeMismatch,

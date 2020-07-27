@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -45,9 +45,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/record_data.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -136,7 +136,7 @@ BSONObj DurableViewCatalogImpl::_validateViewDefinition(OperationContext* opCtx,
     // Check the document is valid BSON, with only the expected fields.
     // Use the latest BSON validation version. Existing view definitions are allowed to contain
     // decimal data even if decimal is disabled.
-    fassert(40224, validateBSON(recordData.data(), recordData.size(), BSONVersion::kLatest));
+    fassert(40224, validateBSON(recordData.data(), recordData.size()));
     BSONObj viewDefinition = recordData.toBson();
 
     bool valid = true;
@@ -195,7 +195,12 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
 
     Snapshotted<BSONObj> oldView;
     if (!id.isValid() || !systemViews->findDoc(opCtx, id, &oldView)) {
-        LOG(2) << "insert view " << view << " into " << _db->getSystemViewsName();
+        LOGV2_DEBUG(22544,
+                    2,
+                    "Insert view {view} into {viewCatalog}",
+                    "Insert view to system views catalog",
+                    "view"_attr = view,
+                    "viewCatalog"_attr = _db->getSystemViewsName());
         uassertStatusOK(
             systemViews->insertDocument(opCtx, InsertStatement(view), &CurOp::get(opCtx)->debug()));
     } else {
@@ -225,7 +230,12 @@ void DurableViewCatalogImpl::remove(OperationContext* opCtx, const NamespaceStri
     if (!id.isValid())
         return;
 
-    LOG(2) << "remove view " << name << " from " << _db->getSystemViewsName();
+    LOGV2_DEBUG(22545,
+                2,
+                "Remove view {view} from {viewCatalog}",
+                "Remove view from system views catalog",
+                "view"_attr = name,
+                "viewCatalog"_attr = _db->getSystemViewsName());
     systemViews->deleteDocument(opCtx, kUninitializedStmtId, id, &CurOp::get(opCtx)->debug());
 }
 }  // namespace mongo

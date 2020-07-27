@@ -51,7 +51,7 @@ class UpsertStage final : public UpdateStage {
     UpsertStage& operator=(const UpsertStage&) = delete;
 
 public:
-    UpsertStage(OperationContext* opCtx,
+    UpsertStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
                 Collection* collection,
@@ -61,16 +61,14 @@ public:
     StageState doWork(WorkingSetID* out) final;
 
 private:
-    BSONObj _produceNewDocumentForInsert(bool isInternalRequest);
+    BSONObj _produceNewDocumentForInsert();
     void _performInsert(BSONObj newDocument);
 
     void _generateNewDocumentFromSuppliedDoc(const FieldRefSet& immutablePaths);
     void _generateNewDocumentFromUpdateOp(const FieldRefSet& immutablePaths);
 
     void _assertDocumentToBeInsertedIsValid(const mutablebson::Document& document,
-                                            const FieldRefSet& shardKeyPaths,
-                                            bool isInternalRequest,
-                                            bool enforceOkForStorage);
+                                            const FieldRefSet& shardKeyPaths);
 };
 
 }  // namespace mongo

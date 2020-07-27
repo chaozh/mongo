@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -39,16 +39,18 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/replica_set_monitor_server_parameters.h"
+#include "mongo/client/scanning_replica_set_monitor.h"
+#include "mongo/client/streamable_replica_set_monitor.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/util/log.h"
-#include "mongo/util/map_util.h"
 
 namespace mongo {
 
@@ -63,10 +65,66 @@ using executor::TaskExecutor;
 using executor::TaskExecutorPool;
 using executor::ThreadPoolTaskExecutor;
 
-ReplicaSetMonitorManager::ReplicaSetMonitorManager() {}
+namespace {
+const auto getGlobalRSMMonitorManager =
+    ServiceContext::declareDecoration<ReplicaSetMonitorManager>();
+}  // namespace
+
+Status ReplicaSetMonitorManagerNetworkConnectionHook::validateHost(
+    const HostAndPort& remoteHost,
+    const BSONObj& isMasterRequest,
+    const executor::RemoteCommandResponse& isMasterReply) {
+    if (gReplicaSetMonitorProtocol != ReplicaSetMonitorProtocol::kScanning) {
+        auto monitor = ReplicaSetMonitorManager::get()->getMonitorForHost(remoteHost);
+        if (!monitor) {
+            return Status::OK();
+        }
+
+        if (std::shared_ptr<StreamableReplicaSetMonitor> streamableMonitor =
+                std::dynamic_pointer_cast<StreamableReplicaSetMonitor>(
+                    ReplicaSetMonitorManager::get()->getMonitorForHost(remoteHost))) {
+
+            auto publisher = streamableMonitor->getEventsPublisher();
+            if (publisher) {
+                try {
+                    if (isMasterReply.status.isOK()) {
+                        publisher->onServerHandshakeCompleteEvent(
+                            isMasterReply.elapsedMillis.get(), remoteHost, isMasterReply.data);
+                    } else {
+                        publisher->onServerHandshakeFailedEvent(
+                            remoteHost, isMasterReply.status, isMasterReply.data);
+                    }
+                } catch (const DBException& exception) {
+                    LOGV2_ERROR(4712101,
+                                "An error occurred publishing a ReplicaSetMonitor handshake event",
+                                "error"_attr = exception.toStatus(),
+                                "replicaSet"_attr = monitor->getName(),
+                                "handshakeStatus"_attr = isMasterReply.status);
+                    return exception.toStatus();
+                }
+            }
+        }
+    }
+
+    return Status::OK();
+}
+
+StatusWith<boost::optional<executor::RemoteCommandRequest>>
+ReplicaSetMonitorManagerNetworkConnectionHook::makeRequest(const HostAndPort& remoteHost) {
+    return {boost::none};
+}
+
+Status ReplicaSetMonitorManagerNetworkConnectionHook::handleReply(
+    const HostAndPort& remoteHost, executor::RemoteCommandResponse&& response) {
+    MONGO_UNREACHABLE;
+}
 
 ReplicaSetMonitorManager::~ReplicaSetMonitorManager() {
     shutdown();
+}
+
+ReplicaSetMonitorManager* ReplicaSetMonitorManager::get() {
+    return &getGlobalRSMMonitorManager(getGlobalServiceContext());
 }
 
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitor(StringData setName) {
@@ -87,10 +145,15 @@ void ReplicaSetMonitorManager::_setupTaskExecutorInLock() {
 
     // construct task executor
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-    auto net = executor::makeNetworkInterface(
-        "ReplicaSetMonitor-TaskExecutor", nullptr, std::move(hookList));
-    auto pool = std::make_unique<NetworkInterfaceThreadPool>(net.get());
-    _taskExecutor = std::make_unique<ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
+    auto networkConnectionHook = std::make_unique<ReplicaSetMonitorManagerNetworkConnectionHook>();
+
+    std::shared_ptr<NetworkInterface> networkInterface = executor::makeNetworkInterface(
+        "ReplicaSetMonitor-TaskExecutor", std::move(networkConnectionHook), std::move(hookList));
+    _connectionManager = std::make_unique<ReplicaSetMonitorConnectionManager>(networkInterface);
+
+    auto pool = std::make_unique<NetworkInterfaceThreadPool>(networkInterface.get());
+
+    _taskExecutor = std::make_shared<ThreadPoolTaskExecutor>(std::move(pool), networkInterface);
     _taskExecutor->startup();
 }
 
@@ -107,7 +170,6 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(
 
 shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const MongoURI& uri) {
     invariant(uri.type() == ConnectionString::SET);
-
     stdx::lock_guard<Latch> lk(_mutex);
     uassert(ErrorCodes::ShutdownInProgress,
             str::stream() << "Unable to get monitor for '" << uri << "' due to shutdown",
@@ -121,12 +183,34 @@ shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getOrCreateMonitor(const
         return monitor;
     }
 
-    log() << "Starting new replica set monitor for " << uri.toString();
-
-    auto newMonitor = std::make_shared<ReplicaSetMonitor>(uri);
+    std::shared_ptr<ReplicaSetMonitor> newMonitor;
+    LOGV2(4603701,
+          "Starting Replica Set Monitor",
+          "protocol"_attr = toString(gReplicaSetMonitorProtocol),
+          "uri"_attr = uri.toString());
+    if (gReplicaSetMonitorProtocol == ReplicaSetMonitorProtocol::kScanning) {
+        newMonitor = std::make_shared<ScanningReplicaSetMonitor>(uri);
+        newMonitor->init();
+    } else {
+        // Both ReplicaSetMonitorProtocol::kSdam and ReplicaSetMonitorProtocol::kStreamable use the
+        // StreamableReplicaSetMonitor.
+        newMonitor = StreamableReplicaSetMonitor::make(uri, getExecutor(), _getConnectionManager());
+    }
     _monitors[setName] = newMonitor;
-    newMonitor->init();
     return newMonitor;
+}
+
+shared_ptr<ReplicaSetMonitor> ReplicaSetMonitorManager::getMonitorForHost(const HostAndPort& host) {
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    for (auto entry : _monitors) {
+        auto monitor = entry.second.lock();
+        if (monitor && monitor->contains(host)) {
+            return monitor;
+        }
+    }
+
+    return shared_ptr<ReplicaSetMonitor>();
 }
 
 vector<string> ReplicaSetMonitorManager::getAllSetNames() {
@@ -149,18 +233,17 @@ void ReplicaSetMonitorManager::removeMonitor(StringData setName) {
             monitor->drop();
         }
         _monitors.erase(it);
-        log() << "Removed ReplicaSetMonitor for replica set " << setName;
+        LOGV2(20187,
+              "Removed ReplicaSetMonitor for replica set {replicaSet}",
+              "Removed ReplicaSetMonitor for replica set",
+              "replicaSet"_attr = setName);
     }
 }
 
 void ReplicaSetMonitorManager::shutdown() {
-    // Sadly, this function can run very late in the post-main shutdown because there is still
-    // a globalRSMonitorManager. We have to be very carefully how we log because this can actually
-    // shutdown later than the logging subsystem. This will be less of an issue once SERVER-42437 is
-    // done.
-
     decltype(_monitors) monitors;
     decltype(_taskExecutor) taskExecutor;
+    decltype(_connectionManager) connectionManager;
     {
         stdx::lock_guard<Latch> lk(_mutex);
         if (std::exchange(_isShutdown, true)) {
@@ -168,27 +251,21 @@ void ReplicaSetMonitorManager::shutdown() {
         }
 
         monitors = std::exchange(_monitors, {});
+        connectionManager = std::exchange(_connectionManager, {});
         taskExecutor = std::exchange(_taskExecutor, {});
     }
 
-    if (taskExecutor) {
-        LOG(1) << "Shutting down task executor used for monitoring replica sets";
-        taskExecutor->shutdown();
-    }
-
-    if (monitors.size()) {
-        log() << "Dropping all ongoing scans against replica sets";
-    }
     for (auto& [name, monitor] : monitors) {
         auto anchor = monitor.lock();
         if (!anchor) {
             continue;
         }
-
         anchor->drop();
     }
 
     if (taskExecutor) {
+        LOGV2_DEBUG(20188, 1, "Shutting down task executor used for monitoring replica sets");
+        taskExecutor->shutdown();
         taskExecutor->join();
     }
 }
@@ -205,8 +282,8 @@ void ReplicaSetMonitorManager::removeAllMonitors() {
 void ReplicaSetMonitorManager::report(BSONObjBuilder* builder, bool forFTDC) {
     // Don't hold _mutex the whole time to avoid ever taking a monitor's mutex while holding the
     // manager's mutex.  Otherwise we could get a deadlock between the manager's, monitor's, and
-    // ShardRegistry's mutex due to the ReplicaSetMonitor's AsynchronousConfigChangeHook potentially
-    // calling ShardRegistry::updateConfigServerConnectionString.
+    // ShardRegistry's mutex due to the ReplicaSetMonitor's AsynchronousConfigChangeHook
+    // potentially calling ShardRegistry::updateConfigServerConnectionString.
     auto setNames = getAllSetNames();
 
     BSONObjBuilder setStats(
@@ -221,9 +298,14 @@ void ReplicaSetMonitorManager::report(BSONObjBuilder* builder, bool forFTDC) {
     }
 }
 
-TaskExecutor* ReplicaSetMonitorManager::getExecutor() {
+std::shared_ptr<executor::TaskExecutor> ReplicaSetMonitorManager::getExecutor() {
     invariant(_taskExecutor);
-    return _taskExecutor.get();
+    return _taskExecutor;
+}
+
+std::shared_ptr<executor::EgressTagCloser> ReplicaSetMonitorManager::_getConnectionManager() {
+    invariant(_connectionManager);
+    return _connectionManager;
 }
 
 ReplicaSetChangeNotifier& ReplicaSetMonitorManager::getNotifier() {
@@ -235,4 +317,7 @@ bool ReplicaSetMonitorManager::isShutdown() const {
     return _isShutdown;
 }
 
+void ReplicaSetMonitorConnectionManager::dropConnections(const HostAndPort& hostAndPort) {
+    _network->dropConnections(hostAndPort);
+}
 }  // namespace mongo

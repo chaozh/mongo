@@ -59,6 +59,13 @@ public:
                                          std::unique_ptr<RecordStore> rs) const final;
     };
 
+    SharedCollectionDecorations* getSharedDecorations() const final;
+
+    void init(OperationContext* opCtx) final;
+    bool isInitialized() const final;
+    bool isCommitted() const final;
+    void setCommitted(bool val) final;
+
     const NamespaceString& ns() const final {
         return _ns;
     }
@@ -90,7 +97,7 @@ public:
     }
 
     const BSONObj getValidatorDoc() const final {
-        return _validatorDoc.getOwned();
+        return _validator.validatorDoc.getOwned();
     }
 
     bool requiresIdIndex() const final;
@@ -235,12 +242,11 @@ public:
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
      */
-    StatusWithMatchExpression parseValidator(
-        OperationContext* opCtx,
-        const BSONObj& validator,
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures,
-        boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
-            maxFeatureCompatibilityVersion = boost::none) const final;
+    Validator parseValidator(OperationContext* opCtx,
+                             const BSONObj& validator,
+                             MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+                             boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
+                                 maxFeatureCompatibilityVersion = boost::none) const final;
 
     /**
      * Sets the validator for this collection.
@@ -248,7 +254,7 @@ public:
      * An empty validator removes all validation.
      * Requires an exclusive lock on the collection.
      */
-    Status setValidator(OperationContext* opCtx, BSONObj validator) final;
+    void setValidator(OperationContext* opCtx, Validator validator) final;
 
     Status setValidationLevel(OperationContext* opCtx, StringData newLevel) final;
     Status setValidationAction(OperationContext* opCtx, StringData newAction) final;
@@ -265,6 +271,9 @@ public:
                            BSONObj newValidator,
                            StringData newLevel,
                            StringData newAction) final;
+
+    bool getRecordPreImages() const final;
+    void setRecordPreImages(OperationContext* opCtx, bool val) final;
 
     bool isTemporary(OperationContext* opCtx) const final;
 
@@ -342,15 +351,12 @@ public:
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         ScanDirection scanDirection) final;
 
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) final;
 
     void establishOplogCollectionForLogging(OperationContext* opCtx) final;
-
-    void init(OperationContext* opCtx) final;
-    bool isInitialized() const final;
 
 private:
     /**
@@ -372,9 +378,16 @@ private:
                             std::vector<InsertStatement>::const_iterator end,
                             OpDebug* opDebug);
 
+    // This object is decorable and decorated with unversioned data related to the collection. Not
+    // associated with any particular Collection instance for the collection, but shared across all
+    // all instances for the same collection. This is a vehicle for users of a collection to cache
+    // unversioned state for a collection that is accessible across all of the Collection instances.
+    std::shared_ptr<SharedCollectionDecorations> _sharedDecorations;
+
     NamespaceString _ns;
     RecordId _catalogId;
     UUID _uuid;
+    bool _committed = true;
 
     // The RecordStore may be null during a repair operation.
     std::unique_ptr<RecordStore> _recordStore;  // owned
@@ -388,20 +401,13 @@ private:
     // If null, the default collation is simple binary compare.
     std::unique_ptr<CollatorInterface> _collator;
 
-    // Empty means no validator.
-    BSONObj _validatorDoc;
 
-    // The collection validator MatchExpression. This is stored as a StatusWith, as we lazily
-    // enforce that collection validators are well formed.
-    // -A non-OK Status indicates that the validator is not well formed, and any attempts to enforce
-    // the validator (inserts) should error.
-    // -A value of {nullptr} indicates that there is no validator.
-    // -Anything else indicates a well formed validator. The MatchExpression will maintain
-    // pointers into _validatorDoc.
-    StatusWithMatchExpression _swValidator;
+    Validator _validator;
 
     ValidationAction _validationAction;
     ValidationLevel _validationLevel;
+
+    bool _recordPreImages = false;
 
     // Notifier object for awaitData. Threads polling a capped collection for new data can wait
     // on this object until notified of the arrival of new data.

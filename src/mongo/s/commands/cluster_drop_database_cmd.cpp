@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -37,7 +37,6 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -74,6 +73,10 @@ public:
         uassert(ErrorCodes::IllegalOperation,
                 "Cannot drop the config database",
                 dbname != NamespaceString::kConfigDb);
+
+        uassert(ErrorCodes::IllegalOperation,
+                "Cannot drop the admin database",
+                dbname != NamespaceString::kAdminDb);
 
         uassert(ErrorCodes::BadValue,
                 "have to pass 1 as db parameter",

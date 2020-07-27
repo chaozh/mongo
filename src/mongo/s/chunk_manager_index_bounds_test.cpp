@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -37,11 +37,10 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/sharding_router_test_fixture.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -59,7 +58,8 @@ protected:
         const NamespaceString nss("test.foo");
         auto qr = std::make_unique<QueryRequest>(nss);
         qr->setFilter(queryObj);
-        boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+        boost::intrusive_ptr<ExpressionContextForTest> expCtx(
+            new ExpressionContextForTest(operationContext()));
         auto statusWithCQ =
             CanonicalQuery::canonicalize(operationContext(),
                                          std::move(qr),
@@ -88,7 +88,10 @@ protected:
             for (size_t i = 0; i < oil.intervals.size(); i++) {
                 if (Interval::INTERVAL_EQUALS !=
                     oil.intervals[i].compare(expectedOil.intervals[i])) {
-                    log() << oil.intervals[i] << " != " << expectedOil.intervals[i];
+                    LOGV2(22676,
+                          "Found mismatching field interval",
+                          "queryFieldInterval"_attr = oil.intervals[i],
+                          "expectedFieldInterval"_attr = expectedOil.intervals[i]);
                 }
                 ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
                               oil.intervals[i].compare(expectedOil.intervals[i]));
@@ -108,9 +111,10 @@ protected:
         const OrderedIntervalList& oil = indexBounds.fields.front();
 
         if (oil.intervals.size() != expectedOil.intervals.size()) {
-            for (size_t i = 0; i < oil.intervals.size(); i++) {
-                log() << oil.intervals[i];
-            }
+            LOGV2(22677,
+                  "Found mismatching field intervals",
+                  "queryFieldInterval"_attr = oil,
+                  "expectedFieldInterval"_attr = expectedOil);
         }
 
         ASSERT_EQUALS(oil.intervals.size(), expectedOil.intervals.size());

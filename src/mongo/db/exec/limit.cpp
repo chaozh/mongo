@@ -43,11 +43,11 @@ using std::vector;
 // static
 const char* LimitStage::kStageType = "LIMIT";
 
-LimitStage::LimitStage(OperationContext* opCtx,
+LimitStage::LimitStage(ExpressionContext* expCtx,
                        long long limit,
                        WorkingSet* ws,
                        std::unique_ptr<PlanStage> child)
-    : PlanStage(kStageType, opCtx), _ws(ws), _numToReturn(limit) {
+    : PlanStage(kStageType, expCtx), _ws(ws), _numToReturn(limit) {
     _specificStats.limit = _numToReturn;
     _children.emplace_back(std::move(child));
 }
@@ -70,11 +70,6 @@ PlanStage::StageState LimitStage::doWork(WorkingSetID* out) {
     if (PlanStage::ADVANCED == status) {
         *out = id;
         --_numToReturn;
-    } else if (PlanStage::FAILURE == status) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
     }

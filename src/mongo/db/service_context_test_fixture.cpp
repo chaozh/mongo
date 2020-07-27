@@ -42,16 +42,18 @@
 namespace mongo {
 
 ScopedGlobalServiceContextForTest::ScopedGlobalServiceContextForTest() {
-    setGlobalServiceContext(ServiceContext::make());
-    auto const serviceContext = getGlobalServiceContext();
+    auto serviceContext = [] {
+        auto serviceContext = ServiceContext::make();
+        auto serviceContextPtr = serviceContext.get();
+        setGlobalServiceContext(std::move(serviceContext));
+        return serviceContextPtr;
+    }();
+
     auto observerRegistry = std::make_unique<OpObserverRegistry>();
     serviceContext->setOpObserver(std::move(observerRegistry));
 }
 
 ScopedGlobalServiceContextForTest::~ScopedGlobalServiceContextForTest() {
-    // TODO Remove in SERVER-42437
-    ReplicaSetMonitor::shutdown();
-
     setGlobalServiceContext({});
 }
 

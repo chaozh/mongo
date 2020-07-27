@@ -40,6 +40,7 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/database_version_gen.h"
 #include "mongo/util/concurrency/notification.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/string_map.h"
 
@@ -128,7 +129,7 @@ class CatalogCache {
     CatalogCache& operator=(const CatalogCache&) = delete;
 
 public:
-    CatalogCache(CatalogCacheLoader& cacheLoader);
+    CatalogCache(CatalogCacheLoader& cacheLoader, std::shared_ptr<ThreadPool> executor);
     ~CatalogCache();
 
     /**
@@ -224,18 +225,16 @@ public:
                                                                  bool shouldBlock);
 
     /**
-     * Invalidates a single shard for the current collection if:
-     *   1. The shard's id is given, and
-     *   2. The epochs given in the two chunk versions match.
-     * Otherwise, invalidates the entire collection, causing any future targetting requests to
-     * block on an upcoming catalog cache refresh.
+     * Invalidates a single shard for the current collection if the epochs given in the chunk
+     * versions match. Otherwise, invalidates the entire collection, causing any future targetting
+     * requests to block on an upcoming catalog cache refresh.
      */
     void invalidateShardOrEntireCollectionEntryForShardedCollection(
         OperationContext* opCtx,
         const NamespaceString& nss,
         boost::optional<ChunkVersion> wantedVersion,
         const ChunkVersion& receivedVersion,
-        boost::optional<ShardId> shardId);
+        ShardId shardId);
 
     /**
      * Non-blocking method that marks the current collection entry for the namespace as needing
@@ -298,6 +297,19 @@ public:
      */
     void report(BSONObjBuilder* builder) const;
 
+    /**
+     * Checks if the current operation was ever marked as needing refresh. If the curent operation
+     * was marked as needing refresh, updates the relevant counters inside the Stats struct.
+     */
+    void checkAndRecordOperationBlockedByRefresh(OperationContext* opCtx, mongo::LogicalOp opType);
+
+    /**
+     * Returns a ThreadPool with default options to be used for CatalogCache.
+     *
+     * The returned ThreadPool is already started up.
+     */
+    static std::shared_ptr<ThreadPool> makeDefaultThreadPool();
+
 private:
     // Make the cache entries friends so they can access the private classes below
     friend class CachedDatabaseInfo;
@@ -307,19 +319,24 @@ private:
      * Cache entry describing a collection.
      */
     struct CollectionRoutingInfoEntry {
-        // Specifies whether the namespace needs a full refresh, which indicates that every shard
-        // should block on said upcoming refresh.
-        bool needsFullRefresh{true};
+        CollectionRoutingInfoEntry() = default;
+        // Disable copy (and move) semantics
+        CollectionRoutingInfoEntry(const CollectionRoutingInfoEntry&) = delete;
+        CollectionRoutingInfoEntry& operator=(const CollectionRoutingInfoEntry&) = delete;
 
-        // Contains a notification to be waited on for the refresh to complete. The
-        // refreshCompletionNotification is only available if:
-        // 1. needsFullRefresh is true, OR
-        // 2. The operation context for a particular operation is marked as needing refresh.
+        // Specifies whether this cache entry needs a refresh (in which case routingInfo should not
+        // be relied on) or it doesn't, in which case there should be a non-null routingInfo.
+        bool needsRefresh{true};
+
+        // Specifies whether the namespace has had an epoch change, which indicates that every
+        // shard should block on an upcoming refresh.
+        bool epochHasChanged{true};
+
+        // Contains a notification to be waited on for the refresh to complete (only available if
+        // needsRefresh is true)
         std::shared_ptr<Notification<Status>> refreshCompletionNotification;
 
-        // Contains the cached routing information. The routingInfo is only available if:
-        // 1. needsFullRefresh is false, AND
-        // 2. The operation context for a particular operation is marked as NOT needing refresh.
+        // Contains the cached routing information (only available if needsRefresh is false)
         std::shared_ptr<RoutingTableHistory> routingInfo;
     };
 
@@ -335,11 +352,6 @@ private:
         // needsRefresh is true)
         std::shared_ptr<Notification<Status>> refreshCompletionNotification;
 
-        // Until SERVER-34061 goes in, after a database refresh, one thread should also load the
-        // sharded collections. In case multiple threads were queued up on the refresh, this bool
-        // ensures only the first loads the collections.
-        bool mustLoadShardedCollections{true};
-
         // Contains the cached info about the database (only available if needsRefresh is false)
         boost::optional<DatabaseType> dbt;
     };
@@ -349,7 +361,7 @@ private:
      * database entry must be in the 'needsRefresh' state.
      */
     void _scheduleDatabaseRefresh(WithLock,
-                                  const std::string& dbName,
+                                  StringData dbName,
                                   std::shared_ptr<DatabaseInfoEntry> dbEntry);
 
     /**
@@ -357,16 +369,17 @@ private:
      * namespace must be in the 'needRefresh' state.
      */
     void _scheduleCollectionRefresh(WithLock,
+                                    ServiceContext* service,
                                     std::shared_ptr<CollectionRoutingInfoEntry> collEntry,
                                     NamespaceString const& nss,
                                     int refreshAttempt);
 
     /**
      * Marks a collection entry as needing refresh. Will create the collection entry if one does
-     * not exist. Also marks the collection as needing a full refresh, which will cause all further
-     * targeting requests against this namespace to block upon a catalog cache refresh.
+     * not exist. Also marks the epoch as changed, which will cause all further targetting requests
+     * against this namespace to block upon a catalog cache refresh.
      */
-    void _createOrGetCollectionEntryAndMarkNeedsFullRefresh(const NamespaceString& nss);
+    void _createOrGetCollectionEntryAndMarkEpochStale(const NamespaceString& nss);
 
     /**
      * Marks a collection entry as needing refresh. Will create the collection entry if one does
@@ -377,15 +390,16 @@ private:
                                                       const ShardId& shardId);
 
     /**
-     * Will create the collection entry if one does not exist.
+     * Marks a collection entry as needing refresh. Will create the collection entry if one does
+     * not exist.
      */
-    void _createCollectionEntry(const NamespaceString& nss);
+    void _createOrGetCollectionEntryAndMarkAsNeedsRefresh(const NamespaceString& nss);
 
     /**
      * Retrieves the collection entry for the given namespace, creating the entry if one does not
      * already exist.
      */
-    boost::optional<CollectionRoutingInfoEntry&> _createOrGetCollectionEntry(
+    std::shared_ptr<CollectionRoutingInfoEntry> _createOrGetCollectionEntry(
         WithLock wl, const NamespaceString& nss);
 
     /**
@@ -463,12 +477,26 @@ private:
         // for whatever reason
         AtomicWord<long long> countFailedRefreshes{0};
 
+        // Cumulative, always-increasing counter of how many operations have been blocked by a
+        // catalog cache refresh. Broken down by operation type to match the operations tracked
+        // by the OpCounters class.
+        struct OperationsBlockedByRefresh {
+            AtomicWord<long long> countAllOperations{0};
+            AtomicWord<long long> countInserts{0};
+            AtomicWord<long long> countQueries{0};
+            AtomicWord<long long> countUpdates{0};
+            AtomicWord<long long> countDeletes{0};
+            AtomicWord<long long> countCommands{0};
+        } operationsBlockedByRefresh;
+
         /**
          * Reports the accumulated statistics for serverStatus.
          */
         void report(BSONObjBuilder* builder) const;
 
     } _stats;
+
+    std::shared_ptr<ThreadPool> _executor;
 
     using DatabaseInfoMap = StringMap<std::shared_ptr<DatabaseInfoEntry>>;
     using CollectionInfoMap = StringMap<std::shared_ptr<CollectionRoutingInfoEntry>>;

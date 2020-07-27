@@ -4,6 +4,8 @@
 //   requires_non_retryable_commands,
 //   # applyOps uses the oplog that require replication support
 //   requires_replication,
+//   # Uses $v: 2 update oplog entries, only available in 4.6.
+//   requires_fcv_46,
 // ]
 
 (function() {
@@ -241,9 +243,15 @@ function testCrudOperationOnNonExistentNamespace(optype, o, o2, expectedErrorCod
 testCrudOperationOnNonExistentNamespace('i', {_id: 0}, {}, ErrorCodes.NamespaceNotFound);
 testCrudOperationOnNonExistentNamespace('u', {x: 0}, {_id: 0}, ErrorCodes.NamespaceNotFound);
 
-// Delete operations on non-existent collections/databases should return OK for idempotency
-// reasons.
-testCrudOperationOnNonExistentNamespace('d', {_id: 0}, {});
+// TODO(SERVER-46221): These oplog entries are inserted as given.  After SERVER-21700 and with
+// steady-state oplog constraint enforcement on, they will result in secondary crashes.  We
+// will need to have applyOps apply operations as executed rather than as given for this to
+// work properly.
+if (false) {
+    // Delete operations on non-existent collections/databases should return OK for idempotency
+    // reasons.
+    testCrudOperationOnNonExistentNamespace('d', {_id: 0}, {});
+}
 
 assert.commandWorked(db.createCollection(t.getName()));
 var a = assert.commandWorked(
@@ -251,10 +259,13 @@ var a = assert.commandWorked(
 assert.eq(1, t.find().count(), "Valid insert failed");
 assert.eq(true, a.results[0], "Bad result value for valid insert");
 
-a = assert.commandWorked(
-    db.adminCommand({applyOps: [{"op": "i", "ns": t.getFullName(), "o": {_id: 5, x: 17}}]}));
-assert.eq(1, t.find().count(), "Duplicate insert failed");
-assert.eq(true, a.results[0], "Bad result value for duplicate insert");
+// TODO(SERVER-46221): Duplicate inserts result in invalid oplog entries, as above.
+if (false) {
+    a = assert.commandWorked(
+        db.adminCommand({applyOps: [{"op": "i", "ns": t.getFullName(), "o": {_id: 5, x: 17}}]}));
+    assert.eq(1, t.find().count(), "Duplicate insert failed");
+    assert.eq(true, a.results[0], "Bad result value for duplicate insert");
+}
 
 var o = {_id: 5, x: 17};
 assert.eq(o, t.findOne(), "Mismatching document inserted.");
@@ -390,11 +401,11 @@ assert.eq(true, res.results[2], "Valid delete with transaction number failed");
 // operations add new fields in lexicographic order.
 res = assert.commandWorked(db.adminCommand({
     applyOps: [
-        {"op": "i", "ns": t.getFullName(), "o": {_id: 6}},
-        {"op": "u", "ns": t.getFullName(), "o2": {_id: 6}, "o": {$set: {z: 1, a: 2}}}
+        {"op": "i", "ns": t.getFullName(), "o": {_id: 9}},
+        {"op": "u", "ns": t.getFullName(), "o2": {_id: 9}, "o": {$set: {z: 1, a: 2}}}
     ]
 }));
-assert.eq(t.findOne({_id: 6}), {_id: 6, a: 2, z: 1});  // Note: 'a' and 'z' have been sorted.
+assert.eq(t.findOne({_id: 9}), {_id: 9, a: 2, z: 1});  // Note: 'a' and 'z' have been sorted.
 
 // 'ModifierInterface' semantics are not supported, so an update with {$v: 0} should fail.
 res = assert.commandFailed(db.adminCommand({
@@ -404,24 +415,55 @@ res = assert.commandFailed(db.adminCommand({
             "op": "u",
             "ns": t.getFullName(),
             "o2": {_id: 7},
-            "o": {$v: NumberLong(0), $set: {z: 1, a: 2}}
+            "o": {$v: NumberInt(0), $set: {z: 1, a: 2}}
         }
     ]
 }));
-assert.eq(res.code, 40682);
+assert.eq(res.code, 4772604);
 
 // When we explicitly specify {$v: 1}, we should get 'UpdateNode' update semantics, and $set
 // operations get performed in lexicographic order.
 res = assert.commandWorked(db.adminCommand({
     applyOps: [
-        {"op": "i", "ns": t.getFullName(), "o": {_id: 8}},
+        {"op": "i", "ns": t.getFullName(), "o": {_id: 10}},
         {
             "op": "u",
             "ns": t.getFullName(),
-            "o2": {_id: 8},
-            "o": {$v: NumberLong(1), $set: {z: 1, a: 2}}
+            "o2": {_id: 10},
+            "o": {$v: NumberInt(1), $set: {z: 1, a: 2}}
         }
     ]
 }));
-assert.eq(t.findOne({_id: 8}), {_id: 8, a: 2, z: 1});  // Note: 'a' and 'z' have been sorted.
+assert.eq(t.findOne({_id: 10}), {_id: 10, a: 2, z: 1});  // Note: 'a' and 'z' have been sorted.
+
+// {$v: 2} entries encode diffs differently, and operations are applied in the order specified
+// rather than in lexicographic order.
+res = assert.commandWorked(db.adminCommand({
+    applyOps: [
+        {"op": "i", "ns": t.getFullName(), "o": {_id: 11, deleteField: 1}},
+        {
+            "op": "u",
+            "ns": t.getFullName(),
+            "o2": {_id: 11},
+            // The diff indicates that 'deleteField' will be removed and 'newField' will be added
+            // with value "foo".
+            "o": {$v: NumberInt(2), diff: {d: {deleteField: false}, i: {newField: "foo"}}}
+        }
+    ]
+}));
+assert.eq(t.findOne({_id: 11}), {_id: 11, newField: "foo"});
+
+// {$v: 3} does not exist yet, and we check that trying to use it throws an error.
+res = assert.commandFailed(db.adminCommand({
+    applyOps: [
+        {"op": "i", "ns": t.getFullName(), "o": {_id: 12}},
+        {
+            "op": "u",
+            "ns": t.getFullName(),
+            "o2": {_id: 12},
+            "o": {$v: NumberInt(3), diff: {d: {deleteField: false}}}
+        }
+    ]
+}));
+assert.eq(res.code, 4772604);
 })();

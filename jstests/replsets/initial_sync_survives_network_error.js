@@ -1,7 +1,6 @@
 /**
  * Tests that initial sync survives a network error during each stage of the cloning process,
  * except for the query stage.
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
@@ -20,7 +19,7 @@ assert.commandWorked(primaryDb.test.insert([{a: 1}, {b: 2}, {c: 3}]));
 
 jsTest.log("Adding a new node to the replica set");
 const secondary = rst.add({
-    rsConfig: {priority: 0},
+    rsConfig: {priority: 0, votes: 0},
     setParameter: {
         'failpoint.initialSyncHangBeforeCopyingDatabases': tojson({mode: 'alwaysOn'}),
         // This test is specifically testing that the cloners stop, so we turn off the

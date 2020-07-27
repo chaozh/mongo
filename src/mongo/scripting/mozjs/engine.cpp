@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,10 +36,10 @@
 #include <js/Initialization.h>
 
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/mozjs/engine_gen.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/proxyscope.h"
-#include "mongo/util/log.h"
 
 namespace js {
 void DisableExtraThreads();
@@ -77,35 +77,43 @@ mongo::Scope* MozJSScriptEngine::createScope() {
     return new MozJSProxyScope(this);
 }
 
-mongo::Scope* MozJSScriptEngine::createScopeForCurrentThread() {
-    return new MozJSImplScope(this);
+mongo::Scope* MozJSScriptEngine::createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) {
+    return new MozJSImplScope(this, jsHeapLimitMB);
 }
 
 void MozJSScriptEngine::interrupt(unsigned opId) {
     stdx::lock_guard<Latch> intLock(_globalInterruptLock);
+    auto knownOps = [&]() {
+        std::vector<unsigned> ret;
+        for (auto&& iSc : _opToScopeMap) {
+            ret.push_back(iSc.first);
+        }
+        return ret;
+    };
     OpIdToScopeMap::iterator iScope = _opToScopeMap.find(opId);
     if (iScope == _opToScopeMap.end()) {
         // got interrupt request for a scope that no longer exists
-        LOG(1) << "received interrupt request for unknown op: " << opId << printKnownOps_inlock();
+        if (shouldLog(logv2::LogSeverity::Debug(2))) {
+            // This log record gets extra attributes when the log severity is at Debug(2)
+            // but we still log the record at log severity Debug(1). Simplify this if SERVER-48671
+            // gets done
+            LOGV2_DEBUG(22783,
+                        1,
+                        "Received interrupt request for unknown op",
+                        "opId"_attr = opId,
+                        "knownOps"_attr = knownOps());
+        } else {
+            LOGV2_DEBUG(22790, 1, "Received interrupt request for unknown op", "opId"_attr = opId);
+        }
         return;
     }
-
-    LOG(1) << "interrupting op: " << opId << printKnownOps_inlock();
-    iScope->second->kill();
-}
-
-std::string MozJSScriptEngine::printKnownOps_inlock() {
-    str::stream out;
-
-    if (shouldLog(logger::LogSeverity::Debug(2))) {
-        out << "  known ops: \n";
-
-        for (auto&& iSc : _opToScopeMap) {
-            out << "  " << iSc.first << "\n";
-        }
+    if (shouldLog(logv2::LogSeverity::Debug(2))) {
+        // Like above, this log record gets extra attributes when the log severity is at Debug(2)
+        LOGV2_DEBUG(22809, 1, "Interrupting op", "opId"_attr = opId, "knownOps"_attr = knownOps());
+    } else {
+        LOGV2_DEBUG(22808, 1, "Interrupting op", "opId"_attr = opId);
     }
-
-    return out;
+    iScope->second->kill();
 }
 
 void MozJSScriptEngine::interruptAll() {
@@ -147,7 +155,11 @@ void MozJSScriptEngine::registerOperation(OperationContext* opCtx, MozJSImplScop
 
     _opToScopeMap[opId] = scope;
 
-    LOG(2) << "SMScope " << reinterpret_cast<uint64_t>(scope) << " registered for op " << opId;
+    LOGV2_DEBUG(22785,
+                2,
+                "scope registered for op",
+                "scope"_attr = reinterpret_cast<uint64_t>(scope),
+                "opId"_attr = opId);
     Status status = opCtx->checkForInterruptNoAssert();
     if (!status.isOK()) {
         scope->kill();
@@ -157,7 +169,11 @@ void MozJSScriptEngine::registerOperation(OperationContext* opCtx, MozJSImplScop
 void MozJSScriptEngine::unregisterOperation(unsigned int opId) {
     stdx::lock_guard<Latch> giLock(_globalInterruptLock);
 
-    LOG(2) << "ImplScope " << reinterpret_cast<uint64_t>(this) << " unregistered for op " << opId;
+    LOGV2_DEBUG(22786,
+                2,
+                "scope unregistered for op",
+                "scope"_attr = reinterpret_cast<uint64_t>(this),
+                "opId"_attr = opId);
 
     if (opId != 0) {
         // scope is currently associated with an operation id

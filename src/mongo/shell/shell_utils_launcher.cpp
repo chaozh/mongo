@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -41,6 +41,7 @@
 #include <boost/iostreams/tee.hpp>
 #include <cctype>
 #include <fcntl.h>
+#include <fmt/format.h>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -61,14 +62,16 @@
 #endif
 
 #include "mongo/base/environment_buffer.h"
+#include "mongo/base/error_codes.h"
 #include "mongo/client/dbclient_connection.h"
 #include "mongo/db/traffic_reader.h"
+#include "mongo/logv2/log.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
@@ -109,6 +112,9 @@ inline int pipe(int fds[2]) {
 namespace shell_utils {
 
 namespace {
+
+using namespace fmt::literals;
+
 void safeClose(int fd) {
 #ifndef _WIN32
     struct ScopedSignalBlocker {
@@ -129,7 +135,7 @@ void safeClose(int fd) {
 #endif
     if (close(fd) != 0) {
         const auto ewd = errnoWithDescription();
-        error() << "failed to close fd " << fd << ": " << ewd;
+        LOGV2_ERROR(22829, "Failed to close fd", "fd"_attr = fd, "error"_attr = ewd);
         fassertFailed(40318);
     }
 }
@@ -187,6 +193,101 @@ void ProgramRegistry::registerReaderThread(ProcessId pid, stdx::thread reader) {
     _outputReaderThreads.emplace(pid, std::move(reader));
 }
 
+void ProgramRegistry::updatePidExitCode(ProcessId pid, int exitCode) {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
+    _pidToExitCode[pid] = exitCode;
+}
+
+bool ProgramRegistry::waitForPid(const ProcessId pid, const bool block, int* const exit_code) {
+    {
+        // Be careful not to hold the lock while waiting for the pid to finish
+        stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
+
+        // unregistered pids are dead
+        if (!this->isPidRegistered(pid)) {
+            if (exit_code) {
+                const auto code = _pidToExitCode.find(pid);
+                if (code != _pidToExitCode.end()) {
+                    *exit_code = code->second;
+                } else {
+                    // If you hit this invariant, you're waiting on a PID that was
+                    // never a child of this process.
+                    MONGO_UNREACHABLE;
+                }
+            }
+            return true;
+        }
+    }
+#ifdef _WIN32
+    HANDLE h = getHandleForPid(pid);
+
+    // wait until the process object is signaled before getting its
+    // exit code. do this even when block is false to ensure that all
+    // file handles open in the process have been closed.
+
+    DWORD ret = WaitForSingleObject(h, (block ? INFINITE : 0));
+    if (ret == WAIT_TIMEOUT) {
+        return false;
+    } else if (ret != WAIT_OBJECT_0) {
+        const auto ewd = errnoWithDescription();
+        LOGV2_INFO(
+            22811, "ProgramRegistry::waitForPid: WaitForSingleObject failed", "error"_attr = ewd);
+    }
+
+    DWORD tmp;
+    if (GetExitCodeProcess(h, &tmp)) {
+        if (tmp == STILL_ACTIVE) {
+            uassert(
+                ErrorCodes::UnknownError, "Process is STILL_ACTIVE even after blocking", !block);
+            return false;
+        }
+        CloseHandle(h);
+        eraseHandleForPid(pid);
+        if (exit_code)
+            *exit_code = tmp;
+        updatePidExitCode(pid, tmp);
+
+        unregisterProgram(pid);
+        return true;
+    } else {
+        const auto ewd = errnoWithDescription();
+        LOGV2_INFO(22812, "GetExitCodeProcess failed", "error"_attr = ewd);
+        return false;
+    }
+#else
+    int status;
+    int ret;
+    do {
+        errno = 0;
+        ret = waitpid(pid.toNative(), &status, (block ? 0 : WNOHANG));
+    } while (ret == -1 && errno == EINTR);
+    if (ret) {
+        int code;
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            code = -WTERMSIG(status);
+        } else {
+            MONGO_UNREACHABLE;
+        }
+        updatePidExitCode(pid, code);
+        if (exit_code) {
+            *exit_code = code;
+        }
+    }
+    if (ret) {
+        unregisterProgram(pid);
+    } else if (block) {
+        uasserted(ErrorCodes::UnknownError, "Process did not exit after blocking");
+    }
+    return ret == pid.toNative();
+#endif
+}
+
+bool ProgramRegistry::isPidDead(const ProcessId pid, int* const exit_code) {
+    return this->waitForPid(pid, false, exit_code);
+}
+
 void ProgramRegistry::getRegisteredPorts(vector<int>& ports) {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
     for (const auto& portPid : _portToPidMap) {
@@ -207,22 +308,19 @@ void ProgramRegistry::getRegisteredPids(vector<ProcessId>& pids) {
 }
 
 #ifdef _WIN32
-HANDLE ProgramRegistry::getHandleForPid(ProcessId pid) {
+HANDLE ProgramRegistry::getHandleForPid(ProcessId pid) const {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
 
-    return _handles[pid];
+    auto iter = _handles.find(pid);
+    uassert(
+        ErrorCodes::BadValue, "Unregistered pid {}"_format(pid.toNative()), iter != _handles.end());
+    return iter->second;
 }
 
 void ProgramRegistry::eraseHandleForPid(ProcessId pid) {
     stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
 
     _handles.erase(pid);
-}
-
-std::size_t ProgramRegistry::countHandleForPid(ProcessId pid) {
-    stdx::lock_guard<stdx::recursive_mutex> lk(_mutex);
-
-    return _handles.count(pid);
 }
 
 void ProgramRegistry::insertHandleForPid(ProcessId pid, HANDLE handle) {
@@ -247,12 +345,16 @@ void ProgramOutputMultiplexer::appendLine(int port,
             sink << name << pid << "| " << line << endl;
         }
     };
-    auto plainShellOutputDomain = logger::globalLogManager()->getNamedDomain("plainShellOutput");
-    logger::LogstreamBuilder builder(
-        plainShellOutputDomain, getThreadName(), logger::LogSeverity::Log());
 
+    std::ostringstream ss;
     sinkProgramOutput(_buffer);
-    sinkProgramOutput(builder);
+    sinkProgramOutput(ss);
+    LOGV2_INFO_OPTIONS(
+        4615640,
+        logv2::LogOptions(logv2::LogTag::kPlainShell | logv2::LogTag::kAllowDuringPromptingShell,
+                          logv2::LogTruncation::Disabled),
+        "{message}",
+        "message"_attr = ss.str());
 }
 
 string ProgramOutputMultiplexer::str() const {
@@ -315,7 +417,9 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMon
             ss << e.number();
             str = ss.str();
         } else {
-            verify(e.type() == mongo::String);
+            uassert(ErrorCodes::FailedToParse,
+                    "Program arguments must be strings",
+                    e.type() == mongo::String);
             str = e.valuestr();
         }
         if (isMongo) {
@@ -333,8 +437,9 @@ ProgramRunner::ProgramRunner(const BSONObj& args, const BSONObj& env, bool isMon
 
     // Load explicitly set environment key value pairs into _envp.
     for (const BSONElement& e : env) {
-        // Environment variable values must be strings
-        verify(e.type() == mongo::String);
+        uassert(ErrorCodes::FailedToParse,
+                "Environment variable values must be strings",
+                e.type() == mongo::String);
 
         _envp.emplace(std::string(e.fieldName()), std::string(e.valuestr()));
     }
@@ -415,7 +520,7 @@ void ProgramRunner::start() {
         int status = pipe(pipeEnds);
         if (status != 0) {
             const auto ewd = errnoWithDescription();
-            error() << "failed to create pipe: " << ewd;
+            LOGV2_ERROR(22830, "Failed to create pipe", "error"_attr = ewd);
             fassertFailed(16701);
         }
 #ifndef _WIN32
@@ -426,13 +531,13 @@ void ProgramRunner::start() {
         status = fcntl(pipeEnds[0], F_SETFD, FD_CLOEXEC);
         if (status != 0) {
             const auto ewd = errnoWithDescription();
-            error() << "failed to set FD_CLOEXEC on pipe end 0: " << ewd;
+            LOGV2_ERROR(22831, "Failed to set FD_CLOEXEC on pipe end 0", "error"_attr = ewd);
             fassertFailed(40308);
         }
         status = fcntl(pipeEnds[1], F_SETFD, FD_CLOEXEC);
         if (status != 0) {
             const auto ewd = errnoWithDescription();
-            error() << "failed to set FD_CLOEXEC on pipe end 1: " << ewd;
+            LOGV2_ERROR(22832, "Failed to set FD_CLOEXEC on pipe end 1", "error"_attr = ewd);
             fassertFailed(40317);
         }
 #endif
@@ -453,14 +558,7 @@ void ProgramRunner::start() {
 
     _pipe = pipeEnds[0];
 
-    {
-        stringstream ss;
-        ss << "shell: started program (sh" << _pid << "): ";
-        for (unsigned i = 0; i < _argv.size(); i++) {
-            ss << " " << _argv[i];
-        }
-        log() << ss.str();
-    }
+    LOGV2_INFO(22810, "shell: Started program", "pid"_attr = _pid, "argv"_attr = _argv);
 }
 
 void ProgramRunner::operator()() {
@@ -698,69 +796,6 @@ void ProgramRunner::launchProcess(int child_stdout) {
 #endif
 }
 
-// returns true if process exited
-// If this function returns true, it will always call `registry.unregisterProgram(pid);`
-// If block is true, this will throw if it cannot wait for the processes to exit.
-bool wait_for_pid(ProcessId pid, bool block = true, int* exit_code = nullptr) {
-#ifdef _WIN32
-    verify(registry.countHandleForPid(pid));
-    HANDLE h = registry.getHandleForPid(pid);
-
-    // wait until the process object is signaled before getting its
-    // exit code. do this even when block is false to ensure that all
-    // file handles open in the process have been closed.
-
-    DWORD ret = WaitForSingleObject(h, (block ? INFINITE : 0));
-    if (ret == WAIT_TIMEOUT) {
-        return false;
-    } else if (ret != WAIT_OBJECT_0) {
-        const auto ewd = errnoWithDescription();
-        log() << "wait_for_pid: WaitForSingleObject failed: " << ewd;
-    }
-
-    DWORD tmp;
-    if (GetExitCodeProcess(h, &tmp)) {
-        if (tmp == STILL_ACTIVE) {
-            uassert(
-                ErrorCodes::UnknownError, "Process is STILL_ACTIVE even after blocking", !block);
-            return false;
-        }
-        CloseHandle(h);
-        registry.eraseHandleForPid(pid);
-        if (exit_code)
-            *exit_code = tmp;
-
-        registry.unregisterProgram(pid);
-        return true;
-    } else {
-        const auto ewd = errnoWithDescription();
-        log() << "GetExitCodeProcess failed: " << ewd;
-        return false;
-    }
-#else
-    int tmp;
-    int ret;
-    do {
-        ret = waitpid(pid.toNative(), &tmp, (block ? 0 : WNOHANG));
-    } while (ret == -1 && errno == EINTR);
-    if (ret && exit_code) {
-        if (WIFEXITED(tmp)) {
-            *exit_code = WEXITSTATUS(tmp);
-        } else if (WIFSIGNALED(tmp)) {
-            *exit_code = -WTERMSIG(tmp);
-        } else {
-            MONGO_UNREACHABLE;
-        }
-    }
-    if (ret) {
-        registry.unregisterProgram(pid);
-    } else if (block) {
-        uasserted(ErrorCodes::UnknownError, "Process did not exit after blocking");
-    }
-    return ret == pid.toNative();
-#endif
-}
-
 BSONObj RawMongoProgramOutput(const BSONObj& args, void* data) {
     return BSON("" << programOutputLogger.str());
 }
@@ -773,7 +808,7 @@ BSONObj ClearRawMongoProgramOutput(const BSONObj& args, void* data) {
 BSONObj CheckProgram(const BSONObj& args, void* data) {
     ProcessId pid = ProcessId::fromNative(singleArg(args).numberInt());
     int exit_code = -123456;  // sentinel value
-    bool isDead = wait_for_pid(pid, false, &exit_code);
+    bool isDead = registry.isPidDead(pid, &exit_code);
     if (!isDead) {
         return BSON("" << BSON("alive" << true));
     }
@@ -783,7 +818,7 @@ BSONObj CheckProgram(const BSONObj& args, void* data) {
 BSONObj WaitProgram(const BSONObj& a, void* data) {
     ProcessId pid = ProcessId::fromNative(singleArg(a).numberInt());
     int exit_code = -123456;  // sentinel value
-    wait_for_pid(pid, true, &exit_code);
+    registry.waitForPid(pid, true, &exit_code);
     return BSON(string("") << exit_code);
 }
 
@@ -796,11 +831,11 @@ BSONObj WaitMongoProgram(const BSONObj& a, void* data) {
     int exit_code = -123456;  // sentinel value
     invariant(port >= 0);
     if (!registry.isPortRegistered(port)) {
-        log() << "No db started on port: " << port;
+        LOGV2_INFO(22813, "No db started on port", "port"_attr = port);
         return BSON(string("") << 0);
     }
     pid = registry.pidForPort(port);
-    wait_for_pid(pid, true, &exit_code);
+    registry.waitForPid(pid, true, &exit_code);
     return BSON(string("") << exit_code);
 }
 
@@ -846,7 +881,7 @@ BSONObj RunProgram(const BSONObj& a, void* data, bool isMongo) {
     stdx::thread t(r);
     registry.registerReaderThread(r.pid(), std::move(t));
     int exit_code = -123456;  // sentinel value
-    wait_for_pid(r.pid(), true, &exit_code);
+    registry.waitForPid(r.pid(), true, &exit_code);
     return BSON(string("") << exit_code);
 }
 
@@ -859,23 +894,33 @@ BSONObj RunNonMongoProgram(const BSONObj& a, void* data) {
 }
 
 BSONObj ResetDbpath(const BSONObj& a, void* data) {
-    verify(a.nFields() == 1);
+    uassert(ErrorCodes::FailedToParse, "Expected 1 field", a.nFields() == 1);
     string path = a.firstElement().valuestrsafe();
     if (path.empty()) {
-        warning() << "ResetDbpath(): nothing to do, path was empty";
+        LOGV2_WARNING(22824, "ResetDbpath(): nothing to do, path was empty");
         return undefinedReturn;
     }
-    if (boost::filesystem::exists(path))
-        boost::filesystem::remove_all(path);
+    if (boost::filesystem::exists(path)) {
+        try {
+            boost::filesystem::remove_all(path);
+        } catch (const boost::filesystem::filesystem_error&) {
+#ifdef _WIN32
+            sleepmillis(100);
+            boost::filesystem::remove_all(path);
+#else
+            throw;
+#endif
+        }
+    }
     boost::filesystem::create_directory(path);
     return undefinedReturn;
 }
 
 BSONObj PathExists(const BSONObj& a, void* data) {
-    verify(a.nFields() == 1);
+    uassert(ErrorCodes::FailedToParse, "Expected 1 field", a.nFields() == 1);
     string path = a.firstElement().valuestrsafe();
     if (path.empty()) {
-        warning() << "PathExists(): path was empty";
+        LOGV2_WARNING(22825, "PathExists(): path was empty");
         return BSON(string("") << false);
     };
     bool exists = boost::filesystem::exists(path);
@@ -892,8 +937,13 @@ void copyDir(const boost::filesystem::path& from, const boost::filesystem::path&
             boost::system::error_code ec;
             boost::filesystem::copy_file(p, to / p.leaf(), ec);
             if (ec) {
-                log() << "Skipping copying of file from '" << p.generic_string() << "' to '"
-                      << (to / p.leaf()).generic_string() << "' due to: " << ec.message();
+                LOGV2_INFO(22814,
+                           "Skipping copying of file from '{from}' to "
+                           "'{to}' due to: {error}",
+                           "Skipping copying of file due to error"
+                           "from"_attr = p.generic_string(),
+                           "to"_attr = (to / p.leaf()).generic_string(),
+                           "error"_attr = ec.message());
             }
         } else if (p.leaf() != "mongod.lock" && p.leaf() != "WiredTiger.lock") {
             if (boost::filesystem::is_directory(p)) {
@@ -908,19 +958,24 @@ void copyDir(const boost::filesystem::path& from, const boost::filesystem::path&
     }
 }
 
-// NOTE target dbpath will be cleared first
+/**
+ * Called from JS as  `copyDbpath(fromDir, toDir);`
+ *
+ * The destination dbpath will be cleared first.
+ */
 BSONObj CopyDbpath(const BSONObj& a, void* data) {
-    verify(a.nFields() == 2);
+    uassert(ErrorCodes::FailedToParse, "Expected 2 fields", a.nFields() == 2);
     BSONObjIterator i(a);
     string from = i.next().str();
     string to = i.next().str();
     if (from.empty() || to.empty()) {
-        warning() << "CopyDbpath(): nothing to do, source or destination path(s) were empty";
+        LOGV2_WARNING(22826,
+                      "CopyDbpath(): nothing to do, source or destination path(s) were empty");
         return undefinedReturn;
     }
     if (boost::filesystem::exists(to))
         boost::filesystem::remove_all(to);
-    boost::filesystem::create_directory(to);
+    boost::filesystem::create_directories(to);
     copyDir(from, to);
     return undefinedReturn;
 }
@@ -928,7 +983,6 @@ BSONObj CopyDbpath(const BSONObj& a, void* data) {
 inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
 #ifdef _WIN32
     if (sig == SIGKILL || port == 0) {
-        verify(registry.countHandleForPid(pid));
         TerminateProcess(registry.getHandleForPid(pid),
                          1);  // returns failure for "zombie" processes.
         return;
@@ -941,11 +995,14 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
         int gle = GetLastError();
         if (gle != ERROR_FILE_NOT_FOUND) {
             const auto ewd = errnoWithDescription();
-            warning() << "kill_wrapper OpenEvent failed: " << ewd;
+            LOGV2_WARNING(22827, "kill_wrapper OpenEvent failed", "error"_attr = ewd);
         } else {
-            log() << "kill_wrapper OpenEvent failed to open event to the process " << pid.asUInt32()
-                  << ". It has likely died already or server is running an older version."
-                  << " Attempting to shutdown through admin command.";
+            LOGV2_INFO(
+                22815,
+                "kill_wrapper OpenEvent failed to open event to the process. It "
+                "has likely died already or server is running an older version. Attempting to "
+                "shutdown through admin command.",
+                "pid"_attr = pid.asUInt32());
 
             // Back-off to the old way of shutting down the server on Windows, in case we
             // are managing a pre-2.6.0rc0 service, which did not have the event.
@@ -984,7 +1041,7 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
     bool result = SetEvent(event);
     if (!result) {
         const auto ewd = errnoWithDescription();
-        error() << "kill_wrapper SetEvent failed: " << ewd;
+        LOGV2_ERROR(22833, "kill_wrapper SetEvent failed", "error"_attr = ewd);
         return;
     }
 #else
@@ -993,8 +1050,9 @@ inline void kill_wrapper(ProcessId pid, int sig, int port, const BSONObj& opt) {
         if (errno == ESRCH) {
         } else {
             const auto ewd = errnoWithDescription();
-            log() << "killFailed: " << ewd;
-            verify(x == 0);
+            LOGV2_INFO(22816, "Kill failed", "error"_attr = ewd);
+            uasserted(ErrorCodes::UnknownError,
+                      "kill({}, {}) failed: {}"_format(pid.toNative(), sig, ewd));
         }
     }
 
@@ -1005,7 +1063,7 @@ int killDb(int port, ProcessId _pid, int signal, const BSONObj& opt, bool waitPi
     ProcessId pid;
     if (port > 0) {
         if (!registry.isPortRegistered(port)) {
-            log() << "No db started on port: " << port;
+            LOGV2_INFO(22817, "No db started on port", "port"_attr = port);
             return 0;
         }
         pid = registry.pidForPort(port);
@@ -1017,16 +1075,16 @@ int killDb(int port, ProcessId _pid, int signal, const BSONObj& opt, bool waitPi
 
     // If we are not waiting for the process to end, then return immediately.
     if (!waitPid) {
-        log() << "skip waiting for pid " << pid << " to terminate";
+        LOGV2_INFO(22818, "Skip waiting for process to terminate", "pid"_attr = pid);
         return 0;
     }
 
     int exitCode = EXIT_FAILURE;
     try {
-        log() << "waiting for process " << pid << " to terminate.";
-        wait_for_pid(pid, true, &exitCode);
+        LOGV2_INFO(22819, "Waiting for process to terminate.", "pid"_attr = pid);
+        registry.waitForPid(pid, true, &exitCode);
     } catch (...) {
-        warning() << "process " << pid << " failed to terminate.";
+        LOGV2_WARNING(22828, "Process failed to terminate.", "pid"_attr = pid);
         return EXIT_FAILURE;
     }
 
@@ -1048,7 +1106,7 @@ int getSignal(const BSONObj& a) {
         BSONObjIterator i(a);
         i.next();
         BSONElement e = i.next();
-        verify(e.isNumber());
+        uassert(ErrorCodes::BadValue, "Expected a signal number", e.isNumber());
         ret = int(e.number());
     }
     return ret;
@@ -1090,10 +1148,10 @@ BSONObj StopMongoProgram(const BSONObj& a, void* data) {
     uassert(ErrorCodes::FailedToParse, "wrong number of arguments", nFields >= 1 && nFields <= 4);
     uassert(ErrorCodes::BadValue, "stopMongoProgram needs a number", a.firstElement().isNumber());
     int port = int(a.firstElement().number());
-    log() << "shell: stopping mongo program, waitpid=" << getWaitPid(a);
+    LOGV2_INFO(22820, "shell: Stopping mongo program", "waitpid"_attr = getWaitPid(a));
     int code =
         killDb(port, ProcessId::fromNative(0), getSignal(a), getStopMongodOpts(a), getWaitPid(a));
-    log() << "shell: stopped mongo program on port " << port;
+    LOGV2_INFO(22821, "shell: Stopped mongo program on port", "port"_attr = port);
     return BSON("" << (double)code);
 }
 
@@ -1104,7 +1162,7 @@ BSONObj StopMongoProgramByPid(const BSONObj& a, void* data) {
         ErrorCodes::BadValue, "stopMongoProgramByPid needs a number", a.firstElement().isNumber());
     ProcessId pid = ProcessId::fromNative(int(a.firstElement().number()));
     int code = killDb(0, pid, getSignal(a), getStopMongodOpts(a));
-    log() << "shell: stopped mongo program with pid " << pid;
+    LOGV2_INFO(22822, "shell: Stopped mongo program with pid", "pid"_attr = pid);
     return BSON("" << (double)code);
 }
 
@@ -1124,7 +1182,8 @@ int KillMongoProgramInstances() {
         int port = registry.portForPid(pid);
         int code = killDb(port != -1 ? port : 0, pid, SIGTERM);
         if (code != EXIT_SUCCESS) {
-            log() << "Process with pid " << pid << " exited with error code " << code;
+            LOGV2_INFO(
+                22823, "Process exited with error code", "pid"_attr = pid, "code"_attr = code);
             returnCode = code;
         }
     }
@@ -1141,8 +1200,7 @@ std::vector<ProcessId> getRunningMongoChildProcessIds() {
                  registeredPids.end(),
                  std::back_inserter(outPids),
                  [](const ProcessId& pid) {
-                     const bool block = false;
-                     bool isDead = wait_for_pid(pid, block);
+                     bool isDead = registry.isPidDead(pid);
                      return !isDead;
                  });
     return outPids;

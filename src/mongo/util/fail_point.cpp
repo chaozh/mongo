@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/fail_point.h"
@@ -41,11 +41,11 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_server_parameter_gen.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -108,20 +108,16 @@ auto FailPoint::setMode(Mode mode, ValType val, BSONObj extra) -> EntryCountT {
 }
 
 auto FailPoint::waitForTimesEntered(EntryCountT targetTimesEntered) const noexcept -> EntryCountT {
-    auto timesEntered = _timesEntered.load();
-    for (; timesEntered < targetTimesEntered; timesEntered = _timesEntered.load()) {
-        sleepmillis(duration_cast<Milliseconds>(kWaitGranularity).count());
-    };
-    return timesEntered;
+    return waitForTimesEntered(Interruptible::notInterruptible(), targetTimesEntered);
 }
 
-auto FailPoint::waitForTimesEntered(OperationContext* opCtx, EntryCountT targetTimesEntered) const
-    -> EntryCountT {
-    auto timesEntered = _timesEntered.load();
-    for (; timesEntered < targetTimesEntered; timesEntered = _timesEntered.load()) {
-        opCtx->sleepFor(kWaitGranularity);
-    };
-    return timesEntered;
+auto FailPoint::waitForTimesEntered(Interruptible* interruptible,
+                                    EntryCountT targetTimesEntered) const -> EntryCountT {
+    while (true) {
+        if (auto entries = _timesEntered.load(); entries >= targetTimesEntered)
+            return entries;
+        interruptible->sleepFor(kWaitGranularity);
+    }
 }
 
 const BSONObj& FailPoint::_getData() const {
@@ -174,7 +170,10 @@ FailPoint::RetCode FailPoint::_slowShouldFailOpenBlockWithoutIncrementingTimesEn
             return slowOff;
         }
         default:
-            error() << "FailPoint Mode not supported: " << static_cast<int>(_mode);
+            LOGV2_ERROR(23832,
+                        "FailPoint mode not supported: {mode}",
+                        "FailPoint mode not supported",
+                        "mode"_attr = static_cast<int>(_mode));
             fassertFailed(16444);
     }
 }
@@ -302,7 +301,11 @@ auto setGlobalFailPoint(const std::string& failPointName, const BSONObj& cmdObj)
     if (failPoint == nullptr)
         uasserted(ErrorCodes::FailPointSetFailed, failPointName + " not found");
     auto timesEntered = failPoint->setMode(uassertStatusOK(FailPoint::parseBSON(cmdObj)));
-    warning() << "failpoint: " << failPointName << " set to: " << failPoint->toBSON();
+    LOGV2_WARNING(23829,
+                  "Set failpoint {failPointName} to: {failPoint}",
+                  "Set failpoint",
+                  "failPointName"_attr = failPointName,
+                  "failPoint"_attr = failPoint->toBSON());
     return timesEntered;
 }
 
@@ -316,12 +319,20 @@ FailPointEnableBlock::FailPointEnableBlock(std::string failPointName, BSONObj da
 
     _initialTimesEntered = _failPoint->setMode(FailPoint::alwaysOn, 0, std::move(data));
 
-    warning() << "failpoint: " << _failPointName << " set to: " << _failPoint->toBSON();
+    LOGV2_WARNING(23830,
+                  "Set failpoint {failPointName} to: {failPoint}",
+                  "Set failpoint",
+                  "failPointName"_attr = _failPointName,
+                  "failPoint"_attr = _failPoint->toBSON());
 }
 
 FailPointEnableBlock::~FailPointEnableBlock() {
     _failPoint->setMode(FailPoint::off);
-    warning() << "failpoint: " << _failPointName << " set to: " << _failPoint->toBSON();
+    LOGV2_WARNING(23831,
+                  "Set failpoint {failPointName} to: {failPoint}",
+                  "Set failpoint",
+                  "failPointName"_attr = _failPointName,
+                  "failPoint"_attr = _failPoint->toBSON());
 }
 
 FailPointRegistry::FailPointRegistry() : _frozen(false) {}

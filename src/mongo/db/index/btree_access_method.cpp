@@ -65,13 +65,16 @@ BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState,
                                             getSortedDataInterface()->getOrdering());
 }
 
-void BtreeAccessMethod::doGetKeys(const BSONObj& obj,
+void BtreeAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                  const BSONObj& obj,
                                   GetKeysContext context,
                                   KeyStringSet* keys,
                                   KeyStringSet* multikeyMetadataKeys,
                                   MultikeyPaths* multikeyPaths,
                                   boost::optional<RecordId> id) const {
-    _keyGenerator->getKeys(obj, keys, multikeyPaths, id);
+    const auto skipMultikey = context == IndexAccessMethod::GetKeysContext::kValidatingKeys &&
+        !_descriptor->getEntry()->isMultikey();
+    _keyGenerator->getKeys(pooledBufferBuilder, obj, skipMultikey, keys, multikeyPaths, id);
 }
 
 }  // namespace mongo

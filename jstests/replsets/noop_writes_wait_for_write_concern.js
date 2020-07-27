@@ -8,6 +8,7 @@
 (function() {
 "use strict";
 load('jstests/libs/write_concern_util.js');
+load('jstests/noPassthrough/libs/index_build.js');
 
 var name = 'noop_writes_wait_for_write_concern';
 var replTest = new ReplSetTest({
@@ -49,7 +50,7 @@ function dropTestCollection() {
 var commands = [];
 
 commands.push({
-    req: {applyOps: [{op: "i", ns: coll.getFullName(), o: {_id: 1}}]},
+    req: {applyOps: [{op: "u", ns: coll.getFullName(), o: {_id: 1}, o2: {_id: 1}}]},
     setupFunc: function() {
         assert.commandWorked(coll.insert({_id: 1}));
     },
@@ -107,12 +108,18 @@ commands.push({
     }
 });
 
+// All voting data bearing nodes are not up for this test. So 'createIndexes' command can't succeed
+// with the default index commitQuorum value "votingMembers". So, running createIndexes cmd using
+// commit quorum "majority".
 commands.push({
-    req: {createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]},
+    req: {createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}], commitQuorum: "majority"},
     setupFunc: function() {
         assert.commandWorked(coll.insert({a: 1}));
-        assert.commandWorkedIgnoringWriteConcernErrors(
-            db.runCommand({createIndexes: collName, indexes: [{key: {a: 1}, name: "a_1"}]}));
+        assert.commandWorkedIgnoringWriteConcernErrors(db.runCommand({
+            createIndexes: collName,
+            indexes: [{key: {a: 1}, name: "a_1"}],
+            commitQuorum: "majority"
+        }));
     },
     confirmFunc: function(res) {
         assert.commandWorkedIgnoringWriteConcernErrors(res);
@@ -202,6 +209,12 @@ function testCommandWithWriteConcern(cmd) {
     // Provide a small wtimeout that we expect to time out.
     cmd.req.writeConcern = {w: 3, wtimeout: 1000};
     jsTest.log("Testing " + tojson(cmd.req));
+
+    if (cmd.req["createIndexes"] !== undefined &&
+        !IndexBuildTest.indexBuildCommitQuorumEnabled(primary)) {
+        jsTest.log("Skipping test because index build commit quorum is not supported.");
+        return;
+    }
 
     dropTestCollection();
 

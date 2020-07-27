@@ -30,11 +30,16 @@
 #pragma once
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 
 namespace mongo {
+class OperationContext;
 
 constexpr StringData kX509AuthMechanism = "MONGODB-X509"_sd;
 
 void disableAuthMechanism(StringData authMechanism);
+
+void doSpeculativeAuthenticate(OperationContext* opCtx, BSONObj isMaster, BSONObjBuilder* result);
 
 }  // namespace mongo

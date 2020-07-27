@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,12 +38,12 @@
 #include "mongo/config.h"
 #include "mongo/db/client.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/bits.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
 namespace ThreadedTests {
@@ -278,7 +278,7 @@ private:
             _hotel.checkOut();
 
             if ((i % (checkIns / 10)) == 0)
-                mongo::unittest::log() << "checked in " << i << " times..." << endl;
+                LOGV2(22517, "checked in {i} times...", "i"_attr = i);
         }
     }
 

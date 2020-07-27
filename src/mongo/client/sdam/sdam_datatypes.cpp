@@ -113,6 +113,24 @@ std::string toString(const TopologyType topologyType) {
     }
 }
 
+StatusWith<TopologyType> parseTopologyType(StringData strTopologyType) {
+    if (strTopologyType == "ReplicaSetNoPrimary") {
+        return TopologyType::kReplicaSetNoPrimary;
+    } else if (strTopologyType == "ReplicaSetWithPrimary") {
+        return TopologyType::kReplicaSetWithPrimary;
+    } else if (strTopologyType == "Sharded") {
+        return TopologyType::kSharded;
+    } else if (strTopologyType == "Unknown") {
+        return TopologyType::kUnknown;
+    } else if (strTopologyType == "Single") {
+        return TopologyType::kSingle;
+    } else {
+        std::stringstream errorMessage;
+        errorMessage << strTopologyType << " is an invalid TopologyType.";
+        return StatusWith<TopologyType>(ErrorCodes::InvalidTopologyType, errorMessage.str());
+    }
+}
+
 std::ostream& operator<<(std::ostream& os, const TopologyType topologyType) {
     os << toString(topologyType);
     return os;
@@ -127,7 +145,7 @@ const std::vector<TopologyType> allTopologyTypes() {
     return result;
 }
 
-const ServerAddress& IsMasterOutcome::getServer() const {
+const HostAndPort& IsMasterOutcome::getServer() const {
     return _server;
 }
 bool IsMasterOutcome::isSuccess() const {
@@ -144,5 +162,25 @@ const boost::optional<TopologyVersion>& IsMasterOutcome::getTopologyVersion() co
 }
 const std::string& IsMasterOutcome::getErrorMsg() const {
     return _errorMsg;
+}
+
+BSONObj IsMasterOutcome::toBSON() const {
+    BSONObjBuilder builder;
+    builder.append("host", _server.toString());
+    builder.append("success", _success);
+
+    if (_errorMsg != "")
+        builder.append("errorMessage", _errorMsg);
+
+    if (_topologyVersion)
+        builder.append("topologyVersion", _topologyVersion->toBSON());
+
+    if (_rtt)
+        builder.append("duration", _rtt->toBSON());
+
+    if (_response)
+        builder.append("response", *_response);
+
+    return builder.obj();
 }
 };  // namespace mongo::sdam

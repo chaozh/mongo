@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -52,24 +52,26 @@
 #include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
-#include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_liaison_mongod.h"
 #include "mongo/db/session_killer.h"
 #include "mongo/db/sessions_collection_standalone.h"
+#include "mongo/db/startup_recovery.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/ttl.h"
+#include "mongo/embedded/embedded_options_parser_init.h"
 #include "mongo/embedded/index_builds_coordinator_embedded.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/read_write_concern_defaults_cache_lookup_embedded.h"
 #include "mongo/embedded/replication_coordinator_embedded.h"
 #include "mongo/embedded/service_entry_point_embedded.h"
-#include "mongo/logger/log_component.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_component.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/util/background.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/time_support.h"
@@ -80,6 +82,7 @@
 namespace mongo {
 namespace embedded {
 namespace {
+
 void initWireSpec() {
     WireSpec& spec = WireSpec::instance();
 
@@ -94,7 +97,6 @@ void initWireSpec() {
 
     spec.isInternalClient = true;
 }
-
 
 // Noop, to fulfill dependencies for other initializers.
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
@@ -145,7 +147,7 @@ GlobalInitializerRegisterer filterAllowedIndexFieldNamesEmbeddedInitializer(
     {"FilterAllowedIndexFieldNames"});
 }  // namespace
 
-using logger::LogComponent;
+using logv2::LogComponent;
 using std::endl;
 
 void shutdown(ServiceContext* srvContext) {
@@ -169,7 +171,7 @@ void shutdown(ServiceContext* srvContext) {
             LogicalSessionCache::set(serviceContext, nullptr);
 
             repl::ReplicationCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
-            IndexBuildsCoordinator::get(serviceContext)->shutdown();
+            IndexBuildsCoordinator::get(serviceContext)->shutdown(shutdownOpCtx.get());
 
             // Global storage engine may not be started in all cases before we exit
             if (serviceContext->getStorageEngine()) {
@@ -182,18 +184,17 @@ void shutdown(ServiceContext* srvContext) {
     }
     setGlobalServiceContext(nullptr);
 
-    log(LogComponent::kControl) << "now exiting";
+    LOGV2_OPTIONS(22551, {LogComponent::kControl}, "now exiting");
 }
 
 
 ServiceContext* initialize(const char* yaml_config) {
     srand(static_cast<unsigned>(curTimeMicros64()));
 
-    // yaml_config is passed to the options parser through the argc/argv interface that already
-    // existed. If it is nullptr then use 0 count which will be interpreted as empty string.
-    const char* argv[2] = {yaml_config, nullptr};
+    if (yaml_config)
+        embedded::EmbeddedOptionsConfig::instance().set(yaml_config);
 
-    Status status = mongo::runGlobalInitializers(yaml_config ? 1 : 0, argv, nullptr);
+    Status status = mongo::runGlobalInitializers(std::vector<std::string>{});
     uassertStatusOKWithContext(status, "Global initilization failed");
     auto giGuard = makeGuard([] { mongo::runGlobalDeinitializers().ignore(); });
     setGlobalServiceContext(ServiceContext::make());
@@ -217,16 +218,19 @@ ServiceContext* initialize(const char* yaml_config) {
 
     {
         ProcessId pid = ProcessId::getCurrent();
-        LogstreamBuilder l = log(LogComponent::kControl);
-        l << "MongoDB starting : pid=" << pid << " port=" << serverGlobalParams.port
-          << " dbpath=" << storageGlobalParams.dbpath;
-
         const bool is32bit = sizeof(int*) == 4;
-        l << (is32bit ? " 32" : " 64") << "-bit" << endl;
+        LOGV2_OPTIONS(4615667,
+                      {logv2::LogComponent::kControl},
+                      "MongoDB starting",
+                      "pid"_attr = pid.toNative(),
+                      "port"_attr = serverGlobalParams.port,
+                      "dbpath"_attr =
+                          boost::filesystem::path(storageGlobalParams.dbpath).generic_string(),
+                      "architecture"_attr = (is32bit ? "32-bit" : "64-bit"));
     }
 
     if (kDebugBuild)
-        log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
+        LOGV2_OPTIONS(22552, {LogComponent::kControl}, "DEBUG build (which is slower)");
 
     // The periodic runner is required by the storage engine to be running beforehand.
     auto periodicRunner = std::make_unique<PeriodicRunnerEmbedded>(
@@ -235,6 +239,7 @@ ServiceContext* initialize(const char* yaml_config) {
 
     setUpCatalog(serviceContext);
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kAllowNoLockFile);
+    StorageControl::startStorageControls(serviceContext);
 
     // Warn if we detect configurations for multiple registered storage engines in the same
     // configuration file/environment.
@@ -249,9 +254,11 @@ ServiceContext* initialize(const char* yaml_config) {
 
             // Warn if field name matches non-active registered storage engine.
             if (isRegisteredStorageEngine(serviceContext, e.fieldName())) {
-                warning() << "Detected configuration for non-active storage engine "
-                          << e.fieldName() << " when current storage engine is "
-                          << storageGlobalParams.engine;
+                LOGV2_WARNING(22554,
+                              "Detected configuration for non-active storage engine {e_fieldName} "
+                              "when current storage engine is {storageGlobalParams_engine}",
+                              "e_fieldName"_attr = e.fieldName(),
+                              "storageGlobalParams_engine"_attr = storageGlobalParams.engine);
             }
         }
     }
@@ -284,23 +291,21 @@ ServiceContext* initialize(const char* yaml_config) {
     }
 
     try {
-        repairDatabasesAndCheckVersion(startupOpCtx.get());
+        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get());
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
-        severe(LogComponent::kControl) << "** IMPORTANT: " << error.toStatus().reason();
+        LOGV2_FATAL_OPTIONS(22555,
+                            logv2::LogOptions(LogComponent::kControl, logv2::FatalMode::kContinue),
+                            "** IMPORTANT: {error_toStatus_reason}",
+                            "error_toStatus_reason"_attr = error.toStatus().reason());
         quickExit(EXIT_NEED_DOWNGRADE);
     }
 
-    // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set.
-    // If we are part of a replica set and are started up with no data files, we do not set the
-    // featureCompatibilityVersion until a primary is chosen. For this case, we expect the
-    // in-memory featureCompatibilityVersion parameter to still be uninitialized until after
-    // startup.
-    if (canCallFCVSetIfCleanStartup) {
-        invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
-    }
+    // Ensure FCV document exists and is initialized in-memory. Fatally asserts if there is an
+    // error.
+    FeatureCompatibilityVersion::fassertInitializedAfterStartup(startupOpCtx.get());
 
     if (storageGlobalParams.upgrade) {
-        log() << "finished checking dbs";
+        LOGV2(22553, "finished checking dbs");
         exitCleanly(EXIT_CLEAN);
     }
 
@@ -327,5 +332,6 @@ ServiceContext* initialize(const char* yaml_config) {
 
     return serviceContext;
 }
+
 }  // namespace embedded
 }  // namespace mongo

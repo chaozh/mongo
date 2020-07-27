@@ -41,7 +41,8 @@
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
-using namespace mongo;
+namespace mongo {
+namespace {
 
 /**
  * A test fixture that creates a CollectionCatalog and Collection* pointer to store in it.
@@ -62,8 +63,11 @@ public:
             std::swap(prevUUID, colUUID);
         ASSERT_GT(colUUID, prevUUID);
         ASSERT_GT(nextUUID, colUUID);
+    }
 
+    void setUp() override {
         ServiceContextMongoDTest::setUp();
+
         std::unique_ptr<Collection> collection = std::make_unique<CollectionMock>(nss);
         col = collection.get();
         // Register dummy collection in catalog.
@@ -310,8 +314,6 @@ protected:
     OperationContextNoop opCtx;
     CollectionCatalog catalog;
 };
-
-namespace {
 
 TEST_F(CollectionCatalogResourceTest, RemoveAllResources) {
     catalog.deregisterAllCollections();
@@ -573,6 +575,15 @@ TEST_F(CollectionCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsFreshestNSS)
     ASSERT_EQUALS(*catalog.lookupNSSByUUID(&opCtx, colUUID), newNss);
 }
 
+// Re-opening the catalog should increment the CollectionCatalog's epoch.
+TEST_F(CollectionCatalogTest, CollectionCatalogEpoch) {
+    auto originalEpoch = catalog.getEpoch();
+    catalog.onCloseCatalog(&opCtx);
+    catalog.onOpenCatalog(&opCtx);
+    auto incrementedEpoch = catalog.getEpoch();
+    ASSERT_EQ(originalEpoch + 1, incrementedEpoch);
+}
+
 DEATH_TEST_F(CollectionCatalogResourceTest, AddInvalidResourceType, "invariant") {
     auto rid = ResourceId(RESOURCE_GLOBAL, 0);
     catalog.addResource(rid, "");
@@ -601,6 +612,84 @@ TEST_F(CollectionCatalogTest, GetAllCollectionNamesAndGetAllDbNames) {
 
     std::vector<std::string> dbNames = {"dbA", "dbB", "dbC", "dbD", "testdb"};
     ASSERT(catalog.getAllDbNames() == dbNames);
+
+    catalog.deregisterAllCollections();
+}
+
+// Test setting and fetching the profile level for a database.
+TEST_F(CollectionCatalogTest, DatabaseProfileLevel) {
+    std::string testDBNameFirst = "testdbfirst";
+    std::string testDBNameSecond = "testdbsecond";
+
+    // Requesting a profile level that is not in the _databaseProfileLevel map should return the
+    // default server-wide setting
+    ASSERT_EQ(catalog.getDatabaseProfileLevel(testDBNameFirst), serverGlobalParams.defaultProfile);
+
+    // Setting the default profile level should have not change the result.
+    catalog.setDatabaseProfileLevel(testDBNameFirst, serverGlobalParams.defaultProfile);
+    ASSERT_EQ(catalog.getDatabaseProfileLevel(testDBNameFirst), serverGlobalParams.defaultProfile);
+
+    // Changing the profile level should make fetching it different.
+    catalog.setDatabaseProfileLevel(testDBNameSecond, serverGlobalParams.defaultProfile + 1);
+    ASSERT_EQ(catalog.getDatabaseProfileLevel(testDBNameSecond),
+              serverGlobalParams.defaultProfile + 1);
+}
+
+TEST_F(CollectionCatalogTest, GetAllCollectionNamesAndGetAllDbNamesWithUncommittedCollections) {
+    NamespaceString aColl("dbA", "collA");
+    NamespaceString b1Coll("dbB", "collB1");
+    NamespaceString b2Coll("dbB", "collB2");
+    NamespaceString cColl("dbC", "collC");
+    NamespaceString d1Coll("dbD", "collD1");
+    NamespaceString d2Coll("dbD", "collD2");
+    NamespaceString d3Coll("dbD", "collD3");
+
+    std::vector<NamespaceString> nsss = {aColl, b1Coll, b2Coll, cColl, d1Coll, d2Coll, d3Coll};
+    for (auto& nss : nsss) {
+        std::unique_ptr<Collection> newColl = std::make_unique<CollectionMock>(nss);
+        auto uuid = CollectionUUID::gen();
+        catalog.registerCollection(uuid, &newColl);
+    }
+
+    // One dbName with only an invisible collection does not appear in dbNames.
+    auto invisibleCollA = catalog.lookupCollectionByNamespace(&opCtx, aColl);
+    invisibleCollA->setCommitted(false);
+
+    auto res = catalog.getAllCollectionNamesFromDb(&opCtx, "dbA");
+    ASSERT(res.empty());
+
+    std::vector<std::string> dbNames = {"dbB", "dbC", "dbD", "testdb"};
+    ASSERT(catalog.getAllDbNames() == dbNames);
+
+    // One dbName with both visible and invisible collections is still visible.
+    std::vector<NamespaceString> dbDNss = {d1Coll, d2Coll, d3Coll};
+    for (auto& nss : dbDNss) {
+        // Test each combination of one collection in dbD being invisible while the other two are
+        // visible.
+        std::vector<NamespaceString> dCollList = dbDNss;
+        dCollList.erase(std::find(dCollList.begin(), dCollList.end(), nss));
+
+        auto invisibleCollD = catalog.lookupCollectionByNamespace(&opCtx, nss);
+        invisibleCollD->setCommitted(false);
+
+        res = catalog.getAllCollectionNamesFromDb(&opCtx, "dbD");
+        std::sort(res.begin(), res.end());
+        ASSERT(res == dCollList);
+
+        ASSERT(catalog.getAllDbNames() == dbNames);
+        invisibleCollD->setCommitted(true);
+    }
+
+    invisibleCollA->setCommitted(true);  // reset visibility.
+
+    // If all dbNames consist only of invisible collections, none of these dbs is visible.
+    for (auto& nss : nsss) {
+        auto invisibleColl = catalog.lookupCollectionByNamespace(&opCtx, nss);
+        invisibleColl->setCommitted(false);
+    }
+
+    std::vector<std::string> dbList = {"testdb"};
+    ASSERT(catalog.getAllDbNames() == dbList);
 
     catalog.deregisterAllCollections();
 }
@@ -718,3 +807,4 @@ TEST_F(ForEachCollectionFromDbTest, ForEachCollectionFromDbWithPredicate) {
 }
 
 }  // namespace
+}  // namespace mongo

@@ -124,11 +124,18 @@ public:
                           StringData idxName,
                           long long newExpireSeconds);
 
+    void updateHiddenSetting(OperationContext* opCtx,
+                             RecordId catalogId,
+                             StringData idxName,
+                             bool hidden);
+
     bool isEqualToMetadataUUID(OperationContext* opCtx,
                                RecordId catalogId,
                                OptionalCollectionUUID uuid);
 
     void setIsTemp(OperationContext* opCtx, RecordId catalogId, bool isTemp);
+
+    void setRecordPreImages(OperationContext* opCtx, RecordId catalogId, bool val) override;
 
     void updateValidator(OperationContext* opCtx,
                          RecordId catalogId,

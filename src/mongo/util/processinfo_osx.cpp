@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -48,7 +48,7 @@
 #include <sys/types.h>
 
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/processinfo.h"
 
 namespace mongo {
@@ -153,7 +153,7 @@ Variant getSysctlByName(const char* sysctlName) {
     } while (status == -1 && errno == ENOMEM);
     if (status == -1) {
         // unrecoverable error from sysctlbyname
-        log() << sysctlName << " unavailable";
+        LOGV2(23351, "{sysctlName} unavailable", "sysctlName"_attr = sysctlName);
         return "";
     }
 
@@ -169,11 +169,15 @@ long long getSysctlByName<NumberVal>(const char* sysctlName) {
     long long value = 0;
     size_t len = sizeof(value);
     if (sysctlbyname(sysctlName, &value, &len, nullptr, 0) < 0) {
-        log() << "Unable to resolve sysctl " << sysctlName << " (number) ";
+        LOGV2(23352,
+              "Unable to resolve sysctl {sysctlName} (number) ",
+              "sysctlName"_attr = sysctlName);
     }
     if (len > 8) {
-        log() << "Unable to resolve sysctl " << sysctlName << " as integer.  System returned "
-              << len << " bytes.";
+        LOGV2(23353,
+              "Unable to resolve sysctl {sysctlName} as integer.  System returned {len} bytes.",
+              "sysctlName"_attr = sysctlName,
+              "len"_attr = len);
     }
     return value;
 }
@@ -223,7 +227,9 @@ bool ProcessInfo::blockCheckSupported() {
 bool ProcessInfo::blockInMemory(const void* start) {
     char x = 0;
     if (mincore(alignToStartOfPage(start), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription();
+        LOGV2(23354,
+              "mincore failed: {errnoWithDescription}",
+              "errnoWithDescription"_attr = errnoWithDescription());
         return 1;
     }
     return x & 0x1;
@@ -232,7 +238,9 @@ bool ProcessInfo::blockInMemory(const void* start) {
 bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
     out->resize(numPages);
     if (mincore(alignToStartOfPage(start), numPages * getPageSize(), &out->front())) {
-        log() << "mincore failed: " << errnoWithDescription();
+        LOGV2(23355,
+              "mincore failed: {errnoWithDescription}",
+              "errnoWithDescription"_attr = errnoWithDescription());
         return false;
     }
     for (size_t i = 0; i < numPages; ++i) {

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -50,7 +50,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"
@@ -659,8 +659,10 @@ bool isInterestingDisk(const boost::filesystem::path& path) {
     }
 
     if (ec) {
-        warning() << "Error checking directory '" << blockDevicePath.generic_string()
-                  << "': " << ec.message();
+        LOGV2_WARNING(23912,
+                      "Error checking directory '{blockDevicePath_generic_string}': {ec_message}",
+                      "blockDevicePath_generic_string"_attr = blockDevicePath.generic_string(),
+                      "ec_message"_attr = ec.message());
         return false;
     }
 
@@ -679,13 +681,19 @@ std::vector<std::string> findPhysicalDisks(StringData sysBlockPath) {
 
     auto statusSysBlock = boost::filesystem::status(sysBlockPathStr, ec);
     if (ec) {
-        warning() << "Error checking directory '" << sysBlockPathStr << "': " << ec.message();
+        LOGV2_WARNING(23913,
+                      "Error checking directory '{sysBlockPathStr}': {ec_message}",
+                      "sysBlockPathStr"_attr = sysBlockPathStr,
+                      "ec_message"_attr = ec.message());
         return {};
     }
 
     if (!(boost::filesystem::exists(statusSysBlock) &&
           boost::filesystem::is_directory(statusSysBlock))) {
-        warning() << "Could not find directory '" << sysBlockPathStr << "': " << ec.message();
+        LOGV2_WARNING(23914,
+                      "Could not find directory '{sysBlockPathStr}': {ec_message}",
+                      "sysBlockPathStr"_attr = sysBlockPathStr,
+                      "ec_message"_attr = ec.message());
         return {};
     }
 
@@ -696,8 +704,10 @@ std::vector<std::string> findPhysicalDisks(StringData sysBlockPath) {
     // disk device. It does not contain disk partitions.
     boost::filesystem::directory_iterator di(sysBlockPathStr, ec);
     if (ec) {
-        warning() << "Error getting directory iterator '" << sysBlockPathStr
-                  << "': " << ec.message();
+        LOGV2_WARNING(23915,
+                      "Error getting directory iterator '{sysBlockPathStr}': {ec_message}",
+                      "sysBlockPathStr"_attr = sysBlockPathStr,
+                      "ec_message"_attr = ec.message());
         return {};
     }
 
@@ -710,6 +720,95 @@ std::vector<std::string> findPhysicalDisks(StringData sysBlockPath) {
     }
 
     return files;
+}
+
+// Here is an example of the type of string it supports:
+// Note: output has been trimmed
+//
+// For more information, see:
+// proc(5) man page
+//
+// > cat /proc/vmstat
+// nr_free_pages 2732282
+// nr_zone_inactive_anon 686253
+// nr_zone_active_anon 4975441
+// nr_zone_inactive_file 2332485
+// nr_zone_active_file 4791149
+// nr_zone_unevictable 0
+// nr_zone_write_pending 0
+// nr_mlock 0
+//
+Status parseProcVMStat(const std::vector<StringData>& keys,
+                       StringData data,
+                       BSONObjBuilder* builder) {
+    bool foundKeys = false;
+
+    using string_split_iterator = boost::split_iterator<StringData::const_iterator>;
+
+    // Split the file by lines.
+    // token_compress_on means the iterator skips over consecutive '\n'. This should not be a
+    // problem in normal /proc/vmstat output.
+    for (string_split_iterator lineIt = string_split_iterator(
+             data.begin(),
+             data.end(),
+             boost::token_finder([](char c) { return c == '\n'; }, boost::token_compress_on));
+         lineIt != string_split_iterator();
+         ++lineIt) {
+
+        StringData line(lineIt->begin(), lineIt->end());
+
+        // Split the line by spaces since this the delimiters for vmstat files.
+        // token_compress_on means the iterator skips over consecutive ' '. This is needed for
+        // every line.
+        string_split_iterator partIt = string_split_iterator(
+            line.begin(),
+            line.end(),
+            boost::token_finder([](char c) { return c == ' '; }, boost::token_compress_on));
+
+        // Skip processing this line if we do not have a key.
+        if (partIt == string_split_iterator()) {
+            continue;
+        }
+
+        StringData key(partIt->begin(), partIt->end());
+
+        ++partIt;
+
+        // Skip processing this line if we only have a key, and no number.
+        if (partIt == string_split_iterator()) {
+            continue;
+        }
+
+        // Check if the key is in the list. /proc/vmstat will have extra keys, and may not have the
+        // keys we want.
+        if (keys.empty() || std::find(keys.begin(), keys.end(), key) != keys.end()) {
+            foundKeys = true;
+
+            StringData stringValue(partIt->begin(), partIt->end());
+
+            uint64_t value;
+
+            if (!NumberParser{}(stringValue, &value).isOK()) {
+                value = 0;
+            }
+
+            builder->appendNumber(key, static_cast<long long>(value));
+        }
+    }
+
+    return foundKeys ? Status::OK()
+                     : Status(ErrorCodes::NoSuchKey, "Failed to find any keys in vmstat string");
+}
+
+Status parseProcVMStatFile(StringData filename,
+                           const std::vector<StringData>& keys,
+                           BSONObjBuilder* builder) {
+    auto swString = readFileAsString(filename);
+    if (!swString.isOK()) {
+        return swString.getStatus();
+    }
+
+    return parseProcVMStat(keys, swString.getValue(), builder);
 }
 
 }  // namespace procparser

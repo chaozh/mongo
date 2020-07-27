@@ -32,9 +32,16 @@
 #include <boost/optional.hpp>
 #include <queue>
 
+#include "mongo/db/exec/multi_plan.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/query_solution.h"
 
 namespace mongo {
+
+class CappedInsertNotifier;
+class CollectionScan;
+struct CappedInsertNotifierData;
 
 class PlanExecutorImpl : public PlanExecutor {
     PlanExecutorImpl(const PlanExecutorImpl&) = delete;
@@ -42,54 +49,9 @@ class PlanExecutorImpl : public PlanExecutor {
 
 public:
     /**
-     * Public factory methods delegate to this impl factory to do their work.
-     */
-    static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
-        OperationContext* opCtx,
-        std::unique_ptr<WorkingSet> ws,
-        std::unique_ptr<PlanStage> rt,
-        std::unique_ptr<QuerySolution> qs,
-        std::unique_ptr<CanonicalQuery> cq,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const Collection* collection,
-        NamespaceString nss,
-        YieldPolicy yieldPolicy);
-
-    virtual ~PlanExecutorImpl();
-    WorkingSet* getWorkingSet() const final;
-    PlanStage* getRootStage() const final;
-    CanonicalQuery* getCanonicalQuery() const final;
-    const NamespaceString& nss() const final;
-    OperationContext* getOpCtx() const final;
-    const boost::intrusive_ptr<ExpressionContext>& getExpCtx() const final;
-    void saveState() final;
-    void restoreState() final;
-    void detachFromOperationContext() final;
-    void reattachToOperationContext(OperationContext* opCtx) final;
-    void restoreStateWithoutRetrying() final;
-    ExecState getNextSnapshotted(Snapshotted<Document>* objOut, RecordId* dlOut) final;
-    ExecState getNextSnapshotted(Snapshotted<BSONObj>* objOut, RecordId* dlOut) final;
-    ExecState getNext(Document* objOut, RecordId* dlOut) final;
-    ExecState getNext(BSONObj* out, RecordId* dlOut) final;
-    bool isEOF() final;
-    Status executePlan() final;
-    void markAsKilled(Status killStatus) final;
-    void dispose(OperationContext* opCtx) final;
-    void enqueue(const Document& obj) final;
-    void enqueue(const BSONObj& obj) final;
-    bool isMarkedAsKilled() const final;
-    Status getKillStatus() final;
-    bool isDisposed() const final;
-    bool isDetached() const final;
-    Timestamp getLatestOplogTimestamp() const final;
-    BSONObj getPostBatchResumeToken() const final;
-
-    Status getMemberObjectStatus(const Document& memberObj) const final;
-    Status getMemberObjectStatus(const BSONObj& memberObj) const final;
-
-private:
-    /**
-     * New PlanExecutor instances are created with the static make() method above.
+     * Callers should obtain PlanExecutorImpl instances uses the 'plan_executor_factory' methods, in
+     * order to avoid depending directly on this concrete implementation of the PlanExecutor
+     * interface.
      */
     PlanExecutorImpl(OperationContext* opCtx,
                      std::unique_ptr<WorkingSet> ws,
@@ -99,13 +61,50 @@ private:
                      const boost::intrusive_ptr<ExpressionContext>& expCtx,
                      const Collection* collection,
                      NamespaceString nss,
-                     YieldPolicy yieldPolicy);
+                     PlanYieldPolicy::YieldPolicy yieldPolicy);
+
+    virtual ~PlanExecutorImpl();
+    PlanStage* getRootStage() const final;
+    CanonicalQuery* getCanonicalQuery() const final;
+    const NamespaceString& nss() const final;
+    OperationContext* getOpCtx() const final;
+    void saveState() final;
+    void restoreState() final;
+    void detachFromOperationContext() final;
+    void reattachToOperationContext(OperationContext* opCtx) final;
+    ExecState getNextDocument(Document* objOut, RecordId* dlOut) final;
+    ExecState getNext(BSONObj* out, RecordId* dlOut) final;
+    bool isEOF() final;
+    void executePlan() final;
+    void markAsKilled(Status killStatus) final;
+    void dispose(OperationContext* opCtx) final;
+    void enqueue(const BSONObj& obj) final;
+    bool isMarkedAsKilled() const final;
+    Status getKillStatus() final;
+    bool isDisposed() const final;
+    Timestamp getLatestOplogTimestamp() const final;
+    BSONObj getPostBatchResumeToken() const final;
+    LockPolicy lockPolicy() const final;
+    std::string getPlanSummary() const final;
+    void getSummaryStats(PlanSummaryStats* statsOut) const final;
+    BSONObj getStats() const final;
 
     /**
-     * Clients of PlanExecutor expect that on receiving a new instance from one of the make()
-     * factory methods, plan selection has already been completed. In order to enforce this
-     * property, this function is called to do plan selection prior to returning the new
-     * PlanExecutor.
+     * Same as restoreState() but without the logic to retry if a WriteConflictException is thrown.
+     *
+     * This is only public for PlanYieldPolicy. DO NOT CALL ANYWHERE ELSE.
+     */
+    void restoreStateWithoutRetrying();
+
+    /**
+     * Return a pointer to this executor's MultiPlanStage, or nullptr if it does not have one.
+     */
+    MultiPlanStage* getMultiPlanStage() const;
+
+private:
+    /**
+     * Called on construction in order to ensure that when callers receive a new instance of a
+     * 'PlanExecutorImpl', plan selection has already been completed.
      *
      * If the tree contains plan selection stages, such as MultiPlanStage or SubplanStage,
      * this calls into their underlying plan selection facilities. Otherwise, does nothing.
@@ -138,21 +137,13 @@ private:
     std::shared_ptr<CappedInsertNotifier> _getCappedInsertNotifier();
 
     /**
-     * Yields locks and waits for inserts to the collection. Returns ADVANCED if there has been an
-     * insertion and there may be new results. Returns FAILURE if the PlanExecutor was killed during
-     * a yield. This method is only to be used for tailable and awaitData cursors, so rather than
-     * returning FAILURE if the operation has exceeded its time limit, we return IS_EOF to preserve
-     * this PlanExecutor for future use.
-     *
-     * If an error is encountered and 'errorObj' is provided, it is populated with an object
-     * describing the error.
+     * Called for tailable and awaitData cursors in order to yield locks and waits for inserts to
+     * the collection being tailed. Returns control to the caller once there has been an insertion
+     * and there may be new results. If the PlanExecutor was killed during a yield, throws an
+     * exception.
      */
-    ExecState _waitForInserts(CappedInsertNotifierData* notifierData,
-                              Snapshotted<Document>* errorObj);
+    void _waitForInserts(CappedInsertNotifierData* notifierData);
 
-    /**
-     * Common implementation for getNext() and getNextSnapshotted().
-     */
     ExecState _getNextImpl(Snapshotted<Document>* objOut, RecordId* dlOut);
 
     // The OperationContext that we're executing within. This can be updated if necessary by using
@@ -195,7 +186,11 @@ private:
 
     enum { kUsable, kSaved, kDetached, kDisposed } _currentState = kUsable;
 
-    bool _everDetachedFromOperationContext = false;
+    // A pointer either to a CollectionScan stage, if present in the execution tree, or nullptr
+    // otherwise. We cache it to avoid the need to traverse the execution tree in runtime when the
+    // executor is requested to return the oplog tracking info. Since this info is provided by
+    // either of these stages, the executor will simply delegate the request to the cached stage.
+    const CollectionScan* _collScanStage{nullptr};
 };
 
 }  // namespace mongo

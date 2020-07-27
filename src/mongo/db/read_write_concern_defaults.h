@@ -32,11 +32,12 @@
 #include <map>
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/read_write_concern_defaults_gen.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/rw_concern_default_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/read_through_cache.h"
 
@@ -53,7 +54,7 @@ public:
     using ReadConcern = repl::ReadConcernArgs;
     using WriteConcern = WriteConcernOptions;
 
-    using FetchDefaultsFn = std::function<boost::optional<RWConcernDefault>(OperationContext*)>;
+    using FetchDefaultsFn = unique_function<boost::optional<RWConcernDefault>(OperationContext*)>;
 
     static constexpr StringData readConcernFieldName = ReadConcern::kReadConcernFieldName;
     static constexpr StringData writeConcernFieldName = WriteConcern::kWriteConcernField;
@@ -65,7 +66,7 @@ public:
     static ReadWriteConcernDefaults& get(OperationContext* opCtx);
     static void create(ServiceContext* service, FetchDefaultsFn fetchDefaultsFn);
 
-    ReadWriteConcernDefaults(FetchDefaultsFn fetchDefaultsFn);
+    ReadWriteConcernDefaults(ServiceContext* service, FetchDefaultsFn fetchDefaultsFn);
     ~ReadWriteConcernDefaults();
 
     /**
@@ -75,7 +76,28 @@ public:
     boost::optional<ReadConcern> getDefaultReadConcern(OperationContext* opCtx);
     boost::optional<WriteConcern> getDefaultWriteConcern(OperationContext* opCtx);
 
-    RWConcernDefault getDefault(OperationContext* opCtx);
+    class RWConcernDefaultAndTime : public RWConcernDefault {
+    public:
+        RWConcernDefaultAndTime() = default;
+        RWConcernDefaultAndTime(RWConcernDefault rwcd, Date_t localUpdateWallClockTime)
+            : RWConcernDefault(std::move(rwcd)),
+              _localUpdateWallClockTime(localUpdateWallClockTime) {}
+
+        Date_t localUpdateWallClockTime() const {
+            return _localUpdateWallClockTime;
+        }
+
+    private:
+        Date_t _localUpdateWallClockTime;
+    };
+
+    /**
+     * Returns the current set of read/write concern defaults along with the wallclock time when
+     * they were cached (for diagnostic purposes).
+     */
+    RWConcernDefaultAndTime getDefault(OperationContext* opCtx) {
+        return _getDefault(opCtx).value_or(RWConcernDefaultAndTime());
+    }
 
     /**
      * Returns true if the RC level is permissible to use as a default, and false if it cannot be a
@@ -128,30 +150,35 @@ public:
     /**
      * Sets the given read write concern as the defaults in the cache.
      */
-    void setDefault(RWConcernDefault&& rwc);
+    void setDefault(OperationContext* opCtx, RWConcernDefault&& rwc);
 
 private:
     enum class Type { kReadWriteConcernEntry };
 
-    boost::optional<RWConcernDefault> _getDefault(OperationContext* opCtx);
+    boost::optional<RWConcernDefaultAndTime> _getDefault(OperationContext* opCtx);
 
     class Cache : public ReadThroughCache<Type, RWConcernDefault> {
         Cache(const Cache&) = delete;
         Cache& operator=(const Cache&) = delete;
 
     public:
-        Cache(LookupFn lookupFn);
+        Cache(ServiceContext* service,
+              ThreadPoolInterface& threadPool,
+              FetchDefaultsFn fetchDefaultsFn);
         virtual ~Cache() = default;
 
-        boost::optional<RWConcernDefault> lookup(OperationContext* opCtx, const Type& key) override;
+        boost::optional<RWConcernDefault> lookup(OperationContext* opCtx);
 
     private:
         Mutex _mutex = MONGO_MAKE_LATCH("ReadWriteConcernDefaults::Cache");
 
-        LookupFn _lookupFn;
+        FetchDefaultsFn _fetchDefaultsFn;
     };
 
     Cache _defaults;
+
+    // Thread pool on which to perform loading of the cached RWC defaults
+    ThreadPool _threadPool;
 };
 
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,6 @@
 #include "mongo/db/fts/fts_index_format.h"
 #include "mongo/db/fts/fts_spec.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -51,8 +50,10 @@ using unittest::assertGet;
 TEST(FTSIndexFormat, Simple1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
                                                                << "text")))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
-    FTSIndexFormat::getKeys(spec,
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
                             BSON("data"
                                  << "cat sat"),
                             &keys,
@@ -71,8 +72,10 @@ TEST(FTSIndexFormat, ExtraBack1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
                                                                << "text"
                                                                << "x" << 1)))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
-    FTSIndexFormat::getKeys(spec,
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
                             BSON("data"
                                  << "cat"
                                  << "x" << 5),
@@ -92,8 +95,10 @@ TEST(FTSIndexFormat, ExtraBack1) {
 TEST(FTSIndexFormat, ExtraFront1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("x" << 1 << "data"
                                                                    << "text")))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
-    FTSIndexFormat::getKeys(spec,
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
                             BSON("data"
                                  << "cat"
                                  << "x" << 5),
@@ -113,9 +118,10 @@ TEST(FTSIndexFormat, ExtraFront1) {
 TEST(FTSIndexFormat, StopWords1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
                                                                << "text")))));
-
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys1;
-    FTSIndexFormat::getKeys(spec,
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
                             BSON("data"
                                  << "computer"),
                             &keys1,
@@ -124,7 +130,8 @@ TEST(FTSIndexFormat, StopWords1) {
     ASSERT_EQUALS(1U, keys1.size());
 
     KeyStringSet keys2;
-    FTSIndexFormat::getKeys(spec,
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
                             BSON("data"
                                  << "any computer"),
                             &keys2,
@@ -166,6 +173,7 @@ TEST(FTSIndexFormat, LongWordsTextIndexVersion1) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
                                                                << "text")
                                                        << "textIndexVersion" << 1))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
@@ -173,7 +181,8 @@ TEST(FTSIndexFormat, LongWordsTextIndexVersion1) {
     // "aaa...aaasat"
     string longWordSat = longPrefix + "sat";
     string text = str::stream() << longWordCat << " " << longWordSat;
-    FTSIndexFormat::getKeys(spec,
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
                             BSON("data" << text),
                             &keys,
                             KeyString::Version::kLatestVersion,
@@ -199,6 +208,7 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion2) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
                                                                << "text")
                                                        << "textIndexVersion" << 2))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
@@ -208,7 +218,8 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion2) {
     // "aaa...aaamongodbfts"
     string longWordMongoDBFts = longPrefix + "mongodbfts";
     string text = str::stream() << longWordCat << " " << longWordSat << " " << longWordMongoDBFts;
-    FTSIndexFormat::getKeys(spec,
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
                             BSON("data" << text),
                             &keys,
                             KeyString::Version::kLatestVersion,
@@ -236,6 +247,7 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion3) {
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << BSON("data"
                                                                << "text")
                                                        << "textIndexVersion" << 3))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     string longPrefix(1024U, 'a');
     // "aaa...aaacat"
@@ -243,7 +255,8 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion3) {
     // "aaa...aaasat"
     string longWordSat = longPrefix + "sat";
     string text = str::stream() << longWordCat << " " << longWordSat;
-    FTSIndexFormat::getKeys(spec,
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
                             BSON("data" << text),
                             &keys,
                             KeyString::Version::kLatestVersion,
@@ -268,70 +281,95 @@ TEST(FTSIndexFormat, LongWordTextIndexVersion3) {
 TEST(FTSIndexFormat, GetKeysWithLeadingEmptyArrayThrows) {
     BSONObj keyPattern = fromjson("{'a.b': 1, data: 'text'}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: {b: []}, data: 'foo'}");
-    ASSERT_THROWS_CODE(
-        FTSIndexFormat::getKeys(
-            spec, objToIndex, &keys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj())),
-        AssertionException,
-        ErrorCodes::CannotBuildIndexKeys);
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               KeyString::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
+                       AssertionException,
+                       ErrorCodes::CannotBuildIndexKeys);
 }
 
 TEST(FTSIndexFormat, GetKeysWithTrailingEmptyArrayThrows) {
     BSONObj keyPattern = fromjson("{data: 'text', 'a.b': 1}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: {b: []}, data: 'foo'}");
-    ASSERT_THROWS_CODE(
-        FTSIndexFormat::getKeys(
-            spec, objToIndex, &keys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj())),
-        AssertionException,
-        ErrorCodes::CannotBuildIndexKeys);
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               KeyString::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
+                       AssertionException,
+                       ErrorCodes::CannotBuildIndexKeys);
 }
 
 TEST(FTSIndexFormat, GetKeysWithLeadingSingleElementArrayThrows) {
     BSONObj keyPattern = fromjson("{'a.b': 1, data: 'text'}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: [{b: 9}], data: 'foo'}");
-    ASSERT_THROWS_CODE(
-        FTSIndexFormat::getKeys(
-            spec, objToIndex, &keys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj())),
-        AssertionException,
-        ErrorCodes::CannotBuildIndexKeys);
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               KeyString::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
+                       AssertionException,
+                       ErrorCodes::CannotBuildIndexKeys);
 }
 
 TEST(FTSIndexFormat, GetKeysWithTrailingSingleElementArrayThrows) {
     BSONObj keyPattern = fromjson("{data: 'text', 'a.b': 1}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: [{b: 9}], data: 'foo'}");
-    ASSERT_THROWS_CODE(
-        FTSIndexFormat::getKeys(
-            spec, objToIndex, &keys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj())),
-        AssertionException,
-        ErrorCodes::CannotBuildIndexKeys);
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               KeyString::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
+                       AssertionException,
+                       ErrorCodes::CannotBuildIndexKeys);
 }
 
 TEST(FTSIndexFormat, GetKeysWithMultiElementArrayThrows) {
     BSONObj keyPattern = fromjson("{'a.b': 1, 'a.c': 'text'}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: [{b: 9, c: 'foo'}, {b: 10, c: 'bar'}]}");
-    ASSERT_THROWS_CODE(
-        FTSIndexFormat::getKeys(
-            spec, objToIndex, &keys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj())),
-        AssertionException,
-        ErrorCodes::CannotBuildIndexKeys);
+    ASSERT_THROWS_CODE(FTSIndexFormat::getKeys(allocator,
+                                               spec,
+                                               objToIndex,
+                                               &keys,
+                                               KeyString::Version::kLatestVersion,
+                                               Ordering::make(BSONObj())),
+                       AssertionException,
+                       ErrorCodes::CannotBuildIndexKeys);
 }
 
 TEST(FTSIndexFormat, GetKeysWithPositionalPathAllowed) {
     BSONObj keyPattern = fromjson("{'a.0': 1, 'a.b': 'text'}");
     FTSSpec spec(assertGet(FTSSpec::fixSpec(BSON("key" << keyPattern << "textIndexVersion" << 3))));
+    SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
     KeyStringSet keys;
     BSONObj objToIndex = fromjson("{a: [{b: 'foo'}, {b: 'bar'}]}");
-    FTSIndexFormat::getKeys(
-        spec, objToIndex, &keys, KeyString::Version::kLatestVersion, Ordering::make(BSONObj()));
+    FTSIndexFormat::getKeys(allocator,
+                            spec,
+                            objToIndex,
+                            &keys,
+                            KeyString::Version::kLatestVersion,
+                            Ordering::make(BSONObj()));
     ASSERT_EQ(2U, keys.size());
 
     {

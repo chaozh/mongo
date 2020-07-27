@@ -95,9 +95,6 @@ selector:
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
 
-  # TODO Unblacklist (SERVER-35538).
-  - jstests/concurrency/fsm_workloads/database_versioning.js
-
   # TODO Unblacklist (SERVER-38852).
   - jstests/concurrency/fsm_workloads/agg_out_interrupt_cleanup.js
 
@@ -140,10 +137,7 @@ selector:
   ##
 
   # ChunkHelper directly talks to the config servers and doesn't support retries for network errors
-  - jstests/concurrency/fsm_workloads/sharded_base_partitioned.js
   - jstests/concurrency/fsm_workloads/sharded_mergeChunks_partitioned.js
-  - jstests/concurrency/fsm_workloads/sharded_moveChunk_drop_shard_key_index.js
-  - jstests/concurrency/fsm_workloads/sharded_moveChunk_partitioned.js
   - jstests/concurrency/fsm_workloads/sharded_splitChunk_partitioned.js
 
   # These workloads frequently time out waiting for the distributed lock to drop a sharded
@@ -169,22 +163,14 @@ selector:
   ##
 
   # Uses getMore in the same state function as a command not supported in a transaction.
+  - jstests/concurrency/fsm_workloads/agg_unionWith_interrupt_cleanup.js
   - jstests/concurrency/fsm_workloads/list_indexes.js
+  - jstests/concurrency/fsm_workloads/agg_union_with_chunk_migrations.js
 
   # Uses non-retryable commands in the same state function as a command not supported in a
   # transaction.
   - jstests/concurrency/fsm_workloads/agg_merge_when_not_matched_insert.js
   - jstests/concurrency/fsm_workloads/agg_merge_when_matched_replace_with_new.js
-
-
-  # TODO SERVER-40713 moveChunk is not considered retryable by the network retry override.
-  - jstests/concurrency/fsm_workloads/agg_with_chunk_migrations.js
-  - jstests/concurrency/fsm_workloads/random_moveChunk_broadcast_delete_transaction.js
-  - jstests/concurrency/fsm_workloads/random_moveChunk_broadcast_update_transaction.js
-  - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key.js
-  - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key_broadcast_delete_transaction.js
-  - jstests/concurrency/fsm_workloads/random_moveChunk_refine_collection_shard_key_broadcast_update_transaction.js
-  - jstests/concurrency/fsm_workloads/random_moveChunk_index_operations.js
 
   # JS engine interruptions on mongos return ErrorCodes::Interrupted, which isn't
   # considered a retryable or transient transaction error.
@@ -195,6 +181,8 @@ selector:
   exclude_with_any_tags:
   - does_not_support_causal_consistency
   - requires_replication
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   - assumes_balancer_on
   # Sharing cursors between state functions will fail in this suite because it will attempt to use
   # the same cursor in multiple transactions.
@@ -207,6 +195,9 @@ selector:
   # Tests which expect commands to fail and catch the error can cause transactions to abort and
   # retry indefinitely.
   - catches_command_failures
+  # This tag corresponds to operations which are run long enough to exceed the stepdown interval
+  # when grouped into transactions.
+  - operations_longer_than_stepdown_interval_in_txns
 
 executor:
   archive:
@@ -236,6 +227,7 @@ executor:
     wait_for_mongos_retarget: true
   - class: CheckReplDBHash
   - class: ValidateCollections
+  - class: CheckOrphansDeleted
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture
@@ -261,6 +253,7 @@ executor:
       set_parameters:
         enableTestCommands: 1
         enableElectionHandoff: 0
+        roleGraphInvalidationIsFatal: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

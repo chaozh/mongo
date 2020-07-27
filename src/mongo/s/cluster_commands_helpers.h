@@ -45,6 +45,13 @@
 
 namespace mongo {
 
+struct RawResponsesResult {
+    bool responseOK;
+    std::set<ShardId> shardsWithSuccessResponses;
+    std::vector<AsyncRequestsSender::Response> successResponses;
+    boost::optional<Status> firstStaleConfigError;
+};
+
 /**
  * This function appends the provided writeConcernError BSONElement to the sharded response.
  */
@@ -58,6 +65,35 @@ void appendWriteConcernErrorToCmdResponse(const ShardId& shardID,
 std::unique_ptr<WriteConcernErrorDetail> getWriteConcernErrorDetailFromBSONObj(const BSONObj& obj);
 
 /**
+ * Makes an expression context suitable for canonicalization of queries that contain let parameters
+ * and runtimeConstants on mongos.
+ */
+boost::intrusive_ptr<ExpressionContext> makeExpressionContextWithDefaultsForTargeter(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& collation,
+    const boost::optional<ExplainOptions::Verbosity>& verbosity,
+    const boost::optional<BSONObj>& letParameters,
+    const boost::optional<RuntimeConstants>& runtimeConstants);
+
+/**
+ * Consults the routing info to build requests for:
+ * 1. If sharded, shards that own chunks for the namespace, or
+ * 2. If unsharded, the primary shard for the database.
+ *
+ * If a shard is included in shardsToSkip, it will be excluded from the list returned to the
+ * caller.
+ */
+std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShards(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const CachedCollectionRoutingInfo& routingInfo,
+    const std::set<ShardId>& shardsToSkip,
+    const BSONObj& cmdObj,
+    const BSONObj& query,
+    const BSONObj& collation);
+
+/**
  * Dispatches all the specified requests in parallel and waits until all complete, returning a
  * vector of the same size and positions as that of 'requests'.
  *
@@ -68,8 +104,18 @@ std::vector<AsyncRequestsSender::Response> gatherResponses(
     StringData dbName,
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy,
-    const std::vector<AsyncRequestsSender::Request>& requests,
-    const std::set<ErrorCodes::Error>& ignorableErrors = {});
+    const std::vector<AsyncRequestsSender::Request>& requests);
+
+/**
+ * Dispatches all the specified requests in parallel and waits until all complete, returning a
+ * vector of the same size and positions as that of 'requests'.
+ */
+std::vector<AsyncRequestsSender::Response> gatherResponsesNoThrowOnStaleShardVersionErrors(
+    OperationContext* opCtx,
+    StringData dbName,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy,
+    const std::vector<AsyncRequestsSender::Request>& requests);
 
 /**
  * Returns a copy of 'cmdObj' with dbVersion appended if it exists in 'dbInfo'
@@ -153,6 +199,30 @@ std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRouting
     const BSONObj& query,
     const BSONObj& collation);
 
+
+/**
+ * Utility for dispatching versioned commands on a namespace, deciding which shards to
+ * target by applying the passed-in query and collation to the local routing table cache.
+ *
+ * Callers can specify shards to skip, even if these shards would be otherwise targeted.
+ *
+ * Allows StaleConfigException errors to append to the response list.
+ *
+ * Return value is the same as scatterGatherUnversionedTargetAllShards().
+ */
+std::vector<AsyncRequestsSender::Response>
+scatterGatherVersionedTargetByRoutingTableNoThrowOnStaleShardVersionErrors(
+    OperationContext* opCtx,
+    StringData dbName,
+    const NamespaceString& nss,
+    const CachedCollectionRoutingInfo& routingInfo,
+    const std::set<ShardId>& shardsToSkip,
+    const BSONObj& cmdObj,
+    const ReadPreferenceSetting& readPref,
+    Shard::RetryPolicy retryPolicy,
+    const BSONObj& query,
+    const BSONObj& collation);
+
 /**
  * Utility for dispatching commands on a namespace, but with special hybrid versioning:
  * - If the namespace is unsharded, a version is attached (so this node can find out if its routing
@@ -205,16 +275,24 @@ AsyncRequestsSender::Response executeCommandAgainstShardWithMinKeyChunk(
  * field called 'raw' in 'output'.
  *
  * If all shards that errored had the same error, writes the common error code to 'output'. Writes a
- * string representation of all errors to 'errmsg.' Errors codes in 'ignoredErrors' are not treated
- * as errors if any shard returned success.
+ * string representation of all errors to 'errmsg.'
  *
- * Returns true if any shard reports success and only ignored errors occur.
+ * ShardNotFound responses are not treated as errors if any shard returned success. We allow
+ * ShardNotFound errors to be ignored as errors since this node may not heave realized that a
+ * shard has been removed.
+ *
+ * Returns:
+ * 1. A boolean indicating whether any shards reported success and only ShardNotFound errors occur.
+ * 2. A set containing the list of shards that reported success or a ShardNotFound error. For shard
+ *    tracking purposes, a shard with a writeConcernError is not considered to be successful.
+ * 3. The list of AsyncRequestsSender::Responses that were successful.
+ * 4. The first stale config error received, if such an error exists.
  */
-bool appendRawResponses(OperationContext* opCtx,
-                        std::string* errmsg,
-                        BSONObjBuilder* output,
-                        const std::vector<AsyncRequestsSender::Response>& shardResponses,
-                        std::set<ErrorCodes::Error> ignoredErrors = {});
+RawResponsesResult appendRawResponses(
+    OperationContext* opCtx,
+    std::string* errmsg,
+    BSONObjBuilder* output,
+    const std::vector<AsyncRequestsSender::Response>& shardResponses);
 
 /**
  * Extracts the query from a query-embedding command ('query' or 'q' fields). If the command does
@@ -228,14 +306,6 @@ BSONObj extractQuery(const BSONObj& cmdObj);
  * type, throws.
  */
 BSONObj extractCollation(const BSONObj& cmdObj);
-
-/**
- * Utility function to compute a single error code from a vector of command results.
- *
- * @return If there is an error code common to all of the error results, returns that error
- *          code; otherwise, returns 0.
- */
-int getUniqueCodeFromCommandResults(const std::vector<Strategy::CommandResult>& results);
 
 /**
  * Utility function to return an empty result set from a command.
@@ -255,7 +325,7 @@ void createShardDatabase(OperationContext* opCtx, StringData dbName);
  * Returns the shards that would be targeted for the given query according to the given routing
  * info.
  */
-std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
+std::set<ShardId> getTargetedShardsForQuery(boost::intrusive_ptr<ExpressionContext> expCtx,
                                             const CachedCollectionRoutingInfo& routingInfo,
                                             const BSONObj& query,
                                             const BSONObj& collation);
@@ -282,5 +352,15 @@ std::vector<std::pair<ShardId, BSONObj>> getVersionedRequestsForTargetedShards(
  */
 StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
     OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Loads all of the indexes for the given namespace from the appropriate shard. For unsharded
+ * collections will read from the primary shard and for sharded collections will read from the shard
+ * that owns the chunk containing the minimum key for the collection's shard key.
+ *
+ * Will not retry on StaleConfig or StaleDbVersion errors.
+ */
+StatusWith<Shard::QueryResponse> loadIndexesFromAuthoritativeShard(OperationContext* opCtx,
+                                                                   const NamespaceString& nss);
 
 }  // namespace mongo

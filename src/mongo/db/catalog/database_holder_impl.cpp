@@ -27,14 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/database_holder_impl.h"
 
 #include "mongo/db/audit.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_impl.h"
@@ -44,7 +43,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -147,7 +146,7 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx, StringData ns, boo
             *justCreated = true;
     }
 
-    auto newDb = std::make_unique<DatabaseImpl>(dbname, ++_epoch);
+    auto newDb = std::make_unique<DatabaseImpl>(dbname);
     newDb->init(opCtx);
 
     // Finally replace our nullptr entry with the new Database pointer.
@@ -175,7 +174,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
     // Store the name so we have if for after the db object is deleted
     auto name = db->name();
 
-    LOG(1) << "dropDatabase " << name;
+    LOGV2_DEBUG(20310, 1, "dropDatabase {name}", "name"_attr = name);
 
     invariant(opCtx->lockState()->isDbLockedForMode(name, MODE_X));
 
@@ -204,6 +203,8 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
         Top::get(serviceContext).collectionDropped(coll->ns());
     }
 
+    // Clean up the in-memory database state.
+    CollectionCatalog::get(opCtx).clearDatabaseProfileLevel(name);
     close(opCtx, name);
 
     auto const storageEngine = serviceContext->getStorageEngine();
@@ -231,10 +232,8 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, StringData ns) {
 
     _dbs.erase(it);
 
-    getGlobalServiceContext()
-        ->getStorageEngine()
-        ->closeDatabase(opCtx, dbName.toString())
-        .transitional_ignore();
+    auto* const storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    storageEngine->closeDatabase(opCtx, dbName.toString()).transitional_ignore();
 }
 
 void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
@@ -250,8 +249,10 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
         dbs.insert(i->first);
     }
 
+    auto* const storageEngine = opCtx->getServiceContext()->getStorageEngine();
+
     for (const auto& name : dbs) {
-        LOG(2) << "DatabaseHolder::closeAll name:" << name;
+        LOGV2_DEBUG(20311, 2, "DatabaseHolder::closeAll name:{name}", "name"_attr = name);
 
         Database* db = _dbs[name];
         CollectionCatalog::get(opCtx).onCloseDatabase(opCtx, name);
@@ -259,10 +260,7 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
 
         _dbs.erase(name);
 
-        getGlobalServiceContext()
-            ->getStorageEngine()
-            ->closeDatabase(opCtx, name)
-            .transitional_ignore();
+        storageEngine->closeDatabase(opCtx, name).transitional_ignore();
     }
 }
 

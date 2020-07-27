@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -45,8 +45,8 @@
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/ttl_collection_cache.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -64,9 +64,10 @@ IndexBuildBlock::IndexBuildBlock(IndexCatalog* indexCatalog,
       _buildUUID(indexBuildUUID),
       _indexCatalogEntry(nullptr) {}
 
-void IndexBuildBlock::deleteTemporaryTables(OperationContext* opCtx) {
+void IndexBuildBlock::finalizeTemporaryTables(OperationContext* opCtx,
+                                              TemporaryRecordStore::FinalizationAction action) {
     if (_indexBuildInterceptor) {
-        _indexBuildInterceptor->deleteTemporaryTables(opCtx);
+        _indexBuildInterceptor->finalizeTemporaryTables(opCtx, action);
     }
 }
 
@@ -81,13 +82,7 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
 
     _indexName = descriptor->indexName();
 
-    if (_spec.hasField("expireAfterSeconds")) {
-        TTLCollectionCache::get(getGlobalServiceContext())
-            .registerTTLInfo(std::make_pair(collection->uuid(), _indexName));
-    }
-
-    bool isBackgroundIndex =
-        _method == IndexBuildMethod::kHybrid || _method == IndexBuildMethod::kBackground;
+    bool isBackgroundIndex = _method == IndexBuildMethod::kHybrid;
     bool isBackgroundSecondaryBuild = false;
     if (auto replCoord = repl::ReplicationCoordinator::get(opCtx)) {
         isBackgroundSecondaryBuild =
@@ -107,13 +102,8 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
     _indexCatalogEntry =
         _indexCatalog->createIndexEntry(opCtx, std::move(descriptor), CreateIndexEntryFlags::kNone);
 
-    // Only track skipped records with two-phase index builds, which is indicated by a present build
-    // UUID.
-    const auto trackSkipped = (_buildUUID) ? IndexBuildInterceptor::TrackSkippedRecords::kTrack
-                                           : IndexBuildInterceptor::TrackSkippedRecords::kNoTrack;
     if (_method == IndexBuildMethod::kHybrid) {
-        _indexBuildInterceptor =
-            std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry, trackSkipped);
+        _indexBuildInterceptor = std::make_unique<IndexBuildInterceptor>(opCtx, _indexCatalogEntry);
         _indexCatalogEntry->setIndexBuildInterceptor(_indexBuildInterceptor.get());
     }
 
@@ -131,7 +121,8 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
     // Register this index with the CollectionQueryInfo to regenerate the cache. This way, updates
     // occurring while an index is being build in the background will be aware of whether or not
     // they need to modify any indexes.
-    CollectionQueryInfo::get(collection).addedIndex(opCtx, _indexCatalogEntry->descriptor());
+    CollectionQueryInfo::get(collection)
+        .addedIndex(opCtx, collection, _indexCatalogEntry->descriptor());
 
     return Status::OK();
 }
@@ -173,34 +164,49 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
 
         // An index build should never be completed with writes remaining in the interceptor.
         invariant(_indexBuildInterceptor->areAllWritesApplied(opCtx));
-
-        // An index build should never be completed without resolving all key constraints.
-        invariant(_indexBuildInterceptor->areAllConstraintsChecked(opCtx));
     }
-
-    log() << "index build: done building index " << _indexName << " on ns " << _nss;
 
     collection->indexBuildSuccess(opCtx, _indexCatalogEntry);
     auto svcCtx = opCtx->getClient()->getServiceContext();
 
-    opCtx->recoveryUnit()->onCommit([svcCtx, entry = _indexCatalogEntry, coll = collection](
-                                        boost::optional<Timestamp> commitTime) {
-        // Note: this runs after the WUOW commits but before we release our X lock on the
-        // collection. This means that any snapshot created after this must include the full
-        // index, and no one can try to read this index before we set the visibility.
-        if (!commitTime) {
-            // The end of background index builds on secondaries does not get a commit
-            // timestamp. We use the cluster time since it's guaranteed to be greater than the
-            // time of the index build. It is possible the cluster time could be in the future,
-            // and we will need to do another write to reach the minimum visible snapshot.
-            commitTime = LogicalClock::getClusterTimeForReplicaSet(svcCtx).asTimestamp();
-        }
-        entry->setMinimumVisibleSnapshot(commitTime.get());
-        // We must also set the minimum visible snapshot on the collection like during init().
-        // This prevents reads in the past from reading inconsistent metadata. We should be
-        // able to remove this when the catalog is versioned.
-        coll->setMinimumVisibleSnapshot(commitTime.get());
-    });
+    opCtx->recoveryUnit()->onCommit(
+        [svcCtx,
+         indexName = _indexName,
+         spec = _spec,
+         entry = _indexCatalogEntry,
+         coll = collection,
+         buildUUID = _buildUUID](boost::optional<Timestamp> commitTime) {
+            // Note: this runs after the WUOW commits but before we release our X lock on the
+            // collection. This means that any snapshot created after this must include the full
+            // index, and no one can try to read this index before we set the visibility.
+            if (!commitTime) {
+                // The end of background index builds on secondaries does not get a commit
+                // timestamp. We use the cluster time since it's guaranteed to be greater than the
+                // time of the index build. It is possible the cluster time could be in the future,
+                // and we will need to do another write to reach the minimum visible snapshot.
+                commitTime = LogicalClock::getClusterTimeForReplicaSet(svcCtx).asTimestamp();
+            }
+
+            LOGV2(20345,
+                  "Index build: done building index {indexName} on ns {nss}",
+                  "Index build: done building",
+                  "buildUUID"_attr = buildUUID,
+                  "namespace"_attr = coll->ns(),
+                  "index"_attr = indexName,
+                  "commitTimestamp"_attr = commitTime);
+
+            entry->setMinimumVisibleSnapshot(commitTime.get());
+            // We must also set the minimum visible snapshot on the collection like during init().
+            // This prevents reads in the past from reading inconsistent metadata. We should be
+            // able to remove this when the catalog is versioned.
+            coll->setMinimumVisibleSnapshot(commitTime.get());
+
+            // Add the index to the TTLCollectionCache upon successfully committing the index build.
+            if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
+                TTLCollectionCache::get(svcCtx).registerTTLInfo(
+                    std::make_pair(coll->uuid(), indexName));
+            }
+        });
 }
 
 }  // namespace mongo

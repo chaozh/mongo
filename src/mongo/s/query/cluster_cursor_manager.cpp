@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +38,8 @@
 
 #include "mongo/db/kill_sessions_common.h"
 #include "mongo/db/logical_session_cache.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/clock_source.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -224,9 +224,13 @@ StatusWith<CursorId> ClusterCursorManager::registerCursor(
     } while (cursorId == 0 || entryMap.count(cursorId) > 0);
 
     // Create a new CursorEntry and register it in the CursorEntryContainer's map.
-    auto emplaceResult = entryMap.emplace(
-        cursorId,
-        CursorEntry(std::move(cursor), cursorType, cursorLifetime, now, authenticatedUsers));
+    auto emplaceResult = entryMap.emplace(cursorId,
+                                          CursorEntry(std::move(cursor),
+                                                      cursorType,
+                                                      cursorLifetime,
+                                                      now,
+                                                      authenticatedUsers,
+                                                      opCtx->getOperationKey()));
     invariant(emplaceResult.second);
 
     return cursorId;
@@ -396,8 +400,11 @@ std::size_t ClusterCursorManager::killMortalCursorsInactiveSince(OperationContex
             !entry.getOperationUsingCursor() && entry.getLastActive() <= cutoff;
 
         if (res) {
-            log() << "Cursor id " << cursorId << " timed out, idle since "
-                  << entry.getLastActive().toString();
+            LOGV2(22837,
+                  "Cursor id {cursorId} timed out, idle since {idleSince}",
+                  "Cursor timed out",
+                  "cursorId"_attr = cursorId,
+                  "idleSince"_attr = entry.getLastActive().toString());
         }
 
         return res;
@@ -582,7 +589,10 @@ std::pair<Status, int> ClusterCursorManager::killCursorsWithMatchingSessions(
             return;
         }
         uassertStatusOK(mgr.killCursor(opCtx, *cursorNss, id));
-        log() << "killing cursor: " << id << " as part of killing session(s)";
+        LOGV2(22838,
+              "Killing cursor: {cursorId} as part of killing session(s)",
+              "Killing cursor as part of killing session(s)",
+              "cursorId"_attr = id);
     };
 
     auto bySessionCursorKiller = makeKillCursorsBySessionAdaptor(opCtx, matcher, std::move(eraser));
@@ -598,9 +608,7 @@ stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForSession(
     stdx::unordered_set<CursorId> cursorIds;
 
     for (auto&& nsContainerPair : _namespaceToContainerMap) {
-        for (auto&& cursorIdEntryPair : nsContainerPair.second.entryMap) {
-            const CursorEntry& entry = cursorIdEntryPair.second;
-
+        for (auto&& [cursorId, entry] : nsContainerPair.second.entryMap) {
             if (entry.isKillPending()) {
                 // Don't include sessions for killed cursors.
                 continue;
@@ -608,7 +616,34 @@ stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForSession(
 
             auto cursorLsid = entry.getLsid();
             if (lsid == cursorLsid) {
-                cursorIds.insert(cursorIdEntryPair.first);
+                cursorIds.insert(cursorId);
+            }
+        }
+    }
+
+    return cursorIds;
+}
+
+stdx::unordered_set<CursorId> ClusterCursorManager::getCursorsForOpKeys(
+    std::vector<OperationKey> opKeys) const {
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    stdx::unordered_set<CursorId> cursorIds;
+
+    // While we could maintain a cached mapping of OperationKey to CursorID to increase performance,
+    // this approach was chosen given that 1) mongos will not have as many open cursors as a shard
+    // and 2) mongos performance has historically not been a bottleneck.
+    for (auto&& opKey : opKeys) {
+        for (auto&& nsContainerPair : _namespaceToContainerMap) {
+            for (auto&& [cursorId, entry] : nsContainerPair.second.entryMap) {
+                if (entry.isKillPending()) {
+                    // Don't include any killed cursors.
+                    continue;
+                }
+
+                if (opKey == entry.getOperationKey()) {
+                    cursorIds.insert(cursorId);
+                }
             }
         }
     }

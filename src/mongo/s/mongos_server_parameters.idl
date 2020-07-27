@@ -36,62 +36,29 @@ imports:
     - "mongo/idl/basic_types.idl"
 
 server_parameters:
-  loadRoutingTableOnStartup:
-    description: >-
-        Enables precaching of the mongos routing table on startup.
-    set_at: [ startup ]
-    cpp_vartype: bool
-    cpp_varname: "gLoadRoutingTableOnStartup"
-    default: true
-
-  warmMinConnectionsInShardingTaskExecutorPoolOnStartup:
-    description: >-
-        Enables prewarming of the connection pool.
-    set_at: [ startup ]
-    cpp_vartype: bool
-    cpp_varname: "gWarmMinConnectionsInShardingTaskExecutorPoolOnStartup"
-    default: true
-
-  warmMinConnectionsInShardingTaskExecutorPoolOnStartupWaitMS:
-    description: >-
-        How long to wait for all hosts to have at least one connection.
-    set_at: [ startup ]
-    cpp_vartype: int
-    cpp_varname: "gWarmMinConnectionsInShardingTaskExecutorPoolOnStartupWaitMS"
-    default: 2000 # 2secs
-
   readHedgingMode:
     description: >-
         Enables hedged reads.
-    set_at: [ startup ]
-    cpp_vartype: std::string
-    cpp_varname: "gReadHedgingMode"
-    default: "on"
+    set_at: [ startup, runtime ]
+    cpp_class:
+      name: HedgingModeServerParameter
+
+  maxTimeMSForHedgedReads:
+    description: >-
+        The maxTimeMS to set on hedged reads.
+    set_at: [ startup, runtime ]
+    cpp_vartype: AtomicWord<int>
+    cpp_varname: "gMaxTimeMSForHedgedReads"
     validator:
-      callback: "validateReadHedgingMode"
+        gte: 0
+    default: 150
 
-  maxTimeMSThresholdForHedging:
+  mongosShutdownTimeoutMillisForSignaledShutdown:
     description: >-
-        The upper threshold for the expected running time of an operation (maxTimeMS)
-        for it to be worth hedging.
-    set_at: [ startup ]
-    cpp_vartype: int
-    cpp_varname: "gMaxTimeMSThresholdForHedging"
-    default: 5000
-
-  hedgingDelayPercentage:
-    description: >-
-        The percentage of maxTimeMS to wait for before dispatching subsequent reads.
-    set_at: [ startup ]
-    cpp_vartype: int
-    cpp_varname: "gHedgingDelayPercentage"
-    default: 25
-
-  defaultHedgingDelayMS:
-    description: >-
-          The default wait time in milliseconds before dispatching subsequent reads if
-          maxTimeMS is not given.
-    set_at: [ startup ]
-    cpp_vartype: int
-    cpp_varname: "gDefaultHedgingDelayMS"
-    default: 1250
+        The time taken for quiesce mode at shutdown in response to SIGTERM.
+    set_at: [ startup, runtime ]
+    cpp_vartype: AtomicWord<int>
+    cpp_varname: "mongosShutdownTimeoutMillisForSignaledShutdown"
+    default: 15000
+    validator:
+        gte: 0

@@ -27,19 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/transport/service_entry_point_utils.h"
 
+#include <fmt/format.h>
 #include <functional>
 #include <memory>
 
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/thread_safety_context.h"
 
 #if !defined(_WIN32)
 #include <sys/resource.h>
@@ -49,22 +51,25 @@
 #define __has_feature(x) 0
 #endif
 
+using namespace fmt::literals;
+
 namespace mongo {
 
 namespace {
 void* runFunc(void* ctx) {
-    std::unique_ptr<std::function<void()>> taskPtr(static_cast<std::function<void()>*>(ctx));
+    auto taskPtr =
+        std::unique_ptr<unique_function<void()>>(static_cast<unique_function<void()>*>(ctx));
     (*taskPtr)();
 
     return nullptr;
 }
 }  // namespace
 
-Status launchServiceWorkerThread(std::function<void()> task) {
+Status launchServiceWorkerThread(unique_function<void()> task) noexcept {
 
     try {
 #if defined(_WIN32)
-        stdx::thread(std::move(task)).detach();
+        stdx::thread([task = std::move(task)]() mutable { task(); }).detach();
 #else
         pthread_attr_t attrs;
         pthread_attr_init(&attrs);
@@ -84,36 +89,40 @@ Status launchServiceWorkerThread(std::function<void()> task) {
             int failed = pthread_attr_setstacksize(&attrs, stackSizeToSet);
             if (failed) {
                 const auto ewd = errnoWithDescription(failed);
-                warning() << "pthread_attr_setstacksize failed: " << ewd;
+                LOGV2_WARNING(22949,
+                              "pthread_attr_setstacksize failed: {error}",
+                              "pthread_attr_setstacksize failed",
+                              "error"_attr = ewd);
             }
         } else if (limits.rlim_cur < 1024 * 1024) {
-            warning() << "Stack size set to " << (limits.rlim_cur / 1024) << "KB. We suggest 1MB";
+            LOGV2_WARNING(22950,
+                          "Stack size set to {stackSizeKiB}KiB. We suggest 1024KiB",
+                          "Stack size not set to suggested 1024KiB",
+                          "stackSizeKiB"_attr = (limits.rlim_cur / 1024));
         }
 
         // Wrap the user-specified `task` so it runs with an installed `sigaltstack`.
         task = [sigAltStackController = std::make_shared<stdx::support::SigAltStackController>(),
-                f = std::move(task)] {
+                f = std::move(task)]() mutable {
             auto sigAltStackGuard = sigAltStackController->makeInstallGuard();
             f();
         };
 
         pthread_t thread;
-        auto ctx = std::make_unique<std::function<void()>>(std::move(task));
+        auto ctx = std::make_unique<unique_function<void()>>(std::move(task));
+        ThreadSafetyContext::getThreadSafetyContext()->onThreadCreate();
         int failed = pthread_create(&thread, &attrs, runFunc, ctx.get());
 
         pthread_attr_destroy(&attrs);
-
-        if (failed) {
-            log() << "pthread_create failed: " << errnoWithDescription(failed);
-            throw std::system_error(
-                std::make_error_code(std::errc::resource_unavailable_try_again));
-        }
+        uassert(4850900, "pthread_create failed: {}"_format(errnoWithDescription(failed)), !failed);
 
         ctx.release();
 #endif
 
-    } catch (...) {
-        return {ErrorCodes::InternalError, "failed to create service entry worker thread"};
+    } catch (const std::exception& e) {
+        LOGV2_ERROR(22948, "Thread creation failed", "error"_attr = e.what());
+        return {ErrorCodes::InternalError,
+                format(FMT_STRING("Failed to create service entry worker thread: {}"), e.what())};
     }
 
     return Status::OK();

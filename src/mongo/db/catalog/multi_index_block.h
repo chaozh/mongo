@@ -40,13 +40,13 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_build_block.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/resumable_index_builds_gen.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/fail_point.h"
 
@@ -62,8 +62,8 @@ class OperationContext;
 /**
  * Builds one or more indexes.
  *
- * If any method other than insert() returns a not-ok Status, this MultiIndexBlock should be
- * considered failed and must be destroyed.
+ * If any method other than insertSingleDocumentForInitialSyncOrRecovery() returns a not-ok Status,
+ * this MultiIndexBlock should be considered failed and must be destroyed.
  *
  * If a MultiIndexBlock is destroyed before commit() or if commit() is rolled back, it will
  * clean up all traces of the indexes being constructed. MultiIndexBlocks should not be
@@ -77,28 +77,6 @@ class MultiIndexBlock {
 public:
     MultiIndexBlock() = default;
     ~MultiIndexBlock();
-
-    /**
-     * Ensures the index build state is cleared correctly after index build success or failure.
-     *
-     * Must be called before object destruction if init() has been called; and safe to call if
-     * init() has not been called.
-     *
-     * By only requiring this call after init(), we allow owners of the object to exit without
-     * further handling if they never use the object.
-     *
-     * `onCleanUp` will be called after all indexes have been removed from the catalog.
-     */
-    using OnCleanUpFn = std::function<void()>;
-    void cleanUpAfterBuild(OperationContext* opCtx, Collection* collection, OnCleanUpFn onCleanUp);
-
-    /**
-     * Not all index aborts need this function, in particular index builds that do not need
-     * to timestamp catalog writes. This is a no-op.
-     */
-    static OnCleanUpFn kNoopOnCleanUpFn;
-
-    static bool areHybridIndexBuildsEnabled();
 
     /**
      * By default we enforce the 'unique' flag in specs when building an index by failing.
@@ -128,7 +106,7 @@ public:
      *
      * Does not need to be called inside of a WriteUnitOfWork (but can be due to nesting).
      *
-     * Requires holding an intent lock on the collection.
+     * Requires holding an exclusive lock on the collection.
      */
     using OnInitFn = std::function<Status(std::vector<BSONObj>& specs)>;
     StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
@@ -156,8 +134,8 @@ public:
     /**
      * Inserts all documents in the Collection into the indexes and logs with timing info.
      *
-     * This is a simplified replacement for insert and doneInserting. Do not call this if you
-     * are calling either of them.
+     * This is a replacement for calling both insertSingleDocumentForInitialSyncOrRecovery and
+     * dumpInsertsFromBulk. Do not call this if you are calling either of them.
      *
      * Will fail if violators of uniqueness constraints exist.
      *
@@ -174,11 +152,13 @@ public:
      *
      * Should be called inside of a WriteUnitOfWork.
      */
-    Status insert(OperationContext* opCtx, const BSONObj& wholeDocument, const RecordId& loc);
+    Status insertSingleDocumentForInitialSyncOrRecovery(OperationContext* opCtx,
+                                                        const BSONObj& wholeDocument,
+                                                        const RecordId& loc);
 
     /**
-     * Call this after the last insert(). This gives the index builder a chance to do any
-     * long-running operations in separate units of work from commit().
+     * Call this after the last insertSingleDocumentForInitialSyncOrRecovery(). This gives the index
+     * builder a chance to do any long-running operations in separate units of work from commit().
      *
      * Do not call if you called insertAllDocumentsInCollection();
      *
@@ -232,7 +212,7 @@ public:
 
     /**
      * Marks the index ready for use. Should only be called as the last method after
-     * doneInserting() or insertAllDocumentsInCollection() return success.
+     * dumpInsertsFromBulk() or insertAllDocumentsInCollection() return success.
      *
      * Should be called inside of a WriteUnitOfWork. If the index building is to be logOp'd,
      * logOp() should be called from the same unit of work as commit().
@@ -257,75 +237,55 @@ public:
     static OnCommitFn kNoopOnCommitFn;
 
     /**
-     * Returns true if this index builder was added to the index catalog successfully.
-     * In addition to having commit() return without errors, the enclosing WUOW has to be committed
-     * for the indexes to show up in the index catalog.
+     * Ensures the index build state is cleared correctly after index build failure.
+     *
+     * Must be called before object destruction if init() has been called; and safe to call if
+     * init() has not been called.
+     *
+     * By only requiring this call after init(), we allow owners of the object to exit without
+     * further handling if they never use the object.
+     *
+     * `onCleanUp` will be called after all indexes have been removed from the catalog.
      */
-    bool isCommitted() const;
+    using OnCleanUpFn = std::function<void()>;
+    void abortIndexBuild(OperationContext* opCtx,
+                         Collection* collection,
+                         OnCleanUpFn onCleanUp) noexcept;
 
     /**
-     * Signals the index build to abort.
-     *
-     * In-progress inserts and commits will still run to completion. However, subsequent index build
-     * operations will fail an IndexBuildAborted error.
-     *
-     * Aborts the uncommitted index build and prevents further inserts or commit attempts from
-     * proceeding. On destruction, all traces of uncommitted index builds will be removed.
-     *
-     * If the index build has already been aborted (using abort() or abortWithoutCleanup()),
-     * this function does nothing.
-     *
-     * If this index build has been committed successfully, this function has no effect.
-     *
-     * May be called from any thread.
+     * Not all index aborts need this function, in particular index builds that do not need
+     * to timestamp catalog writes. This is a no-op.
      */
-    void abort(StringData reason);
+    static OnCleanUpFn kNoopOnCleanUpFn;
 
     /**
      * May be called at any time after construction but before a successful commit(). Suppresses
-     * the default behavior on destruction of removing all traces of uncommitted index builds.
+     * the default behavior on destruction of removing all traces of uncommitted index builds. Does
+     * not perform any storage engine writes. May delete internal tables, but this is not
+     * transactional.
      *
-     * The most common use of this is if the indexes were already dropped via some other
-     * mechanism such as the whole collection being dropped. In that case, it would be invalid
-     * to try to remove the indexes again. Also, replication uses this to ensure that indexes
-     * that are being built on shutdown are resumed on startup.
-     *
-     * Do not use this unless you are really sure you need to.
-     *
-     * Does not matter whether it is called inside of a WriteUnitOfWork. Will not be rolled
-     * back.
-     *
-     * Must be called from owning thread.
+     * This should only be used during rollback.
      */
-    void abortWithoutCleanup(OperationContext* opCtx);
+    void abortWithoutCleanupForRollback(OperationContext* opCtx);
+
+    /**
+     * May be called at any time after construction but before a successful commit(). Suppresses
+     * the default behavior on destruction of removing all traces of uncommitted index builds. If
+     * this is a two-phase hybrid index build and resumable index builds are supported, writes the
+     * current state of the index build to disk using the storage engine. May delete internal
+     * tables, but this is not transactional.
+     *
+     * This should only be used during shutdown.
+     */
+    void abortWithoutCleanupForShutdown(OperationContext* opCtx);
 
     /**
      * Returns true if this build block supports background writes while building an index. This is
-     * true for the kHybrid and kBackground methods.
+     * true for the kHybrid method.
      */
     bool isBackgroundBuilding() const;
 
     void setIndexBuildMethod(IndexBuildMethod indexBuildMethod);
-
-    /**
-     * State transitions:
-     *
-     * Uninitialized --> Running --> Committed
-     *       |              |           ^
-     *       |              |           |
-     *       \--------------+------> Aborted
-     *
-     * It is possible for abort() to skip intermediate states. For example, calling abort() when the
-     * index build has not been initialized will transition from Uninitialized directly to Aborted.
-     *
-     * In the case where we are in the midst of committing the WUOW for a successful commit() call,
-     * we may transition temporarily to Aborted before finally ending at Committed. See comments for
-     * MultiIndexBlock::abort().
-     *
-     * For testing only. Callers should not have to query the state of the MultiIndexBlock directly.
-     */
-    enum class State { kUninitialized, kRunning, kCommitted, kAborted };
-    State getState_forTest() const;
 
 private:
     struct IndexToBuild {
@@ -338,55 +298,37 @@ private:
         InsertDeleteOptions options;
     };
 
-    /**
-     * Returns the current state.
-     */
-    State _getState() const;
+    void _abortWithoutCleanup(OperationContext* opCtx, bool shutdown);
 
-    /**
-     * Updates the current state to a non-Aborted state.
-     */
-    void _setState(State newState);
+    bool _shouldWriteStateToDisk(OperationContext* opCtx, bool shutdown) const;
 
-    /**
-     * Updates the current state to Aborted with the given reason.
-     */
-    void _setStateToAbortedIfNotCommitted(StringData reason);
+    void _writeStateToDisk(OperationContext* opCtx) const;
+
+    BSONObj _constructStateObject() const;
+
 
     // Is set during init() and ensures subsequent function calls act on the same Collection.
     boost::optional<UUID> _collectionUUID;
 
     std::vector<IndexToBuild> _indexes;
 
-    std::unique_ptr<BackgroundOperation> _backgroundOperation;
-
     IndexBuildMethod _method = IndexBuildMethod::kHybrid;
 
     bool _ignoreUnique = false;
-
-    bool _needToCleanup = true;
 
     // Set to true when no work remains to be done, the object can safely destruct without leaving
     // incorrect state set anywhere.
     bool _buildIsCleanedUp = true;
 
-    // Duplicate key constraints should be checked at least once in the MultiIndexBlock.
-    bool _constraintsChecked = false;
-
     // A unique identifier associating this index build with a two-phase index build within a
     // replica set.
     boost::optional<UUID> _buildUUID;
 
-    // Protects member variables of this class declared below.
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("MultiIndexBlock::_mutex");
+    // The RecordId corresponding to the object most recently inserted using this MultiIndexBlock,
+    // or boost::none if nothing has been inserted.
+    boost::optional<RecordId> _lastRecordIdInserted;
 
-    State _state = State::kUninitialized;
-    std::string _abortReason;
+    // The current phase of the index build.
+    IndexBuildPhaseEnum _phase = IndexBuildPhaseEnum::kInitialized;
 };
-
-// For unit tests that need to check MultiIndexBlock states.
-// The ASSERT_*() macros use this function to print the value of 'state' when the predicate fails.
-std::ostream& operator<<(std::ostream& os, const MultiIndexBlock::State& state);
-
-logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& out, const IndexBuildMethod& method);
 }  // namespace mongo

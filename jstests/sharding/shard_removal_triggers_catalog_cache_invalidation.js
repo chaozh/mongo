@@ -1,13 +1,13 @@
 /**
  * Tests that shard removal triggers an update of the catalog cache so that routers don't continue
  * to target shards that have been removed.
- * @tags: [requires_fcv_44]
  */
 (function() {
 'use strict';
 
 // Checking UUID consistency involves talking to shards, but this test shuts down shards.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 
 const dbName = 'TestDB';
 

@@ -1,16 +1,24 @@
-# Copyright 2019 MongoDB Inc.
+# Copyright 2020 MongoDB Inc.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
 
 import math
 import os
@@ -82,6 +90,20 @@ def generate(env):
     if not exists(env):
         return
 
+    # Propagate CCACHE related variables into the command environment
+    for var, host_value in os.environ.items():
+        if var.startswith("CCACHE_"):
+            env["ENV"][var] = host_value
+
+    # SERVER-48289: Adding roll-your-own CFLAGS and CXXFLAGS can cause some very "weird" issues
+    # with using icecc and ccache if they turn out not to be supported by the compiler. Rather
+    # than try to filter each and every flag someone might try for the ones we know don't
+    # work, we'll just let the compiler ignore them. A better approach might be to pre-filter
+    # flags coming in from the environment by passing them through the appropriate *IfSupported
+    # method, but that's a much larger effort.
+    if env.ToolchainIs("clang"):
+        env.AppendUnique(CCFLAGS=["-Qunused-arguments"])
+
     # Record our found CCACHE_VERSION. Other tools that need to know
     # about ccache (like iecc) should query this variable to determine
     # if ccache is active. Looking at the CCACHE variable in the
@@ -89,16 +111,36 @@ def generate(env):
     # but it doesn't work or is out of date.
     env["CCACHE_VERSION"] = _ccache_version_found
 
-    # ccache does not support response files so force scons to always
-    # use the full command
-    #
-    # Note: This only works for Python versions >= 3.5
-    env["MAXLINELENGTH"] = math.inf
+    # Set up a performant ccache configuration. Here, we don't use a second preprocessor and
+    # pass preprocessor arguments that deterministically expand source files so a stable
+    # hash can be calculated on them. This both reduces the amount of work ccache needs to
+    # do and increases the likelihood of a cache hit.
+    env["ENV"]["CCACHE_NOCPP2"] = 1
+    if env.ToolchainIs("clang"):
+        env.AppendUnique(CCFLAGS=["-frewrite-includes"])
+    elif env.ToolchainIs("gcc"):
+        env.AppendUnique(CCFLAGS=["-fdirectives-only"])
+
+
+    # Make a generator to expand to CCACHE in the case where we are
+    # not a conftest. We don't want to use ccache for configure tests
+    # because we don't want to use icecream for configure tests, but
+    # when icecream and ccache are combined we can't easily filter out
+    # configure tests for icecream since in that combination we use
+    # CCACHE_PREFIX to express the icecc tool, and at that point it is
+    # too late for us to meaningfully filter out conftests. So we just
+    # disable ccache for conftests entirely.  Which feels safer
+    # somehow anyway.
+    def ccache_generator(target, source, env, for_signature):
+        if "conftest" not in str(target[0]):
+            return '$CCACHE'
+        return ''
+    env['CCACHE_GENERATOR'] = ccache_generator
 
     # Add ccache to the relevant command lines. Wrap the reference to
     # ccache in the $( $) pattern so that turning ccache on or off
     # doesn't invalidate your build.
-    env["CCCOM"] = "$( $CCACHE $)" + env["CCCOM"]
-    env["CXXCOM"] = "$( $CCACHE $)" + env["CXXCOM"]
-    env["SHCCCOM"] = "$( $CCACHE $)" + env["SHCCCOM"]
-    env["SHCXXCOM"] = "$( $CCACHE $)" + env["SHCXXCOM"]
+    env["CCCOM"] = "$( $CCACHE_GENERATOR $)" + env["CCCOM"]
+    env["CXXCOM"] = "$( $CCACHE_GENERATOR $)" + env["CXXCOM"]
+    env["SHCCCOM"] = "$( $CCACHE_GENERATOR $)" + env["SHCCCOM"]
+    env["SHCXXCOM"] = "$( $CCACHE_GENERATOR $)" + env["SHCXXCOM"]

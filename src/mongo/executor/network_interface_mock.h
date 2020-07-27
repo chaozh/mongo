@@ -82,11 +82,6 @@ public:
     NetworkInterfaceMock();
     virtual ~NetworkInterfaceMock();
 
-    /**
-     * Logs the contents of the queues for diagnostics.
-     */
-    void logQueues();
-
     ////////////////////////////////////////////////////////////////////////////////
     //
     // NetworkInterface methods
@@ -113,6 +108,10 @@ public:
                         RemoteCommandRequestOnAny& request,
                         RemoteCommandCompletionFn&& onFinish,
                         const BatonHandle& baton = nullptr) override;
+    Status startExhaustCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                               RemoteCommandRequestOnAny& request,
+                               RemoteCommandOnReplyFn&& onReply,
+                               const BatonHandle& baton = nullptr) override;
 
     /**
      * If the network operation is in the _unscheduled or _processing queues, moves the operation
@@ -134,6 +133,8 @@ public:
     bool onNetworkThread() override;
 
     void dropConnections(const HostAndPort&) override {}
+
+    void testEgress(const HostAndPort&, transport::ConnectSSLMode, Milliseconds, Status) override {}
 
     ////////////////////////////////////////////////////////////////////////////////
     //

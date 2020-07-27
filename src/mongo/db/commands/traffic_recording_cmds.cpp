@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/traffic_recorder.h"
 #include "mongo/db/traffic_recorder_gen.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -53,9 +53,10 @@ public:
 
         void typedRun(OperationContext* opCtx) {
             TrafficRecorder::get(opCtx->getServiceContext()).start(request());
-            log() << "** Warning: The recording file contains unencrypted user traffic."
-                  << " We recommend that you limit retention of this file and "
-                  << "store it on an encrypted filesystem volume.";
+            LOGV2(20506,
+                  "** Warning: The recording file contains unencrypted user traffic. We recommend "
+                  "that you limit retention of this file and store it on an encrypted filesystem "
+                  "volume.");
         }
 
     private:

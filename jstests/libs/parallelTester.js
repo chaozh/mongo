@@ -178,6 +178,7 @@ if (typeof _threadInject != "undefined") {
             "getlog2.js",
             "logprocessdetails.js",
             "queryoptimizera.js",
+            "log_remote_op_wait.js",
 
             "connections_opened.js",  // counts connections, globally
             "opcounters_write_cmd.js",
@@ -194,19 +195,14 @@ if (typeof _threadInject != "undefined") {
             // Assumes that other tests are not creating cursors.
             "kill_cursors.js",
 
-            // This test takes an IX global lock on an async thread, then runs CRUD ops needing IX
-            // locks. If a concurrent JS test queues a global X lock after the async thread takes
-            // the IX lock, and before the CRUD ops get IX locks, then there's a deadlock: the async
-            // thread will not release the acquired IX lock until the CRUD ops have finished.
-            "background_validation.js",
+            // These tests check global command counters.
+            "find_and_modify_metrics.js",
+            "update_metrics.js",
 
             // Views tests
             "views/invalid_system_views.js",      // Puts invalid view definitions in system.views.
             "views/views_all_commands.js",        // Drops test DB.
             "views/view_with_invalid_dbname.js",  // Puts invalid view definitions in system.views.
-
-            // Destroys and recreates the catalog, which will interfere with other tests.
-            "restart_catalog.js",
 
             // This test works close to the BSON document limit for entries in the durable catalog,
             // so running it in parallel with other tests will cause failures.
@@ -220,6 +216,8 @@ if (typeof _threadInject != "undefined") {
         // The following tests cannot run when shell readMode is legacy.
         if (db.getMongo().readMode() === "legacy") {
             var requires_find_command = [
+                "apply_ops_system_dot_views.js",
+                "explode_for_sort_collation.js",
                 "update_pipeline_shell_helpers.js",
                 "update_with_pipeline.js",
                 "views/dbref_projection.js",
@@ -278,6 +276,7 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_find.js",
             parallelFilesDir + "/profile_findandmodify.js",
             parallelFilesDir + "/profile_getmore.js",
+            parallelFilesDir + "/profile_hide_index.js",
             parallelFilesDir + "/profile_insert.js",
             parallelFilesDir + "/profile_list_collections.js",
             parallelFilesDir + "/profile_list_indexes.js",

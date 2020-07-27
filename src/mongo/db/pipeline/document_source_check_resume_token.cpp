@@ -154,7 +154,8 @@ ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionConte
 
     // In order for the relaxed comparison to be applicable, the client token must have a single _id
     // field, and the resumed stream token must have additional fields beyond _id.
-    if (!(documentKeyFromClient.size() == 1 && documentKeyFromResumedStream.size() > 1)) {
+    if (!(documentKeyFromClient.computeSize() == 1 &&
+          documentKeyFromResumedStream.computeSize() > 1)) {
         return defaultResumeStatus;
     }
 
@@ -327,7 +328,7 @@ void DocumentSourceShardCheckResumability::_assertOplogHasEnoughHistory(
     // Look up the first document in the oplog and compare it with the resume token's clusterTime.
     auto firstEntryExpCtx = pExpCtx->copyWith(NamespaceString::kRsOplogNamespace);
     auto matchSpec = BSON("$match" << BSONObj());
-    auto pipeline = pExpCtx->mongoProcessInterface->makePipeline({matchSpec}, firstEntryExpCtx);
+    auto pipeline = Pipeline::makePipeline({matchSpec}, firstEntryExpCtx);
     if (auto first = pipeline->getNext()) {
         auto firstOplogEntry = Value(*first);
         // If the first entry in the oplog is the replset initialization, then it doesn't matter
@@ -338,7 +339,7 @@ void DocumentSourceShardCheckResumability::_assertOplogHasEnoughHistory(
         const bool isNewRS =
             Value::compare(firstOplogEntry["o"]["msg"], Value(kInitiatingSetMsg), nullptr) == 0 &&
             Value::compare(firstOplogEntry["op"], Value("n"_sd), nullptr) == 0;
-        uassert(ErrorCodes::ChangeStreamFatalError,
+        uassert(ErrorCodes::ChangeStreamHistoryLost,
                 "Resume of change stream was not possible, as the resume point may no longer be in "
                 "the oplog. ",
                 isNewRS || firstOplogEntry["ts"].getTimestamp() < _tokenFromClient.clusterTime);

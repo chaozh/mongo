@@ -13,14 +13,7 @@
 (function() {
 "use strict";
 
-// Arbiters don't replicate the admin.system.keys collection, so they can never validate or sign
-// clusterTime. Gossiping a clusterTime to an arbiter as a user other than __system will fail,
-// so we skip gossiping for this test.
-//
-// TODO SERVER-32639: remove this flag.
-TestData.skipGossipingClusterTime = true;
-
-// TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+// Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
 
 // helper function for verifying contents at the end of the test

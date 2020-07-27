@@ -27,27 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/commands/kill_sessions_remote.h"
-#include "mongo/s/commands/kill_sessions_remote_gen.h"
 
 #include "mongo/db/client.h"
 #include "mongo/db/kill_sessions_common.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
 #include "mongo/executor/async_multicaster.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_gen.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
-
 namespace {
 
 /**
@@ -113,10 +110,6 @@ Status killSessionsRemoteKillCursor(OperationContext* opCtx,
 
 }  // namespace
 
-/**
- * This kill function (meant for mongos), kills matching local ops first, then fans out to all other
- * nodes in the cluster to kill them as well.
- */
 SessionKiller::Result killSessionsRemote(OperationContext* opCtx,
                                          const SessionKiller::Matcher& matcher,
                                          SessionKiller::UniformRandomBitGenerator* urbg) {

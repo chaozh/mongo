@@ -50,8 +50,10 @@ public:
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        LiteParsed(UserMode allUsers, LocalOpsMode localOps)
-            : _allUsers(allUsers), _localOps(localOps) {}
+        LiteParsed(std::string parseTimeName, UserMode allUsers, LocalOpsMode localOps)
+            : LiteParsedDocumentSource(std::move(parseTimeName)),
+              _allUsers(allUsers),
+              _localOps(localOps) {}
 
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             return stdx::unordered_set<NamespaceString>();
@@ -114,7 +116,10 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kNotAllowed,
                                      TransactionRequirement::kNotAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     (_showLocalOpsOnMongoS == LocalOpsMode::kLocalMongosOps
+                                          ? UnionRequirement::kNotAllowed
+                                          : UnionRequirement::kAllowed));
 
         constraints.isIndependentOfAnyCollection = true;
         constraints.requiresInputDocSource = false;

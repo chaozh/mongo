@@ -28,23 +28,28 @@
  */
 
 #include "mongo/base/init.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/matcher/doc_validation_error.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
-#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -90,17 +95,18 @@ void serializeReply(OperationContext* opCtx,
     if (shouldSkipOutput(opCtx))
         return;
 
-    if (continueOnError && !result.results.empty()) {
+    if (continueOnError) {
+        invariant(!result.results.empty());
         const auto& lastResult = result.results.back();
-        if (lastResult == ErrorCodes::StaleConfig ||
-            lastResult == ErrorCodes::CannotImplicitlyCreateCollection ||
-            lastResult == ErrorCodes::StaleDbVersion) {
-            // For ordered:false commands we need to duplicate these error results for all ops
-            // after we stopped. See handleError() in write_ops_exec.cpp for more info.
-            auto err = result.results.back();
-            while (result.results.size() < opsInBatch) {
-                result.results.emplace_back(err);
-            }
+
+        if (lastResult == ErrorCodes::StaleDbVersion ||
+            ErrorCodes::isStaleShardVersionError(lastResult.getStatus())) {
+            // For ordered:false commands we need to duplicate these error results for all ops after
+            // we stopped. See handleError() in write_ops_exec.cpp for more info.
+            //
+            // Omit the reason from the duplicate unordered responses so it doesn't consume BSON
+            // object space
+            result.results.resize(opsInBatch, lastResult.getStatus().withReason(""));
         }
     }
 
@@ -148,6 +154,10 @@ void serializeReply(OperationContext* opCtx,
                 BSONObjBuilder errInfo(error.subobjStart("errInfo"));
                 staleInfo->serialize(&errInfo);
             }
+        } else if (auto docValidationError =
+                       status.extraInfo<doc_validation_error::DocumentValidationFailureInfo>()) {
+            error.append("code", static_cast<int>(ErrorCodes::DocumentValidationFailure));
+            error.append("errInfo", docValidationError->getDetails());
         } else {
             error.append("code", int(status.code()));
             if (auto const extraInfo = status.extraInfo()) {
@@ -320,13 +330,61 @@ private:
 
 class CmdUpdate final : public WriteCommand {
 public:
-    CmdUpdate() : WriteCommand("update") {}
+    CmdUpdate() : WriteCommand("update"), _updateMetrics{"update"} {}
 
 private:
     class Invocation final : public InvocationBase {
     public:
-        Invocation(const WriteCommand* cmd, const OpMsgRequest& request)
-            : InvocationBase(cmd, request), _batch(UpdateOp::parse(request)) {}
+        Invocation(const WriteCommand* cmd,
+                   const OpMsgRequest& request,
+                   UpdateMetrics* updateMetrics)
+            : InvocationBase(cmd, request),
+              _batch(UpdateOp::parse(request)),
+              _commandObj(request.body),
+              _updateMetrics{updateMetrics} {
+
+            invariant(_commandObj.isOwned());
+            invariant(_updateMetrics);
+
+            // Extend the lifetime of `updates` to allow asynchronous mirroring.
+            if (auto seq = request.getSequence("updates"_sd); seq && !seq->objs.empty()) {
+                // Current design ignores contents of `updates` array except for the first entry.
+                // Assuming identical collation for all elements in `updates`, future design could
+                // use the disjunction primitive (i.e, `$or`) to compile all queries into a single
+                // filter. Such a design also requires a sound way of combining hints.
+                invariant(seq->objs.front().isOwned());
+                _updateOpObj = seq->objs.front();
+            }
+        }
+
+        bool supportsReadMirroring() const override {
+            return true;
+        }
+
+        void appendMirrorableRequest(BSONObjBuilder* bob) const override {
+            auto extractQueryDetails = [](const BSONObj& update, BSONObjBuilder* bob) -> void {
+                // "filter", "hint", and "collation" fields are optional.
+                if (update.isEmpty())
+                    return;
+
+                // The constructor verifies the following.
+                invariant(update.isOwned());
+
+                if (update.hasField("q"))
+                    bob->append("filter", update["q"].Obj());
+                if (update.hasField("hint") && !update["hint"].Obj().isEmpty())
+                    bob->append("hint", update["hint"].Obj());
+                if (update.hasField("collation") && !update["collation"].Obj().isEmpty())
+                    bob->append("collation", update["collation"].Obj());
+            };
+
+            invariant(!_commandObj.isEmpty());
+
+            bob->append("find", _commandObj["update"].String());
+            extractQueryDetails(_updateOpObj, bob);
+            bob->append("batchSize", 1);
+            bob->append("singleBatch", true);
+        }
 
     private:
         NamespaceString ns() const override {
@@ -345,6 +403,25 @@ private:
                            _batch.getUpdates().size(),
                            std::move(reply),
                            &result);
+
+            // Collect metrics.
+            for (auto&& update : _batch.getUpdates()) {
+                // If this was a pipeline style update, record that pipeline-style was used and
+                // which stages were being used.
+                auto& updateMod = update.getU();
+                if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
+                    AggregationRequest request(_batch.getNamespace(),
+                                               updateMod.getUpdatePipeline());
+                    LiteParsedPipeline pipeline(request);
+                    pipeline.tickGlobalStageCounters();
+                    _updateMetrics->incrementExecutedWithAggregationPipeline();
+                }
+
+                // If this command had arrayFilters option, record that it was used.
+                if (update.getArrayFilters()) {
+                    _updateMetrics->incrementExecutedWithArrayFilters();
+                }
+            }
         }
 
         void explain(OperationContext* opCtx,
@@ -354,20 +431,13 @@ private:
                     "explained write batches must be of size 1",
                     _batch.getUpdates().size() == 1);
 
-            UpdateRequest updateRequest(_batch.getNamespace());
-            updateRequest.setQuery(_batch.getUpdates()[0].getQ());
-            updateRequest.setUpdateModification(_batch.getUpdates()[0].getU());
-            updateRequest.setUpdateConstants(_batch.getUpdates()[0].getC());
+            UpdateRequest updateRequest(_batch.getUpdates()[0]);
+            updateRequest.setNamespaceString(_batch.getNamespace());
             updateRequest.setRuntimeConstants(
                 _batch.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
-            updateRequest.setCollation(write_ops::collationOf(_batch.getUpdates()[0]));
-            updateRequest.setArrayFilters(write_ops::arrayFiltersOf(_batch.getUpdates()[0]));
-            updateRequest.setMulti(_batch.getUpdates()[0].getMulti());
-            updateRequest.setUpsert(_batch.getUpdates()[0].getUpsert());
-            updateRequest.setUpsertSuppliedDocument(_batch.getUpdates()[0].getUpsertSupplied());
-            updateRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
-            updateRequest.setHint(_batch.getUpdates()[0].getHint());
-            updateRequest.setExplain();
+            updateRequest.setLetParameters(_batch.getLet());
+            updateRequest.setYieldPolicy(PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+            updateRequest.setExplain(verbosity);
 
             const ExtensionsCallbackReal extensionsCallback(opCtx,
                                                             &updateRequest.getNamespaceString());
@@ -378,21 +448,26 @@ private:
             // info is more accurate.
             AutoGetCollection collection(opCtx, _batch.getNamespace(), MODE_IX);
 
-            auto exec = uassertStatusOK(getExecutorUpdate(opCtx,
-                                                          &CurOp::get(opCtx)->debug(),
-                                                          collection.getCollection(),
-                                                          &parsedUpdate,
-                                                          verbosity));
+            auto exec = uassertStatusOK(getExecutorUpdate(
+                &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedUpdate, verbosity));
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(
                 exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);
         }
 
         write_ops::Update _batch;
+
+        BSONObj _commandObj;
+
+        // Holds a shared pointer to the first entry in `updates` array.
+        BSONObj _updateOpObj;
+
+        // Update related command execution metrics.
+        UpdateMetrics* const _updateMetrics;
     };
 
     std::unique_ptr<CommandInvocation> parse(OperationContext*, const OpMsgRequest& request) {
-        return std::make_unique<Invocation>(this, request);
+        return std::make_unique<Invocation>(this, request, &_updateMetrics);
     }
 
     void snipForLogging(mutablebson::Document* cmdObj) const final {
@@ -402,6 +477,9 @@ private:
     std::string help() const final {
         return "update documents";
     }
+
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } cmdUpdate;
 
 class CmdDelete final : public WriteCommand {
@@ -440,12 +518,17 @@ private:
                     "explained write batches must be of size 1",
                     _batch.getDeletes().size() == 1);
 
-            DeleteRequest deleteRequest(_batch.getNamespace());
+            auto deleteRequest = DeleteRequest{};
+            deleteRequest.setNsString(_batch.getNamespace());
+            deleteRequest.setRuntimeConstants(
+                _batch.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
+            deleteRequest.setLet(_batch.getLet());
             deleteRequest.setQuery(_batch.getDeletes()[0].getQ());
             deleteRequest.setCollation(write_ops::collationOf(_batch.getDeletes()[0]));
             deleteRequest.setMulti(_batch.getDeletes()[0].getMulti());
-            deleteRequest.setYieldPolicy(PlanExecutor::YIELD_AUTO);
-            deleteRequest.setExplain();
+            deleteRequest.setYieldPolicy(PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+            deleteRequest.setHint(_batch.getDeletes()[0].getHint());
+            deleteRequest.setIsExplain(true);
 
             ParsedDelete parsedDelete(opCtx, &deleteRequest);
             uassertStatusOK(parsedDelete.parseRequest());
@@ -455,11 +538,8 @@ private:
             AutoGetCollection collection(opCtx, _batch.getNamespace(), MODE_IX);
 
             // Explain the plan tree.
-            auto exec = uassertStatusOK(getExecutorDelete(opCtx,
-                                                          &CurOp::get(opCtx)->debug(),
-                                                          collection.getCollection(),
-                                                          &parsedDelete,
-                                                          verbosity));
+            auto exec = uassertStatusOK(getExecutorDelete(
+                &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedDelete, verbosity));
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(
                 exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);

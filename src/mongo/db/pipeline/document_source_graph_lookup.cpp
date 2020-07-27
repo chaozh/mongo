@@ -48,14 +48,8 @@
 namespace mongo {
 
 namespace {
-void assertIsValidCollectionState(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    if (expCtx->mongoProcessInterface->isSharded(expCtx->opCtx, expCtx->ns)) {
-        const bool foreignShardedAllowed =
-            getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
-        if (!foreignShardedAllowed) {
-            uasserted(31428, "Cannot run $graphLookup with sharded foreign collection");
-        }
-    }
+bool foreignShardedLookupAllowed() {
+    return getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
 }
 }  // namespace
 
@@ -85,7 +79,7 @@ std::unique_ptr<DocumentSourceGraphLookUp::LiteParsed> DocumentSourceGraphLookUp
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "invalid $graphLookup namespace: " << fromNss.ns(),
             fromNss.isValid());
-    return std::make_unique<LiteParsed>(std::move(fromNss));
+    return std::make_unique<LiteParsed>(spec.fieldName(), std::move(fromNss));
 }
 
 REGISTER_DOCUMENT_SOURCE(graphLookup,
@@ -187,8 +181,12 @@ void DocumentSourceGraphLookUp::doDispose() {
 void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
     long long depth = 0;
     bool shouldPerformAnotherQuery;
-    assertIsValidCollectionState(_fromExpCtx);
     do {
+        if (!foreignShardedLookupAllowed()) {
+            // Enforce that the foreign collection must be unsharded for $graphLookup.
+            _fromExpCtx->mongoProcessInterface->setExpectedShardVersion(
+                _fromExpCtx->opCtx, _fromExpCtx->ns, ChunkVersion::UNSHARDED());
+        }
         shouldPerformAnotherQuery = false;
 
         // Check whether each key in the frontier exists in the cache or needs to be queried.
@@ -214,13 +212,13 @@ void DocumentSourceGraphLookUp::doBreadthFirstSearch() {
 
             // We've already allocated space for the trailing $match stage in '_fromPipeline'.
             _fromPipeline.back() = *matchStage;
-            MongoProcessInterface::MakePipelineOptions pipelineOpts;
+            MakePipelineOptions pipelineOpts;
             pipelineOpts.optimize = true;
             pipelineOpts.attachCursorSource = true;
             // By default, $graphLookup doesn't support a sharded 'from' collection.
             pipelineOpts.allowTargetingShards = internalQueryAllowShardedLookup.load();
-            auto pipeline = pExpCtx->mongoProcessInterface->makePipeline(
-                _fromPipeline, _fromExpCtx, pipelineOpts);
+            _variables.copyToExpCtx(_variablesParseState, _fromExpCtx.get());
+            auto pipeline = Pipeline::makePipeline(_fromPipeline, _fromExpCtx, pipelineOpts);
             while (auto next = pipeline->getNext()) {
                 uassert(40271,
                         str::stream()
@@ -359,7 +357,19 @@ void DocumentSourceGraphLookUp::performSearch() {
         _frontierUsageBytes += startingValue.getApproximateSize();
     }
 
-    doBreadthFirstSearch();
+    try {
+        doBreadthFirstSearch();
+    } catch (const ExceptionForCat<ErrorCategory::StaleShardVersionError>& ex) {
+        // If lookup on a sharded collection is disallowed and the foreign collection is sharded,
+        // throw a custom exception.
+        if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+            uassert(31428,
+                    "Cannot run $graphLookup with sharded foreign collection",
+                    foreignShardedLookupAllowed() || !staleInfo->getVersionWanted() ||
+                        staleInfo->getVersionWanted() == ChunkVersion::UNSHARDED());
+        }
+        throw;
+    }
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() const {
@@ -470,7 +480,9 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
       _frontier(pExpCtx->getValueComparator().makeUnorderedValueSet()),
       _visited(ValueComparator::kInstance.makeUnorderedValueMap<Document>()),
       _cache(pExpCtx->getValueComparator()),
-      _unwind(unwindSrc) {
+      _unwind(unwindSrc),
+      _variables(expCtx->variables),
+      _variablesParseState(expCtx->variablesParseState.copyWith(_variables.useIdGenerator())) {
     const auto& resolvedNamespace = pExpCtx->getResolvedNamespace(_from);
     _fromExpCtx = pExpCtx->copyWith(resolvedNamespace.ns);
 
@@ -523,7 +535,7 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
         const auto argName = argument.fieldNameStringData();
 
         if (argName == "startWith") {
-            startWith = Expression::parseOperand(expCtx, argument, vps);
+            startWith = Expression::parseOperand(expCtx.get(), argument, vps);
             continue;
         } else if (argName == "maxDepth") {
             uassert(40100,
@@ -608,7 +620,7 @@ intrusive_ptr<DocumentSource> DocumentSourceGraphLookUp::createFromBson(
 void DocumentSourceGraphLookUp::addInvolvedCollections(
     stdx::unordered_set<NamespaceString>* collectionNames) const {
     collectionNames->insert(_fromExpCtx->ns);
-    auto introspectionPipeline = uassertStatusOK(Pipeline::parse(_fromPipeline, _fromExpCtx));
+    auto introspectionPipeline = Pipeline::parse(_fromPipeline, _fromExpCtx);
     for (auto&& stage : introspectionPipeline->getSources()) {
         stage->addInvolvedCollections(collectionNames);
     }

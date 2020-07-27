@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -43,12 +43,12 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/progress_meter.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
@@ -240,7 +240,7 @@ TEST_F(DConcurrencyTestFixture, ResourceMutex) {
         state.finish(3);
 
         // Step 4: Try to regain the shared lock // transfers control to t1
-        lk.lock(MODE_IS);
+        lk.lock(nullptr, MODE_IS);
 
         // Step 6: CHeck we actually got back the shared lock
         ASSERT(lk.isLocked());
@@ -471,6 +471,24 @@ TEST_F(DConcurrencyTestFixture, RSTLmodeX_Timeout) {
     ASSERT_EQ(
         clients[1].second.get()->lockState()->getLockMode(resourceIdReplicationStateTransitionLock),
         MODE_NONE);
+}
+
+TEST_F(DConcurrencyTestFixture, PBWMmodeX_Timeout) {
+    auto clients = makeKClientsWithLockers(2);
+    Lock::ParallelBatchWriterMode pbwm(clients[0].second.get()->lockState());
+    ASSERT_EQ(clients[0].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_X);
+
+    ASSERT_THROWS_CODE(Lock::GlobalLock(clients[1].second.get(),
+                                        MODE_X,
+                                        Date_t::now() + Milliseconds(1),
+                                        Lock::InterruptBehavior::kThrow),
+                       AssertionException,
+                       ErrorCodes::LockTimeout);
+    ASSERT_EQ(clients[0].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_X);
+    ASSERT_EQ(clients[1].second.get()->lockState()->getLockMode(resourceIdParallelBatchWriterMode),
+              MODE_NONE);
 }
 
 TEST_F(DConcurrencyTestFixture, GlobalLockXSetsGlobalWriteLockedOnOperationContext) {
@@ -1121,12 +1139,12 @@ TEST_F(DConcurrencyTestFixture, DBLockTakesSForAdminS) {
     ASSERT(opCtx->lockState()->getLockMode(resourceIdAdminDB) == MODE_S);
 }
 
-TEST_F(DConcurrencyTestFixture, DBLockTakesXForAdminIX) {
+TEST_F(DConcurrencyTestFixture, DBLockTakesIXForAdminIX) {
     auto opCtx = makeOperationContext();
     getClient()->swapLockState(std::make_unique<LockerImpl>());
     Lock::DBLock dbWrite(opCtx.get(), "admin", MODE_IX);
 
-    ASSERT(opCtx->lockState()->getLockMode(resourceIdAdminDB) == MODE_X);
+    ASSERT(opCtx->lockState()->getLockMode(resourceIdAdminDB) == MODE_IX);
 }
 
 TEST_F(DConcurrencyTestFixture, DBLockTakesXForAdminX) {
@@ -1199,10 +1217,7 @@ TEST_F(DConcurrencyTestFixture, IsCollectionLocked_DB_Locked_IS) {
 
         ASSERT(lockState->isCollectionLockedForMode(ns, MODE_IS));
         ASSERT(!lockState->isCollectionLockedForMode(ns, MODE_IX));
-
-        // TODO: This is TRUE because Lock::CollectionLock converts IS lock to S
-        ASSERT(lockState->isCollectionLockedForMode(ns, MODE_S));
-
+        ASSERT(!lockState->isCollectionLockedForMode(ns, MODE_S));
         ASSERT(!lockState->isCollectionLockedForMode(ns, MODE_X));
     }
 
@@ -1228,12 +1243,10 @@ TEST_F(DConcurrencyTestFixture, IsCollectionLocked_DB_Locked_IX) {
     {
         Lock::CollectionLock collLock(opCtx.get(), ns, MODE_IX);
 
-        // TODO: This is TRUE because Lock::CollectionLock converts IX lock to X
         ASSERT(lockState->isCollectionLockedForMode(ns, MODE_IS));
-
         ASSERT(lockState->isCollectionLockedForMode(ns, MODE_IX));
-        ASSERT(lockState->isCollectionLockedForMode(ns, MODE_S));
-        ASSERT(lockState->isCollectionLockedForMode(ns, MODE_X));
+        ASSERT(!lockState->isCollectionLockedForMode(ns, MODE_S));
+        ASSERT(!lockState->isCollectionLockedForMode(ns, MODE_X));
     }
 
     {
@@ -1249,7 +1262,7 @@ TEST_F(DConcurrencyTestFixture, IsCollectionLocked_DB_Locked_IX) {
 TEST_F(DConcurrencyTestFixture, Stress) {
     const int kNumIterations = 5000;
 
-    ProgressMeter progressMeter(kNumIterations * kMaxStressThreads);
+    ProgressMeter progressMeter(kNumIterations);
     std::vector<std::pair<ServiceContext::UniqueClient, ServiceContext::UniqueOperationContext>>
         clients = makeKClientsWithLockers(kMaxStressThreads);
 
@@ -1265,7 +1278,7 @@ TEST_F(DConcurrencyTestFixture, Stress) {
                 ;
 
             for (int i = 0; i < kNumIterations; i++) {
-                const bool sometimes = (std::rand() % 15 == 0);
+                const bool sometimes = (i % 15 == 0);
 
                 if (i % 7 == 0 && threadId == 0 /* Only one upgrader legal */) {
                     Lock::GlobalWrite w(clients[threadId].second.get());
@@ -1357,7 +1370,8 @@ TEST_F(DConcurrencyTestFixture, Stress) {
                     }
                 }
 
-                progressMeter.hit();
+                if (threadId == kMaxStressThreads - 1)
+                    progressMeter.hit();
             }
         });
     }
@@ -1373,7 +1387,7 @@ TEST_F(DConcurrencyTestFixture, Stress) {
 TEST_F(DConcurrencyTestFixture, StressPartitioned) {
     const int kNumIterations = 5000;
 
-    ProgressMeter progressMeter(kNumIterations * kMaxStressThreads);
+    ProgressMeter progressMeter(kNumIterations);
     std::vector<std::pair<ServiceContext::UniqueClient, ServiceContext::UniqueOperationContext>>
         clients = makeKClientsWithLockers(kMaxStressThreads);
 
@@ -1407,7 +1421,8 @@ TEST_F(DConcurrencyTestFixture, StressPartitioned) {
                     Lock::DBLock y(clients[threadId].second.get(), "local", MODE_IX);
                 }
 
-                progressMeter.hit();
+                if (threadId == kMaxStressThreads - 1)
+                    progressMeter.hit();
             }
         });
     }
@@ -2056,9 +2071,13 @@ TEST_F(DConcurrencyTestFixture, CompatibleFirstStress) {
     for (auto& thread : threads)
         thread.join();
     for (int threadId = 0; threadId < numThreads; threadId++) {
-        log() << "thread " << threadId << " stats: " << acquisitionCount[threadId]
-              << " acquisitions, " << timeoutCount[threadId] << " timeouts, "
-              << busyWaitCount[threadId] / 1'000'000 << "M busy waits";
+        LOGV2(20515,
+              "thread {threadId} stats: {acquisitionCount_threadId} acquisitions, "
+              "{timeoutCount_threadId} timeouts, {busyWaitCount_threadId_1_000_000}M busy waits",
+              "threadId"_attr = threadId,
+              "acquisitionCount_threadId"_attr = acquisitionCount[threadId],
+              "timeoutCount_threadId"_attr = timeoutCount[threadId],
+              "busyWaitCount_threadId_1_000_000"_attr = busyWaitCount[threadId] / 1'000'000);
     }
 }
 
@@ -2223,6 +2242,8 @@ TEST_F(DConcurrencyTestFixture, RSTLLockGuardResilientToExceptionThrownBeforeWai
 }
 
 TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleGlobalNonIntentLocks) {
+    auto opCtx = makeOperationContext();
+
     FailPointEnableBlock failWaitingNonPartitionedLocks("failNonIntentLocksIfWaitNeeded");
 
     LockerImpl locker1;
@@ -2230,12 +2251,12 @@ TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleGlobalN
     LockerImpl locker3;
 
     {
-        locker1.lockGlobal(MODE_IX);
+        locker1.lockGlobal(opCtx.get(), MODE_IX);
 
         // MODE_S attempt.
         stdx::thread t2([&]() {
             UninterruptibleLockGuard noInterrupt(&locker2);
-            locker2.lockGlobal(MODE_S);
+            locker2.lockGlobal(opCtx.get(), MODE_S);
         });
 
         // Wait for the thread to attempt to acquire the global lock in MODE_S.
@@ -2247,12 +2268,12 @@ TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleGlobalN
     }
 
     {
-        locker1.lockGlobal(MODE_IX);
+        locker1.lockGlobal(opCtx.get(), MODE_IX);
 
         // MODE_X attempt.
         stdx::thread t3([&]() {
             UninterruptibleLockGuard noInterrupt(&locker3);
-            locker3.lockGlobal(MODE_X);
+            locker3.lockGlobal(opCtx.get(), MODE_X);
         });
 
         // Wait for the thread to attempt to acquire the global lock in MODE_X.
@@ -2265,6 +2286,8 @@ TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleGlobalN
 }
 
 TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleNonIntentLocks) {
+    auto opCtx = makeOperationContext();
+
     FailPointEnableBlock failWaitingNonPartitionedLocks("failNonIntentLocksIfWaitNeeded");
 
     LockerImpl locker1;
@@ -2274,7 +2297,7 @@ TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleNonInte
     // Granted MODE_X lock, fail incoming MODE_S and MODE_X.
     const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
 
-    locker1.lockGlobal(MODE_IX);
+    locker1.lockGlobal(opCtx.get(), MODE_IX);
 
     {
         locker1.lock(resId, MODE_X);
@@ -2282,7 +2305,7 @@ TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleNonInte
         // MODE_S attempt.
         stdx::thread t2([&]() {
             UninterruptibleLockGuard noInterrupt(&locker2);
-            locker2.lockGlobal(MODE_IS);
+            locker2.lockGlobal(opCtx.get(), MODE_IS);
             locker2.lock(resId, MODE_S);
         });
 
@@ -2301,7 +2324,7 @@ TEST_F(DConcurrencyTestFixture, FailPointInLockDoesNotFailUninterruptibleNonInte
         // MODE_X attempt.
         stdx::thread t3([&]() {
             UninterruptibleLockGuard noInterrupt(&locker3);
-            locker3.lockGlobal(MODE_IX);
+            locker3.lockGlobal(opCtx.get(), MODE_IX);
             locker3.lock(resId, MODE_X);
         });
 
@@ -2323,7 +2346,7 @@ TEST_F(DConcurrencyTestFixture, PBWMRespectsMaxTimeMS) {
     auto opCtx2 = clientOpCtxPairs[1].second.get();
 
     Lock::ResourceLock pbwm1(opCtx1->lockState(), resourceIdParallelBatchWriterMode);
-    pbwm1.lock(MODE_X);
+    pbwm1.lock(nullptr, MODE_X);
 
     opCtx2->setDeadlineAfterNowBy(Seconds{1}, ErrorCodes::ExceededTimeLimit);
 

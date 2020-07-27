@@ -27,15 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/json.h"
 #include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -67,23 +67,32 @@ std::string dumpKeyset(const KeyStringSet& keyStrings) {
 
 bool assertKeysetsEqual(const KeyStringSet& expectedKeys, const KeyStringSet& actualKeys) {
     if (expectedKeys.size() != actualKeys.size()) {
-        log() << "Expected: " << dumpKeyset(expectedKeys) << ", "
-              << "Actual: " << dumpKeyset(actualKeys);
+        LOGV2(20695,
+              "Expected: {dumpKeyset_expectedKeys}, Actual: {dumpKeyset_actualKeys}",
+              "dumpKeyset_expectedKeys"_attr = dumpKeyset(expectedKeys),
+              "dumpKeyset_actualKeys"_attr = dumpKeyset(actualKeys));
         return false;
     }
 
     if (!std::equal(expectedKeys.begin(), expectedKeys.end(), actualKeys.begin())) {
-        log() << "Expected: " << dumpKeyset(expectedKeys) << ", "
-              << "Actual: " << dumpKeyset(actualKeys);
+        LOGV2(20696,
+              "Expected: {dumpKeyset_expectedKeys}, Actual: {dumpKeyset_actualKeys}",
+              "dumpKeyset_expectedKeys"_attr = dumpKeyset(expectedKeys),
+              "dumpKeyset_actualKeys"_attr = dumpKeyset(actualKeys));
         return false;
     }
 
     return true;
 }
 
-// Full-document tests with no projection.
+struct WildcardKeyGeneratorTest : public unittest::Test {
+    SharedBufferFragmentBuilder allocator{KeyString::HeapBuilder::kHeapAllocatorDefaultBytes};
+};
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ExtractTopLevelKey) {
+// Full-document tests with no projection.
+struct WildcardKeyGeneratorFullDocumentTest : public WildcardKeyGeneratorTest {};
+
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ExtractTopLevelKey) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -96,13 +105,13 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ExtractTopLevelKey) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ExtractKeysFromNestedObject) {
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ExtractKeysFromNestedObject) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -117,13 +126,13 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ExtractKeysFromNestedObject) {
 
     KeyStringSet outputKeys;
     KeyStringSet multikeyMetadataKeys;
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ShouldIndexEmptyObject) {
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ShouldIndexEmptyObject) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -136,13 +145,13 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ShouldIndexEmptyObject) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ShouldIndexNonNestedEmptyArrayAsUndefined) {
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ShouldIndexNonNestedEmptyArrayAsUndefined) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -163,13 +172,13 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ShouldIndexNonNestedEmptyArrayAsUndef
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ExtractMultikeyPath) {
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ExtractMultikeyPath) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -189,13 +198,13 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ExtractMultikeyPath) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ExtractMultikeyPathAndDedupKeys) {
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ExtractMultikeyPathAndDedupKeys) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -215,13 +224,13 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ExtractMultikeyPathAndDedupKeys) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ExtractZeroElementMultikeyPath) {
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ExtractZeroElementMultikeyPath) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -242,13 +251,13 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ExtractZeroElementMultikeyPath) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ExtractNestedMultikeyPaths) {
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ExtractNestedMultikeyPaths) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -278,13 +287,13 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ExtractNestedMultikeyPaths) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorFullDocumentTest, ExtractMixedPathTypesAndAllSubpaths) {
+TEST_F(WildcardKeyGeneratorFullDocumentTest, ExtractMixedPathTypesAndAllSubpaths) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -321,15 +330,16 @@ TEST(WildcardKeyGeneratorFullDocumentTest, ExtractMixedPathTypesAndAllSubpaths) 
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
 // Single-subtree implicit projection.
+struct WildcardKeyGeneratorSingleSubtreeTest : public WildcardKeyGeneratorTest {};
 
-TEST(WildcardKeyGeneratorSingleSubtreeTest, ExtractSubtreeWithSinglePathComponent) {
+TEST_F(WildcardKeyGeneratorSingleSubtreeTest, ExtractSubtreeWithSinglePathComponent) {
     WildcardKeyGenerator keyGen{fromjson("{'g.$**': 1}"),
                                 {},
                                 nullptr,
@@ -352,13 +362,13 @@ TEST(WildcardKeyGeneratorSingleSubtreeTest, ExtractSubtreeWithSinglePathComponen
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorSingleSubtreeTest, ExtractSubtreeWithMultiplePathComponents) {
+TEST_F(WildcardKeyGeneratorSingleSubtreeTest, ExtractSubtreeWithMultiplePathComponents) {
     WildcardKeyGenerator keyGen{fromjson("{'g.h.$**': 1}"),
                                 {},
                                 nullptr,
@@ -381,13 +391,13 @@ TEST(WildcardKeyGeneratorSingleSubtreeTest, ExtractSubtreeWithMultiplePathCompon
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorSingleSubtreeTest, ExtractMultikeySubtree) {
+TEST_F(WildcardKeyGeneratorSingleSubtreeTest, ExtractMultikeySubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'g.h.j.$**': 1}"),
                                 {},
                                 nullptr,
@@ -408,13 +418,13 @@ TEST(WildcardKeyGeneratorSingleSubtreeTest, ExtractMultikeySubtree) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorSingleSubtreeTest, ExtractNestedMultikeySubtree) {
+TEST_F(WildcardKeyGeneratorSingleSubtreeTest, ExtractNestedMultikeySubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'a.e.$**': 1}"),
                                 {},
                                 nullptr,
@@ -437,15 +447,16 @@ TEST(WildcardKeyGeneratorSingleSubtreeTest, ExtractNestedMultikeySubtree) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
 // Explicit inclusion tests.
+struct WildcardKeyGeneratorInclusionTest : public WildcardKeyGeneratorTest {};
 
-TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionSingleSubtree) {
+TEST_F(WildcardKeyGeneratorInclusionTest, InclusionProjectionSingleSubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{g: 1}"),
                                 nullptr,
@@ -468,13 +479,13 @@ TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionSingleSubtree) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionNestedSubtree) {
+TEST_F(WildcardKeyGeneratorInclusionTest, InclusionProjectionNestedSubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'g.h': 1}"),
                                 nullptr,
@@ -497,13 +508,13 @@ TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionNestedSubtree) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionMultikeySubtree) {
+TEST_F(WildcardKeyGeneratorInclusionTest, InclusionProjectionMultikeySubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'g.h.j': 1}"),
                                 nullptr,
@@ -524,13 +535,13 @@ TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionMultikeySubtree) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionNestedMultikeySubtree) {
+TEST_F(WildcardKeyGeneratorInclusionTest, InclusionProjectionNestedMultikeySubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'a.e': 1}"),
                                 nullptr,
@@ -551,13 +562,13 @@ TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionNestedMultikeySubtree
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionMultipleSubtrees) {
+TEST_F(WildcardKeyGeneratorInclusionTest, InclusionProjectionMultipleSubtrees) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'a.b': 1, 'a.c': 1, 'a.e': 1, 'g.h.i': 1}"),
                                 nullptr,
@@ -581,15 +592,16 @@ TEST(WildcardKeyGeneratorInclusionTest, InclusionProjectionMultipleSubtrees) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
 // Explicit exclusion tests.
+struct WildcardKeyGeneratorExclusionTest : public WildcardKeyGeneratorTest {};
 
-TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionSingleSubtree) {
+TEST_F(WildcardKeyGeneratorExclusionTest, ExclusionProjectionSingleSubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{g: 0}"),
                                 nullptr,
@@ -617,13 +629,13 @@ TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionSingleSubtree) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionNestedSubtree) {
+TEST_F(WildcardKeyGeneratorExclusionTest, ExclusionProjectionNestedSubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'g.h': 0}"),
                                 nullptr,
@@ -652,13 +664,13 @@ TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionNestedSubtree) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionMultikeySubtree) {
+TEST_F(WildcardKeyGeneratorExclusionTest, ExclusionProjectionMultikeySubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'g.h.j': 0}"),
                                 nullptr,
@@ -688,13 +700,13 @@ TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionMultikeySubtree) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionNestedMultikeySubtree) {
+TEST_F(WildcardKeyGeneratorExclusionTest, ExclusionProjectionNestedMultikeySubtree) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'a.e': 0}"),
                                 nullptr,
@@ -727,13 +739,13 @@ TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionNestedMultikeySubtree
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionMultipleSubtrees) {
+TEST_F(WildcardKeyGeneratorExclusionTest, ExclusionProjectionMultipleSubtrees) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'a.b': 0, 'a.c': 0, 'a.e': 0, 'g.h.i': 0}"),
                                 nullptr,
@@ -763,15 +775,16 @@ TEST(WildcardKeyGeneratorExclusionTest, ExclusionProjectionMultipleSubtrees) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
 // Test _id inclusion and exclusion behaviour.
+struct WildcardKeyGeneratorIdTest : public WildcardKeyGeneratorTest {};
 
-TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldIfProjectionIsEmpty) {
+TEST_F(WildcardKeyGeneratorIdTest, ExcludeIdFieldIfProjectionIsEmpty) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 nullptr,
@@ -794,13 +807,13 @@ TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldIfProjectionIsEmpty) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldForSingleSubtreeKeyPattern) {
+TEST_F(WildcardKeyGeneratorIdTest, ExcludeIdFieldForSingleSubtreeKeyPattern) {
     WildcardKeyGenerator keyGen{fromjson("{'a.$**': 1}"),
                                 {},
                                 nullptr,
@@ -821,13 +834,13 @@ TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldForSingleSubtreeKeyPattern) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, PermitIdFieldAsSingleSubtreeKeyPattern) {
+TEST_F(WildcardKeyGeneratorIdTest, PermitIdFieldAsSingleSubtreeKeyPattern) {
     WildcardKeyGenerator keyGen{fromjson("{'_id.$**': 1}"),
                                 {},
                                 nullptr,
@@ -844,13 +857,13 @@ TEST(WildcardKeyGeneratorIdTest, PermitIdFieldAsSingleSubtreeKeyPattern) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, PermitIdSubfieldAsSingleSubtreeKeyPattern) {
+TEST_F(WildcardKeyGeneratorIdTest, PermitIdSubfieldAsSingleSubtreeKeyPattern) {
     WildcardKeyGenerator keyGen{fromjson("{'_id.id1.$**': 1}"),
                                 {},
                                 nullptr,
@@ -866,13 +879,13 @@ TEST(WildcardKeyGeneratorIdTest, PermitIdSubfieldAsSingleSubtreeKeyPattern) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldByDefaultForInclusionProjection) {
+TEST_F(WildcardKeyGeneratorIdTest, ExcludeIdFieldByDefaultForInclusionProjection) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{a: 1}"),
                                 nullptr,
@@ -893,13 +906,13 @@ TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldByDefaultForInclusionProjection) 
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, PermitIdSubfieldInclusionInExplicitProjection) {
+TEST_F(WildcardKeyGeneratorIdTest, PermitIdSubfieldInclusionInExplicitProjection) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'_id.id1': 1}"),
                                 nullptr,
@@ -915,13 +928,13 @@ TEST(WildcardKeyGeneratorIdTest, PermitIdSubfieldInclusionInExplicitProjection) 
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldByDefaultForExclusionProjection) {
+TEST_F(WildcardKeyGeneratorIdTest, ExcludeIdFieldByDefaultForExclusionProjection) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{a: 0}"),
                                 nullptr,
@@ -938,13 +951,13 @@ TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldByDefaultForExclusionProjection) 
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, PermitIdSubfieldExclusionInExplicitProjection) {
+TEST_F(WildcardKeyGeneratorIdTest, PermitIdSubfieldExclusionInExplicitProjection) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{'_id.id1': 0}"),
                                 nullptr,
@@ -968,13 +981,13 @@ TEST(WildcardKeyGeneratorIdTest, PermitIdSubfieldExclusionInExplicitProjection) 
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, IncludeIdFieldIfExplicitlySpecifiedInProjection) {
+TEST_F(WildcardKeyGeneratorIdTest, IncludeIdFieldIfExplicitlySpecifiedInProjection) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{_id: 1, a: 1}"),
                                 nullptr,
@@ -997,13 +1010,13 @@ TEST(WildcardKeyGeneratorIdTest, IncludeIdFieldIfExplicitlySpecifiedInProjection
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldIfExplicitlySpecifiedInProjection) {
+TEST_F(WildcardKeyGeneratorIdTest, ExcludeIdFieldIfExplicitlySpecifiedInProjection) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{_id: 0, a: 1}"),
                                 nullptr,
@@ -1024,13 +1037,13 @@ TEST(WildcardKeyGeneratorIdTest, ExcludeIdFieldIfExplicitlySpecifiedInProjection
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorIdTest, IncludeIdFieldIfExplicitlySpecifiedInExclusionProjection) {
+TEST_F(WildcardKeyGeneratorIdTest, IncludeIdFieldIfExplicitlySpecifiedInExclusionProjection) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 fromjson("{_id: 1, a: 0}"),
                                 nullptr,
@@ -1049,15 +1062,16 @@ TEST(WildcardKeyGeneratorIdTest, IncludeIdFieldIfExplicitlySpecifiedInExclusionP
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
 // Collation tests.
+struct WildcardKeyGeneratorCollationTest : public WildcardKeyGeneratorTest {};
 
-TEST(WildcardKeyGeneratorCollationTest, CollationMixedPathAndKeyTypes) {
+TEST_F(WildcardKeyGeneratorCollationTest, CollationMixedPathAndKeyTypes) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
@@ -1102,13 +1116,15 @@ TEST(WildcardKeyGeneratorCollationTest, CollationMixedPathAndKeyTypes) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorDottedFieldsTest, DoNotIndexDottedFields) {
+struct WildcardKeyGeneratorDottedFieldsTest : public WildcardKeyGeneratorTest {};
+
+TEST_F(WildcardKeyGeneratorDottedFieldsTest, DoNotIndexDottedFields) {
     WildcardKeyGenerator keyGen{fromjson("{'$**': 1}"),
                                 {},
                                 {},
@@ -1130,13 +1146,13 @@ TEST(WildcardKeyGeneratorDottedFieldsTest, DoNotIndexDottedFields) {
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));
 }
 
-TEST(WildcardKeyGeneratorDottedFieldsTest, DoNotIndexDottedFieldsWithSimilarSubpathInKey) {
+TEST_F(WildcardKeyGeneratorDottedFieldsTest, DoNotIndexDottedFieldsWithSimilarSubpathInKey) {
     WildcardKeyGenerator keyGen{fromjson("{'a.b.$**': 1}"),
                                 {},
                                 {},
@@ -1151,7 +1167,7 @@ TEST(WildcardKeyGeneratorDottedFieldsTest, DoNotIndexDottedFieldsWithSimilarSubp
 
     auto outputKeys = makeKeySet();
     auto multikeyMetadataKeys = makeKeySet();
-    keyGen.generateKeys(inputDoc, &outputKeys, &multikeyMetadataKeys);
+    keyGen.generateKeys(allocator, inputDoc, &outputKeys, &multikeyMetadataKeys);
 
     ASSERT(assertKeysetsEqual(expectedKeys, outputKeys));
     ASSERT(assertKeysetsEqual(expectedMultikeyPaths, multikeyMetadataKeys));

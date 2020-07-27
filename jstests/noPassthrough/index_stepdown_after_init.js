@@ -7,6 +7,7 @@
 "use strict";
 
 load('jstests/noPassthrough/libs/index_build.js');
+load("jstests/libs/logv2_helpers.js");
 
 const rst = new ReplSetTest({
     nodes: [
@@ -34,8 +35,18 @@ assert.commandWorked(primary.adminCommand(
 
 const createIdx = IndexBuildTest.startIndexBuild(primary, coll.getFullName(), {a: 1});
 
-checkLog.contains(
-    primary, 'index build: starting on ' + coll.getFullName() + ' properties: { v: 2, key: { a:');
+if (isJsonLog(primary)) {
+    checkLog.containsJson(primary, 20384, {
+        namespace: coll.getFullName(),
+        properties: (desc) => {
+            return desc.name === 'a_1';
+        },
+    });
+} else {
+    checkLog.contains(
+        primary,
+        'index build: starting on ' + coll.getFullName() + ' properties: { v: 2, key: { a:');
+}
 
 try {
     // Step down the primary.
@@ -50,18 +61,6 @@ IndexBuildTest.waitForIndexBuildToStop(testDB);
 
 const exitCode = createIdx({checkExitSuccess: false});
 assert.neq(0, exitCode, 'expected shell to exit abnormally due to index build being terminated');
-
-if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    // Wait for the IndexBuildCoordinator thread, not the command thread, to report the index build
-    // as failed.
-    checkLog.contains(primary, '[IndexBuildsCoordinatorMongod-0] Index build failed: ');
-
-    // Check that no new index has been created.  This verifies that the index build was aborted
-    // rather than successfully completed.
-    IndexBuildTest.assertIndexes(coll, 1, ['_id_']);
-    rst.stopSet();
-    return;
-}
 
 // With two phase index builds, a stepdown will not abort the index build, which should complete
 // after the node becomes primary again.

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -39,8 +39,8 @@
 #include "mongo/db/session.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/transaction_participant_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -191,12 +191,16 @@ void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
         return;
     }
 
-    severe() << "Entry for session " << lsid->toBSON() << " has txnNumber "
-             << *sessionInfo.getTxnNumber() << " < " << *existingSessionInfo.getTxnNumber();
-    severe() << "New oplog entry: " << redact(entry.toString());
-    severe() << "Existing oplog entry: " << redact(iter->second.toString());
-
-    fassertFailedNoTrace(50843);
+    LOGV2_FATAL_NOTRACE(50843,
+                        "Entry for session {lsid} has txnNumber {sessionInfo_getTxnNumber} < "
+                        "{existingSessionInfo_getTxnNumber}. New oplog entry: {newEntry}, Existing "
+                        "oplog entry: {existingEntry}",
+                        "lsid"_attr = lsid->toBSON(),
+                        "sessionInfo_getTxnNumber"_attr = *sessionInfo.getTxnNumber(),
+                        "existingSessionInfo_getTxnNumber"_attr =
+                            *existingSessionInfo.getTxnNumber(),
+                        "newEntry"_attr = redact(entry.toString()),
+                        "existingEntry"_attr = redact(iter->second.toString()));
 }
 
 std::vector<OplogEntry> SessionUpdateTracker::_flush(const OplogEntry& entry) {

@@ -33,7 +33,7 @@
 
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/exec/delete.h"
-#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -47,7 +47,8 @@ long long deleteObjects(OperationContext* opCtx,
                         bool justOne,
                         bool god,
                         bool fromMigrate) {
-    DeleteRequest request(ns);
+    auto request = DeleteRequest{};
+    request.setNsString(ns);
     request.setQuery(pattern);
     request.setMulti(!justOne);
     request.setGod(god);
@@ -56,13 +57,10 @@ long long deleteObjects(OperationContext* opCtx,
     ParsedDelete parsedDelete(opCtx, &request);
     uassertStatusOK(parsedDelete.parseRequest());
 
-    auto exec = uassertStatusOK(getExecutorDelete(opCtx,
-                                                  &CurOp::get(opCtx)->debug(),
-                                                  collection,
-                                                  &parsedDelete,
-                                                  boost::none /* verbosity */));
+    auto exec = uassertStatusOK(getExecutorDelete(
+        &CurOp::get(opCtx)->debug(), collection, &parsedDelete, boost::none /* verbosity */));
 
-    uassertStatusOK(exec->executePlan());
+    exec->executePlan();
 
     return DeleteStage::getNumDeleted(*exec);
 }

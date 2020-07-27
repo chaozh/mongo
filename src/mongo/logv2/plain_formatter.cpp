@@ -49,25 +49,36 @@ namespace {
 
 struct TextValueExtractor {
     void operator()(StringData name, CustomAttributeValue const& val) {
-        std::string unescapedStr;
         if (val.stringSerialize) {
             fmt::memory_buffer buffer;
             val.stringSerialize(buffer);
-            unescapedStr = fmt::to_string(buffer);
-        } else {
-            unescapedStr = val.toString();
+            _storage.push_back(fmt::to_string(buffer));
+            operator()(name, StringData(_storage.back()));
+        } else if (val.toString) {
+            _storage.push_back(val.toString());
+            operator()(name, StringData(_storage.back()));
+        } else if (val.BSONAppend) {
+            BSONObjBuilder builder;
+            val.BSONAppend(builder, name);
+            BSONElement element = builder.done().getField(name);
+            _storage.push_back(element.toString(false));
+            operator()(name, _storage.back());
+        } else if (val.BSONSerialize) {
+            BSONObjBuilder builder;
+            val.BSONSerialize(builder);
+            operator()(name, builder.done());
+        } else if (val.toBSONArray) {
+            operator()(name, val.toBSONArray());
         }
-        _storage.push_back(unescapedStr);
+    }
+
+    void operator()(StringData name, const BSONObj& val) {
+        _storage.push_back(val.jsonString(JsonStringFormat::ExtendedRelaxedV2_0_0));
         operator()(name, StringData(_storage.back()));
     }
 
-    void operator()(StringData name, const BSONObj* val) {
-        _storage.push_back(val->jsonString(JsonStringFormat::ExtendedRelaxedV2_0_0));
-        operator()(name, StringData(_storage.back()));
-    }
-
-    void operator()(StringData name, const BSONArray* val) {
-        _storage.push_back(val->jsonString(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true));
+    void operator()(StringData name, const BSONArray& val) {
+        _storage.push_back(val.jsonString(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true));
         operator()(name, StringData(_storage.back()));
     }
 
@@ -135,7 +146,7 @@ private:
 }  // namespace
 
 void PlainFormatter::operator()(boost::log::record_view const& rec,
-                                boost::log::formatting_ostream& strm) const {
+                                fmt::memory_buffer& buffer) const {
     using namespace boost::log;
 
     StringData message = extract<StringData>(attributes::message(), rec).get();
@@ -144,11 +155,29 @@ void PlainFormatter::operator()(boost::log::record_view const& rec,
     TextValueExtractor extractor;
     extractor.args.reserve(attrs.size());
     attrs.apply(extractor);
-    fmt::memory_buffer buffer;
     fmt::vformat_to(
         buffer,
         to_string_view(message),
         fmt::basic_format_args<fmt::format_context>(extractor.args.data(), extractor.args.size()));
+
+    size_t attributeMaxSize = buffer.size();
+    if (extract<LogTruncation>(attributes::truncation(), rec).get() == LogTruncation::Enabled) {
+        if (_maxAttributeSizeKB)
+            attributeMaxSize = _maxAttributeSizeKB->loadRelaxed() * 1024;
+        else
+            attributeMaxSize = constants::kDefaultMaxAttributeOutputSizeKB * 1024;
+    }
+
+    buffer.resize(std::min(attributeMaxSize, buffer.size()));
+    if (StringData sd(buffer.data(), buffer.size()); sd.endsWith("\n"_sd))
+        buffer.resize(buffer.size() - 1);
+}
+
+void PlainFormatter::operator()(boost::log::record_view const& rec,
+                                boost::log::formatting_ostream& strm) const {
+    using namespace boost::log;
+    fmt::memory_buffer buffer;
+    operator()(rec, buffer);
     strm.write(buffer.data(), buffer.size());
 }
 

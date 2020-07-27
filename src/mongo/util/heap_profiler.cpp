@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,7 @@
 #include "mongo/base/static_assert.h"
 #include "mongo/config.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/util/tcmalloc_parameters_gen.h"
 
@@ -409,7 +409,7 @@ private:
     // disable profiling and then log an error message.
     void disable(const char* msg) {
         sampleIntervalBytes = 0;
-        log() << msg;
+        LOGV2(23157, "{msg}", "msg"_attr = msg);
     }
 
     //
@@ -537,7 +537,11 @@ private:
             builder.append(frameString);
         }
         stackInfo.stackObj = builder.obj();
-        log() << "heapProfile stack" << stackInfo.stackNum << ": " << stackInfo.stackObj;
+        LOGV2(23158,
+              "heapProfile stack {stackNum}: {stackObj}",
+              "heapProfile stack",
+              "stackNum"_attr = stackInfo.stackNum,
+              "stackObj"_attr = stackInfo.stackObj);
     }
 
     //
@@ -563,12 +567,19 @@ private:
             const size_t objTableSize = objHashTable.memorySizeBytes();
             const size_t stackTableSize = stackHashTable.memorySizeBytes();
             const double MB = 1024 * 1024;
-            log() << "sampleIntervalBytes " << HeapProfilingSampleIntervalBytes << "; "
-                  << "maxActiveMemory " << maxActiveMemory / MB << " MB; "
-                  << "objTableSize " << objTableSize / MB << " MB; "
-                  << "stackTableSize " << stackTableSize / MB << " MB";
+            LOGV2(23159,
+                  "Generating heap profiler serverStatus: sampleIntervalBytes "
+                  "{heapProfilingSampleIntervalBytes}; "
+                  "maxActiveMemory {maxActiveMemoryMB} MB; objTableSize {objTableSize_MB} MB; "
+                  "stackTableSize "
+                  "{stackTableSizeMB} MB",
+                  "Generating heap profiler serverStatus",
+                  "heapProfilingSampleIntervalBytes"_attr = HeapProfilingSampleIntervalBytes,
+                  "maxActiveMemoryMB"_attr = maxActiveMemory / MB,
+                  "objTableSize_MB"_attr = objTableSize / MB,
+                  "stackTableSizeMB"_attr = stackTableSize / MB);
             // print a stack trace to log somap for post-facto symbolization
-            log() << "following stack trace is for heap profiler informational purposes";
+            LOGV2(23160, "Following stack trace is for heap profiler informational purposes");
             printStackTrace();
             logGeneralStats = false;
         }
@@ -631,7 +642,7 @@ private:
         // importantStacks grows monotonically, so it can accumulate unneeded stacks,
         // so we clear it periodically.
         if (++numImportantSamples >= kMaxImportantSamples) {
-            log() << "clearing importantStacks";
+            LOGV2(23161, "Clearing importantStacks");
             importantStacks.clear();
             numImportantSamples = 0;
         }

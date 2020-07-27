@@ -133,8 +133,8 @@ public:
                       const NamespaceString& viewName,
                       const NamespaceString& viewOn,
                       const BSONArray& pipeline) {
-        Lock::DBLock dbLock(operationContext(), viewName.db(), MODE_X);
-        Lock::CollectionLock collLock(operationContext(), viewName, MODE_IX);
+        Lock::DBLock dbLock(operationContext(), viewName.db(), MODE_IX);
+        Lock::CollectionLock collLock(operationContext(), viewName, MODE_X);
         Lock::CollectionLock sysCollLock(
             operationContext(),
             NamespaceString(viewName.db(), NamespaceString::kSystemDotViewsCollectionName),
@@ -269,7 +269,7 @@ TEST_F(ViewCatalogFixture, CreateViewWithPipelineFailsOnInvalidStageName) {
                   AssertionException);
 }
 
-TEST_F(ReplViewCatalogFixture, CreateViewWithPipelineFailsOnIneligibleStage) {
+TEST_F(ReplViewCatalogFixture, CreateViewWithPipelineFailsOnChangeStreamsStage) {
     const NamespaceString viewName("db.view");
     const NamespaceString viewOn("db.coll");
 
@@ -280,6 +280,18 @@ TEST_F(ReplViewCatalogFixture, CreateViewWithPipelineFailsOnIneligibleStage) {
         createView(operationContext(), viewName, viewOn, invalidPipeline, emptyCollation),
         AssertionException,
         ErrorCodes::OptionNotSupportedOnView);
+}
+
+TEST_F(ReplViewCatalogFixture, CreateViewWithPipelineFailsOnCollectionlessStage) {
+    const NamespaceString viewName("db.view");
+    const NamespaceString viewOn("db.coll");
+
+    auto invalidPipeline = BSON_ARRAY(BSON("$currentOp" << BSONObj()));
+
+    ASSERT_THROWS_CODE(
+        createView(operationContext(), viewName, viewOn, invalidPipeline, emptyCollation),
+        AssertionException,
+        ErrorCodes::InvalidNamespace);
 }
 
 TEST_F(ReplViewCatalogFixture, CreateViewWithPipelineFailsOnIneligibleStagePersistentWrite) {
@@ -580,8 +592,8 @@ TEST_F(ViewCatalogFixture, LookupRIDAfterModifyRollback) {
         wunit.commit();
     }
     {
-        Lock::DBLock dbLock(operationContext(), viewName.db(), MODE_X);
-        Lock::CollectionLock collLock(operationContext(), viewName, MODE_IX);
+        Lock::DBLock dbLock(operationContext(), viewName.db(), MODE_IX);
+        Lock::CollectionLock collLock(operationContext(), viewName, MODE_X);
         Lock::CollectionLock sysCollLock(
             operationContext(),
             NamespaceString(viewName.db(), NamespaceString::kSystemDotViewsCollectionName),

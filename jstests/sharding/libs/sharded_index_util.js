@@ -49,11 +49,13 @@ var ShardedIndexUtil = (function() {
 
     let getPerShardIndexes = function(coll) {
         return coll
-            .aggregate([
-                {$indexStats: {}},
-                {$group: {_id: "$shard", indexes: {$push: {spec: "$spec"}}}},
-                {$project: {_id: 0, shard: "$_id", indexes: 1}}
-            ])
+            .aggregate(
+                [
+                    {$indexStats: {}},
+                    {$group: {_id: "$shard", indexes: {$push: {spec: "$spec"}}}},
+                    {$project: {_id: 0, shard: "$_id", indexes: 1}}
+                ],
+                {readConcern: {level: "local"}})
             .toArray();
     };
 
@@ -69,7 +71,7 @@ var ShardedIndexUtil = (function() {
      *  {"shard" : "rs1",
      *      "indexes" : [{"spec" : {"v" : 2, "key" : {"_id" :1}, "name" : "_id_"}}]}];
      */
-    let findInconsistentIndexesAcrossShards = function(indexDocs, isMixedVersion) {
+    let findInconsistentIndexesAcrossShards = function(indexDocs) {
         // Find indexes that exist on all shards. For the example above:
         // [{"spec" : {"v" : 2, "key" : {"_id" : 1}, "name" : "_id_"}}];
         let consistentIndexes = indexDocs[0].indexes;
@@ -84,8 +86,7 @@ var ShardedIndexUtil = (function() {
         for (const indexDoc of indexDocs) {
             const inconsistentIndexes =
                 indexDoc.indexes.filter(index => !this.containsBSON(consistentIndexes, index));
-            inconsistentIndexesOnShard[isMixedVersion ? indexDoc.host : indexDoc.shard] =
-                inconsistentIndexes;
+            inconsistentIndexesOnShard[indexDoc.shard] = inconsistentIndexes;
         }
 
         return inconsistentIndexesOnShard;

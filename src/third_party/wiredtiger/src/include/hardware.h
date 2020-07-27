@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -14,13 +14,6 @@
     do {                    \
         WT_WRITE_BARRIER(); \
         (v) = (val);        \
-    } while (0)
-
-/* Write after all previous stores are completed. */
-#define WT_ORDERED_WRITE(v, val) \
-    do {                         \
-        WT_WRITE_BARRIER();      \
-        (v) = (val);             \
     } while (0)
 
 /*

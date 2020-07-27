@@ -53,6 +53,9 @@ namespace mongo {
  */
 class FlowControl : public ServerStatusSection {
 public:
+    class Bypass;
+    static constexpr int kMaxTickets = 1000 * 1000 * 1000;
+
     FlowControl(ServiceContext* service, repl::ReplicationCoordinator* replCoord);
 
     /**
@@ -66,7 +69,24 @@ public:
 
     static void set(ServiceContext* service, std::unique_ptr<FlowControl> flowControl);
 
-    int getNumTickets();
+    /*
+     * Typical API call.
+     *
+     * Calculates how many tickets should be handed out in the next interval. If there's no majority
+     * point lag, the number of tickets should increase. If there is majority point lag beyond a
+     * threshold, the number of granted tickets is derived from how much progress secondaries are
+     * making.
+     *
+     * If Flow Control is disabled via `disabledUntil`, return the maximum number of tickets.
+     */
+    int getNumTickets() {
+        return getNumTickets(Date_t::now());
+    }
+
+    /**
+     * Exposed for testing.
+     */
+    int getNumTickets(Date_t now);
 
     /**
      * This method is called when replication is reserving `opsApplied` timestamps. `timestamp` is
@@ -86,6 +106,11 @@ public:
      */
     BSONObj generateSection(OperationContext* opCtx,
                             const BSONElement& configElement) const override;
+
+    /**
+     * Disables flow control until `deadline` is reached.
+     */
+    void disableUntil(Date_t deadline);
 
     /**
      * Underscore methods are public for testing.
@@ -112,18 +137,18 @@ public:
     }
 
 private:
-    const int _kMaxTickets = 1000 * 1000 * 1000;
     repl::ReplicationCoordinator* _replCoord;
 
     // These values are updated with each flow control computation and are also surfaced in server
     // status.
-    AtomicWord<int> _lastTargetTicketsPermitted{_kMaxTickets};
+    AtomicWord<int> _lastTargetTicketsPermitted{kMaxTickets};
     AtomicWord<double> _lastLocksPerOp{0.0};
     AtomicWord<int> _lastSustainerAppliedCount{0};
     AtomicWord<bool> _isLagged{false};
     AtomicWord<int> _isLaggedCount{0};
     // Use an int64_t as this is serialized to bson which does not support unsigned 64-bit numbers.
     AtomicWord<std::int64_t> _isLaggedTimeMicros{0};
+    AtomicWord<Date_t> _disableUntil;
 
     mutable Mutex _sampledOpsMutex = MONGO_MAKE_LATCH("FlowControl::_sampledOpsMutex");
     std::deque<Sample> _sampledOpsApplied;
@@ -143,6 +168,24 @@ private:
     std::uint64_t _startWaitTime = 0;
 
     PeriodicJobAnchor _jobAnchor;
+};
+
+class FlowControl::Bypass {
+    Bypass(const Bypass&) = delete;
+    Bypass& operator=(const Bypass&) = delete;
+
+public:
+    Bypass(OperationContext* opCtx)
+        : _opCtx(opCtx), _origValue(opCtx->shouldParticipateInFlowControl()) {
+        _opCtx->setShouldParticipateInFlowControl(false);
+    }
+    ~Bypass() {
+        _opCtx->setShouldParticipateInFlowControl(_origValue);
+    }
+
+private:
+    OperationContext* _opCtx;
+    bool _origValue;
 };
 
 }  // namespace mongo

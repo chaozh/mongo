@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -38,12 +38,12 @@
 #include "mongo/base/simple_string_data_comparator.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/db/snapshot_window_options.h"
+#include "mongo/db/snapshot_window_options_gen.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
@@ -73,6 +73,9 @@ Status wtRCToStatus_slow(int retCode, const char* prefix) {
     }
     if (retCode == EMFILE) {
         return Status(ErrorCodes::TooManyFilesOpen, s);
+    }
+    if (retCode == EBUSY) {
+        return Status(ErrorCodes::ObjectIsBusy, s);
     }
 
     uassert(ErrorCodes::ExceededMemoryLimit, s, retCode != WT_CACHE_FULL);
@@ -141,11 +144,13 @@ StatusWith<std::string> WiredTigerUtil::getMetadataCreate(OperationContext* opCt
 
     WT_CURSOR* cursor = nullptr;
     try {
-        cursor = session->getCachedCursor(
-            "metadata:create", WiredTigerSession::kMetadataCreateTableId, NULL);
+        const std::string metadataURI = "metadata:create";
+        cursor = session->getCachedCursor(metadataURI, WiredTigerSession::kMetadataCreateTableId);
+        if (!cursor) {
+            cursor = session->getNewCursor(metadataURI);
+        }
     } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
-        error() << ex;
-        fassertFailedNoTrace(51257);
+        LOGV2_FATAL_NOTRACE(51257, "Cursor not found", "error"_attr = ex);
     }
     invariant(cursor);
     auto releaser = makeGuard(
@@ -169,10 +174,13 @@ StatusWith<std::string> WiredTigerUtil::getMetadata(OperationContext* opCtx, Str
     auto session = WiredTigerRecoveryUnit::get(opCtx)->getSessionNoTxn();
     WT_CURSOR* cursor = nullptr;
     try {
-        cursor = session->getCachedCursor("metadata:", WiredTigerSession::kMetadataTableId, NULL);
+        const std::string metadataURI = "metadata:";
+        cursor = session->getCachedCursor(metadataURI, WiredTigerSession::kMetadataTableId);
+        if (!cursor) {
+            cursor = session->getNewCursor(metadataURI);
+        }
     } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
-        error() << ex;
-        fassertFailedNoTrace(31293);
+        LOGV2_FATAL_NOTRACE(31293, "Cursor not found", "error"_attr = ex);
     }
     invariant(cursor);
     auto releaser =
@@ -291,9 +299,14 @@ StatusWith<int64_t> WiredTigerUtil::checkApplicationMetadataFormatVersion(Operat
                                     << " has unsupported format version: " << version << ".");
     }
 
-    LOG(2) << "WiredTigerUtil::checkApplicationMetadataFormatVersion "
-           << " uri: " << uri << " ok range " << minimumVersion << " -> " << maximumVersion
-           << " current: " << version;
+    LOGV2_DEBUG(22428,
+                2,
+                "WiredTigerUtil::checkApplicationMetadataFormatVersion  uri: {uri} ok range "
+                "{minimumVersion} -> {maximumVersion} current: {version}",
+                "uri"_attr = uri,
+                "minimumVersion"_attr = minimumVersion,
+                "maximumVersion"_attr = maximumVersion,
+                "version"_attr = version);
 
     return version;
 }
@@ -394,8 +407,11 @@ size_t WiredTigerUtil::getCacheSizeMB(double requestedCacheSizeGB) {
         cacheSizeMB = 1024 * requestedCacheSizeGB;
     }
     if (cacheSizeMB > kMaxSizeCacheMB) {
-        log() << "Requested cache size: " << cacheSizeMB << "MB exceeds max; setting to "
-              << kMaxSizeCacheMB << "MB";
+        LOGV2(22429,
+              "Requested cache size: {requestedMB}MB exceeds max; setting to {maximumMB}MB",
+              "Requested cache size exceeds max, setting to maximum",
+              "requestedMB"_attr = cacheSizeMB,
+              "maximumMB"_attr = kMaxSizeCacheMB);
         cacheSizeMB = kMaxSizeCacheMB;
     }
     return static_cast<size_t>(cacheSizeMB);
@@ -417,9 +433,21 @@ int mdb_handle_error_with_startup_suppression(WT_EVENT_HANDLER* handler,
             if (sd.find("Version incompatibility detected:") != std::string::npos) {
                 return 0;
             }
+
+            // WT shipped with MongoDB 4.4 can read data left behind by 4.0, but cannot write 4.0
+            // compatible data. Instead of forcing an upgrade on the user, it refuses to start up
+            // with this error string.
+            if (sd.find("WiredTiger version incompatible with current binary") !=
+                std::string::npos) {
+                wtHandler->setWtIncompatible();
+                return 0;
+            }
         }
-        error() << "WiredTiger error (" << errorCode << ") " << redact(message)
-                << " Raw: " << message;
+        LOGV2_ERROR(22435,
+                    "WiredTiger error ({error}) {message}",
+                    "WiredTiger error",
+                    "error"_attr = errorCode,
+                    "message"_attr = message);
 
         // Don't abort on WT_PANIC when repairing, as the error will be handled at a higher layer.
         if (storageGlobalParams.repair) {
@@ -437,7 +465,11 @@ int mdb_handle_error(WT_EVENT_HANDLER* handler,
                      int errorCode,
                      const char* message) {
     try {
-        error() << "WiredTiger error (" << errorCode << ") " << redact(message);
+        LOGV2_ERROR(22436,
+                    "WiredTiger error ({errorCode}) {message}",
+                    "WiredTiger error",
+                    "error"_attr = errorCode,
+                    "message"_attr = redact(message));
 
         // Don't abort on WT_PANIC when repairing, as the error will be handled at a higher layer.
         if (storageGlobalParams.repair) {
@@ -452,7 +484,7 @@ int mdb_handle_error(WT_EVENT_HANDLER* handler,
 
 int mdb_handle_message(WT_EVENT_HANDLER* handler, WT_SESSION* session, const char* message) {
     try {
-        log() << "WiredTiger message " << redact(message);
+        LOGV2(22430, "WiredTiger message", "message"_attr = redact(message));
     } catch (...) {
         std::terminate();
     }
@@ -464,7 +496,10 @@ int mdb_handle_progress(WT_EVENT_HANDLER* handler,
                         const char* operation,
                         uint64_t progress) {
     try {
-        log() << "WiredTiger progress " << redact(operation) << " " << progress;
+        LOGV2(22431,
+              "WiredTiger progress",
+              "operation"_attr = redact(operation),
+              "progress"_attr = progress);
     } catch (...) {
         std::terminate();
     }
@@ -603,13 +638,22 @@ Status WiredTigerUtil::setTableLogging(WT_SESSION* session, const std::string& u
         return Status::OK();
     }
 
-    LOG(1) << "Changing table logging settings. Uri: " << uri << " Enable? " << on;
+    LOGV2_DEBUG(22432,
+                1,
+                "Changing table logging settings. Uri: {uri} Enable? {on}",
+                "uri"_attr = uri,
+                "on"_attr = on);
     int ret = session->alter(session, uri.c_str(), setting.c_str());
     if (ret) {
-        severe() << "Failed to update log setting. Uri: " << uri << " Enable? " << on
-                 << " Ret: " << ret << " MD: " << redact(existingMetadata)
-                 << " Msg: " << session->strerror(session, ret);
-        fassertFailed(50756);
+        LOGV2_FATAL(50756,
+                    "Failed to update log setting. Uri: {uri} Enable? {enable} Ret: {error} MD: "
+                    "{metadata} Msg: {message}",
+                    "Failed to update log setting",
+                    "uri"_attr = uri,
+                    "enable"_attr = on,
+                    "error"_attr = ret,
+                    "metadata"_attr = redact(existingMetadata),
+                    "message"_attr = session->strerror(session, ret));
     }
 
     return Status::OK();
@@ -705,21 +749,13 @@ void WiredTigerUtil::appendSnapshotWindowSettings(WiredTigerKVEngine* engine,
     const unsigned currentAvailableSnapshotWindow =
         stableTimestamp.getSecs() - oldestTimestamp.getSecs();
 
-    int64_t score = uassertStatusOK(WiredTigerUtil::getStatisticsValue(
-        session->getSession(), "statistics:", "", WT_STAT_CONN_CACHE_LOOKASIDE_SCORE));
-
-    auto totalNumberOfSnapshotTooOldErrors = snapshotWindowParams.snapshotTooOldErrorCount.load();
+    auto totalNumberOfSnapshotTooOldErrors = snapshotTooOldErrorCount.load();
 
     BSONObjBuilder settings(bob->subobjStart("snapshot-window-settings"));
-    settings.append("cache pressure percentage threshold",
-                    snapshotWindowParams.cachePressureThreshold.load());
-    settings.append("current cache pressure percentage", score);
     settings.append("total number of SnapshotTooOld errors", totalNumberOfSnapshotTooOldErrors);
-    settings.append("max target available snapshots window size in seconds",
-                    snapshotWindowParams.maxTargetSnapshotHistoryWindowInSeconds.load());
-    settings.append("target available snapshots window size in seconds",
-                    snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.load());
-    settings.append("current available snapshots window size in seconds",
+    settings.append("minimum target snapshot window size in seconds",
+                    minSnapshotHistoryWindowInSeconds.load());
+    settings.append("current available snapshot window size in seconds",
                     static_cast<int>(currentAvailableSnapshotWindow));
     settings.append("latest majority snapshot timestamp available",
                     stableTimestamp.toStringPretty());

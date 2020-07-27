@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -50,8 +50,8 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/timer.h"
@@ -82,6 +82,26 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
+    }
+
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const final {
+
+        static const Status kReadConcernNotSupported{ErrorCodes::InvalidOptions,
+                                                     "read concern not supported"};
+        static const Status kDefaultReadConcernNotPermitted{ErrorCodes::InvalidOptions,
+                                                            "default read concern not permitted"};
+        // The dbHash command only supports local and snapshot read concern. Additionally, snapshot
+        // read concern is only supported if test commands are enabled.
+        return {{level != repl::ReadConcernLevel::kLocalReadConcern &&
+                     (!getTestCommandsEnabled() ||
+                      level != repl::ReadConcernLevel::kSnapshotReadConcern),
+                 kReadConcernNotSupported},
+                kDefaultReadConcernNotPermitted};
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
@@ -226,32 +246,8 @@ public:
                 return false;
             }
 
-            // Only hash replicated collections. In 4.4 we use a more general way of choosing what
-            // collections are replicated. This means that mixed 4.2-4.4 replica sets could hash the
-            // same database differently, even when all nodes are up-to-date. We only use the new
-            // method for choosing collections to hash in FCV 4.4 so that when all nodes are
-            // up-to-date, it is guaranteed that they hash the same set of collections.
-            if (serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-                if (repl::ReplicationCoordinator::isOplogDisabledForNS(collNss)) {
-                    return true;
-                }
-            } else {
-                // A set of 'system' collections that are replicated, and therefore included in the
-                // db hash.
-                const std::set<StringData> replicatedSystemCollections{"system.backup_users",
-                                                                       "system.js",
-                                                                       "system.new_users",
-                                                                       "system.roles",
-                                                                       "system.users",
-                                                                       "system.version",
-                                                                       "system.views"};
-                // Only include 'system' collections that are replicated.
-                bool isReplicatedSystemColl =
-                    (replicatedSystemCollections.count(collNss.coll().toString()) > 0);
-                if (collNss.isSystem() && !isReplicatedSystemColl) {
-                    return true;
-                }
+            if (repl::ReplicationCoordinator::isOplogDisabledForNS(collNss)) {
+                return true;
             }
 
             if (collNss.coll().startsWith("tmp.mr.")) {
@@ -363,34 +359,38 @@ private:
                                               BSONObj(),
                                               BSONObj(),
                                               BoundInclusion::kIncludeStartKeyOnly,
-                                              PlanExecutor::NO_YIELD,
+                                              PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                               InternalPlanner::FORWARD,
                                               InternalPlanner::IXSCAN_FETCH);
         } else if (collection->isCapped()) {
             exec = InternalPlanner::collectionScan(
-                opCtx, nss.ns(), collection, PlanExecutor::NO_YIELD);
+                opCtx, nss.ns(), collection, PlanYieldPolicy::YieldPolicy::NO_YIELD);
         } else {
-            log() << "can't find _id index for: " << nss;
+            LOGV2(20455,
+                  "Can't find _id index for namespace: {namespace}",
+                  "Can't find _id index for namespace",
+                  "namespace"_attr = nss);
             return "no _id _index";
         }
 
         md5_state_t st;
         md5_init(&st);
 
-        long long n = 0;
-        PlanExecutor::ExecState state;
-        BSONObj c;
-        verify(nullptr != exec.get());
-        while (PlanExecutor::ADVANCED == (state = exec->getNext(&c, nullptr))) {
-            md5_append(&st, (const md5_byte_t*)c.objdata(), c.objsize());
-            n++;
+        try {
+            long long n = 0;
+            BSONObj c;
+            verify(nullptr != exec.get());
+            while (exec->getNext(&c, nullptr) == PlanExecutor::ADVANCED) {
+                md5_append(&st, (const md5_byte_t*)c.objdata(), c.objsize());
+                n++;
+            }
+        } catch (DBException& exception) {
+            LOGV2_WARNING(
+                20456, "Error while hashing, db possibly dropped", "namespace"_attr = nss);
+            exception.addContext("Plan executor error while running dbHash command");
+            throw;
         }
-        if (PlanExecutor::IS_EOF != state) {
-            warning() << "error while hashing, db dropped? ns=" << nss;
-            uasserted(34371,
-                      "Plan executor error while running dbHash command: " +
-                          WorkingSetCommon::toStatusString(c));
-        }
+
         md5digest d;
         md5_finish(&st, d);
         std::string hash = digestToString(d);

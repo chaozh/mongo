@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +40,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/client/authenticate.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
 #include "mongo/db/audit.h"
@@ -52,13 +53,15 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/stats/counters.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/text.h"
 
@@ -70,7 +73,7 @@ static constexpr auto kX509AuthenticationDisabledMessage = "x.509 authentication
 
 #ifdef MONGO_CONFIG_SSL
 Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BSONObj& cmdObj) {
-    if (!getSSLManager()) {
+    if (!opCtx->getClient()->session()->getSSLManager()) {
         return Status(ErrorCodes::ProtocolError,
                       "SSL support is required for the MONGODB-X509 mechanism.");
     }
@@ -86,7 +89,9 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
             "No verified subject name available from client",
             !clientName.empty());
 
-    if (!getSSLManager()->getSSLConfiguration().hasCA) {
+    auto sslConfiguration = opCtx->getClient()->session()->getSSLConfiguration();
+
+    if (!sslConfiguration->hasCA) {
         return Status(ErrorCodes::AuthenticationFailed,
                       "Unable to verify x.509 certificate, as no CA has been provided.");
     } else if (user.getUser() != clientName.toString()) {
@@ -94,7 +99,7 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
                       "There is no x.509 client certificate matching the user.");
     } else {
         // Handle internal cluster member auth, only applies to server-server connections
-        if (getSSLManager()->getSSLConfiguration().isClusterMember(clientName)) {
+        if (sslConfiguration->isClusterMember(clientName)) {
             int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
             if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_undefined ||
                 clusterAuthMode == ServerGlobalParams::ClusterAuthMode_keyFile) {
@@ -114,8 +119,9 @@ Status _authenticateX509(OperationContext* opCtx, const UserName& user, const BS
                 if (!clientMetadata->getApplicationName().empty() ||
                     (driverName != "MongoDB Internal Client" &&
                      driverName != "NetworkInterfaceTL")) {
-                    warning() << "Client isn't a mongod or mongos, but is connecting with a "
-                                 "certificate with cluster membership";
+                    LOGV2_WARNING(20430,
+                                  "Client isn't a mongod or mongos, but is connecting with a "
+                                  "certificate with cluster membership");
                 }
             }
 
@@ -254,7 +260,11 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
     CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
     if (!serverGlobalParams.quiet.load()) {
         mutablebson::Document cmdToLog(cmdObj, mutablebson::Document::kInPlaceDisabled);
-        log() << " authenticate db: " << dbname << " " << cmdToLog;
+        LOGV2(20427,
+              "Authenticate db: {db} {command}",
+              "Authenticate",
+              "db"_attr = dbname,
+              "command"_attr = cmdToLog);
     }
     std::string mechanism = cmdObj.getStringField("mechanism");
     if (mechanism.empty()) {
@@ -278,13 +288,23 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
         user = internalSecurity.user->getName();
     }
 
-    Status status = _authenticate(opCtx, mechanism, user, cmdObj);
+    Status status = authCounter.incAuthenticateReceived(mechanism);
+    if (status.isOK()) {
+        status = _authenticate(opCtx, mechanism, user, cmdObj);
+    }
     audit::logAuthentication(Client::getCurrent(), mechanism, user, status.code());
+
     if (!status.isOK()) {
         if (!serverGlobalParams.quiet.load()) {
             auto const client = opCtx->getClient();
-            log() << "Failed to authenticate " << user << " from client " << client->getRemote()
-                  << " with mechanism " << mechanism << ": " << status;
+            LOGV2(20428,
+                  "Failed to authenticate {user} from client {client} with mechanism "
+                  "{mechanism}: {error}",
+                  "Failed to authenticate",
+                  "user"_attr = user,
+                  "client"_attr = client->getRemote(),
+                  "mechanism"_attr = mechanism,
+                  "error"_attr = status);
         }
         sleepmillis(saslGlobalParams.authFailedDelay.load());
         if (status.code() == ErrorCodes::AuthenticationFailed) {
@@ -298,10 +318,15 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
     }
 
     if (!serverGlobalParams.quiet.load()) {
-        log() << "Successfully authenticated as principal " << user.getUser() << " on "
-              << user.getDB() << " from client " << opCtx->getClient()->session()->remote();
+        LOGV2(20429,
+              "Successfully authenticated as principal {user} on {db} from client {client}",
+              "Successfully authenticated",
+              "user"_attr = user.getUser(),
+              "db"_attr = user.getDB(),
+              "client"_attr = opCtx->getClient()->session()->remote());
     }
 
+    uassertStatusOK(authCounter.incAuthenticateSuccessful(mechanism));
     result.append("dbname", user.getDB());
     result.append("user", user.getUser());
     return true;
@@ -358,6 +383,28 @@ void disableAuthMechanism(StringData authMechanism) {
     if (authMechanism == kX509AuthMechanism) {
         _isX509AuthDisabled = true;
     }
+}
+
+void doSpeculativeAuthenticate(OperationContext* opCtx,
+                               BSONObj cmdObj,
+                               BSONObjBuilder* result) try {
+    auto mechElem = cmdObj["mechanism"];
+    if (mechElem.type() != String) {
+        return;
+    }
+
+    auto mechanism = mechElem.String();
+
+    // Run will make sure an audit entry happens. Let it reach that point.
+    authCounter.incSpeculativeAuthenticateReceived(mechanism).ignore();
+
+    BSONObjBuilder authResult;
+    if (cmdAuthenticate.run(opCtx, "$external", cmdObj, authResult)) {
+        uassertStatusOK(authCounter.incSpeculativeAuthenticateSuccessful(mechanism));
+        result->append(auth::kSpeculativeAuthenticate, authResult.obj());
+    }
+} catch (...) {
+    // Treat failure like we never even got a speculative start.
 }
 
 }  // namespace mongo

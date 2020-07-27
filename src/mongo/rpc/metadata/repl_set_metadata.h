@@ -46,20 +46,15 @@ extern const char kReplSetMetadataFieldName[];
  */
 class ReplSetMetadata {
 public:
-    /**
-     * Default primary index. Also used to indicate in metadata that there is no
-     * primary.
-     */
-    static const int kNoPrimary = -1;
-
     ReplSetMetadata() = default;
     ReplSetMetadata(long long term,
                     repl::OpTimeAndWallTime committedOpTime,
                     repl::OpTime visibleOpTime,
                     long long configVersion,
-                    OID replicaSetId,
-                    int currentPrimaryIndex,
-                    int currentSyncSourceIndex);
+                    long long configTerm,
+                    OID id,
+                    int currentSyncSourceIndex,
+                    bool isPrimary);
 
     /**
      * format:
@@ -70,14 +65,15 @@ public:
      *     configVersion: 0,
      *     replicaSetId: ObjectId("..."), // Only present in certain versions and above.
      *     primaryIndex: 0,
-     *     syncSourceIndex: 0
+     *     syncSourceIndex: 0,
+     *     isPrimary: false // 4.4 and later
      * }
      */
     static StatusWith<ReplSetMetadata> readFromMetadata(const BSONObj& doc);
     Status writeToMetadata(BSONObjBuilder* builder) const;
 
     /**
-     * Returns the OpTime of the most recent operation with which the client intereacted.
+     * Returns the OpTime of the most recent operation with which the client interacted.
      */
     repl::OpTime getLastOpVisible() const {
         return _lastOpVisible;
@@ -98,6 +94,13 @@ public:
     }
 
     /**
+     * Returns the ReplSetConfig term number of the sender.
+     */
+    long long getConfigTerm() const {
+        return _configTerm;
+    }
+
+    /**
      * Returns true if the sender has a replica set ID.
      */
     bool hasReplicaSetId() const {
@@ -112,19 +115,18 @@ public:
     }
 
     /**
-     * Returns the index of the current primary from the perspective of the sender.
-     * Returns kNoPrimary if there is no primary.
-     */
-    int getPrimaryIndex() const {
-        return _currentPrimaryIndex;
-    }
-
-    /**
      * Returns the index of the sync source of the sender.
      * Returns -1 if it has no sync source.
      */
     int getSyncSourceIndex() const {
         return _currentSyncSourceIndex;
+    }
+
+    /**
+     * Returns true if the sender is primary.
+     */
+    bool getIsPrimary() const {
+        return _isPrimary;
     }
 
     /**
@@ -144,9 +146,10 @@ private:
     repl::OpTime _lastOpVisible;
     long long _currentTerm = -1;
     long long _configVersion = -1;
+    long long _configTerm = repl::OpTime::kUninitializedTerm;
     OID _replicaSetId;
-    int _currentPrimaryIndex = kNoPrimary;
     int _currentSyncSourceIndex = -1;
+    bool _isPrimary;
 };
 
 }  // namespace rpc

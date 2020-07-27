@@ -1,19 +1,14 @@
 /**
- * Regression test that runs validate to test KeyString changes across 4.2 and the current
- * version as specified in SERVER-41908.
- *
- * - First, start mongod in 4.2.
- * - For each index create a new collection in testDb, inserting documents and finally an index is
- *   created.
- * - After all indexes and collections are added, shutdown mongod.
- * - Restart the database as the current version.
- * - Run Validate.
- * - Remove all collections.
- * - Recreate all the indexes.
- * - Shuwdown mongod.
- * - Restart mongod in 4.2.
- * - Run Validate.
- *
+ * Regression test that ensure there have been no KeyString encoding changes between last-lts the
+ * current version. Has the following procedure:
+ * - Start mongod with the last-lts version.
+ * - For each index type, create a new collection, insert documents, and create an index.
+ * - Shutdown mongod and restart with the latest version.
+ * - Run validate.
+ * - Drop all collections.
+ * - Recreate all indexes.
+ * - Shuwdown mongod and restart with the last-lts version.
+ * - Run validate.
  *
  * The following index types are tested:
  * - btree
@@ -21,9 +16,9 @@
  * - geoHaystack
  * - 2dsphere
  * - text
- * - *hashed
- * - *wildcard
- * * these indexes are only created as v2 non-unique because they are not available unique or in v1
+ * - hashed*
+ * - wildcard*
+ * * These indexes are only created as v2 and non-unique because v1 does not support these features.
  *
  * For each index type, a v1 unique, v2 unique, v1 non-unique and v2 non-unique index
  * is considered except for hashed and wildcard, which only consider the v2 non-unique case.
@@ -32,38 +27,37 @@
 'use strict';
 load('jstests/hooks/validate_collections.js');
 
-// ----- Config
-// The number of documents created for each collection
-const numDocs = 100;
+const kNumDocs = 100;
 
 const indexTypes = [
     {
-        // an indicator of what the index is
+        // This is the name of the index.
         indexName: "BTreeIndex",
-        // This function is called to create documents, which are then inserted into the
-        // collection.
+        // This function is called to create documents, which are then inserted into the collection.
         createDoc: i => ({
             a: i,
             b: {x: i, y: i + 1},
             c: [i, i + 1],
         }),
-        // the options given to the .createIndex method
-        // i.e. collection.createIndex(creationOptions)
-        creationOptions: {a: 1, b: 1, c: -1},
-        // This optional parameter specifies extra options to give to createIndex.
-        // In the code, collection.createIndexes(creationOptions, createIndexOptions)
-        // is called.
-        createIndexOptions: {}
+        // This is the index key specification.
+        spec: {a: 1, b: 1, c: -1},
+        // This optional parameter specifies extra options to give to the createIndex helper.
+        // e.g. collection.createIndexes(spec, createIndexOptions)
+        createIndexOptions: {},
     },
-    {indexName: "2d", createDoc: i => ({loc: [i, i]}), creationOptions: {loc: "2d"}},
+    {
+        indexName: "2d",
+        createDoc: i => ({loc: [i, i]}),
+        spec: {loc: "2d"},
+    },
     {
         indexName: "hayStack",
         createDoc: i => ({
             loc: {lng: (i / 2.0) * (i / 2.0), lat: (i / 2.0)},
             a: {x: i, y: i + 1, z: [i, i + 1]},
         }),
-        creationOptions: {loc: "geoHaystack", a: 1},
-        createIndexOptions: {bucketSize: 1}
+        spec: {loc: "geoHaystack", a: 1},
+        createIndexOptions: {bucketSize: 1},
     },
     {
         indexName: "2dSphere",
@@ -84,7 +78,7 @@ const indexTypes = [
                     c: [i, i + 1],
                 });
         },
-        creationOptions: {loc: "2dsphere", b: 1, c: -1}
+        spec: {loc: "2dsphere", b: 1, c: -1},
     },
     {
         indexName: "text",
@@ -92,14 +86,14 @@ const indexTypes = [
             a: "a".repeat(i + 1),
             b: {x: i, y: i + 1, z: [i, i + 1]},
         }),
-        creationOptions: {a: "text", b: 1}
+        spec: {a: "text", b: 1},
     },
     {
         indexName: "hashed",
         createDoc: i => ({
             a: {x: i, y: i + 1, z: [i, i + 1]},
         }),
-        creationOptions: {a: "hashed"}
+        spec: {a: "hashed"},
     },
     {
         indexName: "wildCard",
@@ -117,7 +111,7 @@ const indexTypes = [
                     c: [i, i + 1],
                 };
         },
-        creationOptions: {"$**": 1}
+        spec: {"$**": 1},
     }
 ];
 // -----
@@ -130,22 +124,21 @@ const defaultOptions = {
     noCleanData: true
 };
 
-const testCollection = 'testColl';
+const kCollectionPrefix = 'testColl';
 
-let mongodOptions42 = Object.extend({binVersion: '4.2'}, defaultOptions);
+let mongodOptionsLastLTS = Object.extend({binVersion: 'last-lts'}, defaultOptions);
 let mongodOptionsCurrent = Object.extend({binVersion: 'latest'}, defaultOptions);
 
-// We will first start up an old binary version database, populate the database,
-// then upgrade and validate.
+// We will first start up a last-lts version mongod, populate the database, upgrade, then
+// validate.
 
-// Start up an old binary version mongod.
-jsTestLog("Starting version: 4.2");
-let conn = MongoRunner.runMongod(mongodOptions42);
+jsTestLog("Starting version: last-lts");
+let conn = MongoRunner.runMongod(mongodOptionsLastLTS);
 
-assert.neq(null, conn, 'mongod was unable able to start with version ' + tojson(mongodOptions42));
+assert.neq(
+    null, conn, 'mongod was unable able to start with version ' + tojson(mongodOptionsLastLTS));
 
 let testDb = conn.getDB('test');
-assert.neq(null, testDb, 'testDb not found. conn.getDB(\'test\') returned null');
 
 populateDb(testDb);
 MongoRunner.stopMongod(conn);
@@ -156,66 +149,65 @@ jsTestLog("Starting version: latest");
 conn = MongoRunner.runMongod(mongodOptionsCurrent);
 assert.neq(null, conn, 'mongod was unable to start with the latest version');
 testDb = conn.getDB('test');
-assert.neq(null, testDb, 'testDb not found');
+assert.gt(testDb.getCollectionInfos().length, 0);
 
-jsTestLog("Validating: 4.2 indexes with latest");
+jsTestLog("Validating indexes created with a 'last-lts' version binary using a 'latest' version " +
+          "binary");
 
 // Validate all the indexes.
 assert.commandWorked(validateCollections(testDb, {full: true}));
 
-// Next, we will repopulate the database with the latest version then downgrade and run
-// validate.
+// Next, we will repopulate the database with the latest version then downgrade and run validate.
 dropAllUserCollections(testDb);
 populateDb(testDb);
 MongoRunner.stopMongod(conn);
 
-conn = MongoRunner.runMongod(mongodOptions42);
-assert.neq(null, conn, 'mongod was unable able to start with version ' + tojson(mongodOptions42));
+conn = MongoRunner.runMongod(mongodOptionsLastLTS);
+assert.neq(
+    null, conn, 'mongod was unable able to start with version ' + tojson(mongodOptionsLastLTS));
 
 testDb = conn.getDB('test');
-assert.neq(null, testDb, 'testDb not found. conn.getDB(\'test\') returned null');
+assert.gt(testDb.getCollectionInfos().length, 0);
 
-jsTestLog("Validating: latest indexes with 4.2");
+jsTestLog(
+    "Validating indexes created with 'latest' version binary using a 'last-lts' version binary");
 
 assert.commandWorked(validateCollections(testDb, {full: true}));
 MongoRunner.stopMongod(conn);
 
-// ----------------- Utilities
-
 // Populate the database using the config specified by the indexTypes array.
 function populateDb(testDb) {
     // Create a new collection and index for each indexType in the array.
-    for (let i = 0; i < indexTypes.length; i++) {
-        const indexOptions = indexTypes[i];
+    indexTypes.forEach(indexOptions => {
         // Try unique and non-unique.
-        for (const unique in [true, false]) {
+        [true, false].forEach(unique => {
             // Try index-version 1 and 2.
-            for (let indexVersion = 1; indexVersion <= 2; indexVersion++) {
+            [1, 2].forEach(indexVersion => {
                 let indexName = indexOptions.indexName;
 
                 // We only run V2 non-unique for hashed and wildCard because they don't exist in
                 // v1.
                 if ((indexName == "hashed" || indexName == "wildCard") &&
-                    (unique == true || indexVersion == 1))
-                    continue;
+                    (unique === true || indexVersion === 1))
+                    return;
 
-                indexName += unique == true ? "Unique" : "NotUnique";
+                indexName += unique === true ? "Unique" : "NotUnique";
                 indexName += `Version${indexVersion}`;
-                let collectionName = testCollection + '_' + indexName;
+                let collectionName = kCollectionPrefix + '_' + indexName;
                 print(`${indexName}: Creating Collection`);
                 assert.commandWorked(testDb.createCollection(collectionName));
 
                 print(`${indexName}: Inserting Documents`);
                 if (unique)
-                    insertDocumentsUnique(testDb[collectionName], numDocs, indexOptions.createDoc);
+                    insertDocumentsUnique(testDb[collectionName], kNumDocs, indexOptions.createDoc);
                 else
                     insertDocumentsNotUnique(
-                        testDb[collectionName], numDocs, indexOptions.createDoc);
+                        testDb[collectionName], kNumDocs, indexOptions.createDoc);
 
                 let extraCreateIndexOptions = {
                     name: indexName,
-                    v: indexVersion,
-                    unique: unique == true
+                    v: NumberLong(indexVersion),
+                    unique: unique === true
                 };
 
                 if ("createIndexOptions" in indexOptions)
@@ -223,15 +215,15 @@ function populateDb(testDb) {
                         Object.extend(extraCreateIndexOptions, indexOptions.createIndexOptions);
                 print(JSON.stringify(extraCreateIndexOptions));
                 print(`${indexName}: Creating Index`);
-                assert.commandWorked(testDb[collectionName].createIndex(
-                    indexOptions.creationOptions, extraCreateIndexOptions));
+                assert.commandWorked(
+                    testDb[collectionName].createIndex(indexOptions.spec, extraCreateIndexOptions));
 
                 // Assert that the correct index type was created.
                 let indexSpec = getIndexSpecByName(testDb[collectionName], indexName);
                 assert.eq(indexVersion, indexSpec.v, tojson(indexSpec));
-            }
-        }
-    }
+            });
+        });
+    });
 }
 
 // Drop all user created collections in a database.
@@ -271,20 +263,24 @@ function insertDocumentsNotUnique(collection, numDocs, getDoc) {
     // exponentially growing sequence that allows us to create documents
     // that are duplicated X number of times, for many small values of X and
     // a few large values of X.
+    var bulk = collection.initializeUnorderedBulkOp();
     for (let i = 0; i < numDocs; i += fibonacci(fibNum++)) {
         let doc = getDoc(i);
         for (let j = 0; j < fibonacci(fibNum); j++) {
-            assert.commandWorked(collection.insert(doc));
+            bulk.insert(doc);
         }
     }
+    assert.commandWorked(bulk.execute());
 }
 
 // Inserts numDocs into the collection by calling getDoc.
 // NOTE: getDoc is called exactly numDocs times.
 function insertDocumentsUnique(collection, numDocs, getDoc) {
+    var bulk = collection.initializeUnorderedBulkOp();
     for (let i = 0; i < numDocs; i++) {
         let doc = getDoc(i);
-        assert.commandWorked(collection.insert(doc));
+        bulk.insert(doc);
     }
+    assert.commandWorked(bulk.execute());
 }
 })();

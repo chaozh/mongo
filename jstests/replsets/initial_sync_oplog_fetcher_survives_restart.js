@@ -1,6 +1,8 @@
 /**
  * Tests that initial sync survives a restart during the oplog fetching process.
- * @tags: [requires_persistence, requires_fcv_44]
+ * @tags: [
+ *   requires_persistence,
+ * ]
  */
 (function() {
 "use strict";
@@ -17,7 +19,7 @@ const primaryDb = primary.getDB("test");
 
 jsTest.log("Adding a new node to the replica set");
 const secondary = rst.add({
-    rsConfig: {priority: 0},
+    rsConfig: {priority: 0, votes: 0},
     setParameter: {
         // Wait for the cloners to finish.
         'failpoint.initialSyncHangAfterDataCloning': tojson({mode: 'alwaysOn'}),
@@ -51,7 +53,7 @@ assert.commandWorked(secondary.getDB("test").adminCommand(
     {configureFailPoint: "hangBeforeStartingOplogFetcher", mode: "off"}));
 
 // Wait for retries to happen while the sync source is down.
-checkLog.containsWithAtLeastCount(secondary, "Scheduled new oplog query", nRetries);
+checkLog.containsWithAtLeastCount(secondary, "OplogFetcher reconnecting", nRetries);
 
 const options = {
     waitForConnect: true

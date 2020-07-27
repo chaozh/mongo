@@ -27,14 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/roll_back_local_operations.h"
 
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -114,7 +114,11 @@ StatusWith<RollBackLocalOperations::RollbackCommonPoint> RollBackLocalOperations
 
     while (getTimestamp(_localOplogValue) > getTimestamp(operation)) {
         _scanned++;
-        LOG(2) << "Local oplog entry to roll back: " << redact(_localOplogValue.first);
+        LOGV2_DEBUG(21656,
+                    2,
+                    "Local oplog entry to roll back: {oplogEntry}",
+                    "Local oplog entry to roll back",
+                    "oplogEntry"_attr = redact(_localOplogValue.first));
         auto status = _rollbackOperation(_localOplogValue.first);
         if (!status.isOK()) {
             invariant(ErrorCodes::NoSuchKey != status.code());

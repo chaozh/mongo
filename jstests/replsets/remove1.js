@@ -6,6 +6,14 @@
  * Bring secondary back up
  * Add it back as secondary
  * Make sure both nodes are either primary or secondary
+ *
+ * This test assumes 'newlyAdded' fields are enabled, so blacklist from multiversion tests in 4.6.
+ *
+ * SERVER-49428: Disable for ephemeralForTest, writeConcernMajorityJournalDefault is not off
+ * @tags: [
+ *   requires_fcv_46,
+ *   incompatible_with_eft,
+ * ]
  */
 
 load("jstests/replsets/rslib.js");
@@ -25,7 +33,7 @@ master.getDB("foo").bar.baz.insert({x: 1});
 replTest.awaitReplication();
 
 print("Remove secondary");
-var config = replTest.getReplSetConfig();
+var config = replTest.getReplSetConfigFromNode(0);
 for (var i = 0; i < config.members.length; i++) {
     if (config.members[i].host == secondary.host) {
         config.members.splice(i, 1);
@@ -74,13 +82,18 @@ config.version = nextVersion;
 // perception that the secondary is still "down".
 assert.soon(function() {
     try {
-        reconfig(replTest, config);
+        assert.commandWorked(replTest.getPrimary().adminCommand({replSetReconfig: config}));
         return true;
     } catch (e) {
         return false;
     }
 });
 master = replTest.getPrimary();
+
+// Wait and account for 'newlyAdded' automatic reconfig.
+nextVersion++;
+replTest.waitForAllNewlyAddedRemovals();
+
 secondary = replTest.getSecondary();
 printjson(master.getDB("admin").runCommand({replSetGetStatus: 1}));
 var newConfig = master.getDB("local").system.replset.findOne();

@@ -34,22 +34,29 @@
 #include <cstdint>
 #include <string>
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
+
 class LogTag {
 public:
     enum Value {
         kNone = 0,
 
-        // replica set ramlog
-        kRS = 1 << 0,
-
         // startupWarnings ramlog
-        kStartupWarnings = 1 << 1,
+        kStartupWarnings = 1 << 0,
 
         // representing the logv1 plainShellOutput domain
-        kPlainShell = 1 << 2,
+        kPlainShell = 1 << 1,
+
+        // allow logging while the shell is waiting for user input
+        kAllowDuringPromptingShell = 1 << 2,
     };
+
+    friend Value operator|(Value a, Value b) {
+        return static_cast<Value>(static_cast<uint64_t>(a) | static_cast<uint64_t>(b));
+    }
+    friend Value operator&(Value a, Value b) {
+        return static_cast<Value>(static_cast<uint64_t>(a) & static_cast<uint64_t>(b));
+    }
 
     LogTag() : _value(kNone) {}
     /* implicit */ LogTag(Value value) {
@@ -69,5 +76,5 @@ public:
 private:
     uint64_t _value;
 };
-}  // namespace logv2
-}  // namespace mongo
+
+}  // namespace mongo::logv2

@@ -162,8 +162,7 @@ public:
         return createOplogFn(opCtx, nss);
     };
 
-    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx,
-                                       const NamespaceString& nss) override {
+    StatusWith<size_t> getOplogMaxSize(OperationContext* opCtx) override {
         return 1024 * 1024 * 1024;
     }
 
@@ -263,6 +262,20 @@ public:
         return Status{ErrorCodes::IllegalOperation, "deleteByFilter not implemented."};
     }
 
+    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestamp(
+        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) override {
+        return boost::none;
+    }
+
+    boost::optional<BSONObj> findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+        OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) override {
+        return boost::none;
+    }
+
+    Timestamp getLatestOplogTimestamp(OperationContext* opCtx) override {
+        return Timestamp();
+    }
+
     StatusWith<StorageInterface::CollectionSize> getCollectionSize(
         OperationContext* opCtx, const NamespaceString& nss) override {
         return 0;
@@ -292,8 +305,8 @@ public:
 
     Timestamp getInitialDataTimestamp() const;
 
-    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override {
-        return Status{ErrorCodes::IllegalOperation, "recoverToStableTimestamp not implemented."};
+    Timestamp recoverToStableTimestamp(OperationContext* opCtx) override {
+        return Timestamp();
     }
 
     bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override {

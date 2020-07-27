@@ -27,13 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/db/repl/oplog_fetcher_mock.h"
 
 #include <utility>
 
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -41,20 +40,18 @@ OplogFetcherMock::OplogFetcherMock(
     executor::TaskExecutor* executor,
     OpTime lastFetched,
     HostAndPort source,
-    NamespaceString nss,
     ReplSetConfig config,
     std::unique_ptr<OplogFetcherRestartDecision> oplogFetcherRestartDecision,
     int requiredRBID,
     bool requireFresherSyncSource,
     DataReplicatorExternalState* dataReplicatorExternalState,
-    OplogFetcher::EnqueueDocumentsFn enqueueDocumentsFn,
-    AbstractOplogFetcher::OnShutdownCallbackFn onShutdownCallbackFn,
+    EnqueueDocumentsFn enqueueDocumentsFn,
+    OnShutdownCallbackFn onShutdownCallbackFn,
     const int batchSize,
-    OplogFetcher::StartingPoint startingPoint)
+    StartingPoint startingPoint)
     : OplogFetcher(executor,
                    lastFetched,
                    std::move(source),
-                   std::move(nss),
                    std::move(config),
                    // Pass a dummy OplogFetcherRestartDecision to the base OplogFetcher.
                    std::make_unique<OplogFetcherRestartDecisionDefault>(0),
@@ -64,7 +61,7 @@ OplogFetcherMock::OplogFetcherMock(
                    // Pass a dummy EnqueueDocumentsFn to the base OplogFetcher.
                    [](const auto& a1, const auto& a2, const auto& a3) { return Status::OK(); },
                    // Pass a dummy OnShutdownCallbackFn to the base OplogFetcher.
-                   [](const auto& a) {},
+                   [](const auto& a, const int b) {},
                    batchSize,
                    startingPoint),
       _oplogFetcherRestartDecision(std::move(oplogFetcherRestartDecision)),
@@ -81,7 +78,7 @@ OplogFetcherMock::~OplogFetcherMock() {
     }
 }
 
-void OplogFetcherMock::receiveBatch(CursorId cursorId, Fetcher::Documents documents) {
+void OplogFetcherMock::receiveBatch(CursorId cursorId, OplogFetcher::Documents documents) {
     {
         stdx::lock_guard<Latch> lock(_mutex);
         if (!_isActive_inlock()) {
@@ -213,7 +210,7 @@ void OplogFetcherMock::_finishCallback(Status status) {
     invariant(isActive());
 
     // Call _onShutdownCallbackFn outside of the mutex.
-    _onShutdownCallbackFn(status);
+    _onShutdownCallbackFn(status, ReplicationProcess::kUninitializedRollbackId);
 
     decltype(_onShutdownCallbackFn) onShutdownCallbackFn;
     decltype(_oplogFetcherRestartDecision) oplogFetcherRestartDecision;

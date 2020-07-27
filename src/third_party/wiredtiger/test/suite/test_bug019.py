@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2019 MongoDB, Inc.
+# Public Domain 2014-2020 MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -57,6 +57,8 @@ class test_bug019(wttest.WiredTigerTestCase):
             if i % 500 == 0:
                 prealloc = self.get_prealloc_stat()
                 if prealloc > self.max_prealloc:
+                    self.pr("Updating max_prealloc from " + str(self.max_prealloc))
+                    self.pr("    to new prealloc " + str(prealloc))
                     self.max_prealloc = prealloc
         c.close()
 
@@ -78,9 +80,13 @@ class test_bug019(wttest.WiredTigerTestCase):
         start_prealloc = self.get_prealloc_stat()
         self.populate(self.entries)
         self.session.checkpoint()
+        if self.max_prealloc <= start_prealloc:
+            self.pr("FAILURE: max_prealloc " + str(self.max_prealloc))
+            self.pr("FAILURE: start_prealloc " + str(start_prealloc))
         self.assertTrue(self.max_prealloc > start_prealloc)
 
         # Loop, making sure pre-allocation is working and the range is moving.
+        self.pr("Check pre-allocation range is moving")
         older = self.prepfiles()
         for i in range(1, 10):
             self.populate(self.entries)
@@ -89,6 +95,12 @@ class test_bug019(wttest.WiredTigerTestCase):
             # Files can be returned in any order when reading a directory, older
             # pre-allocated files can persist longer than newer files when newer
             # files are returned first. Confirm files are being consumed.
+            if set(older) < set(newer):
+                self.pr("FAILURE on Iteration " + str(i))
+                self.pr("FAILURE: Older")
+                self.pr(str(older))
+                self.pr("FAILURE: Newer")
+                self.pr(str(newer))
             self.assertFalse(set(older) < set(newer))
 
             older = newer
@@ -102,6 +114,9 @@ class test_bug019(wttest.WiredTigerTestCase):
             if new_prealloc < self.max_prealloc:
                 break
             time.sleep(1.0)
+        if sleepcount >= max_wait_time:
+            self.pr("FAILURE: sleepcount " + str(sleepcount))
+            self.pr("FAILURE: max_wait_time " + str(max_wait_time))
         self.assertTrue(sleepcount < max_wait_time)
 
 if __name__ == '__main__':

@@ -64,9 +64,15 @@ var $config = (function() {
             assertWorkedOrFailedHandleTxnErrors(res,
                                                 [
                                                     ErrorCodes.CannotImplicitlyCreateCollection,
-                                                    ErrorCodes.IndexBuildAlreadyInProgress
+                                                    ErrorCodes.IndexBuildAborted,
+                                                    ErrorCodes.IndexBuildAlreadyInProgress,
+                                                    ErrorCodes.NoMatchingDocument,
                                                 ],
-                                                ErrorCodes.CannotImplicitlyCreateCollection);
+                                                [
+                                                    ErrorCodes.CannotImplicitlyCreateCollection,
+                                                    ErrorCodes.IndexBuildAborted,
+                                                    ErrorCodes.NoMatchingDocument,
+                                                ]);
         }
     };
 
@@ -87,9 +93,13 @@ var $config = (function() {
             assertWorkedOrFailedHandleTxnErrors(coll.createIndex(indexSpec),
                                                 [
                                                     ErrorCodes.CannotImplicitlyCreateCollection,
-                                                    ErrorCodes.IndexBuildAlreadyInProgress
+                                                    ErrorCodes.IndexBuildAlreadyInProgress,
+                                                    ErrorCodes.NoMatchingDocument,
                                                 ],
-                                                ErrorCodes.CannotImplicitlyCreateCollection);
+                                                [
+                                                    ErrorCodes.CannotImplicitlyCreateCollection,
+                                                    ErrorCodes.NoMatchingDocument,
+                                                ]);
         });
     }
 

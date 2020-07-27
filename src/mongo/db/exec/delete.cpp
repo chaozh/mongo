@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
@@ -45,7 +45,6 @@
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -72,12 +71,12 @@ bool shouldRestartDeleteIfNoLongerMatches(const DeleteStageParams* params) {
 // static
 const char* DeleteStage::kStageType = "DELETE";
 
-DeleteStage::DeleteStage(OperationContext* opCtx,
+DeleteStage::DeleteStage(ExpressionContext* expCtx,
                          std::unique_ptr<DeleteStageParams> params,
                          WorkingSet* ws,
                          Collection* collection,
                          PlanStage* child)
-    : RequiresMutableCollectionStage(kStageType, opCtx, collection),
+    : RequiresMutableCollectionStage(kStageType, expCtx, collection),
       _params(std::move(params)),
       _ws(ws),
       _idRetrying(WorkingSet::INVALID_ID),
@@ -124,13 +123,6 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
             case PlanStage::ADVANCED:
                 break;
 
-            case PlanStage::FAILURE:
-                // The stage which produces a failure is responsible for allocating a working set
-                // member with error details.
-                invariant(WorkingSet::INVALID_ID != id);
-                *out = id;
-                return status;
-
             case PlanStage::NEED_TIME:
                 return status;
 
@@ -162,7 +154,7 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
     bool docStillMatches;
     try {
         docStillMatches = write_stage_common::ensureStillMatches(
-            collection(), getOpCtx(), _ws, id, _params->canonicalQuery);
+            collection(), opCtx(), _ws, id, _params->canonicalQuery);
     } catch (const WriteConflictException&) {
         // There was a problem trying to detect if the document still exists, so retry.
         memberFreer.dismiss();
@@ -202,8 +194,8 @@ PlanStage::StageState DeleteStage::doWork(WorkingSetID* out) {
     // Do the write, unless this is an explain.
     if (!_params->isExplain) {
         try {
-            WriteUnitOfWork wunit(getOpCtx());
-            collection()->deleteDocument(getOpCtx(),
+            WriteUnitOfWork wunit(opCtx());
+            collection()->deleteDocument(opCtx(),
                                          _params->stmtId,
                                          recordId,
                                          _params->opDebug,
@@ -262,8 +254,8 @@ void DeleteStage::doRestoreStateRequiresCollection() {
     const NamespaceString& ns = collection()->ns();
     uassert(ErrorCodes::PrimarySteppedDown,
             str::stream() << "Demoted from primary while removing from " << ns.ns(),
-            !getOpCtx()->writesAreReplicated() ||
-                repl::ReplicationCoordinator::get(getOpCtx())->canAcceptWritesFor(getOpCtx(), ns));
+            !opCtx()->writesAreReplicated() ||
+                repl::ReplicationCoordinator::get(opCtx())->canAcceptWritesFor(opCtx(), ns));
 }
 
 unique_ptr<PlanStageStats> DeleteStage::getStats() {

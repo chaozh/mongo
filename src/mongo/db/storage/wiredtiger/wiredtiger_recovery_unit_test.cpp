@@ -163,11 +163,14 @@ public:
         clientAndCtx2 = makeClientAndOpCtx(harnessHelper.get(), "reader");
         ru1 = checked_cast<WiredTigerRecoveryUnit*>(clientAndCtx1.second->recoveryUnit());
         ru2 = checked_cast<WiredTigerRecoveryUnit*>(clientAndCtx2.second->recoveryUnit());
+        snapshotManager = dynamic_cast<WiredTigerSnapshotManager*>(
+            harnessHelper->getEngine()->getSnapshotManager());
     }
 
     std::unique_ptr<WiredTigerRecoveryUnitHarnessHelper> harnessHelper;
     ClientAndCtx clientAndCtx1, clientAndCtx2;
     WiredTigerRecoveryUnit *ru1, *ru2;
+    WiredTigerSnapshotManager* snapshotManager;
 
 private:
     const char* wt_uri = "table:prepare_transaction";
@@ -180,46 +183,84 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, SetReadSource) {
     ASSERT_EQ(Timestamp(1, 1), ru1->getPointInTimeReadTimestamp());
 }
 
-TEST_F(WiredTigerRecoveryUnitTestFixture, CreateAndCheckForCachePressure) {
-    int time = 1;
+TEST_F(WiredTigerRecoveryUnitTestFixture, NoOverlapReadSource) {
+    OperationContext* opCtx1 = clientAndCtx1.second.get();
+    std::unique_ptr<RecordStore> rs(harnessHelper->createRecordStore(opCtx1, "a.b"));
 
-    // Reconfigure the size of the cache to be very small so that building cache pressure is fast.
-    WiredTigerKVEngine* engine = harnessHelper->getEngine();
-    std::string cacheSizeReconfig = "cache_size=1MB";
-    ASSERT_EQ(engine->reconfigure(cacheSizeReconfig.c_str()), 0);
+    const std::string str = str::stream() << "test";
+    const Timestamp ts1{1, 1};
+    const Timestamp ts2{1, 2};
+    const Timestamp ts3{1, 2};
 
-    OperationContext* opCtx = clientAndCtx1.second.get();
-    std::unique_ptr<RecordStore> rs(harnessHelper->createRecordStore(opCtx, "a.b"));
-
-    // Insert one document so that we can then update it in a loop to create cache pressure.
-    // Note: inserts will not create cache pressure.
-    WriteUnitOfWork wu(opCtx);
-    ASSERT_OK(ru1->setTimestamp(Timestamp(time++)));
-    std::string str = str::stream() << "foobarbaz";
-    StatusWith<RecordId> ress = rs->insertRecord(opCtx, str.c_str(), str.size() + 1, Timestamp());
-    ASSERT_OK(ress.getStatus());
-    auto recordId = ress.getValue();
-    wu.commit();
-
-    for (int j = 0; j < 1000; ++j) {
-        // Once we hit the cache pressure threshold, i.e. have successfully created cache pressure
-        // that is detectable, we are done.
-        if (engine->isCacheUnderPressure(opCtx)) {
-            invariant(j != 0);
-            break;
-        }
-
-        try {
-            WriteUnitOfWork wuow(opCtx);
-            ASSERT_OK(ru1->setTimestamp(Timestamp(time++)));
-            std::string s = str::stream()
-                << "abcbcdcdedefefgfghghihijijkjklklmlmnmnomopopqpqrqrsrststutuv" << j;
-            ASSERT_OK(rs->updateRecord(opCtx, recordId, s.c_str(), s.size() + 1));
-            wuow.commit();
-        } catch (const DBException& ex) {
-            invariant(ex.toStatus().code() == ErrorCodes::WriteConflict);
-        }
+    RecordId rid1;
+    {
+        WriteUnitOfWork wuow(opCtx1);
+        StatusWith<RecordId> res = rs->insertRecord(opCtx1, str.c_str(), str.size() + 1, ts1);
+        ASSERT_OK(res);
+        wuow.commit();
+        rid1 = res.getValue();
+        snapshotManager->setLastApplied(ts1);
     }
+
+    // Read without a timestamp. The write should be visible.
+    ASSERT_EQ(opCtx1->recoveryUnit()->getTimestampReadSource(), RecoveryUnit::ReadSource::kUnset);
+    RecordData unused;
+    ASSERT_TRUE(rs->findRecord(opCtx1, rid1, &unused));
+
+    // Read with kNoOverlap. The write should be visible.
+    opCtx1->recoveryUnit()->abandonSnapshot();
+    opCtx1->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+    ASSERT_TRUE(rs->findRecord(opCtx1, rid1, &unused));
+
+    RecordId rid2, rid3;
+    {
+        // Start, but do not commit a transaction with opCtx2. This sets a timestamp at ts2, which
+        // creates a hole. kNoOverlap, which is a function of all_durable, will only be able to read
+        // at the time immediately before.
+        OperationContext* opCtx2 = clientAndCtx2.second.get();
+        WriteUnitOfWork wuow(opCtx2);
+        StatusWith<RecordId> res =
+            rs->insertRecord(opCtx2, str.c_str(), str.size() + 1, Timestamp());
+        ASSERT_OK(opCtx2->recoveryUnit()->setTimestamp(ts2));
+        ASSERT_OK(res);
+
+        // While holding open a transaction with opCtx2, perform an insert at ts3 with opCtx1. This
+        // creates a "hole".
+        {
+            WriteUnitOfWork wuow(opCtx1);
+            StatusWith<RecordId> res = rs->insertRecord(opCtx1, str.c_str(), str.size() + 1, ts3);
+            ASSERT_OK(res);
+            wuow.commit();
+            rid3 = res.getValue();
+            snapshotManager->setLastApplied(ts3);
+        }
+
+        // Read without a timestamp, and we should see the first and third records.
+        opCtx1->recoveryUnit()->abandonSnapshot();
+        opCtx1->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+        ASSERT_TRUE(rs->findRecord(opCtx1, rid1, &unused));
+        ASSERT_FALSE(rs->findRecord(opCtx1, rid2, &unused));
+        ASSERT_TRUE(rs->findRecord(opCtx1, rid3, &unused));
+
+        // Now read at kNoOverlap. Since the transaction at ts2 has not committed, all_durable is
+        // held back to ts1. LastApplied has advanced to ts3, but because kNoOverlap is the minimum,
+        // we should only see one record.
+        opCtx1->recoveryUnit()->abandonSnapshot();
+        opCtx1->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+        ASSERT_TRUE(rs->findRecord(opCtx1, rid1, &unused));
+        ASSERT_FALSE(rs->findRecord(opCtx1, rid2, &unused));
+        ASSERT_FALSE(rs->findRecord(opCtx1, rid3, &unused));
+
+        wuow.commit();
+        rid2 = res.getValue();
+    }
+
+    // Now that the hole has been closed, kNoOverlap should see all 3 records.
+    opCtx1->recoveryUnit()->abandonSnapshot();
+    opCtx1->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
+    ASSERT_TRUE(rs->findRecord(opCtx1, rid1, &unused));
+    ASSERT_TRUE(rs->findRecord(opCtx1, rid2, &unused));
+    ASSERT_TRUE(rs->findRecord(opCtx1, rid3, &unused));
 }
 
 TEST_F(WiredTigerRecoveryUnitTestFixture,
@@ -573,63 +614,6 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampAfterSetTimestampOnAbor
     ASSERT(!commitTs);
 }
 
-TEST_F(WiredTigerRecoveryUnitTestFixture, CheckpointCursorsAreNotCached) {
-    auto opCtx = clientAndCtx1.second.get();
-    auto ru = WiredTigerRecoveryUnit::get(opCtx);
-
-    std::unique_ptr<RecordStore> rs(
-        harnessHelper->createRecordStore(opCtx, "test.checkpoint_not_cached"));
-    auto uri = dynamic_cast<WiredTigerRecordStore*>(rs.get())->getURI();
-
-    WiredTigerKVEngine* engine = harnessHelper->getEngine();
-
-    // Insert a record.
-    ru->beginUnitOfWork(opCtx);
-    StatusWith<RecordId> s = rs->insertRecord(opCtx, "data", 4, Timestamp());
-    ASSERT_TRUE(s.isOK());
-    ASSERT_EQUALS(1, rs->numRecords(opCtx));
-    ru->commitUnitOfWork();
-
-    // Test 1: A normal read should create a new cursor and release it into the session cache.
-
-    // Close all cached cursors to establish a 'before' state.
-    ru->getSession()->closeAllCursors(uri);
-    int cachedCursorsBefore = ru->getSession()->cachedCursors();
-
-    RecordData rd;
-    ASSERT_TRUE(rs->findRecord(opCtx, s.getValue(), &rd));
-
-    // A cursor should have been checked out and released into the cache.
-    ASSERT_GT(ru->getSession()->cachedCursors(), cachedCursorsBefore);
-    // All opened cursors are returned.
-    ASSERT_EQ(0, ru->getSession()->cursorsOut());
-
-    ru->abandonSnapshot();
-
-    // Force a checkpoint.
-    ASSERT_EQUALS(1, engine->flushAllFiles(opCtx, true));
-
-    // Test 2: Checkpoint cursors are not expected to be cached, they
-    // should be immediately closed when destructed.
-    ru->setTimestampReadSource(WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
-
-    // Close any cached cursors to establish a new 'before' state.
-    ru->getSession()->closeAllCursors(uri);
-    cachedCursorsBefore = ru->getSession()->cachedCursors();
-
-    // Will search the checkpoint cursor for the record, then close the checkpoint cursor.
-    ASSERT_TRUE(rs->findRecord(opCtx, s.getValue(), &rd));
-
-    // No new cursors should have been released into the cache, with the exception of a metadata
-    // cursor that is opened to determine if the table is LSM. Metadata cursors are cached.
-    ASSERT_EQ(ru->getSession()->cachedCursors(), cachedCursorsBefore + 1);
-
-    // All opened cursors are closed.
-    ASSERT_EQ(0, ru->getSession()->cursorsOut());
-
-    ASSERT_EQ(ru->getTimestampReadSource(), WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
-}
-
 TEST_F(WiredTigerRecoveryUnitTestFixture, ReadOnceCursorsAreNotCached) {
     auto opCtx = clientAndCtx1.second.get();
     auto ru = WiredTigerRecoveryUnit::get(opCtx);
@@ -678,62 +662,6 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, ReadOnceCursorsAreNotCached) {
     ASSERT_EQ(0, ru->getSession()->cursorsOut());
 
     ASSERT(ru->getReadOnce());
-}
-
-TEST_F(WiredTigerRecoveryUnitTestFixture, CheckpointCursorNotChanged) {
-    auto opCtx = clientAndCtx1.second.get();
-    auto opCtx2 = clientAndCtx2.second.get();
-    auto ru = WiredTigerRecoveryUnit::get(opCtx);
-    auto ru2 = WiredTigerRecoveryUnit::get(opCtx2);
-
-    std::unique_ptr<RecordStore> rs(
-        harnessHelper->createRecordStore(opCtx, "test.checkpoint_stable"));
-
-    WiredTigerKVEngine* engine = harnessHelper->getEngine();
-
-    // Insert a record.
-    ru->beginUnitOfWork(opCtx);
-    StatusWith<RecordId> s1 = rs->insertRecord(opCtx, "data", 4, Timestamp());
-    ASSERT_TRUE(s1.isOK());
-    ASSERT_EQUALS(1, rs->numRecords(opCtx));
-    ru->commitUnitOfWork();
-
-    // Force a checkpoint.
-    ASSERT_EQUALS(1, engine->flushAllFiles(opCtx, true));
-
-    // Test 1: Open a checkpoint cursor and ensure it has the first record.
-    ru2->setTimestampReadSource(WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
-    auto originalCheckpointCursor = rs->getCursor(opCtx2, true);
-    ASSERT(originalCheckpointCursor->seekExact(s1.getValue()));
-
-    // Insert a new record.
-    ru->beginUnitOfWork(opCtx);
-    StatusWith<RecordId> s2 = rs->insertRecord(opCtx, "data_2", 6, Timestamp());
-    ASSERT_TRUE(s2.isOK());
-    ASSERT_EQUALS(2, rs->numRecords(opCtx));
-    ru->commitUnitOfWork();
-
-    // Test 2: New record does not appear in original checkpoint cursor.
-    ASSERT(!originalCheckpointCursor->seekExact(s2.getValue()));
-    ASSERT(originalCheckpointCursor->seekExact(s1.getValue()));
-
-    // Test 3: New record does not appear in new checkpoint cursor since no new checkpoint was
-    // created.
-    ru->setTimestampReadSource(WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
-    auto checkpointCursor = rs->getCursor(opCtx, true);
-    ASSERT(!checkpointCursor->seekExact(s2.getValue()));
-
-    // Force a checkpoint.
-    ASSERT_EQUALS(1, engine->flushAllFiles(opCtx, true));
-
-    // Test 4: Old and new record should appear in new checkpoint cursor. Only old record
-    // should appear in the original checkpoint cursor
-    ru->setTimestampReadSource(WiredTigerRecoveryUnit::ReadSource::kCheckpoint);
-    auto newCheckpointCursor = rs->getCursor(opCtx, true);
-    ASSERT(newCheckpointCursor->seekExact(s1.getValue()));
-    ASSERT(newCheckpointCursor->seekExact(s2.getValue()));
-    ASSERT(originalCheckpointCursor->seekExact(s1.getValue()));
-    ASSERT(!originalCheckpointCursor->seekExact(s2.getValue()));
 }
 
 TEST_F(WiredTigerRecoveryUnitTestFixture, CommitWithDurableTimestamp) {

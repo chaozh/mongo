@@ -51,6 +51,8 @@ namespace mongo {
 using RoundUpPreparedTimestamps = WiredTigerBeginTxnBlock::RoundUpPreparedTimestamps;
 using RoundUpReadTimestamp = WiredTigerBeginTxnBlock::RoundUpReadTimestamp;
 
+extern AtomicWord<std::int64_t> snapshotTooOldErrorCount;
+
 class BSONObjBuilder;
 
 class WiredTigerOperationStats final : public StorageStats {
@@ -107,8 +109,7 @@ public:
 
     bool waitUntilDurable(OperationContext* opCtx) override;
 
-    bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
-                                           bool stableCheckpoint = true) override;
+    bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool stableCheckpoint) override;
 
     void preallocateSnapshot() override;
 
@@ -117,6 +118,10 @@ public:
     boost::optional<Timestamp> getPointInTimeReadTimestamp() override;
 
     Status setTimestamp(Timestamp timestamp) override;
+
+    bool isTimestamped() const override {
+        return _isTimestamped;
+    }
 
     void setCommitTimestamp(Timestamp timestamp) override;
 
@@ -227,6 +232,12 @@ private:
      * was started at.
      */
     Timestamp _beginTransactionAtNoOverlapTimestamp(WT_SESSION* session);
+
+    /**
+     * Starts a transaction at the lastApplied timestamp. Returns the timestamp at which the
+     * transaction was started.
+     */
+    Timestamp _beginTransactionAtLastAppliedTimestamp(WT_SESSION* session);
 
     /**
      * Returns the timestamp at which the current transaction is reading.

@@ -52,25 +52,44 @@ public:
     static Lock::ResourceMutex fcvLock;
 
     /**
-     * Records intent to perform a 4.2 -> 4.4 upgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.2, 'targetVersion'=4.4.
-     * Should be called before schemas are modified.
+     * Reads the featureCompatibilityVersion (FCV) document in admin.system.version and initializes
+     * the FCV global state. Returns an error if the FCV document exists and is invalid. Does not
+     * return an error if it is missing. This should be checked after startup with
+     * fassertInitializedAfterStartup.
+     *
+     * Throws a MustDowngrade error if an existing FCV document contains an invalid version.
      */
-    static void setTargetUpgrade(OperationContext* opCtx);
+    static void initializeForStartup(OperationContext* opCtx);
 
     /**
-     * Records intent to perform a 4.4 -> 4.2 downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.2, 'targetVersion'=4.2.
-     * Should be called before schemas are modified.
+     * Fatally asserts if the featureCompatibilityVersion is not properly initialized after startup.
      */
-    static void setTargetDowngrade(OperationContext* opCtx);
+    static void fassertInitializedAfterStartup(OperationContext* opCtx);
 
     /**
-     * Records the completion of a 4.2 <-> 4.4 upgrade or downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=version and unsetting the 'targetVersion'
-     * field. Should be called after schemas are modified.
+     * Records intent to perform a currentVersion -> kLatest upgrade by updating the on-disk
+     * feature compatibility version document to have 'version'=currentVersion,
+     * 'targetVersion'=kLatest. Should be called before schemas are modified.
      */
-    static void unsetTargetUpgradeOrDowngrade(OperationContext* opCtx, StringData version);
+    static void setTargetUpgradeFrom(OperationContext* opCtx,
+                                     ServerGlobalParams::FeatureCompatibility::Version fromVersion);
+
+    /**
+     * Records intent to perform a downgrade from the latest version by updating the on-disk feature
+     * compatibility version document to have 'version'=version, 'targetVersion'=version and
+     * 'previousVersion'=kLatest. Should be called before schemas are modified.
+     */
+    static void setTargetDowngrade(OperationContext* opCtx,
+                                   ServerGlobalParams::FeatureCompatibility::Version version);
+
+    /**
+     * Records the completion of a upgrade or downgrade by updating the on-disk
+     * feature compatibility version document to have 'version'=version and unsetting the
+     * 'targetVersion' field and the 'previousVersion' field. Should be called after schemas are
+     * modified.
+     */
+    static void unsetTargetUpgradeOrDowngrade(
+        OperationContext* opCtx, ServerGlobalParams::FeatureCompatibility::Version version);
 
     /**
      * If there are no non-local databases, store the featureCompatibilityVersion document. If we
@@ -99,18 +118,38 @@ public:
      */
     static void updateMinWireVersion();
 
+    /**
+     * Ensures the in-memory and on-disk FCV states are consistent after a rollback.
+     */
+    static void onReplicationRollback(OperationContext* opCtx);
+
 private:
     /**
-     * Validate version. Uasserts if invalid.
+     * Set the FCV to newVersion, making sure to close any outgoing connections with incompatible
+     * servers and closing open transactions if necessary. Increments the server TopologyVersion.
      */
-    static void _validateVersion(StringData version);
-
-    /**
-     * Build update command.
-     */
-    typedef std::function<void(BSONObjBuilder)> UpdateBuilder;
-    static void _runUpdateCommand(OperationContext* opCtx, UpdateBuilder callback);
+    static void _setVersion(OperationContext* opCtx,
+                            ServerGlobalParams::FeatureCompatibility::Version newVersion);
 };
 
+/**
+ * Utility class to prevent the FCV from changing while the FixedFCVRegion is in scope.
+ */
+class FixedFCVRegion {
+public:
+    explicit FixedFCVRegion(OperationContext* opCtx) {
+        invariant(!opCtx->lockState()->isLocked());
+        _lk.emplace(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+    }
+
+    ~FixedFCVRegion() = default;
+
+    void release() {
+        _lk.reset();
+    }
+
+private:
+    boost::optional<Lock::SharedLock> _lk;
+};
 
 }  // namespace mongo

@@ -1,4 +1,4 @@
-/*
+/**
  * Test to check that the Initial Sync Test Fixture properly pauses initial sync.
  *
  * The test checks that both the collection cloning and oplog application stages of initial sync
@@ -9,7 +9,10 @@
  * the batches being applied are of the expected size and that only one batch was applied per step()
  * call.
  *
- * @tags: [uses_transactions, uses_prepare_transaction, requires_fcv_44]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {
@@ -17,14 +20,17 @@
 
 load("jstests/core/txns/libs/prepare_helpers.js");
 load("jstests/replsets/libs/initial_sync_test.js");
+load("jstests/libs/logv2_helpers.js");
 
 /**
  * Helper function to check that specific messages appeared or did not appear in the logs.
  */
 function checkLogForMsg(node, msg, contains) {
     if (contains) {
+        jsTest.log("Check for presence of message (" + node.port + "): |" + msg + "|");
         assert(checkLog.checkContainsOnce(node, msg));
     } else {
+        jsTest.log("Check for absence of message (" + node.port + "): |" + msg + "|");
         assert(!checkLog.checkContainsOnce(node, msg));
     }
 }
@@ -48,8 +54,17 @@ function checkLogForGetTimestampMsg(node, timestampName, timestamp, contains) {
 function checkLogForCollectionClonerMsg(node, commandName, dbname, contains, collUUID) {
     let msg =
         "Collection Cloner scheduled a remote command on the " + dbname + " db: { " + commandName;
+
+    if (isJsonLog(node)) {
+        msg = 'Collection Cloner scheduled a remote command","attr":{"stage":"' + dbname +
+            " db: { " + commandName;
+    }
+
     if (commandName === "listIndexes" && contains) {
         msg += ": " + collUUID;
+        if (isJsonLog(node)) {
+            msg = msg.replace('("', '(\\"').replace('")', '\\")');
+        }
     }
 
     checkLogForMsg(node, msg, contains);
@@ -216,7 +231,7 @@ checkLogForOplogApplicationMsg(secondary, 1);
 assert(!initialSyncTest.step());
 checkLogForOplogApplicationMsg(secondary, 9);
 assert(!initialSyncTest.step());
-checkLogForOplogApplicationMsg(secondary, 1);
+checkLogForOplogApplicationMsg(secondary, 3);
 
 assert(initialSyncTest.step(), "Expected initial sync to have completed, but it did not");
 
@@ -228,10 +243,10 @@ assert.commandWorked(primary.getDB("otherDB").otherColl.insert({x: 1}, {writeCon
 
 // Confirm that node can be read from and that it has the inserts that were made while the node
 // was in initial sync.
-assert.eq(secondary.getDB("test").foo.find().count(), 6);
-assert.eq(secondary.getDB("test").bar.find().count(), 6);
-assert.eq(secondary.getDB("test").foo.find().itcount(), 6);
-assert.eq(secondary.getDB("test").bar.find().itcount(), 6);
+assert.eq(secondary.getDB("test").foo.find().count(), 7);
+assert.eq(secondary.getDB("test").bar.find().count(), 7);
+assert.eq(secondary.getDB("test").foo.find().itcount(), 7);
+assert.eq(secondary.getDB("test").bar.find().itcount(), 7);
 
 // Do data consistency checks at the end.
 initialSyncTest.stop();

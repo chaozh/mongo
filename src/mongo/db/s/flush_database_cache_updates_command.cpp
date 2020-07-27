@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -50,7 +50,7 @@
 #include "mongo/s/request_types/flush_database_cache_updates_gen.h"
 
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -133,7 +133,11 @@ public:
             oss.waitForMigrationCriticalSectionSignal(opCtx);
 
             if (request().getSyncFromConfig()) {
-                LOG(1) << "Forcing remote routing table refresh for " << _dbName();
+                LOGV2_DEBUG(21981,
+                            1,
+                            "Forcing remote routing table refresh for {db}",
+                            "Forcing remote routing table refresh",
+                            "db"_attr = _dbName());
                 forceDatabaseRefresh(opCtx, _dbName());
             }
 

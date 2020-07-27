@@ -38,15 +38,19 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/logv2/log_attr.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
 
-const size_t MaxDatabaseNameLen = 128;  // max str len for the db name, including null char
-
 class NamespaceString {
 public:
+    constexpr static size_t MaxDatabaseNameLen =
+        128;  // max str len for the db name, including null char
+    constexpr static size_t MaxNSCollectionLenFCV42 = 120U;
+    constexpr static size_t MaxNsCollectionLen = 255;
+
     // Reserved system namespaces
 
     // Namespace for the admin database
@@ -60,6 +64,10 @@ public:
 
     // Name for the system views collection
     static constexpr StringData kSystemDotViewsCollectionName = "system.views"_sd;
+
+    // Names of privilege document collections
+    static constexpr StringData kSystemUsers = "system.users"_sd;
+    static constexpr StringData kSystemRoles = "system.roles"_sd;
 
     // Prefix for orphan collections
     static constexpr StringData kOrphanCollectionPrefix = "orphan."_sd;
@@ -98,6 +106,9 @@ public:
     // Namespace for storing the persisted state of migration coordinators.
     static const NamespaceString kMigrationCoordinatorsNamespace;
 
+    // Namespace for storing the persisted state of tenant migration donors.
+    static const NamespaceString kMigrationDonorsNamespace;
+
     // Namespace for replica set configuration settings.
     static const NamespaceString kSystemReplSetNamespace;
 
@@ -109,6 +120,9 @@ public:
 
     // Namespace for balancer settings and default read and write concerns.
     static const NamespaceString kConfigSettingsNamespace;
+
+    // Namespace for vector clock state.
+    static const NamespaceString kVectorClockNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -230,6 +244,12 @@ public:
     bool isServerConfigurationCollection() const {
         return (db() == kAdminDb) && (coll() == "system.version");
     }
+    bool isPrivilegeCollection() const {
+        if (!isAdminDB()) {
+            return false;
+        }
+        return (coll() == kSystemUsers) || (coll() == kSystemRoles);
+    }
     bool isConfigDB() const {
         return db() == kConfigDb;
     }
@@ -296,11 +316,6 @@ public:
     bool isDropPendingNamespace() const;
 
     /**
-     * Returns true if the namespace length is valid based on the FCV setting.
-     */
-    bool checkLengthForFCV() const;
-
-    /**
      * Returns the drop-pending namespace name for this namespace, provided the given optime.
      *
      * Example:
@@ -318,8 +333,8 @@ public:
      * Returns true if the namespace is valid. Special namespaces for internal use are considered as
      * valid.
      */
-    bool isValid() const {
-        return validDBName(db(), DollarInDbNameBehavior::Allow) && !coll().empty();
+    bool isValid(DollarInDbNameBehavior behavior = DollarInDbNameBehavior::Allow) const {
+        return validDBName(db(), behavior) && !coll().empty();
     }
 
     /**
@@ -409,9 +424,13 @@ public:
         return H::combine(std::move(h), nss._ns);
     }
 
+    friend auto logAttrs(const NamespaceString& nss) {
+        return "namespace"_attr = nss;
+    }
+
 private:
     std::string _ns;
-    size_t _dotIndex;
+    size_t _dotIndex = 0;
 };
 
 /**
@@ -432,8 +451,18 @@ public:
         return _uuid;
     }
 
+    /**
+     * Returns database name if this object was initialized with a UUID.
+     */
     const std::string& dbname() const {
         return _dbname;
+    }
+
+    /**
+     * Returns database name derived from either '_nss' or '_dbname'.
+     */
+    StringData db() const {
+        return _nss ? _nss->db() : StringData(_dbname);
     }
 
     std::string toString() const;
@@ -460,10 +489,13 @@ StringBuilder& operator<<(StringBuilder& builder, const NamespaceStringOrUUID& n
 inline StringData nsToDatabaseSubstring(StringData ns) {
     size_t i = ns.find('.');
     if (i == std::string::npos) {
-        massert(10078, "nsToDatabase: db too long", ns.size() < MaxDatabaseNameLen);
+        massert(
+            10078, "nsToDatabase: db too long", ns.size() < NamespaceString::MaxDatabaseNameLen);
         return ns;
     }
-    massert(10088, "nsToDatabase: db too long", i < static_cast<size_t>(MaxDatabaseNameLen));
+    massert(10088,
+            "nsToDatabase: db too long",
+            i < static_cast<size_t>(NamespaceString::MaxDatabaseNameLen));
     return ns.substr(0, i);
 }
 

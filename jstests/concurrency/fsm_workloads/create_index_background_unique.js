@@ -5,7 +5,14 @@
  *
  * Creates multiple unique background indexes in parallel.
  *
- * @tags: [creates_background_indexes]
+ * Marked as 'requires_persistence' to prevent the test from running on 'inMemory' variant, because
+ * the test generates a large oplog and 'inMemory' instances have limited resources to accommodate
+ * all nodes in the replica set (which all run in the same instance), so it may fail with the OOM
+ * error.
+ * @tags: [
+ *     creates_background_indexes,
+ *     requires_persistence,
+ * ]
  */
 load("jstests/concurrency/fsm_workload_helpers/assert_handle_fail_in_transaction.js");
 var $config = (function() {
@@ -39,12 +46,18 @@ var $config = (function() {
             // pending catalog changes as of the transaction start (see SERVER-43018).
             assertWorkedOrFailedHandleTxnErrors(res,
                                                 [
+                                                    ErrorCodes.IndexBuildAborted,
                                                     ErrorCodes.IndexBuildAlreadyInProgress,
                                                     ErrorCodes.SnapshotUnavailable,
                                                     ErrorCodes.SnapshotTooOld,
-                                                    ErrorCodes.NotMaster
+                                                    ErrorCodes.NoMatchingDocument,
+                                                    ErrorCodes.NotMaster,
                                                 ],
-                                                [ErrorCodes.NotMaster]);
+                                                [
+                                                    ErrorCodes.IndexBuildAborted,
+                                                    ErrorCodes.NoMatchingDocument,
+                                                    ErrorCodes.NotMaster,
+                                                ]);
         }
 
         function dropIndex(db, collName) {

@@ -35,7 +35,7 @@
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_merge.h"
-#include "mongo/db/pipeline/process_interface_standalone.h"
+#include "mongo/db/pipeline/process_interface/non_shardsvr_process_interface.h"
 
 namespace mongo {
 namespace {
@@ -886,6 +886,23 @@ TEST_F(DocumentSourceMergeTest, OnlyObjectCanBeUsedAsLetVariables) {
                                      << "whenNotMatched" << whenNotMatched));
         ASSERT_THROWS_CODE(createMergeStage(spec), AssertionException, ErrorCodes::TypeMismatch);
     }
+}
+
+TEST_F(DocumentSourceMergeTest, FailsToParseIfOnFieldHaveDuplicates) {
+    auto spec = BSON("$merge" << BSON("into"
+                                      << "target_collection"
+                                      << "on"
+                                      << BSON_ARRAY("x"
+                                                    << "y"
+                                                    << "x")));
+    ASSERT_THROWS_CODE(createMergeStage(spec), AssertionException, 31465);
+
+    spec = BSON("$merge" << BSON("into"
+                                 << "target_collection"
+                                 << "on"
+                                 << BSON_ARRAY("_id"
+                                               << "_id")));
+    ASSERT_THROWS_CODE(createMergeStage(spec), AssertionException, 31465);
 }
 
 }  // namespace

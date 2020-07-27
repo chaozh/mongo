@@ -50,13 +50,15 @@ TwoDAccessMethod::TwoDAccessMethod(IndexCatalogEntry* btreeState,
 }
 
 /** Finds the key objects to put in an index */
-void TwoDAccessMethod::doGetKeys(const BSONObj& obj,
+void TwoDAccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                                 const BSONObj& obj,
                                  GetKeysContext context,
                                  KeyStringSet* keys,
                                  KeyStringSet* multikeyMetadataKeys,
                                  MultikeyPaths* multikeyPaths,
                                  boost::optional<RecordId> id) const {
-    ExpressionKeysPrivate::get2DKeys(obj,
+    ExpressionKeysPrivate::get2DKeys(pooledBufferBuilder,
+                                     obj,
                                      _params,
                                      keys,
                                      getSortedDataInterface()->getKeyStringVersion(),

@@ -72,10 +72,14 @@ public:
         auto privileges = uassertStatusOK(
             AuthorizationSession::get(opCtx->getClient())
                 ->getPrivilegesForAggregate(
-                    aggregationRequest.getNamespaceString(), opMsgRequest.body, false));
+                    aggregationRequest.getNamespaceString(), aggregationRequest, false));
 
         return std::make_unique<Invocation>(
             this, opMsgRequest, std::move(aggregationRequest), std::move(privileges));
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
     }
 
     class Invocation final : public CommandInvocation {
@@ -168,7 +172,9 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
-
+    bool maintenanceOk() const override {
+        return false;
+    }
     ReadWriteType getReadWriteType() const {
         return ReadWriteType::kRead;
     }

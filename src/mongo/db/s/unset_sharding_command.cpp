@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,13 +37,12 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/s/sharded_connection_info.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 namespace {
 
+// No-op command; deprecated as of v4.6.
 class UnsetShardingCommand : public BasicCommand {
 public:
     UnsetShardingCommand() : BasicCommand("unsetSharding") {}
@@ -76,7 +75,6 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        ShardedConnectionInfo::reset(opCtx->getClient());
         return true;
     }
 

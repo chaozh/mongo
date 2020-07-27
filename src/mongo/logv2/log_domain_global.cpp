@@ -29,90 +29,79 @@
 
 #include "log_domain_global.h"
 
+#include "mongo/config.h"
 #include "mongo/logv2/component_settings_filter.h"
 #include "mongo/logv2/composite_backend.h"
 #include "mongo/logv2/console.h"
+#include "mongo/logv2/file_rotate_sink.h"
 #include "mongo/logv2/json_formatter.h"
 #include "mongo/logv2/log_source.h"
 #include "mongo/logv2/ramlog_sink.h"
+#include "mongo/logv2/shared_access_fstream.h"
 #include "mongo/logv2/tagged_severity_filter.h"
 #include "mongo/logv2/text_formatter.h"
+#include "mongo/logv2/uassert_sink.h"
 
 #include <boost/core/null_deleter.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/log/core.hpp>
 #include <boost/log/sinks.hpp>
 
-namespace mongo {
-namespace logv2 {
-namespace {
-
-class RotateCollector : public boost::log::sinks::file::collector {
-public:
-    explicit RotateCollector(LogDomainGlobal::ConfigurationOptions const& options)
-        : _mode{options._fileRotationMode} {}
-
-    void store_file(boost::filesystem::path const& file) override {
-        if (_mode == LogDomainGlobal::ConfigurationOptions::RotationMode::kRename) {
-            auto renameTarget = file.string() + "." + terseCurrentTime(false);
-            boost::system::error_code ec;
-            boost::filesystem::rename(file, renameTarget, ec);
-            if (ec) {
-                // throw here or propagate this error in another way?
-            }
-        }
-    }
-
-    uintmax_t scan_for_files(boost::log::sinks::file::scan_method,
-                             boost::filesystem::path const&,
-                             unsigned int*) override {
-        return 0;
-    }
-
-private:
-    LogDomainGlobal::ConfigurationOptions::RotationMode _mode;
-};
-
-}  // namespace
+namespace mongo::logv2 {
 
 void LogDomainGlobal::ConfigurationOptions::makeDisabled() {
-    _consoleEnabled = false;
+    consoleEnabled = false;
 }
 
 struct LogDomainGlobal::Impl {
-    typedef CompositeBackend<boost::log::sinks::text_ostream_backend, RamLogSink, RamLogSink>
+    typedef CompositeBackend<boost::log::sinks::text_ostream_backend,
+                             RamLogSink,
+                             RamLogSink,
+                             UserAssertSink>
         ConsoleBackend;
 #ifndef _WIN32
-    typedef CompositeBackend<boost::log::sinks::syslog_backend, RamLogSink, RamLogSink>
+    typedef CompositeBackend<boost::log::sinks::syslog_backend,
+                             RamLogSink,
+                             RamLogSink,
+                             UserAssertSink>
         SyslogBackend;
 #endif
-    typedef CompositeBackend<boost::log::sinks::text_file_backend, RamLogSink, RamLogSink>
+    typedef CompositeBackend<FileRotateSink, RamLogSink, RamLogSink, UserAssertSink>
         RotatableFileBackend;
 
     Impl(LogDomainGlobal& parent);
     Status configure(LogDomainGlobal::ConfigurationOptions const& options);
-    Status rotate();
+    Status rotate(bool rename, StringData renameSuffix);
+
+    const ConfigurationOptions& config() const;
+
+    LogSource& source();
 
     LogDomainGlobal& _parent;
     LogComponentSettings _settings;
+    ConfigurationOptions _config;
     boost::shared_ptr<boost::log::sinks::unlocked_sink<ConsoleBackend>> _consoleSink;
     boost::shared_ptr<boost::log::sinks::unlocked_sink<RotatableFileBackend>> _rotatableFileSink;
 #ifndef _WIN32
     boost::shared_ptr<boost::log::sinks::unlocked_sink<SyslogBackend>> _syslogSink;
 #endif
+    AtomicWord<int32_t> activeSourceThreadLocals{0};
+    LogSource shutdownLogSource{&_parent, true};
+    bool isInShutdown{false};
 };
 
 LogDomainGlobal::Impl::Impl(LogDomainGlobal& parent) : _parent(parent) {
     auto console = boost::make_shared<ConsoleBackend>(
         boost::make_shared<boost::log::sinks::text_ostream_backend>(),
         boost::make_shared<RamLogSink>(RamLog::get("global")),
-        boost::make_shared<RamLogSink>(RamLog::get("startupWarnings")));
+        boost::make_shared<RamLogSink>(RamLog::get("startupWarnings")),
+        boost::make_shared<UserAssertSink>());
 
     console->lockedBackend<0>()->add_stream(
         boost::shared_ptr<std::ostream>(&Console::out(), boost::null_deleter()));
     console->lockedBackend<0>()->auto_flush();
     console->setFilter<2>(
-        TaggedSeverityFilter(_parent, {LogTag::kStartupWarnings}, LogSeverity::Warning()));
+        TaggedSeverityFilter(_parent, {LogTag::kStartupWarnings}, LogSeverity::Log()));
 
     _consoleSink =
         boost::make_shared<boost::log::sinks::unlocked_sink<ConsoleBackend>>(std::move(console));
@@ -120,19 +109,24 @@ LogDomainGlobal::Impl::Impl(LogDomainGlobal& parent) : _parent(parent) {
 
     // Set default configuration
     invariant(configure({}).isOK());
+
+    // Make a call to source() to make sure the internal thread_local is created as early as
+    // possible and thus destroyed as late as possible.
+    source();
 }
 
 Status LogDomainGlobal::Impl::configure(LogDomainGlobal::ConfigurationOptions const& options) {
 #ifndef _WIN32
-    if (options._syslogEnabled) {
+    if (options.syslogEnabled) {
         // Create a backend
         auto backend = boost::make_shared<SyslogBackend>(
             boost::make_shared<boost::log::sinks::syslog_backend>(
                 boost::log::keywords::facility =
-                    boost::log::sinks::syslog::make_facility(options._syslogFacility),
+                    boost::log::sinks::syslog::make_facility(options.syslogFacility),
                 boost::log::keywords::use_impl = boost::log::sinks::syslog::native),
             boost::make_shared<RamLogSink>(RamLog::get("global")),
-            boost::make_shared<RamLogSink>(RamLog::get("startupWarnings")));
+            boost::make_shared<RamLogSink>(RamLog::get("startupWarnings")),
+            boost::make_shared<UserAssertSink>());
 
         boost::log::sinks::syslog::custom_severity_mapping<LogSeverity> mapping(
             attributes::severity());
@@ -149,6 +143,8 @@ Status LogDomainGlobal::Impl::configure(LogDomainGlobal::ConfigurationOptions co
         mapping[LogSeverity::Severe()] = boost::log::sinks::syslog::alert;
 
         backend->lockedBackend<0>()->set_severity_mapper(mapping);
+        backend->setFilter<2>(
+            TaggedSeverityFilter(_parent, {LogTag::kStartupWarnings}, LogSeverity::Log()));
 
         _syslogSink =
             boost::make_shared<boost::log::sinks::unlocked_sink<SyslogBackend>>(std::move(backend));
@@ -161,25 +157,20 @@ Status LogDomainGlobal::Impl::configure(LogDomainGlobal::ConfigurationOptions co
     }
 #endif
 
-    if (options._consoleEnabled && _consoleSink.use_count() == 1) {
-        boost::log::core::get()->add_sink(_consoleSink);
-    }
-
-    if (!options._consoleEnabled && _consoleSink.use_count() > 1) {
-        boost::log::core::get()->remove_sink(_consoleSink);
-    }
-
-    if (options._fileEnabled) {
+    if (options.fileEnabled) {
         auto backend = boost::make_shared<RotatableFileBackend>(
-            boost::make_shared<boost::log::sinks::text_file_backend>(
-                boost::log::keywords::file_name = options._filePath),
+            boost::make_shared<FileRotateSink>(options.timestampFormat),
             boost::make_shared<RamLogSink>(RamLog::get("global")),
-            boost::make_shared<RamLogSink>(RamLog::get("startupWarnings")));
-
+            boost::make_shared<RamLogSink>(RamLog::get("startupWarnings")),
+            boost::make_shared<UserAssertSink>());
+        Status ret = backend->lockedBackend<0>()->addFile(
+            options.filePath,
+            options.fileOpenMode == ConfigurationOptions::OpenMode::kAppend ? true : false);
+        if (!ret.isOK())
+            return ret;
         backend->lockedBackend<0>()->auto_flush(true);
-
-        backend->lockedBackend<0>()->set_file_collector(
-            boost::make_shared<RotateCollector>(options));
+        backend->setFilter<2>(
+            TaggedSeverityFilter(_parent, {LogTag::kStartupWarnings}, LogSeverity::Log()));
 
         _rotatableFileSink =
             boost::make_shared<boost::log::sinks::unlocked_sink<RotatableFileBackend>>(backend);
@@ -201,25 +192,72 @@ Status LogDomainGlobal::Impl::configure(LogDomainGlobal::ConfigurationOptions co
 #endif
     };
 
-    switch (options._format) {
-        case LogFormat::kDefault:
-        case LogFormat::kText:
-            setFormatters([] { return TextFormatter(); });
+    switch (options.format) {
+        case LogFormat::kPlain:
+            setFormatters([&] { return PlainFormatter(options.maxAttributeSizeKB); });
             break;
+        case LogFormat::kDefault:
         case LogFormat::kJson:
-            setFormatters([] { return JSONFormatter(); });
+            setFormatters(
+                [&] { return JSONFormatter(options.maxAttributeSizeKB, options.timestampFormat); });
             break;
     }
+
+    if (options.consoleEnabled) {
+        if (_consoleSink.use_count() == 1) {
+            boost::log::core::get()->add_sink(_consoleSink);
+        }
+    } else {
+        if (_consoleSink.use_count() > 1) {
+            boost::log::core::get()->remove_sink(_consoleSink);
+        }
+    }
+
+    _config = options;
 
     return Status::OK();
 }
 
-Status LogDomainGlobal::Impl::rotate() {
+const LogDomainGlobal::ConfigurationOptions& LogDomainGlobal::Impl::config() const {
+    return _config;
+}
+
+Status LogDomainGlobal::Impl::rotate(bool rename, StringData renameSuffix) {
     if (_rotatableFileSink) {
         auto backend = _rotatableFileSink->locked_backend()->lockedBackend<0>();
-        backend->rotate_file();
+        return backend->rotate(rename, renameSuffix);
     }
     return Status::OK();
+}
+
+LogSource& LogDomainGlobal::Impl::source() {
+    // Use a thread_local logger so we don't need to have locking. thread_locals are destroyed
+    // before statics so keep track of number of thread_locals we have active and if this code
+    // is hit when it is zero then we are in shutdown and can use a global LogSource that does
+    // not provide synchronization instead.
+    class SourceCache {
+    public:
+        SourceCache(Impl* domain) : _domain(domain), _source(&domain->_parent) {
+            _domain->activeSourceThreadLocals.addAndFetch(1);
+        }
+        ~SourceCache() {
+            if (_domain->activeSourceThreadLocals.subtractAndFetch(1) == 0) {
+                _domain->isInShutdown = true;
+            }
+        }
+
+        LogSource& source() {
+            return _source;
+        }
+
+    private:
+        Impl* _domain;
+        LogSource _source;
+    };
+    thread_local SourceCache cache(this);
+    if (isInShutdown)
+        return shutdownLogSource;
+    return cache.source();
 }
 
 LogDomainGlobal::LogDomainGlobal() {
@@ -229,9 +267,7 @@ LogDomainGlobal::LogDomainGlobal() {
 LogDomainGlobal::~LogDomainGlobal() {}
 
 LogSource& LogDomainGlobal::source() {
-    // Use a thread_local logger so we don't need to have locking
-    thread_local LogSource lg(this);
-    return lg;
+    return _impl->source();
 }
 
 
@@ -239,13 +275,16 @@ Status LogDomainGlobal::configure(LogDomainGlobal::ConfigurationOptions const& o
     return _impl->configure(options);
 }
 
-Status LogDomainGlobal::rotate() {
-    return _impl->rotate();
+const LogDomainGlobal::ConfigurationOptions& LogDomainGlobal::config() const {
+    return _impl->config();
+}
+
+Status LogDomainGlobal::rotate(bool rename, StringData renameSuffix) {
+    return _impl->rotate(rename, renameSuffix);
 }
 
 LogComponentSettings& LogDomainGlobal::settings() {
     return _impl->_settings;
 }
 
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

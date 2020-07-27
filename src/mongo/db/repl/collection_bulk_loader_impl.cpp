@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -45,8 +45,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/collection_bulk_loader_impl.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -212,7 +212,11 @@ Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::con
 Status CollectionBulkLoaderImpl::commit() {
     return _runTaskReleaseResourcesOnFailure([&] {
         _stats.startBuildingIndexes = Date_t::now();
-        LOG(2) << "Creating indexes for ns: " << _nss.ns();
+        LOGV2_DEBUG(21130,
+                    2,
+                    "Creating indexes for ns: {namespace}",
+                    "Creating indexes",
+                    "namespace"_attr = _nss.ns());
         UnreplicatedWritesBlock uwb(_opCtx.get());
 
         // Commit before deleting dups, so the dups will be removed from secondary indexes when
@@ -309,9 +313,18 @@ Status CollectionBulkLoaderImpl::commit() {
         }
 
         _stats.endBuildingIndexes = Date_t::now();
-        LOG(2) << "Done creating indexes for ns: " << _nss.ns() << ", stats: " << _stats.toString();
+        LOGV2_DEBUG(21131,
+                    2,
+                    "Done creating indexes for ns: {namespace}, stats: {stats}",
+                    "Done creating indexes",
+                    "namespace"_attr = _nss.ns(),
+                    "stats"_attr = _stats.toString());
 
-        _releaseResources();
+        // Clean up here so we do not try to abort the index builds when cleaning up in
+        // _releaseResources.
+        _idIndexBlock.reset();
+        _secondaryIndexesBlock.reset();
+        _autoColl.reset();
         return Status::OK();
     });
 }
@@ -319,13 +332,13 @@ Status CollectionBulkLoaderImpl::commit() {
 void CollectionBulkLoaderImpl::_releaseResources() {
     invariant(&cc() == _opCtx->getClient());
     if (_secondaryIndexesBlock) {
-        _secondaryIndexesBlock->cleanUpAfterBuild(
+        _secondaryIndexesBlock->abortIndexBuild(
             _opCtx.get(), _collection, MultiIndexBlock::kNoopOnCleanUpFn);
         _secondaryIndexesBlock.reset();
     }
 
     if (_idIndexBlock) {
-        _idIndexBlock->cleanUpAfterBuild(
+        _idIndexBlock->abortIndexBuild(
             _opCtx.get(), _collection, MultiIndexBlock::kNoopOnCleanUpFn);
         _idIndexBlock.reset();
     }
@@ -352,14 +365,16 @@ Status CollectionBulkLoaderImpl::_runTaskReleaseResourcesOnFailure(const F& task
 Status CollectionBulkLoaderImpl::_addDocumentToIndexBlocks(const BSONObj& doc,
                                                            const RecordId& loc) {
     if (_idIndexBlock) {
-        auto status = _idIndexBlock->insert(_opCtx.get(), doc, loc);
+        auto status =
+            _idIndexBlock->insertSingleDocumentForInitialSyncOrRecovery(_opCtx.get(), doc, loc);
         if (!status.isOK()) {
             return status.withContext("failed to add document to _id index");
         }
     }
 
     if (_secondaryIndexesBlock) {
-        auto status = _secondaryIndexesBlock->insert(_opCtx.get(), doc, loc);
+        auto status = _secondaryIndexesBlock->insertSingleDocumentForInitialSyncOrRecovery(
+            _opCtx.get(), doc, loc);
         if (!status.isOK()) {
             return status.withContext("failed to add document to secondary indexes");
         }

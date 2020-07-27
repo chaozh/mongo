@@ -74,9 +74,9 @@ env.Library(
 )
 
 env.Library(
-    target='max_validate_mb_per_sec_idl',
+    target='validate_idl',
     source=[
-        env.Idlc('max_validate_mb_per_sec.idl')[0],
+        env.Idlc('validate.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/idl/server_parameter',
@@ -118,8 +118,10 @@ env.Library(
         '$BUILD_DIR/mongo/base',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog_raii',
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/query/query_knobs',
+        '$BUILD_DIR/mongo/db/storage/storage_repair_observer',
     ]
 )
 
@@ -133,6 +135,9 @@ env.Library(
         "$BUILD_DIR/mongo/bson/util/bson_extract",
         "$BUILD_DIR/mongo/db/repl/oplog_entry",
         "$BUILD_DIR/mongo/rpc/command_status",
+    ],
+    LIBDEPS_PRIVATE=[
+        'commit_quorum_options',
     ],
 )
 
@@ -175,22 +180,6 @@ env.Library(
 )
 
 env.Library(
-    target='index_timestamp_helper',
-    source=[
-        "index_timestamp_helper.cpp",
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
-        '$BUILD_DIR/mongo/db/logical_clock',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/db/server_options_core',
-    ]
-)
-
-env.Library(
     target='index_build_block',
     source=[
         "index_build_block.cpp",
@@ -204,8 +193,8 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
-        '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/vector_clock',
     ]
 )
 
@@ -240,17 +229,16 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/audit',
-        '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/resumable_index_builds_idl',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/write_unit_of_work',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/progress_meter',
         'collection',
         'index_build_block',
-        'index_timestamp_helper',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
@@ -274,6 +262,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/idl/server_parameter',
     ]
 )
@@ -339,7 +328,6 @@ env.Library(
         'index_catalog_entry',
         'index_key_validate',
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/collection_index_usage_tracker',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/curop',
@@ -353,6 +341,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/key_string',
         '$BUILD_DIR/mongo/db/storage/durable_catalog_impl',
+        '$BUILD_DIR/mongo/db/storage/execution_context',
         '$BUILD_DIR/mongo/db/storage/storage_engine_impl',
         '$BUILD_DIR/mongo/db/system_index',
         '$BUILD_DIR/mongo/db/views/views_mongod',
@@ -363,12 +352,14 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands/server_status_core',
         '$BUILD_DIR/mongo/db/index/index_build_interceptor',
         '$BUILD_DIR/mongo/db/index/index_access_methods',
-        '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/repl/repl_settings',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+        '$BUILD_DIR/mongo/db/storage/storage_debug_util',
         '$BUILD_DIR/mongo/db/transaction',
+        '$BUILD_DIR/mongo/db/vector_clock',
         'index_build_block',
         'throttle_cursor',
+        'validate_idl',
         'validate_state',
     ],
 )
@@ -383,6 +374,7 @@ env.Library(
         'catalog_impl',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/multi_key_path_tracker',
         'throttle_cursor',
         'validate_state',
     ]
@@ -396,7 +388,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/util/fail_point',
-        'max_validate_mb_per_sec_idl',
+        'validate_idl',
     ],
 )
 
@@ -415,7 +407,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/query_exec',
@@ -437,6 +428,8 @@ env.Library(
     target="collection_query_info",
     source=[
         "$BUILD_DIR/mongo/db/query/collection_query_info.cpp",
+        "$BUILD_DIR/mongo/db/query/collection_index_usage_tracker_decoration.cpp",
+        "$BUILD_DIR/mongo/db/query/query_settings_decoration.cpp",
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -465,6 +458,7 @@ env.CppUnitTest(
         'index_build_entry_test.cpp',
         'index_builds_manager_test.cpp',
         'index_key_validate_test.cpp',
+        'index_signature_test.cpp',
         'index_spec_validate_test.cpp',
         'multi_index_block_test.cpp',
         'rename_collection_test.cpp',
@@ -479,6 +473,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/index_builds_coordinator_mongod',
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/op_observer_impl',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/query/datetime/date_time_support',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
@@ -488,10 +483,9 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replmocks',
         '$BUILD_DIR/mongo/db/repl/storage_interface_impl',
-        '$BUILD_DIR/mongo/db/s/op_observer_sharding_impl',
-        '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
         '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger',
         '$BUILD_DIR/mongo/unittest/unittest',
@@ -500,20 +494,20 @@ env.CppUnitTest(
         'catalog_control',
         'catalog_helpers',
         'catalog_test_fixture',
-        'collection',
-        'collection_catalog',
         'collection_catalog_helper',
+        'collection_catalog',
         'collection_options',
         'collection_validation',
+        'collection',
         'commit_quorum_options',
         'database_holder',
         'index_build_block',
         'index_build_entry_idl',
         'index_builds_manager',
         'index_key_validate',
-        'max_validate_mb_per_sec_idl',
         'multi_index_block',
         'throttle_cursor',
+        'validate_idl',
         'validate_state',
     ],
 )

@@ -1,15 +1,32 @@
 // Helper functions for testing index builds.
 
-class IndexBuildTest {
+load("jstests/libs/fail_point_util.js");
+load("jstests/libs/parallel_shell_helpers.js");
+load("jstests/libs/uuid_util.js");
+
+var IndexBuildTest = class {
     /**
      * Starts an index build in a separate mongo shell process with given options.
+     * Ensures the index build worked or failed with one of the expected failures.
      */
-    static startIndexBuild(conn, ns, keyPattern, options) {
+    static startIndexBuild(conn, ns, keyPattern, options, expectedFailures) {
         options = options || {};
-        return startParallelShell('const coll = db.getMongo().getCollection("' + ns + '");' +
-                                      'assert.commandWorked(coll.createIndex(' +
-                                      tojson(keyPattern) + ', ' + tojson(options) + '));',
-                                  conn.port);
+        expectedFailures = expectedFailures || [];
+
+        if (Array.isArray(keyPattern)) {
+            return startParallelShell(
+                'const coll = db.getMongo().getCollection("' + ns + '");' +
+                    'assert.commandWorkedOrFailedWithCode(coll.createIndexes(' +
+                    JSON.stringify(keyPattern) + ', ' + tojson(options) + '), ' +
+                    JSON.stringify(expectedFailures) + ');',
+                conn.port);
+        } else {
+            return startParallelShell('const coll = db.getMongo().getCollection("' + ns + '");' +
+                                          'assert.commandWorkedOrFailedWithCode(coll.createIndex(' +
+                                          tojson(keyPattern) + ', ' + tojson(options) + '), ' +
+                                          JSON.stringify(expectedFailures) + ');',
+                                      conn.port);
+        }
     }
 
     /**
@@ -123,7 +140,7 @@ class IndexBuildTest {
         notReadyIndexes = notReadyIndexes || [];
         options = options || {};
 
-        let res = coll.runCommand("listIndexes", options);
+        let res = assert.commandWorked(coll.runCommand("listIndexes", options));
         assert.eq(numIndexes,
                   res.cursor.firstBatch.length,
                   'unexpected number of indexes in collection: ' + tojson(res));
@@ -187,22 +204,151 @@ class IndexBuildTest {
     }
 
     /**
-     * Returns true if two phase index builds are supported.
+     * Returns true if majority commit quorum is supported by two phase index builds.
      */
-    static supportsTwoPhaseIndexBuild(conn) {
-        const adminDB = conn.getDB('admin');
-        const serverStatus = assert.commandWorked(adminDB.serverStatus());
-        const storageEngineSection = serverStatus.storageEngine;
-        return storageEngineSection.supportsTwoPhaseIndexBuild;
+    static indexBuildCommitQuorumEnabled(conn) {
+        return assert
+            .commandWorked(conn.adminCommand({getParameter: 1, enableIndexBuildCommitQuorum: 1}))
+            .enableIndexBuildCommitQuorum;
+    }
+};
+
+const ResumableIndexBuildTest = class {
+    /**
+     * Returns whether resumable index builds are supported.
+     */
+    static resumableIndexBuildsEnabled(conn) {
+        return assert
+            .commandWorked(conn.adminCommand({getParameter: 1, enableResumableIndexBuilds: 1}))
+            .enableResumableIndexBuilds;
     }
 
     /**
-     * Returns true if majority commit quorum is supported by two phase index builds.
+     * Creates the specified index in a parallel shell and expects it to fail with
+     * InterruptedDueToReplStateChange. After calling this function and before waiting on the
+     * returned parallel shell to complete, the test should cause the node to go through a replica
+     * set state transition.
      */
-    static supportsIndexBuildMajorityCommitQuorum(conn) {
-        return assert
-            .commandWorked(
-                conn.adminCommand({getParameter: 1, enableIndexBuildMajorityCommitQuorum: 1}))
-            .enableIndexBuildMajorityCommitQuorum;
+    static createIndex(primary, collName, indexSpec, indexName) {
+        return startParallelShell(
+            funWithArgs(function(collName, indexSpec, indexName) {
+                assert.commandFailedWithCode(
+                    db.getCollection(collName).createIndex(indexSpec, {name: indexName}),
+                    ErrorCodes.InterruptedDueToReplStateChange);
+            }, collName, indexSpec, indexName), primary.port);
     }
-}
+
+    /**
+     * Waits for the specified index build to be interrupted and then disables the given failpoint.
+     */
+    static disableFailPointAfterInterruption(conn, failPointName, buildUUID) {
+        return startParallelShell(
+            funWithArgs(function(failPointName, buildUUID) {
+                // Wait for the index build to be interrupted.
+                checkLog.containsJson(db.getMongo(), 20449, {
+                    buildUUID: function(uuid) {
+                        return uuid["uuid"]["$uuid"] === buildUUID;
+                    },
+                    error: function(error) {
+                        return error.code === ErrorCodes.InterruptedDueToReplStateChange;
+                    }
+                });
+
+                // Once the index build has been interrupted, disable the failpoint so that shutdown
+                // or stepdown can proceed.
+                assert.commandWorked(
+                    db.adminCommand({configureFailPoint: failPointName, mode: "off"}));
+            }, failPointName, buildUUID), conn.port);
+    }
+
+    /**
+     * Inserts the given documents once an index build reaches the end of the bulk load phase so
+     * that the documents are inserted into the side writes table for that index build.
+     */
+    static insertIntoSideWritesTable(primary, collName, docs) {
+        return startParallelShell(funWithArgs(function(collName, docs) {
+                                      if (!docs)
+                                          return;
+
+                                      load("jstests/libs/fail_point_util.js");
+
+                                      const sideWritesFp = configureFailPoint(
+                                          db.getMongo(), "hangAfterSettingUpIndexBuild");
+                                      sideWritesFp.wait();
+
+                                      assert.commandWorked(db.getCollection(collName).insert(docs));
+
+                                      sideWritesFp.off();
+                                  }, collName, docs), primary.port);
+    }
+
+    /**
+     * Asserts that the specific index build successfully completed.
+     */
+    static assertCompleted(conn, coll, buildUUID, numIndexes, indexes) {
+        checkLog.containsJson(conn, 20663, {
+            buildUUID: function(uuid) {
+                return uuid["uuid"]["$uuid"] === buildUUID;
+            },
+            namespace: coll.getFullName()
+        });
+        IndexBuildTest.assertIndexes(coll, numIndexes, indexes);
+    }
+
+    /**
+     * Restarts the given node, ensuring that the the index build with name indexName has its state
+     * written to disk upon shutdown and is completed upon startup.
+     */
+    static restart(rst, conn, coll, indexName, failPointName) {
+        clearRawMongoProgramOutput();
+
+        const buildUUID = extractUUIDFromObject(
+            IndexBuildTest
+                .assertIndexes(coll, 2, ["_id_"], [indexName], {includeBuildUUIDs: true})[indexName]
+                .buildUUID);
+
+        const awaitDisableFailPoint = ResumableIndexBuildTest.disableFailPointAfterInterruption(
+            conn, failPointName, buildUUID);
+
+        rst.stop(conn);
+        awaitDisableFailPoint();
+
+        // Ensure that the resumable index build state was written to disk upon clean shutdown.
+        assert(RegExp("4841502.*" + buildUUID).test(rawMongoProgramOutput()));
+
+        rst.start(conn, {noCleanData: true});
+
+        // Ensure that the index build was completed upon the node starting back up.
+        ResumableIndexBuildTest.assertCompleted(conn, coll, buildUUID, 2, ["_id_", indexName]);
+    }
+
+    /**
+     * Runs the resumable index build test specified by the provided failpoint information and
+     * index spec on the provided replica set and namespace. Document(s) specified by
+     * insertIntoSideWritesTable will be inserted after the bulk load phase so that they are
+     * inserted into the side writes table and processed during the drain writes phase.
+     */
+    static run(
+        rst, dbName, collName, indexSpec, failPointName, failPointData, insertIntoSideWritesTable) {
+        const primary = rst.getPrimary();
+        const coll = primary.getDB(dbName).getCollection(collName);
+        const indexName = "resumable_index_build";
+
+        const fp = configureFailPoint(primary, failPointName, failPointData);
+
+        const awaitInsertIntoSideWritesTable = ResumableIndexBuildTest.insertIntoSideWritesTable(
+            primary, collName, insertIntoSideWritesTable);
+
+        const awaitCreateIndex =
+            ResumableIndexBuildTest.createIndex(primary, coll.getName(), indexSpec, indexName);
+
+        fp.wait();
+
+        ResumableIndexBuildTest.restart(rst, primary, coll, indexName, failPointName);
+
+        awaitInsertIntoSideWritesTable();
+        awaitCreateIndex();
+
+        assert.commandWorked(coll.dropIndex(indexName));
+    }
+};

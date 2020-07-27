@@ -53,6 +53,13 @@ function runCommandWithReadAndWriteConcerns(
     }
 
     let shouldForceReadConcern = kCommandsSupportingReadConcern.has(commandName);
+    if (kDefaultReadConcern.level === "snapshot" && !kCommandsSupportingSnapshot.has(commandName)) {
+        shouldForceReadConcern = false;
+    } else if (TestData.disallowSnapshotDistinct && kDefaultReadConcern.level === "snapshot" &&
+               commandName === "distinct") {
+        shouldForceReadConcern = false;
+    }
+
     let shouldForceWriteConcern = kCommandsSupportingWriteConcern.has(commandName);
 
     // All commands in a multi-document transaction have the autocommit property.
@@ -89,9 +96,15 @@ function runCommandWithReadAndWriteConcerns(
     } else if (OverrideHelpers.isMapReduceWithInlineOutput(commandName, commandObjUnwrapped)) {
         // A writeConcern can only be used with non-inline output.
         shouldForceWriteConcern = false;
+    } else if (commandName === "moveChunk") {
+        // The moveChunk command automatically waits for majority write concern regardless of the
+        // user-supplied write concern. Omitting the writeConcern option obviates the need to
+        // specify the _secondaryThrottle=true option as well.
+        shouldForceWriteConcern = false;
     }
 
-    if (kCommandsOnlySupportingReadConcernSnapshot.has(commandName) &&
+    if (commandObj.hasOwnProperty("autocommit") &&
+        kWriteCommandsSupportingSnapshotInTransaction.has(commandName) &&
         kDefaultReadConcern.level === "snapshot") {
         shouldForceReadConcern = true;
     }
@@ -116,7 +129,9 @@ function runCommandWithReadAndWriteConcerns(
 
             if (typeof readConcern !== "object" || readConcern === null ||
                 (readConcern.hasOwnProperty("level") &&
-                 bsonWoCompare({_: readConcern.level}, {_: kDefaultReadConcern.level}) !== 0)) {
+                 bsonWoCompare({_: readConcern.level}, {_: kDefaultReadConcern.level}) !== 0 &&
+                 bsonWoCompare({_: readConcern.level}, {_: "local"}) !== 0 &&
+                 bsonWoCompare({_: readConcern.level}, {_: "available"}) !== 0)) {
                 throw new Error("Cowardly refusing to override read concern of command: " +
                                 tojson(commandObj));
             }
@@ -145,7 +160,8 @@ function runCommandWithReadAndWriteConcerns(
 
             if (typeof writeConcern !== "object" || writeConcern === null ||
                 (writeConcern.hasOwnProperty("w") &&
-                 bsonWoCompare({_: writeConcern.w}, {_: kDefaultWriteConcern.w}) !== 0)) {
+                 bsonWoCompare({_: writeConcern.w}, {_: kDefaultWriteConcern.w}) !== 0 &&
+                 bsonWoCompare({_: writeConcern.w}, {_: 1}) !== 0)) {
                 throw new Error("Cowardly refusing to override write concern of command: " +
                                 tojson(commandObj));
             }

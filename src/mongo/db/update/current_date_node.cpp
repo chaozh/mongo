@@ -27,17 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/update/current_date_node.h"
 
-#include "mongo/db/logical_clock.h"
-#include "mongo/db/logical_time.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/debug_util.h"
-#include "mongo/util/log.h"
+#include "mongo/db/vector_clock_mutable.h"
 
 namespace mongo {
 
@@ -46,14 +41,12 @@ constexpr StringData kType = "$type"_sd;
 constexpr StringData kDate = "date"_sd;
 constexpr StringData kTimestamp = "timestamp"_sd;
 
-Rarely currentDateDeprecationSampler;  // Used to occasionally log deprecation messages.
-
-void setValue(mutablebson::Element* element, bool typeIsDate) {
+void setValue(ServiceContext* service, mutablebson::Element* element, bool typeIsDate) {
     if (typeIsDate) {
         invariant(element->setValueDate(mongo::jsTime()));
     } else {
         invariant(element->setValueTimestamp(
-            LogicalClock::get(getGlobalServiceContext())->reserveTicks(1).asTimestamp()));
+            VectorClockMutable::get(service)->tickClusterTime(1).asTimestamp()));
     }
 }
 }  // namespace
@@ -61,12 +54,6 @@ void setValue(mutablebson::Element* element, bool typeIsDate) {
 Status CurrentDateNode::init(BSONElement modExpr,
                              const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     invariant(modExpr.ok());
-
-    if (currentDateDeprecationSampler.tick()) {
-        warning() << "The $currentDate update operator is deprecated. As an alternative perform "
-                     "updates with an aggregation pipeline and either the 'NOW' or 'CLUSTER_TIME' "
-                     "system variables.";
-    }
 
     if (modExpr.type() == BSONType::Bool) {
         _typeIsDate = true;
@@ -104,17 +91,19 @@ Status CurrentDateNode::init(BSONElement modExpr,
                                        " or a $type expression ({$type: 'timestamp/date'}).");
     }
 
+    _service = expCtx->opCtx->getServiceContext();
+
     return Status::OK();
 }
 
 ModifierNode::ModifyResult CurrentDateNode::updateExistingElement(
     mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
-    setValue(element, _typeIsDate);
+    setValue(_service, element, _typeIsDate);
     return ModifyResult::kNormalUpdate;
 }
 
 void CurrentDateNode::setValueForNewElement(mutablebson::Element* element) const {
-    setValue(element, _typeIsDate);
+    setValue(_service, element, _typeIsDate);
 }
 
 BSONObj CurrentDateNode::operatorValue() const {

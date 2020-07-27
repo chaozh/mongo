@@ -58,8 +58,8 @@ Value AccumulatorFirst::getValue(bool toBeMerged) {
     return _first;
 }
 
-AccumulatorFirst::AccumulatorFirst(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx), _haveFirst(false) {
+AccumulatorFirst::AccumulatorFirst(ExpressionContext* const expCtx)
+    : AccumulatorState(expCtx), _haveFirst(false) {
     _memUsageBytes = sizeof(*this);
 }
 
@@ -70,8 +70,7 @@ void AccumulatorFirst::reset() {
 }
 
 
-intrusive_ptr<Accumulator> AccumulatorFirst::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorFirst::create(ExpressionContext* const expCtx) {
     return new AccumulatorFirst(expCtx);
 }
 }  // namespace mongo

@@ -1,9 +1,5 @@
 // test for SERVER-5013
 // make sure very long long lines get truncated
-// TODO: Handle JSON logs. See SERVER-45140
-// @tags: [
-//  requires_text_logs,
-// ]
 
 (function() {
 "use strict";
@@ -28,14 +24,14 @@ while (Object.bsonsize(query) < 30000) {
     query.x.push(n++);
 }
 
-assertLogTruncated(db, t, 9);
+assertLogTruncated(db, t);
 
 var res = db.adminCommand({setParameter: 1, maxLogSizeKB: 8});
 assert.eq(res.ok, 1);
 
-assertLogTruncated(db, t, 8);
+assertLogTruncated(db, t);
 
-function assertLogTruncated(db, t, maxLogSize) {
+function assertLogTruncated(db, t) {
     var before = db.adminCommand({setParameter: 1, logLevel: 1});
 
     t.findOne(query);
@@ -46,9 +42,9 @@ function assertLogTruncated(db, t, maxLogSize) {
     var log = db.adminCommand({getLog: "global"}).log;
 
     var found = false;
-    var toFind = "warning: log line attempted (16kB) over max size (" + maxLogSize + "kB)";
     for (var i = log.length - 1; i >= 0; i--) {
-        if (log[i].indexOf(toFind) >= 0) {
+        var obj = JSON.parse(log[i]);
+        if (obj.hasOwnProperty("truncated")) {
             found = true;
             break;
         }

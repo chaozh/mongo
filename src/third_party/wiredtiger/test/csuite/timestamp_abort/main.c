@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2019 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -82,15 +82,15 @@ static bool compat, inmem, use_ts;
 static volatile uint64_t global_ts = 1;
 
 #define ENV_CONFIG_COMPAT ",compatibility=(release=\"2.9\")"
-#define ENV_CONFIG_DEF                                               \
-    "cache_size=20M,create,log=(archive=true,file_max=10M,enabled)," \
-    "debug_mode=(table_logging=true,checkpoint_retention=5),"        \
-    "statistics=(fast),statistics_log=(wait=1,json=true),session_max=%d"
-#define ENV_CONFIG_TXNSYNC                                           \
-    "cache_size=20M,create,log=(archive=true,file_max=10M,enabled)," \
-    "debug_mode=(table_logging=true,checkpoint_retention=5),"        \
-    "statistics=(fast),statistics_log=(wait=1,json=true),"           \
-    "transaction_sync=(enabled,method=none),session_max=%d"
+#define ENV_CONFIG_DEF                                        \
+    "cache_size=20M,create,"                                  \
+    "debug_mode=(table_logging=true,checkpoint_retention=5)," \
+    "eviction_updates_trigger=95,eviction_updates_target=80," \
+    "log=(archive=true,file_max=10M,enabled),session_max=%d," \
+    "statistics=(fast),statistics_log=(wait=1,json=true),"
+#define ENV_CONFIG_TXNSYNC \
+    ENV_CONFIG_DEF         \
+    "transaction_sync=(enabled,method=none)"
 #define ENV_CONFIG_REC "log=(archive=false,recover=on)"
 
 typedef struct {
@@ -127,11 +127,14 @@ static WT_THREAD_RET
 thread_ts_run(void *arg)
 {
     WT_DECL_RET;
+    WT_RAND_STATE rnd;
     WT_SESSION *session;
     THREAD_DATA *td;
+    int dbg;
     char tscfg[64], ts_string[WT_TS_HEX_STRING_SIZE];
 
     td = (THREAD_DATA *)arg;
+    __wt_random_init(&rnd);
 
     testutil_check(td->conn->open_session(td->conn, NULL, NULL, &session));
     /* Update the oldest timestamp every 1 millisecond. */
@@ -152,6 +155,18 @@ thread_ts_run(void *arg)
             testutil_check(__wt_snprintf(tscfg, sizeof(tscfg),
               "oldest_timestamp=%s,stable_timestamp=%s", ts_string, ts_string));
             testutil_check(td->conn->set_timestamp(td->conn, tscfg));
+            /*
+             * Set and reset the checkpoint retention setting on a regular basis. We want to test
+             * racing with the internal archive thread while we're here.
+             */
+            dbg = __wt_random(&rnd) % 2;
+            if (dbg == 0)
+                testutil_check(
+                  __wt_snprintf(tscfg, sizeof(tscfg), "debug_mode=(checkpoint_retention=0)"));
+            else
+                testutil_check(
+                  __wt_snprintf(tscfg, sizeof(tscfg), "debug_mode=(checkpoint_retention=5)"));
+            testutil_check(td->conn->reconfigure(td->conn, tscfg));
         }
         __wt_sleep(0, 1000);
     }
@@ -523,7 +538,7 @@ main(int argc, char *argv[])
     WT_RAND_STATE rnd;
     WT_SESSION *session;
     pid_t pid;
-    uint64_t absent_coll, absent_local, absent_oplog, count, key, last_key;
+    uint64_t absent_coll, absent_local, absent_oplog, absent_shadow, count, key, last_key;
     uint64_t stable_fp, stable_val;
     uint32_t i, nth, timeout;
     int ch, status, ret;
@@ -702,7 +717,7 @@ main(int argc, char *argv[])
     }
 
     count = 0;
-    absent_coll = absent_local = absent_oplog = 0;
+    absent_coll = absent_local = absent_oplog = absent_shadow = 0;
     fatal = false;
     for (i = 0; i < nth; ++i) {
         initialize_rep(&c_rep[i]);
@@ -773,6 +788,13 @@ main(int argc, char *argv[])
                 if (c_rep[i].first_miss == INVALID_KEY)
                     c_rep[i].first_miss = key;
                 c_rep[i].absent_key = key;
+            } else if ((ret = cur_shadow->search(cur_shadow)) != 0) {
+                if (ret != WT_NOTFOUND)
+                    testutil_die(ret, "shadow search");
+                else {
+                    printf("%s: SHADOW no record with key %" PRIu64 "\n", fname, key);
+                    absent_shadow++;
+                }
             } else if (c_rep[i].absent_key != INVALID_KEY && c_rep[i].exist_key == INVALID_KEY) {
                 /*
                  * If we get here we found a record that exists after absent records, a hole in our
@@ -844,6 +866,10 @@ main(int argc, char *argv[])
     testutil_check(conn->close(conn, NULL));
     if (!inmem && absent_coll) {
         printf("COLLECTION: %" PRIu64 " record(s) absent from %" PRIu64 "\n", absent_coll, count);
+        fatal = true;
+    }
+    if (!inmem && absent_shadow) {
+        printf("SHADOW: %" PRIu64 " record(s) absent from %" PRIu64 "\n", absent_shadow, count);
         fatal = true;
     }
     if (!inmem && absent_local) {

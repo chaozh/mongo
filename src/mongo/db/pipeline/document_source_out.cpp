@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -35,14 +35,13 @@
 
 #include <fmt/format.h>
 
-#include "mongo/db/background.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/pipeline/document_path_support.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/destructor_guard.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -53,9 +52,6 @@ MONGO_FAIL_POINT_DEFINE(outWaitAfterTempCollectionCreation);
 REGISTER_DOCUMENT_SOURCE(out,
                          DocumentSourceOut::LiteParsed::parse,
                          DocumentSourceOut::createFromBson);
-REGISTER_DOCUMENT_SOURCE(internalOutToDifferentDB,
-                         DocumentSourceOut::LiteParsed::parseToDifferentDB,
-                         DocumentSourceOut::createFromBsonToDifferentDB);
 
 DocumentSourceOut::~DocumentSourceOut() {
     DESTRUCTOR_GUARD(
@@ -76,36 +72,34 @@ DocumentSourceOut::~DocumentSourceOut() {
         });
 }
 
-std::unique_ptr<DocumentSourceOut::LiteParsed> DocumentSourceOut::LiteParsed::parseToDifferentDB(
-    const NamespaceString& nss, const BSONElement& spec) {
-
-    auto specObj = spec.Obj();
-    auto dbElem = specObj["db"];
-    auto collElem = specObj["coll"];
-    uassert(16994,
-            str::stream() << kStageName << " must have db and coll string arguments",
-            dbElem.type() == BSONType::String && collElem.type() == BSONType::String);
-    NamespaceString targetNss{dbElem.String(), collElem.String()};
-    uassert(ErrorCodes::InvalidNamespace,
-            "Invalid {} target namespace, {}"_format(kStageName, targetNss.ns()),
-            targetNss.isValid());
-
-    return std::make_unique<DocumentSourceOut::LiteParsed>(std::move(targetNss));
+NamespaceString DocumentSourceOut::parseNsFromElem(const BSONElement& spec,
+                                                   const StringData& defaultDB) {
+    if (spec.type() == BSONType::String) {
+        return NamespaceString(defaultDB, spec.valueStringData());
+    } else if (spec.type() == BSONType::Object) {
+        auto nsObj = spec.Obj();
+        uassert(16994,
+                str::stream() << "If an object is passed to " << kStageName
+                              << " it must have exactly 2 fields: 'db' and 'coll'",
+                nsObj.nFields() == 2 && nsObj.hasField("coll") && nsObj.hasField("db"));
+        return NamespaceString(nsObj["db"].String(), nsObj["coll"].String());
+    } else {
+        uassert(16990,
+                "{} only supports a string or object argument, but found {}"_format(
+                    kStageName, typeName(spec.type())),
+                spec.type() == BSONType::String);
+    }
+    MONGO_UNREACHABLE;
 }
 
 std::unique_ptr<DocumentSourceOut::LiteParsed> DocumentSourceOut::LiteParsed::parse(
     const NamespaceString& nss, const BSONElement& spec) {
 
-    uassert(16990,
-            "{} only supports a string argument, but found {}"_format(kStageName,
-                                                                      typeName(spec.type())),
-            spec.type() == BSONType::String);
-    NamespaceString targetNss{nss.db(), spec.valueStringData()};
+    NamespaceString targetNss = parseNsFromElem(spec, nss.db());
     uassert(ErrorCodes::InvalidNamespace,
             "Invalid {} target namespace, {}"_format(kStageName, targetNss.ns()),
             targetNss.isValid());
-
-    return std::make_unique<DocumentSourceOut::LiteParsed>(std::move(targetNss));
+    return std::make_unique<DocumentSourceOut::LiteParsed>(spec.fieldName(), std::move(targetNss));
 }
 
 void DocumentSourceOut::initialize() {
@@ -114,6 +108,8 @@ void DocumentSourceOut::initialize() {
     const auto& outputNs = getOutputNs();
     // We will write all results into a temporary collection, then rename the temporary collection
     // to be the target collection once we are done.
+    // Note that this temporary collection name is used by MongoMirror and thus should not be
+    // changed without consultation.
     _tempNs = NamespaceString(str::stream() << outputNs.db() << ".tmp.agg_out." << UUID::gen());
 
     // Save the original collection options and index specs so we can check they didn't change
@@ -132,11 +128,6 @@ void DocumentSourceOut::initialize() {
             "namespace '{}' is capped so it can't be used for {}"_format(outputNs.ns(), kStageName),
             _originalOutOptions["capped"].eoo());
 
-    // Create temp collection, copying options from the existing output collection if any.
-    // Disallows drops and renames on this namespace. This is required to ensure
-    // 'createIndexesOnEmptyCollection' is called on a namespace that both exists and is empty as
-    // the function expects.
-    BackgroundOperation backgroundOp(_tempNs.ns());
     {
         BSONObjBuilder cmd;
         cmd << "create" << _tempNs.coll();
@@ -152,8 +143,8 @@ void DocumentSourceOut::initialize() {
         pExpCtx->opCtx,
         "outWaitAfterTempCollectionCreation",
         []() {
-            log() << "Hanging aggregation due to 'outWaitAfterTempCollectionCreation' "
-                  << "failpoint";
+            LOGV2(20901,
+                  "Hanging aggregation due to 'outWaitAfterTempCollectionCreation' failpoint");
         });
     if (_originalIndexes.empty()) {
         return;
@@ -188,16 +179,6 @@ void DocumentSourceOut::finalize() {
 boost::intrusive_ptr<DocumentSource> DocumentSourceOut::create(
     NamespaceString outputNs, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
 
-    // TODO (SERVER-36832): Allow this combination.
-    uassert(50939,
-            "{} is not supported when the output collection is in a different "
-            "database"_format(kStageName),
-            outputNs.db() == expCtx->ns.db());
-    return createAndAllowDifferentDB(outputNs, expCtx);
-}
-
-boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createAndAllowDifferentDB(
-    NamespaceString outputNs, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             "{} cannot be used in a transaction"_format(kStageName),
             !expCtx->inMultiDocumentTransaction);
@@ -219,24 +200,12 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createAndAllowDifferentD
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
     BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    uassert(31278,
-            "{} only supports a string argument, but found {}"_format(kStageName,
-                                                                      typeName(elem.type())),
-            elem.type() == BSONType::String);
-    return create({expCtx->ns.db(), elem.str()}, expCtx);
+    auto targetNS = parseNsFromElem(elem, expCtx->ns.db());
+    return create(targetNS, expCtx);
 }
 
-boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBsonToDifferentDB(
-    BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-
-    auto nsObj = elem.Obj();
-    return createAndAllowDifferentDB(NamespaceString(nsObj["db"].String(), nsObj["coll"].String()),
-                                     expCtx);
-}
 Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    return _toDifferentDB
-        ? Value(DOC(getSourceName() << DOC("db" << _outputNs.db() << "coll" << _outputNs.coll())))
-        : Value(DOC(getSourceName() << _outputNs.coll()));
+    return Value(DOC(kStageName << DOC("db" << _outputNs.db() << "coll" << _outputNs.coll())));
 }
 
 void DocumentSourceOut::waitWhileFailPointEnabled() {
@@ -245,8 +214,8 @@ void DocumentSourceOut::waitWhileFailPointEnabled() {
         pExpCtx->opCtx,
         "hangWhileBuildingDocumentSourceOutBatch",
         []() {
-            log() << "Hanging aggregation due to 'hangWhileBuildingDocumentSourceOutBatch' "
-                  << "failpoint";
+            LOGV2(20902,
+                  "Hanging aggregation due to 'hangWhileBuildingDocumentSourceOutBatch' failpoint");
         });
 }
 

@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/index_catalog.h"
@@ -40,6 +42,9 @@
 #include "mongo/db/repl/idempotency_update_sequence.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/update/document_diff_calculator.h"
+#include "mongo/db/update/document_diff_test_helpers.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -65,22 +70,44 @@ protected:
     Status resetState() override;
 
     void runIdempotencyTestCase();
+    void runUpdateV2IdempotencyTestCase(double v2Probability);
 
     std::vector<OplogEntry> initOps;
     int64_t seed;
+
+private:
+    // Op-style updates cannot guarantee field order for certain cases.
+    bool _ignoreFieldOrder = true;
 };
 
-BSONObj RandomizedIdempotencyTest::canonicalizeDocumentForDataHash(const BSONObj& obj) {
+BSONObj canonicalizeBSONObjForDataHash(const BSONObj& obj);
+
+BSONArray canonicalizeArrayForDataHash(const BSONObj& arr) {
+    BSONArrayBuilder arrBuilder;
+    for (auto&& elem : arr) {
+        if (elem.type() == mongo::Array) {
+            arrBuilder.append(canonicalizeArrayForDataHash(elem.embeddedObject()));
+        } else if (elem.type() == mongo::Object) {
+            arrBuilder.append(canonicalizeBSONObjForDataHash(elem.embeddedObject()));
+        } else {
+            arrBuilder.append(elem);
+        }
+    }
+    return BSONArray(arrBuilder.obj());
+}
+
+BSONObj canonicalizeBSONObjForDataHash(const BSONObj& obj) {
     BSONObjBuilder objBuilder;
     BSONObjIteratorSorted iter(obj);
     while (iter.more()) {
         auto elem = iter.next();
         if (elem.isABSONObj()) {
             if (elem.type() == mongo::Array) {
-                objBuilder.append(elem.fieldName(), obj);
+                objBuilder.append(elem.fieldName(),
+                                  canonicalizeArrayForDataHash(elem.embeddedObject()));
             } else {
                 // If it is a sub object, we'll have to sort it as well before we append it.
-                auto sortedObj = canonicalizeDocumentForDataHash(elem.Obj());
+                auto sortedObj = canonicalizeBSONObjForDataHash(elem.Obj());
                 objBuilder.append(elem.fieldName(), sortedObj);
             }
         } else {
@@ -88,10 +115,15 @@ BSONObj RandomizedIdempotencyTest::canonicalizeDocumentForDataHash(const BSONObj
             objBuilder.append(elem);
         }
     }
-
     return objBuilder.obj();
 }
 
+BSONObj RandomizedIdempotencyTest::canonicalizeDocumentForDataHash(const BSONObj& obj) {
+    if (!_ignoreFieldOrder) {
+        return obj;
+    }
+    return canonicalizeBSONObjForDataHash(obj);
+}
 BSONObj RandomizedIdempotencyTest::getDoc() {
     AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
     BSONObj doc;
@@ -114,7 +146,10 @@ std::vector<OplogEntry> RandomizedIdempotencyTest::createUpdateSequence(
 std::string RandomizedIdempotencyTest::getStatesString(const std::vector<CollectionState>& state1,
                                                        const std::vector<CollectionState>& state2,
                                                        const std::vector<OplogEntry>& ops) {
-    unittest::log() << IdempotencyTest::getStatesString(state1, state2, ops);
+    LOGV2(21157,
+          "{IdempotencyTest_getStatesString_state1_state2_ops}",
+          "IdempotencyTest_getStatesString_state1_state2_ops"_attr =
+              IdempotencyTest::getStatesString(state1, state2, ops));
     StringBuilder sb;
     sb << "Ran update ops: ";
     sb << "[ ";
@@ -152,6 +187,7 @@ Status RandomizedIdempotencyTest::resetState() {
 }
 
 void RandomizedIdempotencyTest::runIdempotencyTestCase() {
+    _ignoreFieldOrder = true;
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
@@ -159,11 +195,9 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
     size_t depth = 1;
     size_t length = 1;
 
-    // Eliminate the chance of a sub array, because they cause theoretically valid sequences that
-    // cause idempotency issues.
-    const double kScalarProbability = 0.375;
-    const double kDocProbability = 0.375;
-    const double kArrProbability = 0.0;
+    const double kScalarProbability = 0.25;
+    const double kDocProbability = 0.25;
+    const double kArrProbability = 0.25;
 
     this->seed = SecureRandom().nextInt64();
     PseudoRandom seedGenerator(this->seed);
@@ -193,8 +227,72 @@ void RandomizedIdempotencyTest::runIdempotencyTestCase() {
     }
 }
 
+void RandomizedIdempotencyTest::runUpdateV2IdempotencyTestCase(double v2Probability) {
+    _ignoreFieldOrder = (v2Probability < 1.0);
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
+
+    this->seed = SecureRandom().nextInt64();
+    PseudoRandom seedGenerator(this->seed);
+    RandomizedScalarGenerator scalarGenerator{PseudoRandom(seedGenerator.nextInt64())};
+    std::set<StringData> fields{"f00", "f10", "f01", "f11", "f02", "f20"};
+    UpdateSequenceGenerator updateV1Generator({fields, 2 /* depth */, 2 /* length */},
+                                              PseudoRandom(seedGenerator.nextInt64()),
+                                              &scalarGenerator);
+
+    auto generateDocWithId = [&seedGenerator](int id) {
+        MutableDocument doc;
+        doc.addField("_id", Value(id));
+        PseudoRandom rng(seedGenerator.nextInt64());
+        return doc_diff::generateDoc(&rng, &doc, 0);
+    };
+
+    PseudoRandom rng(seedGenerator.nextInt64());
+    for (auto simulation = 0; simulation < 10; ++simulation) {
+        // Initialize the collection with a single document, which would later be updated.
+        auto inputObj = generateDocWithId(kDocId);
+        this->initOps = std::vector<OplogEntry>{createCollection(), insert(inputObj)};
+        ASSERT_OK(resetState());
+        ASSERT_BSONOBJ_BINARY_EQ(inputObj, getDoc());
+
+        auto oldDoc = inputObj;
+        const size_t kUpdateSequenceLength = 15;
+        std::vector<OplogEntry> updateSequence;
+        for (size_t i = 0; i < kUpdateSequenceLength; i++) {
+            BSONObj oplogDiff;
+            boost::optional<BSONObj> generatedDoc;
+            if (rng.nextCanonicalDouble() <= v2Probability) {
+                // With delta based updates, we cannot just generate any random diff since certains
+                // diff when applied to an unrelated object (which would never have produced by
+                // computing the input objects) would break idempotency. So we do a dry run of what
+                // the collection state would look like and compute diffs based on that.
+                generatedDoc = generateDocWithId(kDocId);
+                auto diff = doc_diff::computeDiff(oldDoc, *generatedDoc);
+                ASSERT(diff);
+                oplogDiff = BSON("$v" << 2 << "diff" << *diff);
+            } else {
+                oplogDiff = updateV1Generator.generateUpdate();
+            }
+            auto op = update(kDocId, oplogDiff);
+            ASSERT_OK(runOpInitialSync(op));
+            if (generatedDoc) {
+                ASSERT_BSONOBJ_BINARY_EQ(*generatedDoc, getDoc());
+            }
+            oldDoc = getDoc();
+            updateSequence.push_back(std::move(op));
+        }
+        testOpsAreIdempotent(updateSequence, SequenceType::kAnyPrefixOrSuffix);
+    }
+}
+
 TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotent) {
     runIdempotencyTestCase();
+}
+TEST_F(RandomizedIdempotencyTest, CheckUpdateSequencesAreIdempotentV2) {
+    runUpdateV2IdempotencyTestCase(1.0);
+    runUpdateV2IdempotencyTestCase(0.4);
+    runUpdateV2IdempotencyTestCase(0.5);
+    runUpdateV2IdempotencyTestCase(0.6);
 }
 
 TEST_F(IdempotencyTest, UpdateTwoFields) {

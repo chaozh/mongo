@@ -33,6 +33,9 @@
 #include <vector>
 
 #include "mongo/client/replica_set_change_notifier.h"
+#include "mongo/executor/egress_tag_closer.h"
+#include "mongo/executor/network_connection_hook.h"
+#include "mongo/executor/network_interface.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/hierarchical_acquisition.h"
@@ -45,6 +48,46 @@ class ConnectionString;
 class ReplicaSetMonitor;
 class MongoURI;
 
+class ReplicaSetMonitorManagerNetworkConnectionHook final : public executor::NetworkConnectionHook {
+public:
+    ReplicaSetMonitorManagerNetworkConnectionHook() = default;
+    virtual ~ReplicaSetMonitorManagerNetworkConnectionHook() = default;
+
+    Status validateHost(const HostAndPort& remoteHost,
+                        const BSONObj& isMasterRequest,
+                        const executor::RemoteCommandResponse& isMasterReply) override;
+
+    StatusWith<boost::optional<executor::RemoteCommandRequest>> makeRequest(
+        const HostAndPort& remoteHost) override;
+
+    Status handleReply(const HostAndPort& remoteHost,
+                       executor::RemoteCommandResponse&& response) override;
+};
+
+class ReplicaSetMonitorConnectionManager : public executor::EgressTagCloser {
+    ReplicaSetMonitorConnectionManager() = delete;
+
+public:
+    ReplicaSetMonitorConnectionManager(std::shared_ptr<executor::NetworkInterface> network)
+        : _network(network) {}
+
+    void dropConnections(const HostAndPort& hostAndPort) override;
+
+    // Not supported.
+    void dropConnections(transport::Session::TagMask tags) override {
+        MONGO_UNREACHABLE;
+    };
+    // Not supported.
+    void mutateTags(const HostAndPort& hostAndPort,
+                    const std::function<transport::Session::TagMask(transport::Session::TagMask)>&
+                        mutateFunc) override {
+        MONGO_UNREACHABLE;
+    };
+
+private:
+    std::shared_ptr<executor::NetworkInterface> _network;
+};
+
 /**
  * Manages the lifetime of a set of replica set monitors.
  */
@@ -53,8 +96,10 @@ class ReplicaSetMonitorManager {
     ReplicaSetMonitorManager& operator=(const ReplicaSetMonitorManager&) = delete;
 
 public:
-    ReplicaSetMonitorManager();
+    ReplicaSetMonitorManager() = default;
     ~ReplicaSetMonitorManager();
+
+    static ReplicaSetMonitorManager* get();
 
     /**
      * Create or retrieve a monitor for a particular replica set. The getter method returns
@@ -76,6 +121,8 @@ public:
      */
     void removeMonitor(StringData setName);
 
+    std::shared_ptr<ReplicaSetMonitor> getMonitorForHost(const HostAndPort& host);
+
     /**
      * Removes and destroys all replica set monitors. Should be used for unit tests only.
      */
@@ -95,21 +142,31 @@ public:
     /**
      * Returns an executor for running RSM tasks.
      */
-    executor::TaskExecutor* getExecutor();
+    std::shared_ptr<executor::TaskExecutor> getExecutor();
 
     ReplicaSetChangeNotifier& getNotifier();
 
     bool isShutdown() const;
 
+
 private:
+    /**
+     * Returns an EgressTagCloser controlling the executor's network interface.
+     */
+    std::shared_ptr<executor::EgressTagCloser> _getConnectionManager();
+
     using ReplicaSetMonitorsMap = StringMap<std::weak_ptr<ReplicaSetMonitor>>;
 
     // Protects access to the replica set monitors
     mutable Mutex _mutex =
-        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(4), "ReplicaSetMonitorManager::_mutex");
+        MONGO_MAKE_LATCH(HierarchicalAcquisitionLevel(6), "ReplicaSetMonitorManager::_mutex");
 
     // Executor for monitoring replica sets.
-    std::unique_ptr<executor::TaskExecutor> _taskExecutor;
+    std::shared_ptr<executor::TaskExecutor> _taskExecutor;
+
+    // Allows closing connections established by the network interface associated with the
+    // _taskExecutor instance
+    std::shared_ptr<ReplicaSetMonitorConnectionManager> _connectionManager;
 
     // Widget to notify listeners when a RSM notices a change
     ReplicaSetChangeNotifier _notifier;

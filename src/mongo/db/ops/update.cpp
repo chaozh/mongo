@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,6 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -50,7 +49,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/update/update_driver.h"
 #include "mongo/db/update_index_data.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -59,38 +57,34 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     invariant(db);
 
     // Explain should never use this helper.
-    invariant(!request.isExplain());
+    invariant(!request.explain());
 
     const NamespaceString& nsString = request.getNamespaceString();
-    Collection* collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nsString);
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nsString, MODE_IX));
+
+    Collection* collection;
 
     // The update stage does not create its own collection.  As such, if the update is
     // an upsert, create the collection that the update stage inserts into beforehand.
-    if (!collection && request.isUpsert()) {
-        // We have to have an exclusive lock on the db to be allowed to create the collection.
-        // Callers should either get an X or create the collection.
-        const Locker* locker = opCtx->lockState();
-        invariant(locker->isW() ||
-                  locker->isLockHeldForMode(ResourceId(RESOURCE_DATABASE, nsString.db()), MODE_IX));
+    writeConflictRetry(opCtx, "createCollection", nsString.ns(), [&] {
+        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nsString);
+        if (collection || !request.isUpsert()) {
+            return;
+        }
 
-        writeConflictRetry(opCtx, "createCollection", nsString.ns(), [&] {
-            Lock::DBLock lk(opCtx, nsString.db(), MODE_X);
+        const bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
+            !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nsString);
 
-            const bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-                !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nsString);
-
-            if (userInitiatedWritesAndNotPrimary) {
-                uassertStatusOK(Status(ErrorCodes::PrimarySteppedDown,
-                                       str::stream() << "Not primary while creating collection "
-                                                     << nsString << " during upsert"));
-            }
-            WriteUnitOfWork wuow(opCtx);
-            collection = db->createCollection(opCtx, nsString, CollectionOptions());
-            invariant(collection);
-            wuow.commit();
-        });
-    }
+        if (userInitiatedWritesAndNotPrimary) {
+            uassertStatusOK(Status(ErrorCodes::PrimarySteppedDown,
+                                   str::stream() << "Not primary while creating collection "
+                                                 << nsString << " during upsert"));
+        }
+        WriteUnitOfWork wuow(opCtx);
+        collection = db->createCollection(opCtx, nsString, CollectionOptions());
+        invariant(collection);
+        wuow.commit();
+    });
 
     // Parse the update, get an executor for it, run the executor, get stats out.
     const ExtensionsCallbackReal extensionsCallback(opCtx, &request.getNamespaceString());
@@ -98,35 +92,14 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     uassertStatusOK(parsedUpdate.parseRequest());
 
     OpDebug* const nullOpDebug = nullptr;
-    auto exec = uassertStatusOK(getExecutorUpdate(
-        opCtx, nullOpDebug, collection, &parsedUpdate, boost::none /* verbosity */));
+    auto exec = uassertStatusOK(
+        getExecutorUpdate(nullOpDebug, collection, &parsedUpdate, boost::none /* verbosity */));
 
-    uassertStatusOK(exec->executePlan());
+    exec->executePlan();
 
     const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
 
     return UpdateStage::makeUpdateResult(updateStats);
-}
-
-BSONObj applyUpdateOperators(OperationContext* opCtx,
-                             const BSONObj& from,
-                             const BSONObj& operators) {
-    const CollatorInterface* collator = nullptr;
-    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
-    UpdateDriver driver(std::move(expCtx));
-    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    driver.parse(operators, arrayFilters);
-
-    mutablebson::Document doc(from, mutablebson::Document::kInPlaceDisabled);
-
-    const bool validateForStorage = false;
-    const FieldRefSet emptyImmutablePaths;
-    const bool isInsert = false;
-
-    uassertStatusOK(
-        driver.update(StringData(), &doc, validateForStorage, emptyImmutablePaths, isInsert));
-
-    return doc.getObject();
 }
 
 }  // namespace mongo

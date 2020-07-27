@@ -40,8 +40,8 @@
 #include "mongo/db/pipeline/document_source_check_resume_token.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/db/pipeline/resume_token.h"
-#include "mongo/db/pipeline/stub_mongo_process_interface.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/unittest/death_test.h"
@@ -57,7 +57,7 @@ static constexpr StringData kTestNs = "test.ns"_sd;
 
 class CheckResumeTokenTest : public AggregationContextFixture {
 public:
-    CheckResumeTokenTest() : _mock(DocumentSourceMock::createForTest()) {}
+    CheckResumeTokenTest() : _mock(DocumentSourceMock::createForTest(getExpCtx())) {}
 
 protected:
     /**
@@ -261,7 +261,7 @@ TEST_F(CheckResumeTokenTest, ShouldFailIfTokenHasWrongNamespace) {
 
 TEST_F(CheckResumeTokenTest, ShouldSucceedWithBinaryCollation) {
     CollatorInterfaceMock collatorCompareLower(CollatorInterfaceMock::MockType::kToLowerString);
-    getExpCtx()->setCollator(&collatorCompareLower);
+    getExpCtx()->setCollator(collatorCompareLower.clone());
 
     Timestamp resumeTimestamp(100, 1);
 
@@ -601,30 +601,12 @@ public:
         return false;
     }
 
-    std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const MakePipelineOptions opts) final {
-        auto pipeline = uassertStatusOK(Pipeline::parse(rawPipeline, expCtx));
-
-        if (opts.optimize) {
-            pipeline->optimizePipeline();
-        }
-
-        if (opts.attachCursorSource) {
-            pipeline = attachCursorSourceToPipeline(expCtx, pipeline.release(), false);
-        }
-
-        return pipeline;
-    }
-
     std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        Pipeline* ownedPipeline,
-        bool localCursorOnly) final {
-        std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
-                                                            PipelineDeleter(expCtx->opCtx));
-        pipeline->addInitialSource(DocumentSourceMock::createForTest(_mockResults));
+        Pipeline* ownedPipeline, bool localCursorOnly) final {
+        std::unique_ptr<Pipeline, PipelineDeleter> pipeline(
+            ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->opCtx));
+        pipeline->addInitialSource(
+            DocumentSourceMock::createForTest(_mockResults, pipeline->getContext()));
         return pipeline;
     }
 
@@ -702,7 +684,7 @@ TEST_F(ShardCheckResumabilityTest,
     deque<DocumentSource::GetNextResult> mockOplog({Document{{"ts", oplogTimestamp}}});
     getExpCtx()->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockOplog);
     ASSERT_THROWS_CODE(
-        shardCheckResumability->getNext(), AssertionException, ErrorCodes::ChangeStreamFatalError);
+        shardCheckResumability->getNext(), AssertionException, ErrorCodes::ChangeStreamHistoryLost);
 }
 
 TEST_F(ShardCheckResumabilityTest, ShouldSucceedWithNoDocumentsInPipelineAndOplogIsEmpty) {
@@ -742,7 +724,7 @@ TEST_F(ShardCheckResumabilityTest,
     deque<DocumentSource::GetNextResult> mockOplog({Document{{"ts", oplogTimestamp}}});
     getExpCtx()->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockOplog);
     ASSERT_THROWS_CODE(
-        shardCheckResumability->getNext(), AssertionException, ErrorCodes::ChangeStreamFatalError);
+        shardCheckResumability->getNext(), AssertionException, ErrorCodes::ChangeStreamHistoryLost);
 }
 
 TEST_F(ShardCheckResumabilityTest, ShouldIgnoreOplogAfterFirstDoc) {

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -50,8 +50,9 @@
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/query_settings_decoration.h"
+#include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/util/log.h"
 
 
 namespace {
@@ -74,7 +75,7 @@ static Status getQuerySettingsAndPlanCache(OperationContext* opCtx,
         return Status(ErrorCodes::BadValue, "no such collection");
     }
 
-    QuerySettings* querySettings = CollectionQueryInfo::get(collection).getQuerySettings();
+    QuerySettings* querySettings = QuerySettingsDecoration::get(collection->getSharedDecorations());
     invariant(querySettings);
 
     *querySettingsOut = querySettings;
@@ -264,7 +265,10 @@ Status ClearFilters::clear(OperationContext* opCtx,
         // Remove entry from plan cache
         planCache->remove(*cq).transitional_ignore();
 
-        LOG(0) << "Removed index filter on " << redact(cq->toStringShort());
+        LOGV2(20479,
+              "Removed index filter on {query}",
+              "Removed index filter on query",
+              "query"_attr = redact(cq->toStringShort()));
 
         return Status::OK();
     }
@@ -320,7 +324,10 @@ Status ClearFilters::clear(OperationContext* opCtx,
         planCache->remove(*cq).transitional_ignore();
     }
 
-    LOG(0) << "Removed all index filters for collection: " << ns;
+    LOGV2(20480,
+          "Removed all index filters for collection: {namespace}",
+          "Removed all index filters for collection",
+          "namespace"_attr = ns);
 
     return Status::OK();
 }
@@ -397,7 +404,11 @@ Status SetFilter::set(OperationContext* opCtx,
     // Remove entry from plan cache.
     planCache->remove(*cq).transitional_ignore();
 
-    LOG(0) << "Index filter set on " << redact(cq->toStringShort()) << " " << indexesElt;
+    LOGV2(20481,
+          "Index filter set on {query} {indexes}",
+          "Index filter set on query",
+          "query"_attr = redact(cq->toStringShort()),
+          "indexes"_attr = indexesElt);
 
     return Status::OK();
 }

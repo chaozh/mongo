@@ -38,7 +38,6 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/active_migrations_registry.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
 #include "mongo/platform/mutex.h"
@@ -202,14 +201,11 @@ private:
 
     stdx::thread _migrateThreadHandle;
 
-    // Whether to use the resumable range deleter. This decision is based on whether the FCV 4.2 or
-    // FCV 4.4 protocol are in use and the disableResumableRangeDeleter option is off.
-    bool _enableResumableRangeDeleter{true};
-
     UUID _migrationId;
     LogicalSessionId _lsid;
     TxnNumber _txnNumber;
     NamespaceString _nss;
+    boost::optional<UUID> _collUuid;
     ConnectionString _fromShardConnString;
     ShardId _fromShard;
     ShardId _toShard;

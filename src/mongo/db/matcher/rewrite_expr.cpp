@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -36,7 +36,7 @@
 #include "mongo/db/matcher/expression_internal_expr_eq.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -44,16 +44,28 @@ using CmpOp = ExpressionCompare::CmpOp;
 
 RewriteExpr::RewriteResult RewriteExpr::rewrite(const boost::intrusive_ptr<Expression>& expression,
                                                 const CollatorInterface* collator) {
-    LOG(5) << "Expression prior to rewrite: " << expression->serialize(false);
+    LOGV2_DEBUG(20725,
+                5,
+                "Expression prior to rewrite: {expression}",
+                "Expression prior to rewrite",
+                "expression"_attr = expression->serialize(false));
 
     RewriteExpr rewriteExpr(collator);
     std::unique_ptr<MatchExpression> matchExpression;
 
     if (auto matchTree = rewriteExpr._rewriteExpression(expression)) {
         matchExpression = std::move(matchTree);
-        LOG(5) << "Post-rewrite MatchExpression: " << matchExpression->debugString();
+        LOGV2_DEBUG(20726,
+                    5,
+                    "Post-rewrite MatchExpression: {expression}",
+                    "Post-rewrite MatchExpression",
+                    "expression"_attr = matchExpression->debugString());
         matchExpression = MatchExpression::optimize(std::move(matchExpression));
-        LOG(5) << "Post-rewrite/post-optimized MatchExpression: " << matchExpression->debugString();
+        LOGV2_DEBUG(20727,
+                    5,
+                    "Post-rewrite/post-optimized MatchExpression: {expression}",
+                    "Post-rewrite/post-optimized MatchExpression",
+                    "expression"_attr = matchExpression->debugString());
     }
 
     return {std::move(matchExpression), std::move(rewriteExpr._matchExprElemStorage)};

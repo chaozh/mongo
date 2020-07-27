@@ -35,6 +35,7 @@
 #include "mongo/base/status.h"
 #include "mongo/db/json.h"
 #include "mongo/db/logical_time.h"
+#include "mongo/db/read_write_concern_provenance.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/util/time_support.h"
@@ -53,6 +54,8 @@ public:
     static constexpr StringData kAfterClusterTimeFieldName = "afterClusterTime"_sd;
     static constexpr StringData kAtClusterTimeFieldName = "atClusterTime"_sd;
     static constexpr StringData kLevelFieldName = "level"_sd;
+
+    static const BSONObj kImplicitDefault;
 
     /**
      * Represents the internal mechanism an operation uses to satisfy 'majority' read concern.
@@ -168,6 +171,34 @@ public:
     BSONObj toBSONInner() const;
     std::string toString() const;
 
+    ReadWriteConcernProvenance& getProvenance() {
+        return _provenance;
+    }
+    const ReadWriteConcernProvenance& getProvenance() const {
+        return _provenance;
+    }
+
+    /**
+     * Set atClusterTime, clear afterClusterTime. The BSON representation becomes
+     * {level: "snapshot", atClusterTime: <ts>}.
+     */
+    void setArgsAtClusterTimeForSnapshot(Timestamp ts) {
+        invariant(_level && _level == ReadConcernLevel::kSnapshotReadConcern);
+        // Only overwrite a server-selected atClusterTime, not user-supplied.
+        invariant(_atClusterTime.is_initialized() == _atClusterTimeSelected);
+        _afterClusterTime = boost::none;
+        _atClusterTime = LogicalTime(ts);
+        _atClusterTimeSelected = true;
+    }
+
+    /**
+     * Return whether an atClusterTime has been selected by the server for a snapshot read. This
+     * function returns false if the atClusterTime was specified by the client.
+     */
+    bool wasAtClusterTimeSelected() const {
+        return _atClusterTimeSelected;
+    }
+
 private:
     /**
      * Appends level, afterOpTime, and the other "inner" fields of the read concern args.
@@ -200,6 +231,10 @@ private:
      * opposed to being absent or missing.
      */
     bool _specified;
+
+    ReadWriteConcernProvenance _provenance;
+
+    bool _atClusterTimeSelected = false;
 };
 
 }  // namespace repl

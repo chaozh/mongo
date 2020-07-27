@@ -3,14 +3,20 @@ test_kind: js_test
 selector:
   roots:
   - jstests/sharding/*.js
+  - jstests/sharding/change_streams/*.js
+  - jstests/sharding/query/*.js
   exclude_files:
-  # Auth tests require authentication on the stepdown thread's connection
-  - jstests/sharding/auth*.js
+    # Skip any tests that run with auth explicitly.
+    # Auth tests require authentication on the stepdown thread's connection
+  - jstests/sharding/*[aA]uth*.js
+  - jstests/sharding/query/*[aA]uth*.js
+  - jstests/sharding/change_streams/*[aA]uth*.js
+
   - jstests/sharding/localhostAuthBypass.js
   - jstests/sharding/kill_sessions.js
   - jstests/sharding/mongos_rs_auth_shard_failure_tolerance.js
-  - jstests/sharding/mrShardedOutputAuth.js
-  - jstests/sharding/aggregation_currentop.js
+  - jstests/sharding/query/mrShardedOutputAuth.js
+  - jstests/sharding/query/aggregation_currentop.js
   - jstests/sharding/advance_cluster_time_action_type.js
   - jstests/sharding/mongod_returns_no_cluster_time_without_keys.js
   # Count/write/aggregate commands against the config shard do not support retries yet
@@ -18,20 +24,18 @@ selector:
   - jstests/sharding/addshard2.js
   - jstests/sharding/autosplit.js
   - jstests/sharding/auto_rebalance_parallel.js
-  - jstests/sharding/auto_rebalance_parallel_replica_sets.js
   - jstests/sharding/basic_drop_coll.js
   - jstests/sharding/basic_merge.js
   - jstests/sharding/count1.js
   - jstests/sharding/count2.js
-  - jstests/sharding/current_op_with_drop_shard.js
+  - jstests/sharding/query/current_op_with_drop_shard.js
   - jstests/sharding/cursor1.js
   - jstests/sharding/diffservers1.js
   - jstests/sharding/disable_autosplit.js
-  - jstests/sharding/drop_collection_in_admin_and_config_dbs.js
   - jstests/sharding/drop_sharded_db.js
   - jstests/sharding/findandmodify1.js
-  - jstests/sharding/findandmodify2.js
-  - jstests/sharding/geo_near_sharded.js
+  - jstests/sharding/findandmodify_autosplit.js
+  - jstests/sharding/query/geo_near_sharded.js
   - jstests/sharding/hash_basic.js
   - jstests/sharding/hash_shard1.js
   - jstests/sharding/hash_shard_non_empty.js
@@ -49,6 +53,7 @@ selector:
   - jstests/sharding/prefix_shard_key.js
   - jstests/sharding/presplit.js
   - jstests/sharding/query_config.js
+  - jstests/sharding/range_deleter_interacts_correctly_with_refine_shard_key.js
   - jstests/sharding/remove1.js
   - jstests/sharding/rename_across_mongos.js
   - jstests/sharding/shard1.js
@@ -96,11 +101,13 @@ selector:
   - jstests/sharding/key_rotation.js
   - jstests/sharding/keys_rotation_interval_sec.js
   - jstests/sharding/migration_coordinator_basic.js # sets a failpoint on the config primary
-  - jstests/sharding/migration_coordinator_failover.js # sets a failpoint on the config primary
+  - jstests/sharding/migration_coordinator_abort_failover.js # sets a failpoint on the config primary
+  - jstests/sharding/migration_coordinator_commit_failover.js # sets a failpoint on the config primary
   - jstests/sharding/move_chunk_find_and_modify_with_write_retryability.js
   - jstests/sharding/move_chunk_insert_with_write_retryability.js
   - jstests/sharding/move_chunk_remove_with_write_retryability.js
   - jstests/sharding/move_chunk_update_with_write_retryability.js
+  - jstests/sharding/restart_transactions.js
   - jstests/sharding/txn_two_phase_commit_commands_basic_requirements.js
   - jstests/sharding/txn_two_phase_commit_coordinator_shutdown_and_restart.js
   - jstests/sharding/txn_two_phase_commit_failover.js
@@ -130,11 +137,13 @@ selector:
   - jstests/sharding/mongos_no_replica_set_refresh.js
   - jstests/sharding/movechunk_interrupt_at_primary_stepdown.js
   - jstests/sharding/primary_config_server_blackholed_from_mongos.js
+  - jstests/sharding/refine_collection_shard_key_abort_on_stepup.js
   # Nothing is affected by config server step down
   - jstests/sharding/basic_sharding_params.js
   # ShardingTest is never used, so continuous step down thread never starts
   - jstests/sharding/config_rs_change.js
   - jstests/sharding/empty_cluster_init.js
+  # Temporarily blacklisted until more robust
   # Expects same secondaries for entire test
   - jstests/sharding/commands_that_write_accept_wc_configRS.js
   - jstests/sharding/commands_that_write_accept_wc_shards.js
@@ -146,9 +155,6 @@ selector:
   - jstests/sharding/migration_ignore_interrupts_1.js
   - jstests/sharding/migration_sets_fromMigrate_flag.js
   - jstests/sharding/migration_waits_for_majority_commit.js
-  # Stepping down the config can cause moveChunks stopped on shards via killOp to be restarted.
-  - jstests/sharding/migration_ignore_interrupts_3.js
-  - jstests/sharding/migration_ignore_interrupts_4.js
   # listCollections is not retryable
   - jstests/sharding/sessions_collection_auto_healing.js
   # shardCollection is not retryable
@@ -184,23 +190,21 @@ selector:
   # Moves a chunk before continuing a transaction, which can lead to snapshot errors if the
   # CSRS failovers are sufficiently slow.
   - jstests/sharding/transactions_reject_writes_for_moved_chunks.js
-  - jstests/sharding/transactions_target_at_point_in_time.js
+  - jstests/sharding/snapshot_reads_target_at_point_in_time.js
   # Tests that rely on shards becoming aware of collection drops regardless of config stepdowns.
   # (SERVER-34760)
   - jstests/sharding/merge_requires_unique_index.js
-  - jstests/sharding/merge_stale_on_fields.js
-  - jstests/sharding/out_fails_to_replace_sharded_collection.js
+  - jstests/sharding/query/merge_stale_on_fields.js
+  - jstests/sharding/query/out_fails_to_replace_sharded_collection.js
   # In this suite the cluster may end up in a state where each shard believes the
   # collection is sharded and the mongos believes it is unsharded. $merge is not
   # prepared to work correctly in this situation. This should be fixed by a future
   # improvement in sharding infrastructure, and can be unblacklisted by SERVER-40172.
-  - jstests/sharding/merge_to_existing.js
+  - jstests/sharding/query/merge_to_existing.js
   # Sets a failpoint on find commands which can lead to a hang when a config steps down.
   - jstests/sharding/sharding_statistics_server_status.js
   # setShardVersion is not robust during config server stepdown.
   - jstests/sharding/mongos_no_detect_sharding.js
-  # Aggregation with $merge will fail until SERVER-41949 is finished.
-  - jstests/sharding/merge_with_move_primary.js
   # Runs commands directly on the config server primary and is not robust to the primary changing.
   - jstests/sharding/read_write_concern_defaults_commands_api.js
   - jstests/sharding/read_write_concern_defaults_propagation.js
@@ -213,12 +217,18 @@ selector:
   # profiling/logging (on the configsvr primary), so cannot tolerate the configsvr primary changing.
   - jstests/sharding/read_write_concern_defaults_application.js
 
+  # SERVER-48537 addShard is not idempotent for retries
+  - jstests/sharding/conversion_of_replica_set_to_sharded_cluster.js
+  - jstests/sharding/move_primary_with_writes.js
+
 executor:
   config:
     shell_options:
       global_vars:
         TestData:
+          # TODO: SERVER-45994 remove
           skipCheckingCatalogCacheConsistencyWithShardingCatalog: true
+          skipCheckOrphans: true
       eval: "load('jstests/libs/override_methods/sharding_continuous_config_stepdown.js');"
       nodb: ''
       readMode: commands

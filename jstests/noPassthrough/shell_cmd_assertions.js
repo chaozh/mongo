@@ -330,10 +330,96 @@ tests.push(function invalidResponsesAttemptToProvideInformationCommandFailed() {
     });
 });
 
+tests.push(function assertCallsHangAnalyzer() {
+    function runAssertTest(f, expectCall) {
+        const oldMongoRunner = MongoRunner;
+        let runs = 0;
+        try {
+            MongoRunner.runHangAnalyzer = function() {
+                ++runs;
+            };
+            f();
+            assert(false);
+        } catch (e) {
+            if (expectCall) {
+                assert.eq(runs, 1);
+            } else {
+                assert.eq(runs, 0);
+            }
+        } finally {
+            MongoRunner = oldMongoRunner;
+        }
+    }
+    const nonTimeOutWriteConcernError = {
+        n: 1,
+        ok: 1,
+        writeConcernError: {
+            code: ErrorCodes.WriteConcernFailed,
+            codeName: "WriteConcernFailed",
+            errmsg: "foo",
+        },
+    };
+
+    const lockTimeoutError = {
+        ok: 0,
+        errmsg: "Unable to acquire lock",
+        code: ErrorCodes.LockTimeout,
+        codeName: "LockTimeout",
+    };
+
+    const lockTimeoutTransientTransactionError = {
+        errorLabels: ["TransientTransactionError"],
+        ok: 0,
+        errmsg: "Unable to acquire lock",
+        code: ErrorCodes.LockTimeout,
+        codeName: "LockTimeout",
+    };
+
+    runAssertTest(() => assert.commandWorked(sampleWriteConcernError), true);
+    runAssertTest(() => assert.commandWorked(nonTimeOutWriteConcernError), false);
+
+    runAssertTest(() => assert.commandFailed(sampleWriteConcernError), false);
+
+    runAssertTest(
+        () => assert.commandFailedWithCode(sampleWriteConcernError, ErrorCodes.DuplicateKey), true);
+    runAssertTest(
+        () => assert.commandFailedWithCode(nonTimeOutWriteConcernError, ErrorCodes.DuplicateKey),
+        false);
+    runAssertTest(
+        () => assert.commandFailedWithCode(sampleWriteConcernError, ErrorCodes.WriteConcernFailed),
+        false);
+
+    runAssertTest(() => assert.commandWorkedIgnoringWriteConcernErrors(sampleWriteConcernError),
+                  false);
+
+    runAssertTest(() => assert.commandWorked(lockTimeoutError), true);
+    runAssertTest(() => assert.commandFailed(lockTimeoutError), false);
+    runAssertTest(() => assert.commandFailedWithCode(lockTimeoutError, ErrorCodes.DuplicateKey),
+                  true);
+    runAssertTest(() => assert.commandFailedWithCode(lockTimeoutError, ErrorCodes.LockTimeout),
+                  false);
+
+    runAssertTest(() => assert.commandWorked(lockTimeoutTransientTransactionError), false);
+    runAssertTest(() => assert.commandFailed(lockTimeoutTransientTransactionError), false);
+    runAssertTest(() => assert.commandFailedWithCode(lockTimeoutTransientTransactionError,
+                                                     ErrorCodes.DuplicateKey),
+                  false);
+    runAssertTest(() => assert.commandFailedWithCode(lockTimeoutTransientTransactionError,
+                                                     ErrorCodes.LockTimeout),
+                  false);
+});
+
 tests.forEach((test) => {
     jsTest.log(`Starting test '${test.name}'`);
     setup();
-    test();
+    const oldMongoRunner = MongoRunner;
+    try {
+        // We shouldn't actually run the hang-analyzer for these tests.
+        MongoRunner.runHangAnalyzer = Function.prototype;
+        test();
+    } finally {
+        MongoRunner = oldMongoRunner;
+    }
 });
 
 /* cleanup */

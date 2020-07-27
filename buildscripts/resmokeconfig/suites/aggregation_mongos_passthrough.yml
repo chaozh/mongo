@@ -6,15 +6,14 @@ selector:
   exclude_files:
   - jstests/aggregation/extras/*.js
   - jstests/aggregation/data/*.js
-  # The following tests start their own mongod.
-  - jstests/aggregation/bugs/cursor_timeout.js
-  - jstests/aggregation/bugs/lookup_unwind_getmore.js
-  - jstests/aggregation/bugs/lookup_unwind_killcursor.js
   # TODO: Remove when SERVER-23229 is fixed.
   - jstests/aggregation/bugs/groupMissing.js
   # Mongos does not support runtimeConstants.
   - jstests/aggregation/accumulators/internal_js_reduce_with_scope.js
   - jstests/aggregation/expressions/internal_js_emit_with_scope.js
+  # $unionWith explain output does not check whether the collection is sharded in a sharded
+  # cluster.
+  - jstests/aggregation/sources/unionWith/unionWith_explain.js
   exclude_with_any_tags:
   - assumes_against_mongod_not_mongos
   - requires_profiling

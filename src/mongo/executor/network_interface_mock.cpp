@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,7 @@
 
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/network_connection_hook.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
@@ -62,26 +62,6 @@ NetworkInterfaceMock::~NetworkInterfaceMock() {
     invariant(!_hasStarted || inShutdown());
     invariant(_scheduled.empty());
     invariant(_blackHoled.empty());
-}
-
-void NetworkInterfaceMock::logQueues() {
-    stdx::unique_lock<stdx::mutex> lk(_mutex);
-    const std::vector<std::pair<std::string, const NetworkOperationList*>> queues{
-        {"unscheduled", &_unscheduled},
-        {"scheduled", &_scheduled},
-        {"processing", &_processing},
-        {"blackholes", &_blackHoled}};
-
-    for (auto&& queue : queues) {
-        if (queue.second->empty()) {
-            continue;
-        }
-
-        log() << "**** queue: " << queue.first << " ****";
-        for (auto&& item : *queue.second) {
-            log() << "\t\t " << item.getDiagnosticString();
-        }
-    }
 }
 
 std::string NetworkInterfaceMock::getDiagnosticString() {
@@ -128,6 +108,13 @@ Status NetworkInterfaceMock::startCommand(const CallbackHandle& cbHandle,
     }
 
     return Status::OK();
+}
+
+Status NetworkInterfaceMock::startExhaustCommand(const CallbackHandle& cbHandle,
+                                                 RemoteCommandRequestOnAny& request,
+                                                 RemoteCommandOnReplyFn&& onReply,
+                                                 const BatonHandle& baton) {
+    MONGO_UNREACHABLE;
 }
 
 void NetworkInterfaceMock::setHandshakeReplyForHost(
@@ -240,8 +227,10 @@ void NetworkInterfaceMock::shutdown() {
     _waitingToRunMask |= kExecutorThread;  // Prevents network thread from scheduling.
     lk.unlock();
     for (NetworkOperationIterator iter = todo.begin(); iter != todo.end(); ++iter) {
-        warning() << "Mock network interface shutting down with outstanding request: "
-                  << iter->getRequest();
+        LOGV2_WARNING(22590,
+                      "Mock network interface shutting down with outstanding request: {request}",
+                      "Mock network interface shutting down with outstanding request",
+                      "request"_attr = iter->getRequest());
         iter->setResponse(
             now, {ErrorCodes::ShutdownInProgress, "Shutting down mock network", Milliseconds(0)});
         iter->finishResponse();
@@ -590,7 +579,9 @@ void NetworkInterfaceMock::signalWorkAvailable() {
 
 void NetworkInterfaceMock::_runReadyNetworkOperations_inlock(stdx::unique_lock<stdx::mutex>* lk) {
     while (!_alarms.empty() && _now_inlock() >= _alarms.top().when) {
-        auto& alarm = _alarms.top();
+        // It's safe to remove the const qualifier here as we immediately remove the top.
+        AlarmInfo alarm = std::move(const_cast<AlarmInfo&>(_alarms.top()));
+        _alarms.pop();
 
         // If the handle isn't cancelled, then run it
         auto iter = _canceledAlarms.find(alarm.handle);
@@ -601,8 +592,6 @@ void NetworkInterfaceMock::_runReadyNetworkOperations_inlock(stdx::unique_lock<s
         } else {
             _canceledAlarms.erase(iter);
         }
-
-        _alarms.pop();
     }
     while (!_scheduled.empty() && _scheduled.front().getResponseDate() <= _now_inlock()) {
         invariant(_currentlyRunning == kNetworkThread);

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -46,16 +46,15 @@
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_id.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
 const auto kOplogField = "oplog";
-const auto kWaitsForNewOplogField = "waitsForNewOplog";
 const WriteConcernOptions kMajorityWC(WriteConcernOptions::kMajority,
                                       WriteConcernOptions::SyncMode::UNSET,
                                       Milliseconds(0));
@@ -389,7 +388,6 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
 
             nextBatch = getNextSessionOplogBatch(opCtx, _fromShard, _migrationSessionId);
             oplogArray = BSONArray{nextBatch[kOplogField].Obj()};
-            const auto donorWaitsForNewOplog = nextBatch[kWaitsForNewOplogField].trueValue();
 
             if (oplogArray.isEmpty()) {
                 {
@@ -420,15 +418,6 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
                         _state = State::ReadyToCommit;
                         _isStateChanged.notify_all();
                     }
-                }
-
-                // TODO: SERVER-40187 Completely remove after v4.2. donorWaitsForNewOplog is a
-                // 'feature flag' indicating that the donor does block until there are new oplog
-                // to return so we don't need to sleep here.
-                if (!donorWaitsForNewOplog && lastOpTimeWaited == lastResult.oplogTime) {
-                    // We got an empty result at least twice in a row from the source shard so space
-                    // it out a little bit so we don't hammer the shard
-                    opCtx->sleepFor(Milliseconds(200));
                 }
 
                 lastOpTimeWaited = lastResult.oplogTime;

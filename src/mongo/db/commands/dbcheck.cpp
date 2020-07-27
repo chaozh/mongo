@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -47,7 +47,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/util/background.h"
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -84,7 +84,6 @@ bool canRunDbCheckOn(const NamespaceString& nss) {
     // TODO: SERVER-30826.
     const std::set<StringData> replicatedSystemCollections{"system.backup_users",
                                                            "system.js",
-                                                           "system.new_users",
                                                            "system.roles",
                                                            "system.users",
                                                            "system.version",
@@ -210,7 +209,7 @@ protected:
             }
 
             if (_done) {
-                log() << "dbCheck terminated due to stepdown";
+                LOGV2(20451, "dbCheck terminated due to stepdown");
                 return;
             }
         }
@@ -489,6 +488,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
+    }
+
+    bool maintenanceOk() const override {
+        return false;
     }
 
     virtual bool adminOnly() const {

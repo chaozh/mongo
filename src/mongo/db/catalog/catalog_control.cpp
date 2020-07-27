@@ -26,15 +26,15 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-#define LOG_FOR_RECOVERY(level) \
-    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kStorageRecovery)
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+#define LOGV2_FOR_RECOVERY(ID, DLEVEL, MESSAGE, ...) \
+    LOGV2_DEBUG_OPTIONS(ID, DLEVEL, {logv2::LogComponent::kStorageRecovery}, MESSAGE, ##__VA_ARGS__)
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/catalog_control.h"
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
@@ -43,14 +43,13 @@
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/rebuild_indexes.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace catalog {
 MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
-    BackgroundOperation::assertNoBgOpInProg();
     IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgress();
 
     MinVisibleTimestampMap minVisibleTimestampMap;
@@ -72,8 +71,12 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
             // If there's a minimum visible, invariant there's also a UUID.
             invariant(!minVisible || uuid);
             if (uuid && minVisible) {
-                LOG(1) << "closeCatalog: preserving min visible timestamp. Collection: "
-                       << coll->ns() << " UUID: " << uuid << " TS: " << minVisible;
+                LOGV2_DEBUG(20269,
+                            1,
+                            "closeCatalog: preserving min visible timestamp.",
+                            "coll_ns"_attr = coll->ns(),
+                            "uuid"_attr = uuid,
+                            "minVisible"_attr = minVisible);
                 minVisibleTimestampMap[*uuid] = *minVisible;
             }
         }
@@ -87,14 +90,14 @@ MinVisibleTimestampMap closeCatalog(OperationContext* opCtx) {
     // to work before acquiring locks, and might otherwise spuriously regard a UUID as unknown
     // while reloading the catalog.
     CollectionCatalog::get(opCtx).onCloseCatalog(opCtx);
-    LOG(1) << "closeCatalog: closing collection catalog";
+    LOGV2_DEBUG(20270, 1, "closeCatalog: closing collection catalog");
 
     // Close all databases.
-    log() << "closeCatalog: closing all databases";
+    LOGV2(20271, "closeCatalog: closing all databases");
     databaseHolder->closeAll(opCtx);
 
     // Close the storage engine's catalog.
-    log() << "closeCatalog: closing storage engine catalog";
+    LOGV2(20272, "closeCatalog: closing storage engine catalog");
     opCtx->getServiceContext()->getStorageEngine()->closeCatalog(opCtx);
 
     reopenOnFailure.dismiss();
@@ -105,11 +108,11 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
     invariant(opCtx->lockState()->isW());
 
     // Load the catalog in the storage engine.
-    log() << "openCatalog: loading storage engine catalog";
+    LOGV2(20273, "openCatalog: loading storage engine catalog");
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     storageEngine->loadCatalog(opCtx);
 
-    log() << "openCatalog: reconciling catalog and idents";
+    LOGV2(20274, "openCatalog: reconciling catalog and idents");
     auto reconcileResult = fassert(40688, storageEngine->reconcileCatalogAndIdents(opCtx));
 
     // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
@@ -149,27 +152,31 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
         invariant(collection, str::stream() << "couldn't get collection " << collNss.toString());
 
         for (const auto& indexName : entry.second.first) {
-            log() << "openCatalog: rebuilding index: collection: " << collNss.toString()
-                  << ", index: " << indexName;
+            LOGV2(20275,
+                  "openCatalog: rebuilding index: collection: {collNss}, index: {indexName}",
+                  "openCatalog: rebuilding index",
+                  "namespace"_attr = collNss.toString(),
+                  "index"_attr = indexName);
         }
 
         std::vector<BSONObj> indexSpecs = entry.second.second;
         fassert(40690, rebuildIndexesOnCollection(opCtx, collection, indexSpecs, RepairData::kNo));
     }
 
-    // Once all unfinished index builds have been dropped and the catalog has been reloaded, restart
-    // any unfinished index builds. This will not restart any index builds to completion, but rather
-    // start the background thread, build the index, and wait for a replicated commit or abort oplog
-    // entry.
+    // Once all unfinished index builds have been dropped and the catalog has been reloaded, resume
+    // or restart any unfinished index builds. This will not resume/restart any index builds to
+    // completion, but rather start the background thread, build the index, and wait for a
+    // replicated commit or abort oplog entry.
     IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
-        opCtx, reconcileResult.indexBuildsToRestart);
+        opCtx, reconcileResult.indexBuildsToRestart, reconcileResult.indexBuildsToResume);
 
     // Open all databases and repopulate the CollectionCatalog.
-    log() << "openCatalog: reopening all databases";
+    LOGV2(20276, "openCatalog: reopening all databases");
     auto databaseHolder = DatabaseHolder::get(opCtx);
     std::vector<std::string> databasesToOpen = storageEngine->listDatabases();
     for (auto&& dbName : databasesToOpen) {
-        LOG_FOR_RECOVERY(1) << "openCatalog: dbholder reopening database " << dbName;
+        LOGV2_FOR_RECOVERY(
+            23992, 1, "openCatalog: dbholder reopening database", "db"_attr = dbName);
         auto db = databaseHolder->openDb(opCtx, dbName);
         invariant(db, str::stream() << "failed to reopen database " << dbName);
         for (auto&& collNss :
@@ -189,7 +196,7 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
             // If this is the oplog collection, re-establish the replication system's cached pointer
             // to the oplog.
             if (collNss.isOplog()) {
-                log() << "openCatalog: updating cached oplog pointer";
+                LOGV2(20277, "openCatalog: updating cached oplog pointer");
                 collection->establishOplogCollectionForLogging(opCtx);
             }
         }
@@ -199,7 +206,7 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
     // catalog. Clear the pre-closing state.
     CollectionCatalog::get(opCtx).onOpenCatalog(opCtx);
     opCtx->getServiceContext()->incrementCatalogGeneration();
-    log() << "openCatalog: finished reloading collection catalog";
+    LOGV2(20278, "openCatalog: finished reloading collection catalog");
 }
 }  // namespace catalog
 }  // namespace mongo

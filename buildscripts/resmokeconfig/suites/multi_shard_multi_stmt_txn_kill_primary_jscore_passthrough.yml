@@ -126,6 +126,7 @@ selector:
   - jstests/core/sortf.js
   - jstests/core/sortg.js
   - jstests/core/sortj.js
+  - jstests/core/sort_with_meta_operator.js
   - jstests/core/tailable_skip_limit.js
   - jstests/core/type_array.js
   - jstests/core/uniqueness.js
@@ -157,10 +158,6 @@ selector:
   - jstests/core/sort_array.js
   - jstests/core/views/views_collation.js
   - jstests/core/wildcard_index_count.js
-
-  # $out
-  - jstests/core/bypass_doc_validation.js
-  - jstests/core/views/views_aggregation.js
 
   # $listSessions
   - jstests/core/list_all_local_sessions.js
@@ -373,8 +370,13 @@ selector:
   # system.profile collection doesn't exist on mongos. Also, transactions are not allowed to operate
   # on capped collections.
   - requires_profiling
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
+
+  # $out is not supported in transactions
+  - uses_$out
 
 executor:
   archive:

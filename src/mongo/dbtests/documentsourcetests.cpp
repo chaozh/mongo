@@ -48,7 +48,7 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/mock_yield_policies.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/dbtests/dbtests.h"
@@ -97,11 +97,15 @@ protected:
         }
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(qr)));
 
-        auto exec = uassertStatusOK(
-            getExecutor(opCtx(), ctx.getCollection(), std::move(cq), PlanExecutor::NO_YIELD, 0));
+        auto exec = uassertStatusOK(getExecutor(opCtx(),
+                                                ctx.getCollection(),
+                                                std::move(cq),
+                                                PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                0));
 
         exec->saveState();
-        _source = DocumentSourceCursor::create(ctx.getCollection(), std::move(exec), _ctx);
+        _source = DocumentSourceCursor::create(
+            ctx.getCollection(), std::move(exec), _ctx, DocumentSourceCursor::CursorType::kRegular);
     }
 
     intrusive_ptr<ExpressionContextForTest> ctx() {
@@ -227,8 +231,8 @@ TEST_F(DocumentSourceCursorTest, SerializationNoExplainLevel) {
 
 TEST_F(DocumentSourceCursorTest, SerializationQueryPlannerExplainLevel) {
     auto verb = ExplainOptions::Verbosity::kQueryPlanner;
-    createSource();
     ctx()->explain = verb;
+    createSource();
 
     auto explainResult = source()->serialize(verb);
     ASSERT_FALSE(explainResult["$cursor"]["queryPlanner"].missing());
@@ -239,8 +243,8 @@ TEST_F(DocumentSourceCursorTest, SerializationQueryPlannerExplainLevel) {
 
 TEST_F(DocumentSourceCursorTest, SerializationExecStatsExplainLevel) {
     auto verb = ExplainOptions::Verbosity::kExecStats;
-    createSource();
     ctx()->explain = verb;
+    createSource();
 
     // Execute the plan so that the source populates its internal execution stats.
     exhaustCursor();
@@ -255,8 +259,8 @@ TEST_F(DocumentSourceCursorTest, SerializationExecStatsExplainLevel) {
 
 TEST_F(DocumentSourceCursorTest, SerializationExecAllPlansExplainLevel) {
     auto verb = ExplainOptions::Verbosity::kExecAllPlans;
-    createSource();
     ctx()->explain = verb;
+    createSource();
 
     // Execute the plan so that the source populates its internal executionStats.
     exhaustCursor();
@@ -272,8 +276,8 @@ TEST_F(DocumentSourceCursorTest, SerializationExecAllPlansExplainLevel) {
 TEST_F(DocumentSourceCursorTest, ExpressionContextAndSerializeVerbosityMismatch) {
     const auto verb1 = ExplainOptions::Verbosity::kExecAllPlans;
     const auto verb2 = ExplainOptions::Verbosity::kQueryPlanner;
-    createSource();
     ctx()->explain = verb1;
+    createSource();
 
     // Execute the plan so that the source populates its internal executionStats.
     exhaustCursor();
@@ -300,26 +304,31 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout)
     collScanParams.tailable = true;
     auto filter = BSON("a" << 1);
     auto matchExpression = uassertStatusOK(MatchExpressionParser::parse(filter, ctx()));
-    auto collectionScan = std::make_unique<CollectionScan>(
-        opCtx(), readLock.getCollection(), collScanParams, workingSet.get(), matchExpression.get());
+    auto collectionScan = std::make_unique<CollectionScan>(ctx().get(),
+                                                           readLock.getCollection(),
+                                                           collScanParams,
+                                                           workingSet.get(),
+                                                           matchExpression.get());
     auto queryRequest = std::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
     queryRequest->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
     auto planExecutor =
-        uassertStatusOK(PlanExecutor::make(std::move(canonicalQuery),
-                                           std::move(workingSet),
-                                           std::move(collectionScan),
-                                           readLock.getCollection(),
-                                           PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT));
+        uassertStatusOK(plan_executor_factory::make(std::move(canonicalQuery),
+                                                    std::move(workingSet),
+                                                    std::move(collectionScan),
+                                                    readLock.getCollection(),
+                                                    PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
-    auto cursor =
-        DocumentSourceCursor::create(readLock.getCollection(), std::move(planExecutor), ctx());
+    auto cursor = DocumentSourceCursor::create(readLock.getCollection(),
+                                               std::move(planExecutor),
+                                               ctx(),
+                                               DocumentSourceCursor::CursorType::kRegular);
 
     ON_BLOCK_EXIT([cursor]() { cursor->dispose(); });
     ASSERT_THROWS_CODE(
@@ -337,25 +346,30 @@ TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
     CollectionScanParams collScanParams;
     auto filter = BSON("a" << 1);
     auto matchExpression = uassertStatusOK(MatchExpressionParser::parse(filter, ctx()));
-    auto collectionScan = std::make_unique<CollectionScan>(
-        opCtx(), readLock.getCollection(), collScanParams, workingSet.get(), matchExpression.get());
+    auto collectionScan = std::make_unique<CollectionScan>(ctx().get(),
+                                                           readLock.getCollection(),
+                                                           collScanParams,
+                                                           workingSet.get(),
+                                                           matchExpression.get());
     auto queryRequest = std::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
     auto planExecutor =
-        uassertStatusOK(PlanExecutor::make(std::move(canonicalQuery),
-                                           std::move(workingSet),
-                                           std::move(collectionScan),
-                                           readLock.getCollection(),
-                                           PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT));
+        uassertStatusOK(plan_executor_factory::make(std::move(canonicalQuery),
+                                                    std::move(workingSet),
+                                                    std::move(collectionScan),
+                                                    readLock.getCollection(),
+                                                    PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kNormal;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
-    auto cursor =
-        DocumentSourceCursor::create(readLock.getCollection(), std::move(planExecutor), ctx());
+    auto cursor = DocumentSourceCursor::create(readLock.getCollection(),
+                                               std::move(planExecutor),
+                                               ctx(),
+                                               DocumentSourceCursor::CursorType::kRegular);
 
     ON_BLOCK_EXIT([cursor]() { cursor->dispose(); });
     ASSERT_THROWS_CODE(
@@ -381,26 +395,31 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
     collScanParams.tailable = true;
     auto filter = BSON("a" << 1);
     auto matchExpression = uassertStatusOK(MatchExpressionParser::parse(filter, ctx()));
-    auto collectionScan = std::make_unique<CollectionScan>(
-        opCtx(), readLock.getCollection(), collScanParams, workingSet.get(), matchExpression.get());
+    auto collectionScan = std::make_unique<CollectionScan>(ctx().get(),
+                                                           readLock.getCollection(),
+                                                           collScanParams,
+                                                           workingSet.get(),
+                                                           matchExpression.get());
     auto queryRequest = std::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
     queryRequest->setTailableMode(TailableModeEnum::kTailableAndAwaitData);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
-    auto planExecutor =
-        uassertStatusOK(PlanExecutor::make(std::move(canonicalQuery),
-                                           std::move(workingSet),
-                                           std::move(collectionScan),
-                                           readLock.getCollection(),
-                                           PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED));
+    auto planExecutor = uassertStatusOK(
+        plan_executor_factory::make(std::move(canonicalQuery),
+                                    std::move(workingSet),
+                                    std::move(collectionScan),
+                                    readLock.getCollection(),
+                                    PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
-    auto cursor =
-        DocumentSourceCursor::create(readLock.getCollection(), std::move(planExecutor), ctx());
+    auto cursor = DocumentSourceCursor::create(readLock.getCollection(),
+                                               std::move(planExecutor),
+                                               ctx(),
+                                               DocumentSourceCursor::CursorType::kRegular);
 
     ON_BLOCK_EXIT([cursor]() { cursor->dispose(); });
     ASSERT_THROWS_CODE(cursor->getNext().isEOF(), AssertionException, ErrorCodes::QueryPlanKilled);
@@ -417,25 +436,30 @@ TEST_F(DocumentSourceCursorTest, NormalCursorShouldErrorAfterBeingKilled) {
     CollectionScanParams collScanParams;
     auto filter = BSON("a" << 1);
     auto matchExpression = uassertStatusOK(MatchExpressionParser::parse(filter, ctx()));
-    auto collectionScan = std::make_unique<CollectionScan>(
-        opCtx(), readLock.getCollection(), collScanParams, workingSet.get(), matchExpression.get());
+    auto collectionScan = std::make_unique<CollectionScan>(ctx().get(),
+                                                           readLock.getCollection(),
+                                                           collScanParams,
+                                                           workingSet.get(),
+                                                           matchExpression.get());
     auto queryRequest = std::make_unique<QueryRequest>(nss);
     queryRequest->setFilter(filter);
     auto canonicalQuery = unittest::assertGet(
         CanonicalQuery::canonicalize(opCtx(), std::move(queryRequest), nullptr));
-    auto planExecutor =
-        uassertStatusOK(PlanExecutor::make(std::move(canonicalQuery),
-                                           std::move(workingSet),
-                                           std::move(collectionScan),
-                                           readLock.getCollection(),
-                                           PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED));
+    auto planExecutor = uassertStatusOK(
+        plan_executor_factory::make(std::move(canonicalQuery),
+                                    std::move(workingSet),
+                                    std::move(collectionScan),
+                                    readLock.getCollection(),
+                                    PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kNormal;
     // DocumentSourceCursor expects a PlanExecutor that has had its state saved.
     planExecutor->saveState();
-    auto cursor =
-        DocumentSourceCursor::create(readLock.getCollection(), std::move(planExecutor), ctx());
+    auto cursor = DocumentSourceCursor::create(readLock.getCollection(),
+                                               std::move(planExecutor),
+                                               ctx(),
+                                               DocumentSourceCursor::CursorType::kRegular);
 
     ON_BLOCK_EXIT([cursor]() { cursor->dispose(); });
     ASSERT_THROWS_CODE(cursor->getNext().isEOF(), AssertionException, ErrorCodes::QueryPlanKilled);

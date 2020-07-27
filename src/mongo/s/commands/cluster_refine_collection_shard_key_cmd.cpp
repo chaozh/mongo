@@ -27,16 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/refine_collection_shard_key_gen.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -59,7 +59,7 @@ public:
                                                                                              nss));
 
             if (MONGO_unlikely(hangRefineCollectionShardKeyAfterRefresh.shouldFail())) {
-                log() << "Hit hangRefineCollectionShardKeyAfterRefresh failpoint";
+                LOGV2(22756, "Hit hangRefineCollectionShardKeyAfterRefresh failpoint");
                 hangRefineCollectionShardKeyAfterRefresh.pauseWhileSet(opCtx);
             }
 

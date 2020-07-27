@@ -39,8 +39,6 @@
 
 namespace mongo {
 
-using unittest::log;
-
 namespace {
 
 class IndexBuildsManagerTest : public CatalogTestFixture {
@@ -91,12 +89,12 @@ TEST_F(IndexBuildsManagerTest, IndexBuildsManagerSetUpAndTearDown) {
                                                   _buildUUID,
                                                   MultiIndexBlock::kNoopOnInitFn));
 
-    _indexBuildsManager.tearDownIndexBuild(operationContext(),
-                                           autoColl.getCollection(),
-                                           _buildUUID,
-                                           MultiIndexBlock::kNoopOnCleanUpFn);
+    _indexBuildsManager.abortIndexBuild(operationContext(),
+                                        autoColl.getCollection(),
+                                        _buildUUID,
+                                        MultiIndexBlock::kNoopOnCleanUpFn);
+    _indexBuildsManager.unregisterIndexBuild(_buildUUID);
 }
-
 }  // namespace
 
 }  // namespace mongo

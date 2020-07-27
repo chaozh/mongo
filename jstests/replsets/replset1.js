@@ -124,26 +124,8 @@ var doTest = function(signal) {
 
     t.save({a: 1000});
     t.ensureIndex({a: 1});
+    replTest.awaitReplication();
 
-    var result = db.runCommand({getLastError: 1, w: 3, wtimeout: 30000});
-    printjson(result);
-    var lastOp = result.lastOp;
-    const oplogEntries = replTest.dumpOplog(master);
-    const lastOplogOp = oplogEntries[0];
-    assert.eq(lastOplogOp['ts'], lastOp['ts']);
-    assert.eq(lastOplogOp['t'], lastOp['t']);
-
-    replTest.waitForAllIndexBuildsToFinish('foo', 'foo');
-
-    ts.forEach(function(z) {
-        assert.eq(2, z.getIndexKeys().length, "A " + z.getMongo());
-    });
-
-    t.reIndex();
-
-    replTest.waitForAllIndexBuildsToFinish('foo', 'foo');
-
-    db.getLastError(3, 30000);
     ts.forEach(function(z) {
         assert.eq(2, z.getIndexKeys().length, "A " + z.getMongo());
     });

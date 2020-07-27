@@ -33,8 +33,7 @@
 
 #include <memory>
 
-#include "mongo/db/snapshot_window_options.h"
-#include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store.h"
+#include "mongo/db/storage/devnull/ephemeral_catalog_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 
@@ -244,21 +243,42 @@ std::unique_ptr<SortedDataInterface> DevNullKVEngine::getSortedDataInterface(
     return std::make_unique<DevNullSortedDataInterface>();
 }
 
-bool DevNullKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {
-    return (_cachePressureForTest >= snapshotWindowParams.cachePressureThreshold.load());
-}
+namespace {
 
-void DevNullKVEngine::setCachePressureForTest(int pressure) {
-    invariant(pressure >= 0 && pressure <= 100);
-    _cachePressureForTest = pressure;
-}
+class StreamingCursorImpl : public StorageEngine::StreamingCursor {
+public:
+    StreamingCursorImpl() = delete;
+    StreamingCursorImpl(StorageEngine::BackupOptions options)
+        : StorageEngine::StreamingCursor(options) {
+        _backupBlocks = {{"filename.wt"}};
+        _exhaustCursor = false;
+    };
 
-StatusWith<StorageEngine::BackupInformation> DevNullKVEngine::beginNonBlockingBackup(
+    ~StreamingCursorImpl() = default;
+
+    BSONObj getMetadataObject(UUID backupId) {
+        return BSONObj();
+    }
+
+    StatusWith<std::vector<StorageEngine::BackupBlock>> getNextBatch(const std::size_t batchSize) {
+        if (_exhaustCursor) {
+            std::vector<StorageEngine::BackupBlock> emptyVector;
+            return emptyVector;
+        }
+        _exhaustCursor = true;
+        return _backupBlocks;
+    }
+
+private:
+    std::vector<StorageEngine::BackupBlock> _backupBlocks;
+    bool _exhaustCursor;
+};
+
+}  // namespace
+
+StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> DevNullKVEngine::beginNonBlockingBackup(
     OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
-    StorageEngine::BackupInformation backupInformation;
-    StorageEngine::BackupFile backupFile(0);
-    backupInformation.insert({"filename.wt", backupFile});
-    return backupInformation;
+    return std::make_unique<StreamingCursorImpl>(options);
 }
 
 StatusWith<std::vector<std::string>> DevNullKVEngine::extendBackupCursor(OperationContext* opCtx) {

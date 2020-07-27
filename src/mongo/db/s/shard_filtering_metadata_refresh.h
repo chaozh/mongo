@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/database_version_gen.h"
 
@@ -56,8 +57,19 @@ class OperationContext;
  */
 Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
                                       const NamespaceString& nss,
-                                      ChunkVersion shardVersionReceived,
-                                      bool forceRefreshFromThisThread = false) noexcept;
+                                      boost::optional<ChunkVersion> shardVersionReceived) noexcept;
+
+void onShardVersionMismatch(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            boost::optional<ChunkVersion> shardVersionReceived);
+
+/**
+ * Unconditionally get the shard's filtering metadata from the config server on the calling thread
+ * and returns it or throw.
+ *
+ * NOTE: Does network I/O, so it must not be called with a lock
+ */
+CollectionMetadata forceGetCurrentMetadata(OperationContext* opCtx, const NamespaceString& nss);
 
 /**
  * Unconditionally causes the shard's filtering metadata to be refreshed from the config server and
@@ -83,5 +95,25 @@ Status onDbVersionMismatchNoExcept(
     const boost::optional<DatabaseVersion>& serverDbVersion) noexcept;
 
 void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName);
+
+/**
+ * RAII-style class that enters the migration critical section and refresh the filtering
+ * metadata for the specified collection. The critical section is released when this object
+ * goes out of scope.
+ */
+class ScopedShardVersionCriticalSection {
+    ScopedShardVersionCriticalSection(const ScopedShardVersionCriticalSection&) = delete;
+    ScopedShardVersionCriticalSection& operator=(const ScopedShardVersionCriticalSection&) = delete;
+
+public:
+    ScopedShardVersionCriticalSection(OperationContext* opCtx, NamespaceString nss);
+    ~ScopedShardVersionCriticalSection();
+
+    void enterCommitPhase();
+
+private:
+    OperationContext* const _opCtx;
+    const NamespaceString _nss;
+};
 
 }  // namespace mongo

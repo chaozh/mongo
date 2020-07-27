@@ -3,9 +3,15 @@ test_kind: js_test
 selector:
   roots:
   - jstests/sharding/*.js
+  - jstests/sharding/change_streams/*.js
+  - jstests/sharding/query/*.js
   exclude_with_any_tags:
   - multiversion_incompatible
-  - requires_fcv_44
+  - requires_fcv_46
+  - need_fixing_for_46
+  exclude_files:
+  # TODO SERVER-46040: Enable when SERVER-46040 is backported
+  - jstests/sharding/drop_indexes_with_stale_config_error.js
 executor:
   config:
     shell_options:
@@ -14,4 +20,4 @@ executor:
       global_vars:
         TestData:
           useRandomBinVersionsWithinReplicaSet: true
-          mongosBinVersion: 'last-stable'
+          mongosBinVersion: 'last-lts'

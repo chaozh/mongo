@@ -70,6 +70,10 @@ public:
 
     virtual void enterTerminalShutdown();
 
+    virtual bool enterQuiesceModeIfSecondary(Milliseconds quieseTime);
+
+    virtual bool inQuiesceMode() const;
+
     virtual void shutdown(OperationContext* opCtx);
 
     void markAsCleanShutdownIfPossible(OperationContext* opCtx) override;
@@ -110,13 +114,18 @@ public:
 
     virtual bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName);
 
-    bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceString& ns) override;
+    bool canAcceptWritesFor(OperationContext* opCtx,
+                            const NamespaceStringOrUUID& nsOrUUID) override;
 
-    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) override;
+    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
+                                   const NamespaceStringOrUUID& nsOrUUID) override;
 
     virtual Status checkIfWriteConcernCanBeSatisfied(const WriteConcernOptions& writeConcern) const;
 
     virtual Status checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const;
+
+    virtual bool isCommitQuorumSatisfied(const CommitQuorumOptions& commitQuorum,
+                                         const std::vector<mongo::HostAndPort>& members) const;
 
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
@@ -131,7 +140,7 @@ public:
     virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime);
 
     virtual void setMyLastAppliedOpTimeAndWallTimeForward(
-        const OpTimeAndWallTime& opTimeAndWallTime, DataConsistency consistency);
+        const OpTimeAndWallTime& opTimeAndWallTime);
     virtual void setMyLastDurableOpTimeAndWallTimeForward(
         const OpTimeAndWallTime& opTimeAndWallTime);
 
@@ -144,6 +153,10 @@ public:
 
     virtual OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const;
     virtual OpTime getMyLastDurableOpTime() const;
+
+    virtual Status waitUntilMajorityOpTime(OperationContext* opCtx,
+                                           OpTime targetOpTime,
+                                           boost::optional<Date_t> deadline) override;
 
     virtual Status waitUntilOpTimeForRead(OperationContext* opCtx,
                                           const ReadConcernArgs& settings) override;
@@ -162,7 +175,7 @@ public:
 
     virtual Status setFollowerMode(const MemberState& newState);
 
-    virtual Status setFollowerModeStrict(OperationContext* opCtx, const MemberState& newState);
+    virtual Status setFollowerModeRollback(OperationContext* opCtx);
 
     virtual ApplierState getApplierState();
 
@@ -171,8 +184,6 @@ public:
     virtual Status waitForDrainFinish(Milliseconds timeout) override;
 
     virtual void signalUpstreamUpdater();
-
-    virtual Status resyncData(OperationContext* opCtx, bool waitUntilCompleted) override;
 
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
 
@@ -184,7 +195,9 @@ public:
 
     virtual ReplSetConfig getConfig() const;
 
-    virtual void processReplSetGetConfig(BSONObjBuilder* result);
+    virtual void processReplSetGetConfig(BSONObjBuilder* result,
+                                         bool commitmentStatus = false,
+                                         bool includeNewlyAdded = false);
 
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
 
@@ -207,6 +220,12 @@ public:
                                           const ReplSetReconfigArgs& args,
                                           BSONObjBuilder* resultObj);
 
+    virtual Status doReplSetReconfig(OperationContext* opCtx,
+                                     GetNewConfigFn getNewConfig,
+                                     bool force);
+
+    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment);
+
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj);
@@ -218,8 +237,6 @@ public:
 
     virtual std::vector<HostAndPort> getHostsWrittenTo(const OpTime& op, bool durablyWritten);
 
-    virtual std::vector<HostAndPort> getOtherNodesInReplSet() const;
-
     virtual WriteConcernOptions getGetLastErrorDefault();
 
     virtual Status checkReplEnabledForCommand(BSONObjBuilder* result);
@@ -228,13 +245,15 @@ public:
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
 
-    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx, DataConsistency consistency);
+    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx);
 
     bool lastOpTimesWereReset() const;
 
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
-                                        const rpc::ReplSetMetadata& replMetadata,
-                                        boost::optional<rpc::OplogQueryMetadata> oqMetadata);
+    virtual ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort& currentSource,
+                                                          const rpc::ReplSetMetadata& replMetadata,
+                                                          const rpc::OplogQueryMetadata& oqMetadata,
+                                                          const OpTime& previousOpTimeFetched,
+                                                          const OpTime& lastOpTimeFetched);
 
     virtual OpTime getLastCommittedOpTime() const;
 
@@ -308,6 +327,8 @@ public:
 
     virtual bool setContainsArbiter() const override;
 
+    virtual bool replSetContainsNewlyAddedMembers() const override;
+
     virtual void attemptToAdvanceStableTimestamp() override;
 
     virtual void finishRecoveryIfEligible(OperationContext* opCtx) override;
@@ -321,33 +342,53 @@ public:
 
     virtual TopologyVersion getTopologyVersion() const;
 
-    virtual void incrementTopologyVersion(OperationContext* opCtx) override;
+    virtual void incrementTopologyVersion() override;
 
     virtual std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
-        boost::optional<Date_t> deadline) const override;
+        boost::optional<Date_t> deadline) override;
 
-    virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
+    virtual SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
+        const SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion) override;
+
+    virtual StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const
+        noexcept override;
+
+    virtual HostAndPort getCurrentPrimaryHostAndPort() const override;
+
+    void cancelCbkHandle(executor::TaskExecutor::CallbackHandle activeHandle) override;
+    BSONObj runCmdOnPrimaryAndAwaitResponse(OperationContext* opCtx,
+                                            const std::string& dbName,
+                                            const BSONObj& cmdObj,
+                                            OnRemoteCmdScheduledFn onRemoteCmdScheduled,
+                                            OnRemoteCmdCompleteFn onRemoteCmdComplete) override;
+    virtual void restartHeartbeats_forTest() override;
 
 private:
     ServiceContext* const _service;
     ReplSettings _settings;
     StorageInterface* _storage = nullptr;
-    MemberState _memberState;
-    OpTime _myLastDurableOpTime;
-    Date_t _myLastDurableWallTime;
-    OpTime _myLastAppliedOpTime;
-    Date_t _myLastAppliedWallTime;
-    ReplSetConfig _getConfigReturnValue;
     AwaitReplicationReturnValueFunction _awaitReplicationReturnValueFunction = [](OperationContext*,
                                                                                   const OpTime&) {
         return StatusAndDuration(Status::OK(), Milliseconds(0));
     };
-    bool _alwaysAllowWrites = false;
-    bool _resetLastOpTimesCalled = false;
+
+    // Guards all the variables below
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ReplicationCoordinatorExternalStateMock::_mutex");
+
+    MemberState _memberState;
+    ReplSetConfig _getConfigReturnValue;
+    OpTime _myLastDurableOpTime;
+    Date_t _myLastDurableWallTime;
+    OpTime _myLastAppliedOpTime;
+    Date_t _myLastAppliedWallTime;
+
     long long _term = OpTime::kInitialTerm;
+    bool _resetLastOpTimesCalled = false;
+    bool _alwaysAllowWrites = false;
     bool _canAcceptNonLocalWrites = false;
 };
 

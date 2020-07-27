@@ -1,16 +1,25 @@
-# Copyright 2019 MongoDB Inc.
+# Copyright 2020 MongoDB Inc.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
 #
-# http://www.apache.org/licenses/LICENSE-2.0
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
 #
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+
 """Pseudo-builders for building test lists for Resmoke"""
 
 import SCons
@@ -21,14 +30,14 @@ TEST_REGISTRY = defaultdict(list)
 
 def register_test(env, file, test):
     """Register test into the dictionary of tests for file_name"""
-    test_path = test.path
-    if getattr(test.attributes, "AIB_INSTALL_ACTIONS", []):
-        test_path = getattr(test.attributes, "AIB_INSTALL_ACTIONS")[0].path
+    test_path = test
+    if env.get("AUTO_INSTALL_ENABLED", False) and env.GetAutoInstalledFiles(test):
+        test_path = env.GetAutoInstalledFiles(test)[0]
 
     if SCons.Util.is_String(file):
         file = env.File(file)
 
-    env.Depends(file, test)
+    env.Depends(file, test_path)
     file_name = file.path
     TEST_REGISTRY[file_name].append(test_path)
     env.GenerateTestExecutionAliases(test)
@@ -41,7 +50,7 @@ def test_list_builder_action(env, target, source):
     else:
         filename = target[0].path
 
-    source = [env.subst(s) if SCons.Util.is_String(s) else s.path for s in source]
+    source = [env.File(s).path if SCons.Util.is_String(s) else s.path for s in source]
 
     with open(filename, "w") as ofile:
         tests = TEST_REGISTRY[filename]

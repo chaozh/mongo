@@ -1,11 +1,13 @@
 """The unittest.TestCase for Server Discovery and Monitoring JSON tests."""
 import os
 import os.path
-from . import interface
-from ... import core
-from ... import utils
-from ...utils import globstar
-from ... import errors
+
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.testcases import interface
+from buildscripts.resmokelib.utils import globstar
 
 
 class SDAMJsonTestCase(interface.ProcessTestCase):
@@ -13,7 +15,7 @@ class SDAMJsonTestCase(interface.ProcessTestCase):
 
     REGISTERED_NAME = "sdam_json_test"
     EXECUTABLE_BUILD_PATH = "build/**/mongo/client/sdam/sdam_json_test"
-    TEST_DIR = os.path.normpath("src/mongo/client/sdam/json_tests")
+    TEST_DIR = os.path.normpath("src/mongo/client/sdam/json_tests/sdam_tests")
 
     def __init__(self, logger, json_test_file, program_options=None):
         """Initialize the TestCase with the executable to run."""
@@ -24,6 +26,14 @@ class SDAMJsonTestCase(interface.ProcessTestCase):
         self.program_options = utils.default_if_none(program_options, {}).copy()
 
     def _find_executable(self):
+        if config.INSTALL_DIR is not None:
+            binary = os.path.join(config.INSTALL_DIR, "sdam_json_test")
+            if os.name == "nt":
+                binary += ".exe"
+
+            if os.path.isfile(binary):
+                return binary
+
         execs = globstar.glob(self.EXECUTABLE_BUILD_PATH + '.exe')
         if not execs:
             execs = globstar.glob(self.EXECUTABLE_BUILD_PATH)

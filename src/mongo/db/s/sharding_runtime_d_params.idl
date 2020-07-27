@@ -92,8 +92,45 @@ server_parameters:
         default: 900
 
     disableResumableRangeDeleter:
-        description: 'Disable the resumable range deleter and revert to prior behavior.'
-        set_at: [startup, runtime]
-        cpp_vartype: AtomicWord<bool> 
+        description: >-
+          Disable the resumable range deleter. Ranges will not be submitted for deletion, and if an
+          incoming migration sees orphans in the incoming range, the migration will fail. The
+          resumable range deleter replaced the old non-durable range deleter as of FCV 4.4.
+        set_at: [startup]
+        cpp_vartype: AtomicWord<bool>
         cpp_varname : disableResumableRangeDeleter
         default: false
+
+    enableShardedIndexConsistencyCheck:
+        description: >-
+          Enable the periodic sharded index consistency check on the config server's primary.
+          The count of sharded collections with inconsistent indexes is exposed via the
+          'shardedIndexConsistency' section in the serverStatus output.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: enableShardedIndexConsistencyCheck
+        default: true
+
+    shardedIndexConsistencyCheckIntervalMS:
+        description: 'Time interval in milliseconds between subsequent index checks.'
+        set_at: [startup]
+        cpp_vartype: int
+        cpp_varname: shardedIndexConsistencyCheckIntervalMS
+        default: 600000
+
+    minNumChunksForSessionsCollection:
+        description: 'The minimum number of chunks for config.system.sessions collection'
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: minNumChunksForSessionsCollection
+        default: 1024
+        validator: { gte: 1, lte: 1000000 }
+
+    coordinateCommitReturnImmediatelyAfterPersistingDecision:
+        description: >-
+          Whether the transaction coordinator should return the decision as soon as the
+          the decision is made durable.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: coordinateCommitReturnImmediatelyAfterPersistingDecision
+        default: true

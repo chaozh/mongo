@@ -40,6 +40,7 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/scopeguard.h"
 
@@ -91,15 +92,12 @@ bool WhereMatchExpression::matches(const MatchableDocument* doc, MatchDetails* d
     _scope->registerOperation(Client::getCurrent()->getOperationContext());
     const auto guard = makeGuard([&] { _scope->unregisterOperation(); });
 
-    if (!getScope().isEmpty()) {
-        _scope->init(&getScope());
-    }
-
     _scope->advanceGeneration();
     _scope->setObject("obj", const_cast<BSONObj&>(obj));
     _scope->setBoolean("fullObject", true);  // this is a hack b/c fullObject used to be relevant
 
-    int err = _scope->invoke(_func, nullptr, &obj, 1000 * 60, false);
+    int err =
+        _scope->invoke(_func, nullptr, &obj, internalQueryJavaScriptFnTimeoutMillis.load(), false);
     if (err == -3) {  // INVOKE_ERROR
         stringstream ss;
         ss << "error on invocation of $where function:\n" << _scope->getError();
@@ -114,7 +112,6 @@ bool WhereMatchExpression::matches(const MatchableDocument* doc, MatchDetails* d
 unique_ptr<MatchExpression> WhereMatchExpression::shallowClone() const {
     WhereParams params;
     params.code = getCode();
-    params.scope = getScope();
     unique_ptr<WhereMatchExpression> e =
         std::make_unique<WhereMatchExpression>(_opCtx, std::move(params), _dbName);
     if (getTag()) {

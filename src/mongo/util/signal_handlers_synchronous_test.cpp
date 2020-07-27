@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -81,7 +81,7 @@ DEATH_TEST(FatalTerminateTest,
 
 DEATH_TEST(FatalTerminateTest,
            TerminateIsFatalWithDBException,
-           " terminate() called. An exception is active") {
+           "terminate() called. An exception is active") {
     try {
         uasserted(28720, "Fatal DBException occurrence");
     } catch (...) {

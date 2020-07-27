@@ -27,14 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/db/jsobj.h"
 
 #include <boost/lexical_cast.hpp>
 
 #include "mongo/bson/timestamp.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -105,7 +105,7 @@ BSONObjBuilder& BSONObjBuilder::appendMinForType(StringData fieldName, int t) {
             appendCodeWScope(fieldName, "", BSONObj());
             return *this;
     };
-    log() << "type not supported for appendMinElementForType: " << t;
+    LOGV2(20101, "type not supported for appendMinElementForType: {t}", "t"_attr = t);
     uassert(10061, "type not supported for appendMinElementForType", false);
 }
 
@@ -173,7 +173,7 @@ BSONObjBuilder& BSONObjBuilder::appendMaxForType(StringData fieldName, int t) {
             appendMinForType(fieldName, MaxKey);
             return *this;
     }
-    log() << "type not supported for appendMaxElementForType: " << t;
+    LOGV2(20102, "type not supported for appendMaxElementForType: {t}", "t"_attr = t);
     uassert(14853, "type not supported for appendMaxElementForType", false);
 }
 
@@ -235,25 +235,7 @@ BSONObjBuilder::~BSONObjBuilder() {
     }
 }
 
-template <typename Alloc>
-void BasicBufBuilder<Alloc>::grow_reallocate(int minSize) {
-    if (minSize > BufferMaxSize) {
-        std::stringstream ss;
-        ss << "BufBuilder attempted to grow() to " << minSize << " bytes, past the 64MB limit.";
-        msgasserted(13548, ss.str().c_str());
-    }
-
-    int a = 64;
-    while (a < minSize)
-        a = a * 2;
-
-    _buf.realloc(a);
-    size = a;
-}
-
-template class BasicBufBuilder<SharedBufferAllocator>;
-template class BasicBufBuilder<StackAllocator>;
-template class StringBuilderImpl<SharedBufferAllocator>;
-template class StringBuilderImpl<StackAllocator>;
+template class StringBuilderImpl<BufBuilder>;
+template class StringBuilderImpl<StackBufBuilderBase<StackSizeDefault>>;
 
 }  // namespace mongo

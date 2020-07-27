@@ -98,7 +98,7 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {}
+                   boost::optional<IndexCollModInfo> indexInfo) override {}
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override {}
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
@@ -140,8 +140,9 @@ public:
     void onEmptyCapped(OperationContext* opCtx,
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) override {}
-    void onUnpreparedTransactionCommit(
-        OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) override{};
+    void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) override {}
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
         OplogSlot commitOplogEntryOpTime,
@@ -149,11 +150,14 @@ public:
         const std::vector<repl::ReplOperation>& statements) noexcept override{};
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) override{};
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) override{};
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override{};
     void onReplicationRollback(OperationContext* opCtx,
                                const RollbackObserverInfo& rbInfo) override {}
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) override {}
 };
 
 }  // namespace mongo

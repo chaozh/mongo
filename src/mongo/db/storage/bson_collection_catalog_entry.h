@@ -64,6 +64,8 @@ public:
 
         void updateTTLSetting(long long newExpireSeconds);
 
+        void updateHiddenSetting(bool hidden);
+
         std::string name() const {
             return spec["name"].String();
         }
@@ -95,8 +97,6 @@ public:
          * called name existed and was deleted, and false otherwise.
          */
         bool eraseIndex(StringData name);
-
-        void rename(StringData toNS);
 
         KVPrefix getMaxPrefix() const;
 

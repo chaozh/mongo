@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -27,6 +27,16 @@ static inline u_char
 __wt_hex(int c)
 {
     return ((u_char) "0123456789abcdef"[c]);
+}
+
+/*
+ * __wt_safe_sub --
+ *     Subtract unsigned integers, rounding to zero if the result would be negative.
+ */
+static inline uint64_t
+__wt_safe_sub(uint64_t v1, uint64_t v2)
+{
+    return (v2 > v1 ? 0 : v1 - v2);
 }
 
 /*

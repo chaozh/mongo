@@ -1,7 +1,5 @@
 /**
  * Test the autosplitter when a collection has very low cardinality
- *
- * @tags: [requires_fcv_44]
  */
 
 (function() {
@@ -30,6 +28,7 @@ function insertBigDocsWithKey(key, numDocs) {
         bulk.insert({sk: key, sub: i, bs: bigString});
     }
     assert.commandWorked(bulk.execute());
+    waitForOngoingChunkSplits(st);
 }
 
 function numChunks() {

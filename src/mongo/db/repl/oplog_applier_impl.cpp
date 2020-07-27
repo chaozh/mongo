@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/db/repl/oplog_applier_impl.h"
 
@@ -43,11 +43,15 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/insert_group.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/timer_stats.h"
+#include "mongo/db/storage/control/storage_control.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/basic.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
+#include "mongo/util/log_with_sampling.h"
 #include "third_party/murmurhash3/MurmurHash3.h"
 
 namespace mongo {
@@ -96,38 +100,37 @@ NamespaceStringOrUUID getNsOrUUID(const NamespaceString& nss, const OplogEntry& 
  * Used for logging a report of ops that take longer than "slowMS" to apply. This is called
  * right before returning from applyOplogEntryOrGroupedInserts, and it returns the same status.
  */
-Status finishAndLogApply(ClockSource* clockSource,
+Status finishAndLogApply(OperationContext* opCtx,
+                         ClockSource* clockSource,
                          Status finalStatus,
                          Date_t applyStartTime,
                          const OplogEntryOrGroupedInserts& entryOrGroupedInserts) {
 
     if (finalStatus.isOK()) {
         auto applyEndTime = clockSource->now();
-        auto diffMS = durationCount<Milliseconds>(applyEndTime - applyStartTime);
+        auto opDuration = durationCount<Milliseconds>(applyEndTime - applyStartTime);
 
-        // This op was slow to apply, so we should log a report of it.
-        if (diffMS > serverGlobalParams.slowMS) {
+        if (shouldLogSlowOpWithSampling(opCtx,
+                                        MONGO_LOGV2_DEFAULT_COMPONENT,
+                                        Milliseconds(opDuration),
+                                        Milliseconds(serverGlobalParams.slowMS))
+                .first) {
 
-            StringBuilder s;
-            s << "applied op: ";
+            logv2::DynamicAttributes attrs;
 
+            auto redacted = redact(entryOrGroupedInserts.toBSON());
             if (entryOrGroupedInserts.getOp().getOpType() == OpTypeEnum::kCommand) {
-                s << "command ";
+                attrs.add("command", redacted);
             } else {
-                s << "CRUD ";
+                attrs.add("CRUD", redacted);
             }
 
-            s << redact(entryOrGroupedInserts.toBSON());
-            s << ", took " << diffMS << "ms";
+            attrs.add("duration", Milliseconds(opDuration));
 
-            log() << s.str();
+            LOGV2(51801, "Applied op", attrs);
         }
     }
     return finalStatus;
-}
-
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
 }
 
 /**
@@ -270,6 +273,21 @@ void _addOplogChainOpsToWriterVectors(OperationContext* opCtx,
 
 void stableSortByNamespace(std::vector<const OplogEntry*>* oplogEntryPointers) {
     auto nssComparator = [](const OplogEntry* l, const OplogEntry* r) {
+        // Specially sort collections that are $cmd first, before everything else.  This will
+        // move commands with the special $cmd collection name to the beginning, rather than sorting
+        // them potentially in the middle of the sorted vector of insert/update/delete ops.
+        // This special sort behavior is required because DDL operations need to run before
+        // create/update/delete operations in a multi-doc transaction.
+        if (l->getNss().isCommand()) {
+            if (r->getNss().isCommand())
+                // l == r; now compare the namespace
+                return l->getNss() < r->getNss();
+            // l < r
+            return true;
+        }
+        if (r->getNss().isCommand())
+            // l > r
+            return false;
         return l->getNss() < r->getNss();
     };
     std::stable_sort(oplogEntryPointers->begin(), oplogEntryPointers->end(), nssComparator);
@@ -285,17 +303,15 @@ public:
     ApplyBatchFinalizer(ReplicationCoordinator* replCoord) : _replCoord(replCoord) {}
     virtual ~ApplyBatchFinalizer(){};
 
-    virtual void record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                        ReplicationCoordinator::DataConsistency consistency) {
-        _recordApplied(newOpTimeAndWallTime, consistency);
+    virtual void record(const OpTimeAndWallTime& newOpTimeAndWallTime) {
+        _recordApplied(newOpTimeAndWallTime);
     };
 
 protected:
-    void _recordApplied(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                        ReplicationCoordinator::DataConsistency consistency) {
+    void _recordApplied(const OpTimeAndWallTime& newOpTimeAndWallTime) {
         // We have to use setMyLastAppliedOpTimeAndWallTimeForward since this thread races with
         // ReplicationExternalStateImpl::onTransitionToPrimary.
-        _replCoord->setMyLastAppliedOpTimeAndWallTimeForward(newOpTimeAndWallTime, consistency);
+        _replCoord->setMyLastAppliedOpTimeAndWallTimeForward(newOpTimeAndWallTime);
     }
 
     void _recordDurable(const OpTimeAndWallTime& newOpTimeAndWallTime) {
@@ -316,8 +332,7 @@ public:
           _waiterThread{&ApplyBatchFinalizerForJournal::_run, this} {};
     ~ApplyBatchFinalizerForJournal();
 
-    void record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                ReplicationCoordinator::DataConsistency consistency) override;
+    void record(const OpTimeAndWallTime& newOpTimeAndWallTime) override;
 
 private:
     /**
@@ -348,9 +363,8 @@ ApplyBatchFinalizerForJournal::~ApplyBatchFinalizerForJournal() {
     _waiterThread.join();
 }
 
-void ApplyBatchFinalizerForJournal::record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                                           ReplicationCoordinator::DataConsistency consistency) {
-    _recordApplied(newOpTimeAndWallTime, consistency);
+void ApplyBatchFinalizerForJournal::record(const OpTimeAndWallTime& newOpTimeAndWallTime) {
+    _recordApplied(newOpTimeAndWallTime);
 
     stdx::unique_lock<Latch> lock(_mutex);
     _latestOpTimeAndWallTime = newOpTimeAndWallTime;
@@ -429,8 +443,9 @@ void OplogApplierImpl::_run(OplogBuffer* oplogBuffer) {
 
         // For pausing replication in tests.
         if (MONGO_unlikely(rsSyncApplyStop.shouldFail())) {
-            log() << "Oplog Applier - rsSyncApplyStop fail point enabled. Blocking until fail "
-                     "point is disabled.";
+            LOGV2(21229,
+                  "Oplog Applier - rsSyncApplyStop fail point enabled. Blocking until fail "
+                  "point is disabled");
             rsSyncApplyStop.pauseWhileSet(&opCtx);
         }
 
@@ -512,16 +527,8 @@ void OplogApplierImpl::_run(OplogBuffer* oplogBuffer) {
         _storageInterface->oplogDiskLocRegister(
             &opCtx, lastOpTimeInBatch.getTimestamp(), orderedCommit);
 
-        // 4. Finalize this batch. We are at a consistent optime if our current optime is >= the
-        // current 'minValid' optime. Note that recording the lastOpTime in the finalizer includes
-        // advancing the global timestamp to at least its timestamp.
-        const auto minValid = _consistencyMarkers->getMinValid(&opCtx);
-        auto consistency = (lastOpTimeInBatch >= minValid)
-            ? ReplicationCoordinator::DataConsistency::Consistent
-            : ReplicationCoordinator::DataConsistency::Inconsistent;
-
-        // The finalizer advances the global timestamp to lastOpTimeInBatch.
-        finalizer->record({lastOpTimeInBatch, lastWallTimeInBatch}, consistency);
+        // 4. Finalize this batch. The finalizer advances the global timestamp to lastOpTimeInBatch.
+        finalizer->record({lastOpTimeInBatch, lastWallTimeInBatch});
     }
 }
 
@@ -597,7 +604,11 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
                                                       std::vector<OplogEntry> ops) {
     invariant(!ops.empty());
 
-    LOG(2) << "replication batch size is " << ops.size();
+    LOGV2_DEBUG(21230,
+                2,
+                "replication batch size is {size}",
+                "Replication batch size",
+                "size"_attr = ops.size());
 
     // Stop all readers until we're done. This also prevents doc-locking engines from deleting old
     // entries from the oplog until we finish writing.
@@ -605,7 +616,7 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
 
     invariant(_replCoord);
     if (_replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Stopped) {
-        severe() << "attempting to replicate ops while primary";
+        LOGV2_FATAL_CONTINUE(21234, "Attempting to replicate ops while primary");
         return {ErrorCodes::CannotApplyOplogWhilePrimary,
                 "attempting to replicate ops while primary"};
     }
@@ -648,8 +659,9 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
         // Use this fail point to hold the PBWM lock after we have written the oplog entries but
         // before we have applied them.
         if (MONGO_unlikely(pauseBatchApplicationAfterWritingOplogEntries.shouldFail())) {
-            log() << "pauseBatchApplicationAfterWritingOplogEntries fail point enabled. Blocking "
-                     "until fail point is disabled.";
+            LOGV2(21231,
+                  "pauseBatchApplicationAfterWritingOplogEntries fail point enabled. Blocking "
+                  "until fail point is disabled");
             pauseBatchApplicationAfterWritingOplogEntries.pauseWhileSet(opCtx);
         }
 
@@ -694,12 +706,19 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
             for (auto it = statusVector.cbegin(); it != statusVector.cend(); ++it) {
                 const auto& status = *it;
                 if (!status.isOK()) {
-                    severe()
-                        << "Failed to apply batch of operations. Number of operations in batch: "
-                        << ops.size() << ". First operation: " << redact(ops.front().toBSON())
-                        << ". Last operation: " << redact(ops.back().toBSON())
-                        << ". Oplog application failed in writer thread "
-                        << std::distance(statusVector.cbegin(), it) << ": " << redact(status);
+                    LOGV2_FATAL_CONTINUE(
+                        21235,
+                        "Failed to apply batch of operations. Number of operations in "
+                        "batch: {numOperationsInBatch}. First operation: {firstOperation}. "
+                        "Last operation: "
+                        "{lastOperation}. Oplog application failed in writer thread "
+                        "{failedWriterThread}: {error}",
+                        "Failed to apply batch of operations",
+                        "numOperationsInBatch"_attr = ops.size(),
+                        "firstOperation"_attr = redact(ops.front().toBSON()),
+                        "lastOperation"_attr = redact(ops.back().toBSON()),
+                        "failedWriterThread"_attr = std::distance(statusVector.cbegin(), it),
+                        "error"_attr = redact(status));
                     return status;
                 }
             }
@@ -711,18 +730,19 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
     // new writes with timestamps associated with those oplog entries will show up in the future. We
     // want to flush the journal as soon as possible in order to free ops waiting with 'j' write
     // concern.
-    const auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    storageEngine->triggerJournalFlush();
+    StorageControl::triggerJournalFlush(opCtx->getServiceContext());
 
     // Use this fail point to hold the PBWM lock and prevent the batch from completing.
     if (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {
-        log() << "pauseBatchApplicationBeforeCompletion fail point enabled. Blocking until fail "
-                 "point is disabled.";
+        LOGV2(21232,
+              "pauseBatchApplicationBeforeCompletion fail point enabled. Blocking until fail "
+              "point is disabled");
         while (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {
             if (inShutdown()) {
-                severe() << "Turn off pauseBatchApplicationBeforeCompletion before attempting "
-                            "clean shutdown";
-                fassertFailedNoTrace(50798);
+                LOGV2_FATAL_NOTRACE(
+                    50798,
+                    "Turn off pauseBatchApplicationBeforeCompletion before attempting "
+                    "clean shutdown");
             }
             sleepmillis(100);
         }
@@ -899,10 +919,10 @@ Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
     auto applyStartTime = clockSource->now();
 
     if (MONGO_unlikely(hangAfterRecordingOpApplicationStartTime.shouldFail())) {
-        log() << "applyOplogEntryOrGroupedInserts - fail point "
-                 "hangAfterRecordingOpApplicationStartTime "
-                 "enabled. "
-              << "Blocking until fail point is disabled. ";
+        LOGV2(21233,
+              "applyOplogEntryOrGroupedInserts - fail point "
+              "hangAfterRecordingOpApplicationStartTime "
+              "enabled. Blocking until fail point is disabled");
         hangAfterRecordingOpApplicationStartTime.pauseWhileSet();
     }
 
@@ -935,17 +955,16 @@ Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
                             db);
                     OldClientContext ctx(opCtx, autoColl.getNss().ns(), db);
 
-                    // We convert updates to upserts when not in initial sync because after rollback
-                    // and during startup we may replay an update after a delete and crash since we
-                    // do not ignore errors. In initial sync we simply ignore these update errors so
-                    // there is no reason to upsert.
+                    // We convert updates to upserts in secondary mode when the
+                    // oplogApplicationEnforcesSteadyStateConstraints parameter is false, to avoid
+                    // failing on the constraint that updates in steady state mode always update
+                    // an existing document.
                     //
-                    // TODO (SERVER-21700): Never upsert during oplog application unless an external
-                    // applyOps wants to. We should ignore these errors intelligently while in
-                    // RECOVERING and STARTUP mode (similar to initial sync) instead so we do not
-                    // accidentally ignore real errors.
-                    bool shouldAlwaysUpsert =
-                        (oplogApplicationMode != OplogApplication::Mode::kInitialSync);
+                    // In initial sync and recovery modes we always ignore errors about missing
+                    // documents on update, so there is no reason to convert the updates to upsert.
+
+                    bool shouldAlwaysUpsert = !oplogApplicationEnforcesSteadyStateConstraints &&
+                        oplogApplicationMode == OplogApplication::Mode::kSecondary;
                     Status status = applyOperation_inlock(opCtx,
                                                           db,
                                                           entryOrGroupedInserts,
@@ -957,12 +976,16 @@ Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
                     }
                     return status;
                 } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
-                    // Delete operations on non-existent namespaces can be treated as successful for
-                    // idempotency reasons.
-                    // During RECOVERING mode, we ignore NamespaceNotFound for all CRUD ops since
-                    // storage does not wait for drops to be checkpointed (SERVER-33161).
-                    if (opType == OpTypeEnum::kDelete ||
-                        oplogApplicationMode == OplogApplication::Mode::kRecovering) {
+                    // This can happen in initial sync or recovery modes (when a delete of the
+                    // namespace appears later in the oplog), but we will ignore it in the caller.
+                    //
+                    // When we're not enforcing steady-state constraints, the error is ignored
+                    // only for deletes, on the grounds that deleting from a non-existent collection
+                    // is a no-op.
+                    if (opType == OpTypeEnum::kDelete &&
+                        !oplogApplicationEnforcesSteadyStateConstraints &&
+                        oplogApplicationMode == OplogApplication::Mode::kSecondary) {
+                        replOpCounters.gotDeleteFromMissingNamespace();
                         return Status::OK();
                     }
 
@@ -971,7 +994,7 @@ Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
                     throw;
                 }
             });
-        return finishAndLogApply(clockSource, status, applyStartTime, entryOrGroupedInserts);
+        return finishAndLogApply(opCtx, clockSource, status, applyStartTime, entryOrGroupedInserts);
     } else if (opType == OpTypeEnum::kCommand) {
         auto status =
             writeConflictRetry(opCtx, "applyOplogEntryOrGroupedInserts_command", nss.ns(), [&] {
@@ -980,7 +1003,7 @@ Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
                 incrementOpsAppliedStats();
                 return status;
             });
-        return finishAndLogApply(clockSource, status, applyStartTime, entryOrGroupedInserts);
+        return finishAndLogApply(opCtx, clockSource, status, applyStartTime, entryOrGroupedInserts);
     }
 
     MONGO_UNREACHABLE;
@@ -1007,6 +1030,8 @@ Status OplogApplierImpl::applyOplogBatchPerWorker(OperationContext* opCtx,
     opCtx->recoveryUnit()->setPrepareConflictBehavior(
         PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
+    // Group the operations by namespace in order to get larger groups for bulk inserts, but do not
+    // mix up the current order of oplog entries within the same namespace (thus *stable* sort).
     stableSortByNamespace(ops);
 
     const auto oplogApplicationMode = getOptions().mode;
@@ -1037,12 +1062,16 @@ Status OplogApplierImpl::applyOplogBatchPerWorker(OperationContext* opCtx,
                     // Tried to apply an update operation but the document is missing, there must be
                     // a delete operation for the document later in the oplog.
                     if (status == ErrorCodes::UpdateOperationFailed &&
-                        oplogApplicationMode == OplogApplication::Mode::kInitialSync) {
+                        (oplogApplicationMode == OplogApplication::Mode::kInitialSync ||
+                         oplogApplicationMode == OplogApplication::Mode::kRecovering)) {
                         continue;
                     }
 
-                    severe() << "Error applying operation (" << redact(entry.toBSON())
-                             << "): " << causedBy(redact(status));
+                    LOGV2_FATAL_CONTINUE(21237,
+                                         "Error applying operation ({oplogEntry}): {error}",
+                                         "Error applying operation",
+                                         "oplogEntry"_attr = redact(entry.toBSON()),
+                                         "error"_attr = causedBy(redact(status)));
                     return status;
                 }
             } catch (const DBException& e) {
@@ -1053,8 +1082,11 @@ Status OplogApplierImpl::applyOplogBatchPerWorker(OperationContext* opCtx,
                     continue;
                 }
 
-                severe() << "writer worker caught exception: " << redact(e)
-                         << " on: " << redact(entry.toBSON());
+                LOGV2_FATAL_CONTINUE(21238,
+                                     "writer worker caught exception: {error} on: {oplogEntry}",
+                                     "Writer worker caught exception",
+                                     "error"_attr = redact(e),
+                                     "oplogEntry"_attr = redact(entry.toBSON()));
                 return e.toStatus();
             }
         }

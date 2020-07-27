@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include <vector>
@@ -50,7 +48,6 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/uuid.h"
 

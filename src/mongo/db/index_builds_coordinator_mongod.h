@@ -60,7 +60,7 @@ public:
      * Shuts down the thread pool, signals interrupt to all index builds, then waits for all of the
      * threads to finish.
      */
-    void shutdown() override;
+    void shutdown(OperationContext* opCtx) override;
 
     /**
      * Sets up the in-memory and persisted state of the index build, then passes the build off to an
@@ -78,12 +78,19 @@ public:
         IndexBuildProtocol protocol,
         IndexBuildOptions indexBuildOptions) override;
 
-    Status voteCommitIndexBuild(const UUID& buildUUID, const HostAndPort& hostAndPort) override;
+    Status voteCommitIndexBuild(OperationContext* opCtx,
+                                const UUID& buildUUID,
+                                const HostAndPort& hostAndPort) override;
 
     Status setCommitQuorum(OperationContext* opCtx,
                            const NamespaceString& nss,
                            const std::vector<StringData>& indexNames,
                            const CommitQuorumOptions& newCommitQuorum) override;
+
+    void setSignalAndCancelVoteRequestCbkIfActive(WithLock ReplIndexBuildStateLk,
+                                                  OperationContext* opCtx,
+                                                  std::shared_ptr<ReplIndexBuildState> replState,
+                                                  IndexBuildAction signal) override;
 
 private:
     /**
@@ -123,8 +130,43 @@ private:
      */
     void _refreshReplStateFromPersisted(OperationContext* opCtx, const UUID& buildUUID);
 
+    /**
+     * Process voteCommitIndexBuild command's response.
+     */
+    bool _checkVoteCommitIndexCmdSucceeded(const BSONObj& response, const UUID& indexBuildUUID);
+
+    /**
+     * Signals index builder to commit.
+     */
+    void _sendCommitQuorumSatisfiedSignal(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState);
+
+
+    void _signalIfCommitQuorumIsSatisfied(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+
+    bool _signalIfCommitQuorumNotEnabled(OperationContext* opCtx,
+                                         std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    void _signalPrimaryForCommitReadiness(OperationContext* opCtx,
+                                          std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    IndexBuildAction _drainSideWritesUntilNextActionIsAvailable(
+        OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState) override;
+
+    void _waitForNextIndexBuildActionAndCommit(OperationContext* opCtx,
+                                               std::shared_ptr<ReplIndexBuildState> replState,
+                                               const IndexBuildOptions& indexBuildOptions) override;
+
     // Thread pool on which index builds are run.
     ThreadPool _threadPool;
+
+    // Protected by _mutex.
+    int _numActiveIndexBuilds = 0;
+
+    // Condition signalled to indicate that an index build thread finished executing.
+    stdx::condition_variable _indexBuildFinished;
 };
 
 }  // namespace mongo

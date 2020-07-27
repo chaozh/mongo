@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
 #include "mongo/db/s/balancer/balancer_random.h"
 #include "mongo/db/s/balancer/migration_manager.h"
@@ -53,25 +54,19 @@ class Status;
  * there is an imbalance by checking the difference in chunks between the most and least
  * loaded shards. It would issue a request for a chunk migration per round, if it found so.
  */
-class Balancer {
+class Balancer : public ReplicaSetAwareServiceConfigSvr<Balancer> {
     Balancer(const Balancer&) = delete;
     Balancer& operator=(const Balancer&) = delete;
 
 public:
-    Balancer(ServiceContext* serviceContext);
-    ~Balancer();
-
     /**
-     * Instantiates an instance of the balancer and installs it on the specified service context.
-     * This method is not thread-safe and must be called only once when the service is starting.
-     */
-    static void create(ServiceContext* serviceContext);
-
-    /**
-     * Retrieves the per-service instance of the Balancer.
+     * Provide access to the Balancer decoration on ServiceContext.
      */
     static Balancer* get(ServiceContext* serviceContext);
     static Balancer* get(OperationContext* operationContext);
+
+    Balancer();
+    ~Balancer();
 
     /**
      * Invoked when the config server primary enters the 'PRIMARY' state and is invoked while the
@@ -170,6 +165,14 @@ private:
     };
 
     /**
+     * ReplicaSetAwareService entry points.
+     */
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final;
+    void onStepDown() final;
+    void onBecomeArbiter() final;
+
+    /**
      * The main balancer loop, which runs in a separate thread.
      */
     void _mainThread();
@@ -198,10 +201,15 @@ private:
     bool _checkOIDs(OperationContext* opCtx);
 
     /**
-     * Iterates through all chunks in all collections and ensures that no chunks straddle tag
-     * boundary. If any do, they will be split.
+     * Iterates through all chunks in all collections. If the collection is the sessions collection,
+     * checks if the number of chunks is greater than or equal to the configured minimum number of
+     * chunks for the sessions collection (minNumChunksForSessionsCollection). If it isn't,
+     * calculates split points that evenly partition the key space into N ranges (where N is
+     * minNumChunksForSessionsCollection rounded up the next power of 2), and splits any chunks that
+     * straddle those split points. If the collection is any other collection, splits any chunks
+     * that straddle tag boundaries.
      */
-    Status _enforceTagRanges(OperationContext* opCtx);
+    Status _splitChunksIfNeeded(OperationContext* opCtx);
 
     /**
      * Schedules migrations for the specified set of chunks and returns how many chunks were

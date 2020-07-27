@@ -13,6 +13,8 @@
  *
  * @tags: [requires_replication]
  */
+load("jstests/libs/logv2_helpers.js");
+
 (function() {
 'use strict';
 
@@ -45,7 +47,11 @@ assert.commandFailedWithCode(lowerDB.createCollection("test"), ErrorCodes.Databa
 rst.awaitReplication();
 failPoint.off();
 
-checkLog.contains(primary, "dropDatabase " + dbNameUpper + " - finished");
+if (isJsonLog(primary)) {
+    checkLog.containsJson(primary, 20336, {"db": dbNameUpper});
+} else {
+    checkLog.contains(primary, "dropDatabase " + dbNameUpper + " - finished");
+}
 assert.commandWorked(lowerDB.createCollection("test"));
 
 awaitDropUpper();

@@ -4,6 +4,8 @@
  *
  * @tags: [requires_document_locking]
  */
+load("jstests/libs/logv2_helpers.js");
+
 (function() {
 "use strict";
 
@@ -54,15 +56,19 @@ crudOpsForPhase(testDB.hybrid, 0);
 assert.eq(totalDocs, testDB.hybrid.count());
 
 // Hang the build after the first document.
-let stopKey = {'i': 1};
-turnFailPointOn("hangBeforeIndexBuildOf", stopKey);
+turnFailPointOn("hangIndexBuildDuringCollectionScanPhaseBeforeInsertion", {fieldsToMatch: {i: 1}});
 
 // Start the background build.
 let bgBuild = startParallelShell(function() {
     assert.commandWorked(db.hybrid.createIndex({i: 1}, {background: true}));
 }, conn.port);
 
-checkLog.contains(conn, "Hanging before index build of i=1");
+checkLog.containsJson(conn, 20386, {
+    where: "before",
+    doc: function(doc) {
+        return doc.i === 1;
+    }
+});
 
 // Phase 1: Collection scan and external sort
 // Insert documents while doing the bulk build.
@@ -73,7 +79,7 @@ assert.eq(totalDocs, testDB.hybrid.count());
 turnFailPointOn("hangAfterIndexBuildDumpsInsertsFromBulk");
 
 // Wait for the bulk insert to complete.
-turnFailPointOff("hangBeforeIndexBuildOf");
+turnFailPointOff("hangIndexBuildDuringCollectionScanPhaseBeforeInsertion");
 checkLog.contains(conn, "Hanging after dumping inserts from bulk builder");
 
 // Phase 2: First drain

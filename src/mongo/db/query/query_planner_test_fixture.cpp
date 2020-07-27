@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -42,7 +42,7 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_test_lib.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
 namespace mongo {
@@ -53,6 +53,8 @@ const NamespaceString QueryPlannerTest::nss("test.collection");
 
 void QueryPlannerTest::setUp() {
     opCtx = serviceContext.makeOperationContext();
+    expCtx = make_intrusive<ExpressionContext>(
+        opCtx.get(), std::unique_ptr<CollatorInterface>(nullptr), nss);
     internalQueryPlannerEnableHashIntersection.store(true);
     params.options = QueryPlannerParams::INCLUDE_COLLSCAN;
     addIndex(BSON("_id" << 1));
@@ -62,6 +64,7 @@ void QueryPlannerTest::clearState() {
     plannerStatus = Status::OK();
     solns.clear();
     cq.reset();
+    expCtx.reset();
     relaxBoundsCheck = false;
 }
 
@@ -148,7 +151,7 @@ void QueryPlannerTest::addIndex(BSONObj keyPattern, const MultikeyPaths& multike
     const bool multikey =
         std::any_of(multikeyPaths.cbegin(),
                     multikeyPaths.cend(),
-                    [](const std::set<size_t>& components) { return !components.empty(); });
+                    [](const MultikeyComponents& components) { return !components.empty(); });
     const bool sparse = false;
     const bool unique = false;
     const char name[] = "my_index_with_path_level_multikey_info";
@@ -327,7 +330,6 @@ void QueryPlannerTest::runQueryFull(const BSONObj& query,
     qr->setHint(hint);
     qr->setMin(minObj);
     qr->setMax(maxObj);
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
                                      std::move(qr),
@@ -408,7 +410,6 @@ void QueryPlannerTest::runInvalidQueryFull(const BSONObj& query,
     qr->setHint(hint);
     qr->setMin(minObj);
     qr->setMax(maxObj);
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
                                      std::move(qr),
@@ -432,7 +433,6 @@ void QueryPlannerTest::runQueryAsCommand(const BSONObj& cmdObj) {
     std::unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
                                      std::move(qr),
@@ -456,7 +456,6 @@ void QueryPlannerTest::runInvalidQueryAsCommand(const BSONObj& cmdObj) {
     std::unique_ptr<QueryRequest> qr(
         assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
 
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
                                      std::move(qr),
@@ -478,7 +477,7 @@ size_t QueryPlannerTest::getNumSolutions() const {
 void QueryPlannerTest::dumpSolutions() const {
     str::stream ost;
     dumpSolutions(ost);
-    log() << std::string(ost);
+    LOGV2(20985, "{value}", "Solutions", "value"_attr = std::string(ost));
 }
 
 void QueryPlannerTest::dumpSolutions(str::stream& ost) const {
@@ -550,10 +549,13 @@ void QueryPlannerTest::assertHasOnlyCollscan() const {
 }
 
 std::unique_ptr<MatchExpression> QueryPlannerTest::parseMatchExpression(
-    const BSONObj& obj, const CollatorInterface* collator) {
-    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(collator);
-    StatusWithMatchExpression status = MatchExpressionParser::parse(obj, std::move(expCtx));
+    const BSONObj& obj, const boost::intrusive_ptr<ExpressionContext>& optionalExpCtx) {
+    auto expCtx = optionalExpCtx;
+    if (!expCtx.get()) {
+        expCtx = make_intrusive<ExpressionContextForTest>();
+    }
+
+    StatusWithMatchExpression status = MatchExpressionParser::parse(obj, expCtx);
     if (!status.isOK()) {
         FAIL(str::stream() << "failed to parse query: " << obj.toString()
                            << ". Reason: " << status.getStatus().toString());

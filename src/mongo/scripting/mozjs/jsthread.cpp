@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/mozjs/jsthread.h"
@@ -44,7 +42,6 @@
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/util/log.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
@@ -184,7 +181,8 @@ private:
             auto thisv = static_cast<JSThread*>(priv);
 
             try {
-                MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()));
+                MozJSImplScope scope(static_cast<MozJSScriptEngine*>(getGlobalScriptEngine()),
+                                     boost::none /* Don't override global jsHeapLimitMB */);
 
                 scope.setParentStack(thisv->_sharedData->_stack);
                 thisv->_sharedData->_returnData = scope.callThreadArgs(thisv->_sharedData->_args);

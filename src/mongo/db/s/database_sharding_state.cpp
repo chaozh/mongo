@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,10 +35,10 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/database_version_helpers.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -120,8 +120,11 @@ void DatabaseShardingState::setDbVersion(OperationContext* opCtx,
                                          boost::optional<DatabaseVersion> newDbVersion,
                                          DSSLock&) {
     invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_X));
-    log() << "setting this node's cached database version for " << _dbName << " to "
-          << (newDbVersion ? newDbVersion->toBSON() : BSONObj());
+    LOGV2(21950,
+          "Setting this node's cached database version for {db} to {newDbVersion}",
+          "Setting this node's cached database version",
+          "db"_attr = _dbName,
+          "newDbVersion"_attr = (newDbVersion ? newDbVersion->toBSON() : BSONObj()));
     _dbVersion = newDbVersion;
 }
 
@@ -144,10 +147,10 @@ void DatabaseShardingState::checkDbVersion(OperationContext* opCtx, DSSLock&) co
     }
 
     uassert(StaleDbRoutingVersion(_dbName, *clientDbVersion, boost::none),
-            "don't know dbVersion",
+            str::stream() << "don't know dbVersion for database " << _dbName,
             _dbVersion);
     uassert(StaleDbRoutingVersion(_dbName, *clientDbVersion, *_dbVersion),
-            "dbVersion mismatch",
+            str::stream() << "dbVersion mismatch for database " << _dbName,
             databaseVersion::equal(*clientDbVersion, *_dbVersion));
 }
 

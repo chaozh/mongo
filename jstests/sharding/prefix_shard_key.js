@@ -6,9 +6,11 @@
 // Part 3: Shard new collection on {skey : 1} but with a longer index.
 //         Insert docs with same val for 'skey' but different vals for 'extra'.
 //         Move chunks around and check that [min,max) chunk boundaries are properly obeyed.
-// @tags: [requires_fcv_44]
 (function() {
 'use strict';
+
+// Shard key index does not exactly match shard key, so it is not compatible with $min/$max.
+TestData.skipCheckOrphans = true;
 
 var checkDocCounts = function(expectedShardCount) {
     for (var shardName in expectedShardCount) {

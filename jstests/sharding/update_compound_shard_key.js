@@ -1,13 +1,25 @@
 /**
  * Tests to validate the functionality of update command in the presence of a compound shard key.
- * @tags: [uses_transactions, uses_multi_shard_transaction, requires_fcv_44]
+ *
+ * Use the 'requires_find_command' tag to skip this test in sharding_op_query suite. Otherwise,
+ * sessionDB.coll.find() will throw "Cannot run a legacy query on a session".
+ *
+ * @tags: [
+ *  requires_find_command,
+ *  uses_multi_shard_transaction,
+ *  uses_transactions,
+ * ]
  */
 (function() {
 'use strict';
 
+load("jstests/sharding/libs/sharded_transactions_helpers.js");
 load("jstests/sharding/libs/update_shard_key_helpers.js");
 
 const st = new ShardingTest({mongos: 1, shards: 3});
+
+enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st);
+
 const kDbName = 'update_compound_sk';
 const ns = kDbName + '.coll';
 const session = st.s.startSession({retryWrites: true});
@@ -107,9 +119,15 @@ assertUpdateWorkedWithNoMatchingDoc({x: 10}, {x: 10, y: 3, z: 3, a: 5}, false);
 assertUpdateWorkedWithNoMatchingDoc({x: 100, y: 55, a: 15}, {x: 100, y: 55, z: 3, a: 6}, false);
 assertUpdateWorkedWithNoMatchingDoc({x: 11, _id: 3}, {x: 11, y: 3, z: 3, a: 7}, false);
 
-// Partial shard key in query can target a single shard, and succeeds in updating shard key value.
-assertUpdateWorkedWithNoMatchingDoc({x: 400, y: 50, a: 5}, {x: 100, y: 55, z: 3, a: 1}, false);
-assertUpdateWorked({x: 4, z: 3}, {x: 4, y: 3, z: 4, a: 1}, false, 0);
+// Partial shard key in query can target a single shard, but fails while attempting to
+// modify shard key value.
+assert.commandFailedWithCode(
+    st.s.getDB(kDbName).coll.update(
+        {x: 100, y: 50, a: 5}, {x: 100, y: 55, z: 3, a: 1}, {upsert: false}),
+    31025);
+assert.commandFailedWithCode(
+    st.s.getDB(kDbName).coll.update({x: 4, z: 3}, {x: 4, y: 3, z: 4, a: 1}, {upsert: false}),
+    31025);
 
 // Full shard key in query, matches no document.
 assertUpdateWorkedWithNoMatchingDoc({x: 4, y: 0, z: 0}, {x: 1110, y: 55, z: 3, a: 111}, false);
@@ -128,9 +146,11 @@ assertUpdateWorkedWithNoMatchingDoc({_id: 1}, {x: 110, y: 55, z: 3, a: 110}, fal
 assertUpdateWorked({_id: 0, y: 3}, {z: 3, x: 4, y: 3, a: 2}, false, 0);
 assertUpdateWorked({_id: 0}, {z: 3, x: 4, y: 3, replStyle: 2}, false, 0);
 
-// When query matches a doc and updates the shard key.
-assertUpdateWorked({}, {x: 110, y: 55, z: 3, a: 110}, false, 2);
-assertUpdateWorked({_id: 2}, {x: 110, y: 55, z: 3, a: 110}, false, 2);
+// When query matches a doc and fails to update because shard key needs to be updated.
+assert.commandFailedWithCode(
+    st.s.getDB(kDbName).coll.update({}, {x: 110, y: 55, z: 3, a: 110}, false), 31025);
+assert.commandFailedWithCode(
+    st.s.getDB(kDbName).coll.update({_id: 2}, {x: 110, y: 55, z: 3, a: 110}, false), 31025);
 
 //
 // Test upsert-specific behaviours.
@@ -153,7 +173,7 @@ assert.commandFailedWithCode(
 session.startTransaction();
 assertUpdateWorkedWithNoMatchingDoc({x: 4, y: 0, z: 0}, updateDoc, true, true);
 assert.commandWorked(session.commitTransaction_forTesting());
-assert.eq(1, st.s.getDB(kDbName).coll.find(updateDoc).itcount());
+assert.eq(1, sessionDB.coll.find(updateDoc).itcount());
 
 // Full shard key not specified in query.
 
@@ -228,9 +248,15 @@ assertUpdateWorkedWithNoMatchingDoc({x: -1, y: 0}, {"$set": {z: 3, y: 110, a: 91
 assertUpdateWorked({x: 4, z: 3}, {"$set": {opStyle: 3}}, false, 0);
 assertUpdateWorked({x: 4, _id: 0, z: 3}, {"$set": {y: 3, x: 4, z: 3, opStyle: 4}}, false, 0);
 
-// Partial shard key in query can target a single shard and updates the shard key.
-assertUpdateWorked({_id: 1, x: 100, z: 3, a: 5}, {"$set": {y: 55, a: 11}}, false, 1);
-assertUpdateWorked({x: 4, z: 3}, {"$set": {x: 4, y: 3, z: 4, a: 1}}, false, 0);
+// Partial shard key in query can target a single shard, but fails while attempting to modify
+// shard key value.
+assert.commandFailedWithCode(
+    st.s.getDB(kDbName).coll.update(
+        {_id: 1, x: 100, z: 3, a: 5}, {"$set": {y: 55, a: 11}}, {upsert: false}),
+    31025);
+assert.commandFailedWithCode(st.s.getDB(kDbName).coll.update(
+                                 {x: 4, z: 3}, {"$set": {x: 4, y: 3, z: 4, a: 1}}, {upsert: false}),
+                             31025);
 
 // Test upsert-specific behaviours.
 
@@ -248,7 +274,7 @@ assert.commandFailedWithCode(
 session.startTransaction();
 assertUpdateWorkedWithNoMatchingDoc({x: 4, y: 0, z: 0, opStyle: true}, update, true, true);
 assert.commandWorked(session.commitTransaction_forTesting());
-assert.eq(1, st.s.getDB(kDbName).coll.find(update["$set"]).itcount());
+assert.eq(1, sessionDB.coll.find(update["$set"]).itcount());
 
 // Full shard key not specified in query.
 
@@ -285,16 +311,16 @@ assert.commandFailedWithCode(
 [false, true].forEach(function(isUpsert) {
     // Full shard key in query.
     assertUpdateWorked(
-        {_id: 0, x: 4, z: 4, y: 3}, [{$addFields: {pipelineUpdate: isUpsert}}], isUpsert, 0);
+        {_id: 0, x: 4, z: 3, y: 3}, [{$addFields: {pipelineUpdate: isUpsert}}], isUpsert, 0);
     assert.eq(1,
               st.s.getDB(kDbName)
-                  .coll.find({_id: 0, x: 4, z: 4, y: 3, pipelineUpdate: isUpsert})
+                  .coll.find({_id: 0, x: 4, z: 3, y: 3, pipelineUpdate: isUpsert})
                   .itcount());
     assertUpdateWorkedWithNoMatchingDoc(
-        {_id: 15, x: 44, z: 4, y: 3}, [{$addFields: {pipelineUpdate: true}}], isUpsert);
+        {_id: 15, x: 44, z: 3, y: 3}, [{$addFields: {pipelineUpdate: true}}], isUpsert);
     assert.eq(isUpsert ? 1 : 0,
               st.s.getDB(kDbName)
-                  .coll.find({_id: 15, x: 44, z: 4, y: 3, pipelineUpdate: true})
+                  .coll.find({_id: 15, x: 44, z: 3, y: 3, pipelineUpdate: true})
                   .itcount());
 
     assertUpdateWorkedWithNoMatchingDoc(
@@ -340,7 +366,7 @@ assertUpdateWorkedWithNoMatchingDoc({_id: 14, z: 4, x: 3}, [{$addFields: {foo: 4
 // value.
 assertUpdateWorkedWithNoMatchingDoc(
     {x: 46, z: 4}, [{$addFields: {y: 10, pipelineUpdateNoOp: false}}], false);
-assertUpdateWorked({x: 4, z: 4}, [{$addFields: {pipelineUpdateDoc: false}}], false, 0);
+assertUpdateWorked({x: 4, z: 3}, [{$addFields: {pipelineUpdateDoc: false}}], false, 0);
 
 // Partial shard key in query cannot target a single shard.
 assert.commandFailedWithCode(
@@ -378,7 +404,7 @@ assertUpdateWorkedWithNoMatchingDoc({x: 4, y: 0, z: 0, pipelineUpdate: true},
                                     }],
                                     true);
 assert.commandWorked(session.commitTransaction_forTesting());
-assert.eq(1, st.s.getDB(kDbName).coll.find({x: 2111, y: 55, z: 3, pipelineUpdate: true}).itcount());
+assert.eq(1, sessionDB.coll.find({x: 2111, y: 55, z: 3, pipelineUpdate: true}).itcount());
 
 // Full shard key not specified in query.
 assert.commandFailedWithCode(st.s.getDB(kDbName).coll.update(

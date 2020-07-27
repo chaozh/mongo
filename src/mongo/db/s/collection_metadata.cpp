@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,6 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -70,7 +69,7 @@ BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {
 void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
     if (isSharded()) {
         _cm->getVersion().appendLegacyWithField(&bb, "collVersion");
-        getShardVersion().appendLegacyWithField(&bb, "shardVersion");
+        getShardVersionForLogging().appendLegacyWithField(&bb, "shardVersion");
         bb.append("keyPattern", _cm->getShardKeyPattern().toBSON());
     } else {
         ChunkVersion::UNSHARDED().appendLegacyWithField(&bb, "collVersion");
@@ -81,7 +80,7 @@ void CollectionMetadata::toBSONBasic(BSONObjBuilder& bb) const {
 std::string CollectionMetadata::toStringBasic() const {
     if (isSharded()) {
         return str::stream() << "collection version: " << _cm->getVersion().toString()
-                             << ", shard version: " << getShardVersion().toString();
+                             << ", shard version: " << getShardVersionForLogging().toString();
     } else {
         return "collection version: <unsharded>";
     }
@@ -92,12 +91,12 @@ RangeMap CollectionMetadata::getChunks() const {
 
     RangeMap chunksMap(SimpleBSONObjComparator::kInstance.makeBSONObjIndexedMap<BSONObj>());
 
-    for (const auto& chunk : _cm->chunks()) {
-        if (chunk.getShardId() != _thisShardId)
-            continue;
+    _cm->forEachChunk([this, &chunksMap](const auto& chunk) {
+        if (chunk.getShardId() == _thisShardId)
+            chunksMap.emplace_hint(chunksMap.end(), chunk.getMin(), chunk.getMax());
 
-        chunksMap.emplace_hint(chunksMap.end(), chunk.getMin(), chunk.getMax());
-    }
+        return true;
+    });
 
     return chunksMap;
 }
@@ -105,13 +104,13 @@ RangeMap CollectionMetadata::getChunks() const {
 bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey, ChunkType* chunk) const {
     invariant(isSharded());
 
-    auto foundIt = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
-    if (foundIt.begin() == foundIt.end())
+    auto nextChunk = _cm->getNextChunkOnShard(lookupKey, _thisShardId);
+    if (!nextChunk)
         return false;
 
-    const auto& nextChunk = *foundIt.begin();
-    chunk->setMin(nextChunk.getMin());
-    chunk->setMax(nextChunk.getMax());
+    chunk->setMin(nextChunk->getMin());
+    chunk->setMax(nextChunk->getMax());
+
     return true;
 }
 
@@ -131,8 +130,9 @@ Status CollectionMetadata::checkChunkIsValid(const ChunkType& chunk) const {
         existingChunk.getMax().woCompare(chunk.getMax())) {
         return {ErrorCodes::StaleShardVersion,
                 str::stream() << "Unable to find chunk with the exact bounds "
-                              << ChunkRange(chunk.getMin(), chunk.getMax()).toString()
-                              << " at collection version " << getCollVersion().toString()};
+                              << chunk.getRange().toString() << " at collection version "
+                              << getCollVersion().toString()
+                              << " found existing chunk: " << existingChunk.toString()};
     }
 
     return Status::OK();
@@ -211,14 +211,16 @@ void CollectionMetadata::toBSONChunks(BSONArrayBuilder* builder) const {
     if (!isSharded())
         return;
 
-    for (const auto& chunk : _cm->chunks()) {
+    _cm->forEachChunk([this, &builder](const auto& chunk) {
         if (chunk.getShardId() == _thisShardId) {
             BSONArrayBuilder chunkBB(builder->subarrayStart());
             chunkBB.append(chunk.getMin());
             chunkBB.append(chunk.getMax());
             chunkBB.done();
         }
-    }
+
+        return true;
+    });
 }
 
 }  // namespace mongo

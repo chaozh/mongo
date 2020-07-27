@@ -1,11 +1,14 @@
 /**
  * Tests that rolling back the insertion of the shardIdentity document on a shard causes the node
  * rolling it back to shut down.
- * @tags: [requires_persistence, requires_journaling]
+ * @tags: [multiversion_incompatible, requires_persistence, requires_journaling]
  */
 
 (function() {
 "use strict";
+
+// This test triggers an unclean shutdown (an fassert), which may cause inaccurate fast counts.
+TestData.skipEnforceFastCountOnValidate = true;
 
 load('jstests/libs/write_concern_util.js');
 
@@ -85,8 +88,7 @@ jsTest.log("Waiting for original primary to rollback and shut down");
 // Wait until the node shuts itself down during the rollback. We will hit the first assertion if
 // we rollback using 'recoverToStableTimestamp' and the second if using 'rollbackViaRefetch'.
 assert.soon(() => {
-    return (rawMongoProgramOutput().indexOf("Fatal Assertion 50712") !== -1 ||
-            rawMongoProgramOutput().indexOf("Fatal Assertion 40498") !== -1);
+    return (rawMongoProgramOutput().search(/Fatal assertion.*(40498|50712)/) !== -1);
 });
 
 // Restart the original primary again.  This time, the shardIdentity document should already be

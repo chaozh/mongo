@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2019 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -242,8 +242,13 @@ thread_insert(void *arg)
          */
         key = (int)(__wt_random(&rnd) % N_RECORDS);
         maincur->set_key(maincur, key);
+/* FIXME-WT-6180: disable lower isolation levels. */
+#if 0
         if (sharedopts->remove)
             testutil_check(session->begin_transaction(session, "isolation=snapshot"));
+#else
+        testutil_check(session->begin_transaction(session, "isolation=snapshot"));
+#endif
         if (sharedopts->remove && __wt_random(&rnd) % 5 == 0 && maincur->search(maincur) == 0) {
             /*
              * Another thread can be removing at the same time.
@@ -278,12 +283,20 @@ thread_insert(void *arg)
             else if (ret == WT_ROLLBACK)
                 threadargs->rollbacks++;
         }
+/* FIXME-WT-6180: disable lower isolation levels. */
+#if 0
         if (sharedopts->remove) {
             if (ret == WT_ROLLBACK)
                 testutil_check(session->rollback_transaction(session, NULL));
             else
                 testutil_check(session->commit_transaction(session, NULL));
         }
+#else
+        if (ret == WT_ROLLBACK)
+            testutil_check(session->rollback_transaction(session, NULL));
+        else
+            testutil_check(session->commit_transaction(session, NULL));
+#endif
         if (i % 1000 == 0 && i != 0) {
             if (i % 10000 == 0)
                 fprintf(stderr, "*");

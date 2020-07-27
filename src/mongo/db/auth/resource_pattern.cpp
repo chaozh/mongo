@@ -27,15 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include <iostream>
 
 #include "mongo/db/auth/resource_pattern.h"
 
-#include "mongo/util/log.h"
 
 namespace mongo {
 

@@ -27,17 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <memory>
 
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/wildcard_access_method.h"
+#include "mongo/db/query/wildcard_multikey_paths.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -97,7 +98,8 @@ protected:
         auto collection = autoColl.getCollection();
 
         // Verify whether or not the index has been marked as multikey.
-        ASSERT_EQ(expectIndexIsMultikey, getIndexDesc(collection, indexName)->isMultikey());
+        ASSERT_EQ(expectIndexIsMultikey,
+                  getIndexDesc(collection, indexName)->getEntry()->isMultikey());
 
         // Obtain a cursor over the index, and confirm that the keys are present in order.
         auto indexCursor = getIndexCursor(collection, indexName);
@@ -116,9 +118,12 @@ protected:
             // Confirm that there are no further keys in the index.
             ASSERT(!indexKey);
         } catch (const TestAssertionFailureException& ex) {
-            log() << "Writing remaining index keys to debug log:";
+            LOGV2(22518, "Writing remaining index keys to debug log:");
             while (indexKey) {
-                log() << "{ key: " << indexKey->key << ", loc: " << indexKey->loc << " }";
+                LOGV2(22519,
+                      "{{ key: {indexKey_key}, loc: {indexKey_loc} }}",
+                      "indexKey_key"_attr = indexKey->key,
+                      "indexKey_loc"_attr = indexKey->loc);
                 indexKey = indexCursor->next();
             }
             throw ex;
@@ -143,7 +148,9 @@ protected:
         auto collection = autoColl.getCollection();
         auto indexAccessMethod = getIndex(collection, indexName);
         MultikeyMetadataAccessStats stats;
-        auto multikeyPathSet = indexAccessMethod->getMultikeyPathSet(opCtx(), &stats);
+        auto wam = dynamic_cast<const WildcardAccessMethod*>(indexAccessMethod);
+        ASSERT(wam != nullptr);
+        auto multikeyPathSet = getWildcardMultikeyPathSet(wam, opCtx(), &stats);
 
         ASSERT(expectedFieldRefs == multikeyPathSet);
     }
@@ -197,8 +204,8 @@ protected:
         auto coll = autoColl.getCollection();
 
         MultiIndexBlock indexer;
-        ON_BLOCK_EXIT(
-            [&] { indexer.cleanUpAfterBuild(opCtx(), coll, MultiIndexBlock::kNoopOnCleanUpFn); });
+        auto abortOnExit = makeGuard(
+            [&] { indexer.abortIndexBuild(opCtx(), coll, MultiIndexBlock::kNoopOnCleanUpFn); });
 
         // Initialize the index builder and add all documents currently in the collection.
         ASSERT_OK(
@@ -209,6 +216,7 @@ protected:
         WriteUnitOfWork wunit(opCtx());
         ASSERT_OK(indexer.commit(
             opCtx(), coll, MultiIndexBlock::kNoopOnCreateEachFn, MultiIndexBlock::kNoopOnCommitFn));
+        abortOnExit.dismiss();
         wunit.commit();
     }
 

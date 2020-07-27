@@ -27,12 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/scripting/mozjs/implscope.h"
 
+#include <iostream>
 #include <memory>
 
 #include <js/CharacterEncoding.h>
@@ -42,6 +43,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/config.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/stack_locator.h"
@@ -50,7 +52,6 @@
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 #if !defined(__has_feature)
@@ -104,7 +105,20 @@ bool closeToMaxMemory() {
 }  // namespace
 
 thread_local MozJSImplScope::ASANHandles* kCurrentASANHandles = nullptr;
-thread_local MozJSImplScope* kCurrentScope = nullptr;
+
+
+// You may wonder what the point is to making this thread local
+// variable atomic. We found that without making this atomic, in
+// dynamic builds, the hang analyzer (GDB script) would sometimes see
+// a stale value here which pointed to a destroyed scope. The theory
+// is that this is due to the different TLS model that applies when
+// building a dynamic library. We never dug down to a complete root
+// cause, but emperically demonstrated that making it atomic allowed
+// the hang analyzer tests to pass. Given that we do intend to read
+// this from "another thread" (being GDB), it makes some sense. Or it
+// might be a GDB bug of some sort that forcing it into an atomic
+// papers over.
+thread_local std::atomic<MozJSImplScope*> kCurrentScope = nullptr;  // NOLINT
 
 struct MozJSImplScope::MozJSEntry {
     MozJSEntry(MozJSImplScope* scope)
@@ -135,6 +149,7 @@ void MozJSImplScope::registerOperation(OperationContext* opCtx) {
 
     _opCtx = opCtx;
     _opId = opCtx->getOpID();
+    _opCtxThreadId = stdx::this_thread::get_id();
 
     _engine->registerOperation(opCtx, this);
 }
@@ -152,7 +167,7 @@ void MozJSImplScope::kill() {
 
         // If we are on the right thread, in the middle of an operation, and we have a registered
         // opCtx, then we should check the opCtx for interrupts.
-        if (_mr._thread.get_id() == stdx::this_thread::get_id() && _inOp > 0 && _opCtx) {
+        if (_opCtxThreadId == stdx::this_thread::get_id() && _inOp > 0 && _opCtx) {
             _killStatus = _opCtx->checkForInterruptNoAssert();
         }
 
@@ -218,13 +233,16 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
 }
 
 void MozJSImplScope::_gcCallback(JSContext* rt, JSGCStatus status, void* data) {
-    if (!shouldLog(logger::LogSeverity::Debug(1))) {
+    if (!shouldLog(logv2::LogSeverity::Debug(1))) {
         // don't collect stats unless verbose
         return;
     }
 
-    log() << "MozJS GC " << (status == JSGC_BEGIN ? "prologue" : "epilogue") << " heap stats - "
-          << " total: " << mongo::sm::get_total_bytes() << " limit: " << mongo::sm::get_max_bytes();
+    LOGV2_INFO(22787,
+               "MozJS GC heap stats",
+               "phase"_attr = (status == JSGC_BEGIN ? "prologue" : "epilogue"),
+               "total"_attr = mongo::sm::get_total_bytes(),
+               "limit"_attr = mongo::sm::get_max_bytes());
 }
 
 #if __has_feature(address_sanitizer)
@@ -261,16 +279,21 @@ void MozJSImplScope::ASANHandles::removePointer(void* ptr) {}
 #endif
 
 
-MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
+MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine,
+                                       boost::optional<int> jsHeapLimitMB) {
     /**
      * The maximum amount of memory to be given out per thread to mozilla. We
      * manage this by trapping all calls to malloc, free, etc. and keeping track of
-     * counts in some thread locals
+     * counts in some thread locals. If 'jsHeapLimitMB' is specified then we use this instead of the
+     * engine limit, given it does not exceed the engine limit.
      */
+    const auto engineJsHeapLimit = engine->getJSHeapLimitMB();
+    const auto jsHeapLimit =
+        jsHeapLimitMB ? std::min(*jsHeapLimitMB, engineJsHeapLimit) : engineJsHeapLimit;
 
-    const auto jsHeapLimit = engine->getJSHeapLimitMB();
     if (jsHeapLimit != 0 && jsHeapLimit < 10) {
-        warning() << "JavaScript may not be able to initialize with a heap limit less than 10MB.";
+        LOGV2_WARNING(22788,
+                      "JavaScript may not be able to initialize with a heap limit less than 10MB.");
     }
     size_t mallocMemoryLimit = 1024ul * 1024 * jsHeapLimit;
     mongo::sm::reset(mallocMemoryLimit);
@@ -360,9 +383,9 @@ MozJSImplScope::MozRuntime::MozRuntime(const MozJSScriptEngine* engine) {
     }
 }
 
-MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
+MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine, boost::optional<int> jsHeapLimitMB)
     : _engine(engine),
-      _mr(engine),
+      _mr(engine, jsHeapLimitMB),
       _context(_mr._context.get()),
       _globalProto(_context),
       _global(_globalProto.getProto()),
@@ -407,41 +430,47 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _statusProto(_context),
       _timestampProto(_context),
       _uriProto(_context) {
-    kCurrentScope = this;
 
-    JS_AddInterruptCallback(_context, _interruptCallback);
-    JS_SetGCCallback(_context, _gcCallback, this);
-    JS_SetContextPrivate(_context, this);
-    JSAutoRequest ar(_context);
+    try {
+        kCurrentScope = this;
 
-    JSAutoCompartment ac(_context, _global);
+        JS_AddInterruptCallback(_context, _interruptCallback);
+        JS_SetGCCallback(_context, _gcCallback, this);
+        JS_SetContextPrivate(_context, this);
+        JSAutoRequest ar(_context);
 
-    _checkErrorState(JS_InitStandardClasses(_context, _global));
+        JSAutoCompartment ac(_context, _global);
 
-    installBSONTypes();
+        _checkErrorState(JS_InitStandardClasses(_context, _global));
 
-    JS_FireOnNewGlobalObject(_context, _global);
+        installBSONTypes();
 
-    execSetup(JSFiles::assert);
-    execSetup(JSFiles::types);
+        JS_FireOnNewGlobalObject(_context, _global);
 
-    // install global utility functions
-    installGlobalUtils(*this);
-    _mongoHelpersProto.install(_global);
+        execSetup(JSFiles::assert);
+        execSetup(JSFiles::types);
 
-    // install process-specific utilities in the global scope (dependancy: types.js, assert.js)
-    if (_engine->getScopeInitCallback())
-        _engine->getScopeInitCallback()(*this);
+        // install global utility functions
+        installGlobalUtils(*this);
+        _mongoHelpersProto.install(_global);
+
+        // install process-specific utilities in the global scope (dependancy: types.js, assert.js)
+        if (_engine->getScopeInitCallback())
+            _engine->getScopeInitCallback()(*this);
+    } catch (...) {
+        kCurrentScope = nullptr;
+        throw;
+    }
 }
 
 MozJSImplScope::~MozJSImplScope() {
+    kCurrentScope = nullptr;
+
     for (auto&& x : _funcs) {
         x.reset();
     }
 
     unregisterOperation();
-
-    kCurrentScope = nullptr;
 }
 
 bool MozJSImplScope::hasOutOfMemoryException() {
@@ -618,9 +647,14 @@ bool hasFunctionIdentifier(StringData code) {
 ScriptingFunction MozJSImplScope::_createFunction(const char* raw) {
     return _runSafely([&] {
         JS::RootedValue fun(_context);
+        auto it = _funcCodeToHandleMap.find(StringData(raw));
+        if (it != _funcCodeToHandleMap.end()) {
+            return it->second;
+        }
         _MozJSCreateFunction(raw, &fun);
         _funcs.emplace_back(_context, fun.get());
-        return _funcs.size();
+        _funcCodeToHandleMap.emplace(raw, _funcs.size());
+        return ScriptingFunction(_funcs.size());
     });
 }
 
@@ -694,7 +728,7 @@ int MozJSImplScope::invoke(ScriptingFunction func,
             // must validate the handle because TerminateExecution may have
             // been thrown after the above checks
             if (out.isObject() && _nativeFunctionProto.instanceOf(out)) {
-                warning() << "storing native function as return value";
+                LOGV2_WARNING(22789, "storing native function as return value");
                 _lastRetIsNativeCode = true;
             } else {
                 _lastRetIsNativeCode = false;
@@ -912,7 +946,11 @@ bool MozJSImplScope::_checkErrorState(bool success, bool reportError, bool asser
     }
 
     if (reportError)
-        error() << redact(_error);
+        LOGV2_INFO_OPTIONS(
+            20163,
+            logv2::LogOptions(logv2::LogTag::kPlainShell, logv2::LogTruncation::Disabled),
+            "{jsError}",
+            "jsError"_attr = redact(_error));
 
     // Clear the status state
     auto status = std::move(_status);

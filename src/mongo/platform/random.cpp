@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -51,8 +51,8 @@
 #include <memory>
 #include <random>
 
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 #ifdef _WIN32
 #define SECURE_RANDOM_BCRYPT
@@ -95,9 +95,10 @@ public:
         auto ntstatus = ::BCryptOpenAlgorithmProvider(
             &_algHandle, BCRYPT_RNG_ALGORITHM, MS_PRIMITIVE_PROVIDER, 0);
         if (ntstatus != STATUS_SUCCESS) {
-            error() << "Failed to open crypto algorithm provider while creating secure random "
-                       "object; NTSTATUS: "
-                    << ntstatus;
+            LOGV2_ERROR(23822,
+                        "Failed to open crypto algorithm provider while creating secure random "
+                        "object; NTSTATUS: {ntstatus}",
+                        "ntstatus"_attr = ntstatus);
             fassertFailed(28815);
         }
     }
@@ -105,17 +106,20 @@ public:
     ~Source() {
         auto ntstatus = ::BCryptCloseAlgorithmProvider(_algHandle, 0);
         if (ntstatus != STATUS_SUCCESS) {
-            warning() << "Failed to close crypto algorithm provider destroying secure random "
-                         "object; NTSTATUS: "
-                      << ntstatus;
+            LOGV2_WARNING(23821,
+                          "Failed to close crypto algorithm provider destroying secure random "
+                          "object; NTSTATUS: {ntstatus}",
+                          "ntstatus"_attr = ntstatus);
         }
     }
 
     size_t refill(uint8_t* buf, size_t n) {
         auto ntstatus = ::BCryptGenRandom(_algHandle, reinterpret_cast<PUCHAR>(buf), n, 0);
         if (ntstatus != STATUS_SUCCESS) {
-            error() << "Failed to generate random number from secure random object; NTSTATUS: "
-                    << ntstatus;
+            LOGV2_ERROR(
+                23823,
+                "Failed to generate random number from secure random object; NTSTATUS: {ntstatus}",
+                "ntstatus"_attr = ntstatus);
             fassertFailed(28814);
         }
         return n;
@@ -138,7 +142,10 @@ public:
                     continue;
                 } else {
                     auto errSave = errno;
-                    error() << "SecureRandom: read `" << kFn << "`: " << strerror(errSave);
+                    LOGV2_ERROR(23824,
+                                "SecureRandom: read `{kFn}`: {strerror_errSave}",
+                                "kFn"_attr = kFn,
+                                "strerror_errSave"_attr = strerror(errSave));
                     fassertFailed(28840);
                 }
             }
@@ -160,7 +167,10 @@ private:
                     continue;
                 } else {
                     auto errSave = errno;
-                    error() << "SecureRandom: open `" << kFn << "`: " << strerror(errSave);
+                    LOGV2_ERROR(23825,
+                                "SecureRandom: open `{kFn}`: {strerror_errSave}",
+                                "kFn"_attr = kFn,
+                                "strerror_errSave"_attr = strerror(errSave));
                     fassertFailed(28839);
                 }
             }

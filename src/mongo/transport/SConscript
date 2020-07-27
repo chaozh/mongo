@@ -7,6 +7,7 @@ env = env.Clone()
 env.Library(
     target='transport_layer_common',
     source=[
+        'ismaster_metrics.cpp',
         'service_entry_point_utils.cpp',
         'session.cpp',
         'transport_layer.cpp',
@@ -14,6 +15,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/util/net/ssl_manager',
     ],
 )
 
@@ -84,7 +86,7 @@ env.Library(
 tlEnv.Library(
     target='service_executor',
     source=[
-        'service_executor_adaptive.cpp',
+        'service_executor_fixed.cpp',
         'service_executor_reserved.cpp',
         'service_executor_synchronous.cpp',
         env.Idlc('service_executor.idl')[0],
@@ -94,6 +96,7 @@ tlEnv.Library(
     ],
     LIBDEPS_PRIVATE=[
         "$BUILD_DIR/mongo/idl/server_parameter",
+        "$BUILD_DIR/mongo/util/concurrency/thread_pool",
         "$BUILD_DIR/mongo/util/processinfo",
         '$BUILD_DIR/third_party/shim_asio',
         'transport_layer_common',
@@ -174,8 +177,6 @@ tlEnv.CppUnitTest(
         'message_compressor_registry_test.cpp',
         'transport_layer_asio_test.cpp',
         'service_executor_test.cpp',
-        # Disable this test until SERVER-30475 and associated build failure tickets are resolved.
-        # 'service_executor_adaptive_test.cpp',
         'max_conns_override_test.cpp',
         'service_state_machine_test.cpp',
     ],

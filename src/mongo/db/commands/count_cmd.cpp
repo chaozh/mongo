@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
@@ -47,7 +45,6 @@
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/views/resolved_view.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -92,7 +89,18 @@ public:
 
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const override {
-        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+        static const Status kSnapshotNotSupported{ErrorCodes::InvalidOptions,
+                                                  "read concern snapshot not supported"};
+        return {{level == repl::ReadConcernLevel::kSnapshotReadConcern, kSnapshotNotSupported},
+                Status::OK()};
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
+    }
+
+    bool supportsReadMirroring(const BSONObj&) const override {
+        return true;
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -165,10 +173,16 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
+        auto rangePreserver =
+            CollectionShardingState::get(opCtx, nss)
+                ->getOwnershipFilter(
+                    opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
+
+        auto expCtx = makeExpressionContextForGetExecutor(
+            opCtx, request.getCollation().value_or(BSONObj()), nss);
 
         auto statusWithPlanExecutor =
-            getExecutorCount(opCtx, collection, request, true /*explain*/, nss);
+            getExecutorCount(expCtx, collection, request, true /*explain*/, nss);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -222,10 +236,18 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getCurrentMetadata();
+        auto rangePreserver =
+            CollectionShardingState::get(opCtx, nss)
+                ->getOwnershipFilter(
+                    opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
 
         auto statusWithPlanExecutor =
-            getExecutorCount(opCtx, collection, request, false /*explain*/, nss);
+            getExecutorCount(makeExpressionContextForGetExecutor(
+                                 opCtx, request.getCollation().value_or(BSONObj()), nss),
+                             collection,
+                             request,
+                             false /*explain*/,
+                             nss);
         uassertStatusOK(statusWithPlanExecutor.getStatus());
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -234,23 +256,20 @@ public:
         auto curOp = CurOp::get(opCtx);
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            curOp->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+            curOp->setPlanSummary_inlock(exec->getPlanSummary());
         }
 
-        Status execPlanStatus = exec->executePlan();
-        uassertStatusOK(execPlanStatus);
+        exec->executePlan();
 
         PlanSummaryStats summaryStats;
-        Explain::getSummaryStats(*exec, &summaryStats);
+        exec->getSummaryStats(&summaryStats);
         if (collection) {
-            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 
         if (curOp->shouldDBProfile()) {
-            BSONObjBuilder execStatsBob;
-            Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-            curOp->debug().execStats = execStatsBob.obj();
+            curOp->debug().execStats = exec->getStats();
         }
 
         // Plan is done executing. We just need to pull the count out of the root stage.
@@ -260,6 +279,24 @@ public:
 
         result.appendNumber("n", countStats->nCounted);
         return true;
+    }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob, const BSONObj& cmdObj) const override {
+        static const auto kMirrorableKeys = [] {
+            BSONObjBuilder keyBob;
+
+            keyBob.append("count", 1);
+            keyBob.append("query", 1);
+            keyBob.append("skip", 1);
+            keyBob.append("limit", 1);
+            keyBob.append("hint", 1);
+            keyBob.append("collation", 1);
+
+            return keyBob.obj();
+        }();
+
+        // Filter the keys that can be mirrored
+        cmdObj.filterFieldsUndotted(bob, kMirrorableKeys, true);
     }
 
 } cmdCount;

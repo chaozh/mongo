@@ -50,8 +50,6 @@ namespace mongo {
 using boost::intrusive_ptr;
 using std::vector;
 
-constexpr size_t DocumentSourceLookUp::kMaxSubPipelineDepth;
-
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
                                            std::string as,
                                            const boost::intrusive_ptr<ExpressionContext>& expCtx)
@@ -63,13 +61,7 @@ DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
     const auto& resolvedNamespace = expCtx->getResolvedNamespace(_fromNs);
     _resolvedNs = resolvedNamespace.ns;
     _resolvedPipeline = resolvedNamespace.pipeline;
-    _fromExpCtx = expCtx->copyWith(_resolvedNs);
-
-    _fromExpCtx->subPipelineDepth += 1;
-    uassert(ErrorCodes::MaxSubPipelineDepthExceeded,
-            str::stream() << "Maximum number of nested $lookup sub-pipelines exceeded. Limit is "
-                          << kMaxSubPipelineDepth,
-            _fromExpCtx->subPipelineDepth <= kMaxSubPipelineDepth);
+    _fromExpCtx = expCtx->copyForSubPipeline(resolvedNamespace.ns);
 }
 
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
@@ -105,11 +97,11 @@ DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
 
     for (auto&& varElem : letVariables) {
         const auto varName = varElem.fieldNameStringData();
-        Variables::uassertValidNameForUserWrite(varName);
+        Variables::validateNameForUserWrite(varName);
 
         _letVariables.emplace_back(
             varName.toString(),
-            Expression::parseOperand(expCtx, varElem, expCtx->variablesParseState),
+            Expression::parseOperand(expCtx.get(), varElem, expCtx->variablesParseState),
             _variablesParseState.defineVariable(varName));
     }
 
@@ -146,8 +138,8 @@ std::unique_ptr<DocumentSourceLookUp::LiteParsed> DocumentSourceLookUp::LitePars
         liteParsedPipeline = LiteParsedPipeline(fromNss, pipeline);
     }
 
-    return std::make_unique<DocumentSourceLookUp::LiteParsed>(std::move(fromNss),
-                                                              std::move(liteParsedPipeline));
+    return std::make_unique<DocumentSourceLookUp::LiteParsed>(
+        spec.fieldName(), std::move(fromNss), std::move(liteParsedPipeline));
 }
 
 PrivilegeVector DocumentSourceLookUp::LiteParsed::requiredPrivileges(
@@ -184,19 +176,6 @@ const char* DocumentSourceLookUp::getSourceName() const {
 }
 
 StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
-    // By default, $lookup is allowed in a transaction and does not use disk.
-    auto diskRequirement = DiskUseRequirement::kNoDiskUse;
-    auto txnRequirement = TransactionRequirement::kAllowed;
-
-    // However, if $lookup is specified with a pipeline, it inherits the strictest disk use and
-    // transaction requirement from the children in its pipeline.
-    if (wasConstructedWithPipelineSyntax()) {
-        const auto resolvedRequirements = StageConstraints::resolveDiskUseAndTransactionRequirement(
-            _resolvedIntrospectionPipeline->getSources());
-        diskRequirement = resolvedRequirements.first;
-        txnRequirement = resolvedRequirements.second;
-    }
-
     // If executing on mongos and the foreign collection is sharded, then this stage can run on
     // mongos or any shard.
     HostTypeRequirement hostRequirement =
@@ -211,16 +190,26 @@ StageConstraints DocumentSourceLookUp::constraints(Pipeline::SplitState) const {
         hostRequirement = HostTypeRequirement::kPrimaryShard;
     }
 
+    // By default, $lookup is allowed in a transaction and does not use disk.
     StageConstraints constraints(StreamType::kStreaming,
                                  PositionRequirement::kNone,
                                  hostRequirement,
-                                 diskRequirement,
+                                 DiskUseRequirement::kNoDiskUse,
                                  FacetRequirement::kAllowed,
-                                 txnRequirement,
-                                 LookupRequirement::kAllowed);
+                                 TransactionRequirement::kAllowed,
+                                 LookupRequirement::kAllowed,
+                                 UnionRequirement::kAllowed);
+
+    // However, if $lookup is specified with a pipeline, it inherits the strictest disk use, facet,
+    // transaction, and lookup requirements from the children in its pipeline.
+    if (wasConstructedWithPipelineSyntax()) {
+        constraints = StageConstraints::getStrictestConstraints(
+            _resolvedIntrospectionPipeline->getSources(), constraints);
+    }
 
     constraints.canSwapWithMatch = true;
     constraints.canSwapWithLimitAndSample = !_unwindSrc;
+
     return constraints;
 }
 
@@ -245,16 +234,19 @@ BSONObj buildEqualityOrQuery(const std::string& fieldName, const BSONArray& valu
     return orBuilder.obj();
 }
 
-void assertIsValidCollectionState(const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    if (expCtx->mongoProcessInterface->isSharded(expCtx->opCtx, expCtx->ns)) {
-        const bool foreignShardedAllowed =
-            getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
-        if (!foreignShardedAllowed) {
-            uasserted(51069, "Cannot run $lookup with sharded foreign collection");
-        }
-    }
+void lookupPipeValidator(const Pipeline& pipeline) {
+    const auto& sources = pipeline.getSources();
+    std::for_each(sources.begin(), sources.end(), [](auto& src) {
+        uassert(51047,
+                str::stream() << src->getSourceName()
+                              << " is not allowed within a $lookup's sub-pipeline",
+                src->constraints().isAllowedInLookupPipeline());
+    });
 }
 
+bool foreignShardedLookupAllowed() {
+    return getTestCommandsEnabled() && internalQueryAllowShardedLookup.load();
+}
 }  // namespace
 
 DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
@@ -280,7 +272,20 @@ DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
         _resolvedPipeline.back() = matchStage;
     }
 
-    auto pipeline = buildPipeline(inputDoc);
+    std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
+    try {
+        pipeline = buildPipeline(inputDoc);
+    } catch (const ExceptionForCat<ErrorCategory::StaleShardVersionError>& ex) {
+        // If lookup on a sharded collection is disallowed and the foreign collection is sharded,
+        // throw a custom exception.
+        if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+            uassert(51069,
+                    "Cannot run $lookup with sharded foreign collection",
+                    foreignShardedLookupAllowed() || !staleInfo->getVersionWanted() ||
+                        staleInfo->getVersionWanted() == ChunkVersion::UNSHARDED());
+        }
+        throw;
+    }
 
     std::vector<Value> results;
     long long objsize = 0;
@@ -308,33 +313,35 @@ DocumentSource::GetNextResult DocumentSourceLookUp::doGetNext() {
 std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     const Document& inputDoc) {
     // Copy all 'let' variables into the foreign pipeline's expression context.
-    copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
-
-    assertIsValidCollectionState(_fromExpCtx);
+    _variables.copyToExpCtx(_variablesParseState, _fromExpCtx.get());
 
     // Resolve the 'let' variables to values per the given input document.
     resolveLetVariables(inputDoc, &_fromExpCtx->variables);
 
-    // If we don't have a cache, build and return the pipeline immediately.
-    if (!_cache || _cache->isAbandoned()) {
-        MongoProcessInterface::MakePipelineOptions pipelineOpts;
-        pipelineOpts.optimize = true;
-        pipelineOpts.attachCursorSource = true;
-        // By default, $lookup doesnt support sharded 'from' collections.
-        pipelineOpts.allowTargetingShards = internalQueryAllowShardedLookup.load();
-        return pExpCtx->mongoProcessInterface->makePipeline(
-            _resolvedPipeline, _fromExpCtx, pipelineOpts);
+    if (!foreignShardedLookupAllowed()) {
+        // Enforce that the foreign collection must be unsharded for lookup.
+        _fromExpCtx->mongoProcessInterface->setExpectedShardVersion(
+            _fromExpCtx->opCtx, _fromExpCtx->ns, ChunkVersion::UNSHARDED());
     }
 
-    // Tailor the pipeline construction for our needs. We want a non-optimized pipeline without a
-    // cursor source.
-    MongoProcessInterface::MakePipelineOptions pipelineOpts;
+    // If we don't have a cache, build and return the pipeline immediately.
+    if (!_cache || _cache->isAbandoned()) {
+        MakePipelineOptions pipelineOpts;
+        pipelineOpts.optimize = true;
+        pipelineOpts.attachCursorSource = true;
+        pipelineOpts.validator = lookupPipeValidator;
+        // By default, $lookup doesnt support sharded 'from' collections.
+        pipelineOpts.allowTargetingShards = internalQueryAllowShardedLookup.load();
+        return Pipeline::makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts);
+    }
+
+    // Construct the basic pipeline without a cache stage. Avoid optimizing here since we need to
+    // add the cache first, as detailed below.
+    MakePipelineOptions pipelineOpts;
     pipelineOpts.optimize = false;
     pipelineOpts.attachCursorSource = false;
-
-    // Construct the basic pipeline without a cache stage.
-    auto pipeline =
-        pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts);
+    pipelineOpts.validator = lookupPipeValidator;
+    auto pipeline = Pipeline::makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts);
 
     // Add the cache stage at the end and optimize. During the optimization process, the cache will
     // either move itself to the correct position in the pipeline, or will abandon itself if no
@@ -354,7 +361,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     if (!_cache->isServing()) {
         // The cache has either been abandoned or has not yet been built. Attach a cursor.
         pipeline = pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(
-            _fromExpCtx, pipeline.release(), internalQueryAllowShardedLookup.load());
+            pipeline.release(), internalQueryAllowShardedLookup.load() /* allowTargetingShards*/);
     }
 
     // If the cache has been abandoned, release it.
@@ -660,13 +667,6 @@ DocumentSource::GetNextResult DocumentSourceLookUp::unwindResult() {
     return output.freeze();
 }
 
-void DocumentSourceLookUp::copyVariablesToExpCtx(const Variables& vars,
-                                                 const VariablesParseState& vps,
-                                                 ExpressionContext* expCtx) {
-    expCtx->variables = vars;
-    expCtx->variablesParseState = vps.copyWith(expCtx->variables.useIdGenerator());
-}
-
 void DocumentSourceLookUp::resolveLetVariables(const Document& localDoc, Variables* variables) {
     invariant(variables);
 
@@ -677,22 +677,9 @@ void DocumentSourceLookUp::resolveLetVariables(const Document& localDoc, Variabl
 }
 
 void DocumentSourceLookUp::initializeResolvedIntrospectionPipeline() {
-    copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
+    _variables.copyToExpCtx(_variablesParseState, _fromExpCtx.get());
     _resolvedIntrospectionPipeline =
-        uassertStatusOK(Pipeline::parse(_resolvedPipeline, _fromExpCtx));
-
-    auto& sources = _resolvedIntrospectionPipeline->getSources();
-
-    auto it = std::find_if(
-        sources.begin(), sources.end(), [](const boost::intrusive_ptr<DocumentSource>& src) {
-            return !src->constraints().isAllowedInLookupPipeline();
-        });
-
-    // For other stages, use a generic error.
-    uassert(51047,
-            str::stream() << (*it)->getSourceName()
-                          << " is not allowed within a $lookup's sub-pipeline",
-            it == sources.end());
+        Pipeline::parse(_resolvedPipeline, _fromExpCtx, lookupPipeValidator);
 }
 
 void DocumentSourceLookUp::serializeToArray(

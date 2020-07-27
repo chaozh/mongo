@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -37,7 +37,6 @@
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/client.h"
-#include "mongo/util/log.h"
 
 using namespace std::literals::string_literals;
 
@@ -91,25 +90,13 @@ AllMappings computeReverseMappings(SplitHorizon::ForwardMapping forwardMapping) 
 }
 
 SplitHorizon::ForwardMapping computeForwardMappings(
-    const HostAndPort& host, const boost::optional<BSONElement>& horizonsElement) {
+    const HostAndPort& host, const boost::optional<BSONObj>& horizonsObject) {
     SplitHorizon::ForwardMapping forwardMapping;
 
-    if (horizonsElement) {
+    if (horizonsObject) {
         using MapMember = std::pair<std::string, HostAndPort>;
 
-        if (horizonsElement->eoo()) {
-            uasserted(ErrorCodes::BadValue,
-                      str::stream() << "The horizons field cannot be empty, if present.");
-        }
-
-        if (horizonsElement->type() != Object) {
-            uasserted(ErrorCodes::TypeMismatch,
-                      str::stream() << "The horizons field must be an object");
-        }
-
-        const auto& horizonsObject = horizonsElement->Obj();
-
-        if (horizonsObject.isEmpty()) {
+        if (horizonsObject->isEmpty()) {
             uasserted(ErrorCodes::BadValue,
                       str::stream() << "The horizons field cannot be empty, if present.");
         }
@@ -137,7 +124,7 @@ SplitHorizon::ForwardMapping computeForwardMappings(
         const auto horizonEntries = [&] {
             std::vector<MapMember> rv;
             std::transform(
-                begin(horizonsObject), end(horizonsObject), inserter(rv, end(rv)), convert);
+                begin(*horizonsObject), end(*horizonsObject), inserter(rv, end(rv)), convert);
             return rv;
         }();
 
@@ -232,9 +219,8 @@ SplitHorizon::SplitHorizon(ForwardMapping mapping)
 // A split horizon constructed from the BSON configuration and the host specifier for this member
 // needs to compute the forward mapping table.  In turn that will be used to compute the reverse
 // mapping table.
-SplitHorizon::SplitHorizon(const HostAndPort& host,
-                           const boost::optional<BSONElement>& horizonsElement)
-    : SplitHorizon(computeForwardMappings(host, horizonsElement)) {}
+SplitHorizon::SplitHorizon(const HostAndPort& host, const boost::optional<BSONObj>& horizonsObject)
+    : SplitHorizon(computeForwardMappings(host, horizonsObject)) {}
 
 }  // namespace repl
 }  // namespace mongo

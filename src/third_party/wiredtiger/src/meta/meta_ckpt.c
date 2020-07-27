@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -14,6 +14,78 @@ static int __ckpt_load(WT_SESSION_IMPL *, WT_CONFIG_ITEM *, WT_CONFIG_ITEM *, WT
 static int __ckpt_named(WT_SESSION_IMPL *, const char *, const char *, WT_CKPT *);
 static int __ckpt_set(WT_SESSION_IMPL *, const char *, const char *, bool);
 static int __ckpt_version_chk(WT_SESSION_IMPL *, const char *, const char *);
+
+/*
+ * __ckpt_load_blk_mods --
+ *     Load the block information from the config string.
+ */
+static int
+__ckpt_load_blk_mods(WT_SESSION_IMPL *session, const char *config, WT_CKPT *ckpt)
+{
+    WT_BLKINCR *blkincr;
+    WT_BLOCK_MODS *blk_mod;
+    WT_CONFIG blkconf;
+    WT_CONFIG_ITEM b, k, v;
+    WT_CONNECTION_IMPL *conn;
+    WT_DECL_RET;
+    uint64_t i;
+
+    conn = S2C(session);
+    if (config == NULL)
+        return (0);
+    /*
+     * We could be reading in a configuration from an earlier release. If the string doesn't exist
+     * then we're done.
+     */
+    if ((ret = __wt_config_getones(session, config, "checkpoint_backup_info", &v)) != 0)
+        return (ret == WT_NOTFOUND ? 0 : ret);
+    __wt_config_subinit(session, &blkconf, &v);
+    /*
+     * Load block lists. Ignore any that have an id string that is not known.
+     *
+     * Remove those not known (TODO).
+     */
+    blkincr = NULL;
+    while ((ret = __wt_config_next(&blkconf, &k, &v)) == 0) {
+        /*
+         * See if this is a valid backup string.
+         */
+        for (i = 0; i < WT_BLKINCR_MAX; ++i) {
+            blkincr = &conn->incr_backups[i];
+            if (blkincr->id_str != NULL && WT_STRING_MATCH(blkincr->id_str, k.str, k.len))
+                break;
+        }
+        if (i == WT_BLKINCR_MAX)
+            /*
+             * This is the place to note that we want to remove an unknown id.
+             */
+            continue;
+
+        /*
+         * We have a valid entry. Load the block information.
+         */
+        blk_mod = &ckpt->backup_blocks[i];
+        WT_RET(__wt_strdup(session, blkincr->id_str, &blk_mod->id_str));
+        WT_RET(__wt_config_subgets(session, &v, "granularity", &b));
+        blk_mod->granularity = (uint64_t)b.val;
+        WT_RET(__wt_config_subgets(session, &v, "nbits", &b));
+        blk_mod->nbits = (uint64_t)b.val;
+        WT_RET(__wt_config_subgets(session, &v, "offset", &b));
+        blk_mod->offset = (uint64_t)b.val;
+        WT_RET(__wt_config_subgets(session, &v, "rename", &b));
+        if (b.val)
+            F_SET(blk_mod, WT_BLOCK_MODS_RENAME);
+        else
+            F_CLR(blk_mod, WT_BLOCK_MODS_RENAME);
+        ret = __wt_config_subgets(session, &v, "blocks", &b);
+        WT_RET_NOTFOUND_OK(ret);
+        if (ret != WT_NOTFOUND) {
+            WT_RET(__wt_backup_load_incr(session, &b, &blk_mod->bitstring, blk_mod->nbits));
+            F_SET(blk_mod, WT_BLOCK_MODS_VALID);
+        }
+    }
+    return (ret == WT_NOTFOUND ? 0 : ret);
+}
 
 /*
  * __wt_meta_checkpoint --
@@ -118,7 +190,7 @@ __ckpt_set(WT_SESSION_IMPL *session, const char *fname, const char *v, bool use_
      * use the slower path through configuration parsing functions.
      */
     config = newcfg = NULL;
-    str = v == NULL ? "checkpoint=(),checkpoint_lsn=" : v;
+    str = v == NULL ? "checkpoint=(),checkpoint_backup_info=(),checkpoint_lsn=" : v;
     if (use_base && session->dhandle != NULL) {
         WT_ERR(__wt_scr_alloc(session, 0, &tmp));
         WT_ASSERT(session, strcmp(session->dhandle->name, fname) == 0);
@@ -260,11 +332,10 @@ __wt_meta_block_metadata(WT_SESSION_IMPL *session, const char *config, WT_CKPT *
     filecfg[1] = config;
 
     /*
-     * Find out if this file is encrypted. If encrypting, encrypt and encode.
-     * The metadata has to be encrypted because it contains private data
-     * (for example, column names). We pass the block manager text that
-     * describes the metadata (the encryption information), and the
-     * possibly encrypted metadata encoded as a hexadecimal string.
+     * Find out if this file is encrypted. If encrypting, encrypt and encode. The metadata has to be
+     * encrypted because it contains private data (for example, column names). We pass the block
+     * manager text that describes the metadata (the encryption information), and the possibly
+     * encrypted metadata encoded as a hexadecimal string.
      */
     WT_ERR(__wt_btree_config_encryptor(session, filecfg, &kencryptor));
     if (kencryptor == NULL) {
@@ -275,7 +346,7 @@ __wt_meta_block_metadata(WT_SESSION_IMPL *session, const char *config, WT_CKPT *
         __wt_encrypt_size(session, kencryptor, a->size, &encrypt_size);
         WT_ERR(__wt_buf_grow(session, b, encrypt_size));
         WT_ERR(__wt_encrypt(session, kencryptor, 0, a, b));
-        WT_ERR(__wt_buf_grow(session, a, b->size * 2));
+        WT_ERR(__wt_buf_grow(session, a, b->size * 2 + 1));
         __wt_fill_hex(b->mem, b->size, a->mem, a->memsize, &a->size);
 
         metadata = a->data;
@@ -315,6 +386,104 @@ __ckpt_compare_order(const void *a, const void *b)
 }
 
 /*
+ * __ckpt_valid_blk_mods --
+ *     Make sure that this set of block mods reflects the current valid backup identifiers. If so,
+ *     there is nothing to do. If not, free up old information and set it up for the current
+ *     information.
+ */
+static int
+__ckpt_valid_blk_mods(WT_SESSION_IMPL *session, WT_CKPT *ckpt, bool rename)
+{
+    WT_BLKINCR *blk;
+    WT_BLOCK_MODS *blk_mod;
+    uint64_t i;
+    bool free, setup;
+
+    WT_ASSERT(session, F_ISSET(ckpt, WT_CKPT_ADD));
+    for (i = 0; i < WT_BLKINCR_MAX; ++i) {
+        blk = &S2C(session)->incr_backups[i];
+        blk_mod = &ckpt->backup_blocks[i];
+
+        /*
+         * Check the state of our block list array compared to the global one. There are
+         * several possibilities:
+         * - There is no global information for this index, nothing to do but free our resources.
+         * - We don't have any backup information locally. Set up our entry.
+         * - Our entry's id string matches the current global information. We just want to add our
+         *   information to the existing list.
+         * - Our entry's id string does not match the current one. It is outdated. Free old
+         * resources and then set up our entry.
+         */
+
+        /* Check if the global entry is valid at our index.  */
+        if (!F_ISSET(blk, WT_BLKINCR_VALID)) {
+            free = true;
+            setup = false;
+        } else if (F_ISSET(blk_mod, WT_BLOCK_MODS_VALID) &&
+          WT_STRING_MATCH(blk_mod->id_str, blk->id_str, strlen(blk->id_str))) {
+            /* We match, keep our entry and don't set up. */
+            setup = false;
+            free = false;
+        } else {
+            /* We don't match, free any old information. */
+            free = true;
+            setup = true;
+        }
+
+        /* If we are keeping or setting up an entry on a rename, set the flag. */
+        if (rename && (!free || setup))
+            F_SET(blk_mod, WT_BLOCK_MODS_RENAME);
+
+        /* Free any old information if we need to do so.  */
+        if (free && F_ISSET(blk_mod, WT_BLOCK_MODS_VALID)) {
+            __wt_free(session, blk_mod->id_str);
+            __wt_buf_free(session, &blk_mod->bitstring);
+            blk_mod->nbits = 0;
+            blk_mod->granularity = 0;
+            blk_mod->offset = 0;
+            F_CLR(blk_mod, WT_BLOCK_MODS_VALID);
+        }
+
+        /* Set up the block list to point to the current information.  */
+        if (setup) {
+            WT_RET(__wt_strdup(session, blk->id_str, &blk_mod->id_str));
+            WT_CLEAR(blk_mod->bitstring);
+            blk_mod->granularity = S2C(session)->incr_granularity;
+            blk_mod->nbits = 0;
+            blk_mod->offset = 0;
+            F_SET(blk_mod, WT_BLOCK_MODS_VALID);
+        }
+    }
+    return (0);
+}
+
+/*
+ * __wt_meta_blk_mods_load --
+ *     Load the block mods for a given checkpoint and set up all the information to store.
+ */
+int
+__wt_meta_blk_mods_load(WT_SESSION_IMPL *session, const char *config, WT_CKPT *ckpt, bool rename)
+{
+    /*
+     * Load most recent checkpoint backup blocks to this checkpoint.
+     */
+    WT_RET(__ckpt_load_blk_mods(session, config, ckpt));
+
+    WT_RET(__wt_meta_block_metadata(session, config, ckpt));
+
+    /*
+     * Set the add-a-checkpoint flag, and if we're doing incremental backups, request a list of the
+     * checkpoint's modified blocks from the block manager.
+     */
+    F_SET(ckpt, WT_CKPT_ADD);
+    if (F_ISSET(S2C(session), WT_CONN_INCR_BACKUP)) {
+        F_SET(ckpt, WT_CKPT_BLOCK_MODS);
+        WT_RET(__ckpt_valid_blk_mods(session, ckpt, rename));
+    }
+    return (0);
+}
+
+/*
  * __wt_meta_ckptlist_get --
  *     Load all available checkpoint information for a file.
  */
@@ -325,9 +494,10 @@ __wt_meta_ckptlist_get(
     WT_CKPT *ckpt, *ckptbase;
     WT_CONFIG ckptconf;
     WT_CONFIG_ITEM k, v;
+    WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
     size_t allocated, slot;
-    int64_t maxorder;
+    uint64_t most_recent;
     char *config;
 
     *ckptbasep = NULL;
@@ -335,6 +505,7 @@ __wt_meta_ckptlist_get(
     ckptbase = NULL;
     allocated = slot = 0;
     config = NULL;
+    conn = S2C(session);
 
     /* Retrieve the metadata information for the file. */
     WT_RET(__wt_metadata_search(session, fname, &config));
@@ -352,7 +523,7 @@ __wt_meta_ckptlist_get(
             WT_ERR(__ckpt_load(session, &k, &v, ckpt));
         }
     }
-    WT_ERR_NOTFOUND_OK(ret);
+    WT_ERR_NOTFOUND_OK(ret, false);
     if (!update && slot == 0)
         WT_ERR(WT_NOTFOUND);
 
@@ -372,16 +543,21 @@ __wt_meta_ckptlist_get(
         WT_ERR(__wt_realloc_def(session, &allocated, slot + 2, &ckptbase));
 
         /* The caller may be adding a value, initialize it. */
-        maxorder = 0;
-        WT_CKPT_FOREACH (ckptbase, ckpt)
-            if (ckpt->order > maxorder)
-                maxorder = ckpt->order;
-        ckpt->order = maxorder + 1;
+        ckpt = &ckptbase[slot];
+        ckpt->order = (slot == 0) ? 1 : ckptbase[slot - 1].order + 1;
         __wt_seconds(session, &ckpt->sec);
-
-        WT_ERR(__wt_meta_block_metadata(session, config, ckpt));
-
-        F_SET(ckpt, WT_CKPT_ADD);
+        /*
+         * Update time value for most recent checkpoint, not letting it move backwards. It is
+         * possible to race here, so use atomic CAS. This code relies on the fact that anyone we
+         * race with will only increase (never decrease) the most recent checkpoint time value.
+         */
+        for (;;) {
+            WT_ORDERED_READ(most_recent, conn->ckpt_most_recent);
+            if (ckpt->sec <= most_recent ||
+              __wt_atomic_cas64(&conn->ckpt_most_recent, most_recent, ckpt->sec))
+                break;
+        }
+        WT_ERR(__wt_meta_blk_mods_load(session, config, ckpt, false));
     }
 
     /* Return the array to our caller. */
@@ -438,23 +614,64 @@ __ckpt_load(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *k, WT_CONFIG_ITEM *v, WT_C
     ckpt->size = (uint64_t)a.val;
 
     /* Default to durability. */
-    ret = __wt_config_subgets(session, v, "newest_durable_ts", &a);
-    WT_RET_NOTFOUND_OK(ret);
-    ckpt->newest_durable_ts = ret == WT_NOTFOUND || a.len == 0 ? WT_TS_NONE : (uint64_t)a.val;
+    WT_TIME_AGGREGATE_INIT(&ckpt->ta);
+
     ret = __wt_config_subgets(session, v, "oldest_start_ts", &a);
     WT_RET_NOTFOUND_OK(ret);
-    ckpt->oldest_start_ts = ret == WT_NOTFOUND || a.len == 0 ? WT_TS_NONE : (uint64_t)a.val;
+    if (ret != WT_NOTFOUND && a.len != 0)
+        ckpt->ta.oldest_start_ts = (uint64_t)a.val;
+
     ret = __wt_config_subgets(session, v, "oldest_start_txn", &a);
     WT_RET_NOTFOUND_OK(ret);
-    ckpt->oldest_start_txn = ret == WT_NOTFOUND || a.len == 0 ? WT_TXN_NONE : (uint64_t)a.val;
+    if (ret != WT_NOTFOUND && a.len != 0)
+        ckpt->ta.oldest_start_txn = (uint64_t)a.val;
+
+    ret = __wt_config_subgets(session, v, "newest_start_durable_ts", &a);
+    WT_RET_NOTFOUND_OK(ret);
+    if (ret != WT_NOTFOUND && a.len != 0)
+        ckpt->ta.newest_start_durable_ts = (uint64_t)a.val;
+    else {
+        /*
+         * Backward compatibility changes, as the parameter name is different in older versions of
+         * WT, make sure that we read older format in case if we didn't find the newer format name.
+         */
+        ret = __wt_config_subgets(session, v, "start_durable_ts", &a);
+        WT_RET_NOTFOUND_OK(ret);
+        if (ret != WT_NOTFOUND && a.len != 0)
+            ckpt->ta.newest_start_durable_ts = (uint64_t)a.val;
+    }
+
     ret = __wt_config_subgets(session, v, "newest_stop_ts", &a);
     WT_RET_NOTFOUND_OK(ret);
-    ckpt->newest_stop_ts = ret == WT_NOTFOUND || a.len == 0 ? WT_TS_MAX : (uint64_t)a.val;
+    if (ret != WT_NOTFOUND && a.len != 0)
+        ckpt->ta.newest_stop_ts = (uint64_t)a.val;
+
     ret = __wt_config_subgets(session, v, "newest_stop_txn", &a);
     WT_RET_NOTFOUND_OK(ret);
-    ckpt->newest_stop_txn = ret == WT_NOTFOUND || a.len == 0 ? WT_TXN_MAX : (uint64_t)a.val;
-    __wt_check_addr_validity(session, ckpt->oldest_start_ts, ckpt->oldest_start_txn,
-      ckpt->newest_stop_ts, ckpt->newest_stop_txn);
+    if (ret != WT_NOTFOUND && a.len != 0)
+        ckpt->ta.newest_stop_txn = (uint64_t)a.val;
+
+    ret = __wt_config_subgets(session, v, "newest_stop_durable_ts", &a);
+    WT_RET_NOTFOUND_OK(ret);
+    if (ret != WT_NOTFOUND && a.len != 0)
+        ckpt->ta.newest_stop_durable_ts = (uint64_t)a.val;
+    else {
+        /*
+         * Backward compatibility changes, as the parameter name is different in older versions of
+         * WT, make sure that we read older format in case if we didn't find the newer format name.
+         */
+        ret = __wt_config_subgets(session, v, "stop_durable_ts", &a);
+        WT_RET_NOTFOUND_OK(ret);
+        if (ret != WT_NOTFOUND && a.len != 0)
+            ckpt->ta.newest_stop_durable_ts = (uint64_t)a.val;
+    }
+
+    ret = __wt_config_subgets(session, v, "prepare", &a);
+    WT_RET_NOTFOUND_OK(ret);
+    if (ret != WT_NOTFOUND && a.len != 0)
+        ckpt->ta.prepare = (uint8_t)a.val;
+
+    WT_RET(__wt_check_addr_validity(session, &ckpt->ta, false));
 
     WT_RET(__wt_config_subgets(session, v, "write_gen", &a));
     if (a.len == 0)
@@ -468,59 +685,48 @@ format:
 }
 
 /*
- * __wt_metadata_set_base_write_gen --
- *     Set the connection's base write generation.
+ * __wt_metadata_update_base_write_gen --
+ *     Update the connection's base write generation.
  */
 int
-__wt_metadata_set_base_write_gen(WT_SESSION_IMPL *session)
+__wt_metadata_update_base_write_gen(WT_SESSION_IMPL *session, const char *config)
 {
     WT_CKPT ckpt;
+    WT_CONNECTION_IMPL *conn;
+    WT_DECL_RET;
 
-    WT_RET(__wt_meta_checkpoint(session, WT_METAFILE_URI, NULL, &ckpt));
+    conn = S2C(session);
+    memset(&ckpt, 0, sizeof(ckpt));
 
-    /*
-     * We track the maximum page generation we've ever seen, and I'm not interested in debugging
-     * off-by-ones.
-     */
-    S2C(session)->base_write_gen = ckpt.write_gen + 1;
-
-    __wt_meta_checkpoint_free(session, &ckpt);
+    if ((ret = __ckpt_last(session, config, &ckpt)) == 0) {
+        conn->base_write_gen = WT_MAX(ckpt.write_gen + 1, conn->base_write_gen);
+        __wt_meta_checkpoint_free(session, &ckpt);
+    } else
+        WT_RET_NOTFOUND_OK(ret);
 
     return (0);
 }
 
 /*
- * __ckptlist_review_write_gen --
- *     Review the checkpoint's write generation.
+ * __wt_metadata_init_base_write_gen --
+ *     Initialize the connection's base write generation.
  */
-static void
-__ckptlist_review_write_gen(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
+int
+__wt_metadata_init_base_write_gen(WT_SESSION_IMPL *session)
 {
-    uint64_t v;
+    WT_DECL_RET;
+    char *config;
 
-    /*
-     * Every page written in a given wiredtiger_open() session needs to be in a single "generation",
-     * it's how we know to ignore transactional information found on pages written in previous
-     * generations. We make this work by writing the maximum write generation we've ever seen as the
-     * write-generation of the metadata file's checkpoint. When wiredtiger_open() is called, we copy
-     * that write generation into the connection's name space as the base write generation value.
-     * Then, whenever we open a file, if the file's write generation is less than the base value, we
-     * update the file's write generation so all writes will appear after the base value, and we
-     * ignore transactions on pages where the write generation is less than the base value.
-     *
-     * At every checkpoint, if the file's checkpoint write generation is larger than the
-     * connection's maximum write generation, update the connection.
-     */
-    do {
-        WT_ORDERED_READ(v, S2C(session)->max_write_gen);
-    } while (
-      ckpt->write_gen > v && !__wt_atomic_cas64(&S2C(session)->max_write_gen, v, ckpt->write_gen));
+    /* Initialize the base write gen to 1 */
+    S2C(session)->base_write_gen = 1;
+    /* Retrieve the metadata entry for the metadata file. */
+    WT_ERR(__wt_metadata_search(session, WT_METAFILE_URI, &config));
+    /* Update base write gen to the write gen of metadata. */
+    WT_ERR(__wt_metadata_update_base_write_gen(session, config));
 
-    /*
-     * If checkpointing the metadata file, update its write generation to be the maximum we've seen.
-     */
-    if (session->dhandle != NULL && WT_IS_METADATA(session->dhandle) && ckpt->write_gen < v)
-        ckpt->write_gen = v;
+err:
+    __wt_free(session, config);
+    return (ret);
 }
 
 /*
@@ -551,8 +757,7 @@ __wt_meta_ckptlist_to_meta(WT_SESSION_IMPL *session, WT_CKPT *ckptbase, WT_ITEM 
                 WT_RET(__wt_raw_to_hex(session, ckpt->raw.data, ckpt->raw.size, &ckpt->addr));
         }
 
-        __wt_check_addr_validity(session, ckpt->oldest_start_ts, ckpt->oldest_start_txn,
-          ckpt->newest_stop_ts, ckpt->newest_stop_txn);
+        WT_RET(__wt_check_addr_validity(session, &ckpt->ta, false));
 
         WT_RET(__wt_buf_catfmt(session, buf, "%s%s", sep, ckpt->name));
         sep = ",";
@@ -560,20 +765,67 @@ __wt_meta_ckptlist_to_meta(WT_SESSION_IMPL *session, WT_CKPT *ckptbase, WT_ITEM 
         if (strcmp(ckpt->name, WT_CHECKPOINT) == 0)
             WT_RET(__wt_buf_catfmt(session, buf, ".%" PRId64, ckpt->order));
 
-        /*
-         * Use PRId64 formats: WiredTiger's configuration code handles signed 8B values.
-         */
+        /* Use PRId64 formats: WiredTiger's configuration code handles signed 8B values. */
         WT_RET(__wt_buf_catfmt(session, buf,
           "=(addr=\"%.*s\",order=%" PRId64 ",time=%" PRIu64 ",size=%" PRId64
-          ",newest_durable_ts=%" PRId64 ",oldest_start_ts=%" PRId64 ",oldest_start_txn=%" PRId64
-          ",newest_stop_ts=%" PRId64 ",newest_stop_txn=%" PRId64 ",write_gen=%" PRId64 ")",
+          ",newest_start_durable_ts=%" PRId64 ",oldest_start_ts=%" PRId64
+          ",oldest_start_txn=%" PRId64 ",newest_stop_durable_ts=%" PRId64 ",newest_stop_ts=%" PRId64
+          ",newest_stop_txn=%" PRId64 ",prepare=%d,write_gen=%" PRId64 ")",
           (int)ckpt->addr.size, (char *)ckpt->addr.data, ckpt->order, ckpt->sec,
-          (int64_t)ckpt->size, (int64_t)ckpt->newest_durable_ts, (int64_t)ckpt->oldest_start_ts,
-          (int64_t)ckpt->oldest_start_txn, (int64_t)ckpt->newest_stop_ts,
-          (int64_t)ckpt->newest_stop_txn, (int64_t)ckpt->write_gen));
+          (int64_t)ckpt->size, (int64_t)ckpt->ta.newest_start_durable_ts,
+          (int64_t)ckpt->ta.oldest_start_ts, (int64_t)ckpt->ta.oldest_start_txn,
+          (int64_t)ckpt->ta.newest_stop_durable_ts, (int64_t)ckpt->ta.newest_stop_ts,
+          (int64_t)ckpt->ta.newest_stop_txn, (int)ckpt->ta.prepare, (int64_t)ckpt->write_gen));
     }
     WT_RET(__wt_buf_catfmt(session, buf, ")"));
 
+    return (0);
+}
+
+/*
+ * __wt_ckpt_blkmod_to_meta --
+ *     Add in any modification block string needed, including an empty one.
+ */
+int
+__wt_ckpt_blkmod_to_meta(WT_SESSION_IMPL *session, WT_ITEM *buf, WT_CKPT *ckpt)
+{
+    WT_BLOCK_MODS *blk;
+    WT_ITEM bitstring;
+    u_int i;
+    bool valid;
+
+    WT_CLEAR(bitstring);
+    valid = false;
+    for (i = 0, blk = &ckpt->backup_blocks[0]; i < WT_BLKINCR_MAX; ++i, ++blk)
+        if (F_ISSET(blk, WT_BLOCK_MODS_VALID))
+            valid = true;
+
+    /*
+     * If the existing block modifications are not valid, there is nothing to do.
+     */
+    if (!valid) {
+        WT_RET(__wt_buf_catfmt(session, buf, ",checkpoint_backup_info="));
+        return (0);
+    }
+
+    /*
+     * We have at least one valid modified block list.
+     */
+    WT_RET(__wt_buf_catfmt(session, buf, ",checkpoint_backup_info=("));
+    for (i = 0, blk = &ckpt->backup_blocks[0]; i < WT_BLKINCR_MAX; ++i, ++blk) {
+        if (!F_ISSET(blk, WT_BLOCK_MODS_VALID))
+            continue;
+        WT_RET(__wt_raw_to_hex(session, blk->bitstring.data, blk->bitstring.size, &bitstring));
+        WT_RET(__wt_buf_catfmt(session, buf,
+          "%s\"%s\"=(id=%" PRIu32 ",granularity=%" PRIu64 ",nbits=%" PRIu64 ",offset=%" PRIu64
+          ",rename=%d,blocks=%.*s)",
+          i == 0 ? "" : ",", blk->id_str, i, blk->granularity, blk->nbits, blk->offset,
+          F_ISSET(blk, WT_BLOCK_MODS_RENAME) ? 1 : 0, (int)bitstring.size, (char *)bitstring.data));
+        /* The hex string length should match the appropriate number of bits. */
+        WT_ASSERT(session, (blk->nbits >> 2) <= bitstring.size);
+        __wt_buf_free(session, &bitstring);
+    }
+    WT_RET(__wt_buf_catfmt(session, buf, ")"));
     return (0);
 }
 
@@ -593,6 +845,10 @@ __wt_meta_ckptlist_set(
     WT_RET(__wt_scr_alloc(session, 1024, &buf));
 
     WT_ERR(__wt_meta_ckptlist_to_meta(session, ckptbase, buf));
+    /* Add backup block modifications for any added checkpoint. */
+    WT_CKPT_FOREACH (ckptbase, ckpt)
+        if (F_ISSET(ckpt, WT_CKPT_ADD))
+            WT_ERR(__wt_ckpt_blkmod_to_meta(session, buf, ckpt));
 
     has_lsn = ckptlsn != NULL;
     if (ckptlsn != NULL)
@@ -600,10 +856,6 @@ __wt_meta_ckptlist_set(
           ckptlsn->l.file, (uintmax_t)ckptlsn->l.offset));
 
     WT_ERR(__ckpt_set(session, fname, buf->mem, has_lsn));
-
-    /* Review the checkpoint's write generation. */
-    WT_CKPT_FOREACH (ckptbase, ckpt)
-        __ckptlist_review_write_gen(session, ckpt);
 
 err:
     __wt_scr_free(session, &buf);
@@ -634,6 +886,9 @@ __wt_meta_ckptlist_free(WT_SESSION_IMPL *session, WT_CKPT **ckptbasep)
 void
 __wt_meta_checkpoint_free(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
 {
+    WT_BLOCK_MODS *blk_mod;
+    uint64_t i;
+
     if (ckpt == NULL)
         return;
 
@@ -643,6 +898,12 @@ __wt_meta_checkpoint_free(WT_SESSION_IMPL *session, WT_CKPT *ckpt)
     __wt_buf_free(session, &ckpt->addr);
     __wt_buf_free(session, &ckpt->raw);
     __wt_free(session, ckpt->bpriv);
+    for (i = 0; i < WT_BLKINCR_MAX; ++i) {
+        blk_mod = &ckpt->backup_blocks[i];
+        __wt_buf_free(session, &blk_mod->bitstring);
+        __wt_free(session, blk_mod->id_str);
+        F_CLR(blk_mod, WT_BLOCK_MODS_VALID);
+    }
 
     WT_CLEAR(*ckpt); /* Clear to prepare for re-use. */
 }
@@ -674,7 +935,7 @@ __wt_meta_sysinfo_set(WT_SESSION_IMPL *session)
      * entry.
      */
     if (strcmp(hex_timestamp, "0") == 0)
-        WT_ERR_NOTFOUND_OK(__wt_metadata_remove(session, WT_SYSTEM_CKPT_URI));
+        WT_ERR_NOTFOUND_OK(__wt_metadata_remove(session, WT_SYSTEM_CKPT_URI), false);
     else {
         WT_ERR(__wt_buf_catfmt(session, buf, "checkpoint_timestamp=\"%s\"", hex_timestamp));
         WT_ERR(__wt_metadata_update(session, WT_SYSTEM_CKPT_URI, buf->data));

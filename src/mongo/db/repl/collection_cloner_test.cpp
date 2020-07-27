@@ -59,7 +59,7 @@ public:
     CollectionClonerTest() {}
 
 protected:
-    void setUp() final {
+    void setUp() override {
         ClonerTestFixture::setUp();
         _collectionStats = std::make_shared<CollectionMockStats>();
         _standardCreateCollectionFn = [this](const NamespaceString& nss,
@@ -78,8 +78,8 @@ protected:
         };
         _storageInterface.createCollectionForBulkFn = _standardCreateCollectionFn;
 
-        _mockClient->setWireVersions(WireVersion::PLACEHOLDER_FOR_44,
-                                     WireVersion::PLACEHOLDER_FOR_44);
+        _mockClient->setWireVersions(WireVersion::RESUMABLE_INITIAL_SYNC,
+                                     WireVersion::RESUMABLE_INITIAL_SYNC);
         _mockServer->assignCollectionUuid(_nss.ns(), _collUuid);
         _mockServer->setCommandReply("replSetGetRBID",
                                      BSON("ok" << 1 << "rbid" << _sharedData->getRollBackId()));
@@ -101,8 +101,12 @@ protected:
         return cloner->_progressMeter;
     }
 
-    std::vector<BSONObj>& getIndexSpecs(CollectionCloner* cloner) {
-        return cloner->_indexSpecs;
+    std::vector<BSONObj> getIndexSpecs(CollectionCloner* cloner) {
+        std::vector<BSONObj> indexSpecs = cloner->_readyIndexSpecs;
+        for (const auto& unfinishedSpec : cloner->_unfinishedIndexSpecs) {
+            indexSpecs.push_back(unfinishedSpec["spec"].Obj());
+        }
+        return indexSpecs;
     }
 
     BSONObj& getIdIndexSpec(CollectionCloner* cloner) {
@@ -125,7 +129,25 @@ protected:
                                                        << "b_1")};
 };
 
-TEST_F(CollectionClonerTest, CountStage) {
+class CollectionClonerTestResumable : public CollectionClonerTest {
+    void setUp() final {
+        CollectionClonerTest::setUp();
+        setInitialSyncId();
+    }
+};
+
+class CollectionClonerTestNonResumable : public CollectionClonerTest {
+    void setUp() final {
+        CollectionClonerTest::setUp();
+        // Set client wireVersion to 4.2, where we do not yet support resumable cloning.
+        _mockClient->setWireVersions(WireVersion::SHARDED_TRANSACTIONS,
+                                     WireVersion::SHARDED_TRANSACTIONS);
+        stdx::lock_guard<InitialSyncSharedData> lk(*_sharedData);
+        _sharedData->setSyncSourceWireVersion(lk, WireVersion::SHARDED_TRANSACTIONS);
+    }
+};
+
+TEST_F(CollectionClonerTestResumable, CountStage) {
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("count");
     _mockServer->setCommandReply("count", createCountResponse(100));
@@ -134,7 +156,7 @@ TEST_F(CollectionClonerTest, CountStage) {
 }
 
 // On a negative count, the CollectionCloner should use a zero count.
-TEST_F(CollectionClonerTest, CountStageNegativeCount) {
+TEST_F(CollectionClonerTestResumable, CountStageNegativeCount) {
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("count");
     _mockServer->setCommandReply("count", createCountResponse(-100));
@@ -143,19 +165,21 @@ TEST_F(CollectionClonerTest, CountStageNegativeCount) {
 }
 
 // On NamespaceNotFound, the CollectionCloner should exit without doing anything.
-TEST_F(CollectionClonerTest, CountStageNamespaceNotFound) {
+TEST_F(CollectionClonerTestResumable, CountStageNamespaceNotFound) {
     auto cloner = makeCollectionCloner();
     _mockServer->setCommandReply("count", Status(ErrorCodes::NamespaceNotFound, "NoSuchUuid"));
     ASSERT_OK(cloner->run());
 }
 
-TEST_F(CollectionClonerTest, CollectionClonerPassesThroughNonRetriableErrorFromCountCommand) {
+TEST_F(CollectionClonerTestResumable,
+       CollectionClonerPassesThroughNonRetriableErrorFromCountCommand) {
     auto cloner = makeCollectionCloner();
     _mockServer->setCommandReply("count", Status(ErrorCodes::OperationFailed, ""));
     ASSERT_EQUALS(ErrorCodes::OperationFailed, cloner->run());
 }
 
-TEST_F(CollectionClonerTest, CollectionClonerPassesThroughCommandStatusErrorFromCountCommand) {
+TEST_F(CollectionClonerTestResumable,
+       CollectionClonerPassesThroughCommandStatusErrorFromCountCommand) {
     auto cloner = makeCollectionCloner();
     _mockServer->setCommandReply("count", Status(ErrorCodes::OperationFailed, ""));
     _mockServer->setCommandReply("count",
@@ -167,7 +191,8 @@ TEST_F(CollectionClonerTest, CollectionClonerPassesThroughCommandStatusErrorFrom
     ASSERT_STRING_CONTAINS(status.reason(), "TEST error");
 }
 
-TEST_F(CollectionClonerTest, CollectionClonerReturnsNoSuchKeyOnMissingDocumentCountFieldName) {
+TEST_F(CollectionClonerTestResumable,
+       CollectionClonerReturnsNoSuchKeyOnMissingDocumentCountFieldName) {
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("count");
     _mockServer->setCommandReply("count", BSON("ok" << 1));
@@ -175,7 +200,7 @@ TEST_F(CollectionClonerTest, CollectionClonerReturnsNoSuchKeyOnMissingDocumentCo
     ASSERT_EQUALS(ErrorCodes::NoSuchKey, status);
 }
 
-TEST_F(CollectionClonerTest, ListIndexesReturnedNoIndexes) {
+TEST_F(CollectionClonerTestResumable, ListIndexesReturnedNoIndexes) {
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("listIndexes");
     _mockServer->setCommandReply("count", createCountResponse(1));
@@ -187,7 +212,7 @@ TEST_F(CollectionClonerTest, ListIndexesReturnedNoIndexes) {
 }
 
 // NamespaceNotFound is treated the same as no index.
-TEST_F(CollectionClonerTest, ListIndexesReturnedNamespaceNotFound) {
+TEST_F(CollectionClonerTestResumable, ListIndexesReturnedNamespaceNotFound) {
     auto cloner = makeCollectionCloner();
     _mockServer->setCommandReply("count", createCountResponse(1));
     _mockServer->setCommandReply("listIndexes",
@@ -199,7 +224,7 @@ TEST_F(CollectionClonerTest, ListIndexesReturnedNamespaceNotFound) {
     ASSERT_EQ(0, cloner->getStats().indexes);
 }
 
-TEST_F(CollectionClonerTest, ListIndexesHasResults) {
+TEST_F(CollectionClonerTestResumable, ListIndexesHasResults) {
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("listIndexes");
     _mockServer->setCommandReply("count", createCountResponse(1));
@@ -216,7 +241,7 @@ TEST_F(CollectionClonerTest, ListIndexesHasResults) {
     ASSERT_EQ(3, cloner->getStats().indexes);
 }
 
-TEST_F(CollectionClonerTest, CollectionClonerResendsListIndexesCommandOnRetriableError) {
+TEST_F(CollectionClonerTestResumable, CollectionClonerResendsListIndexesCommandOnRetriableError) {
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("listIndexes");
     _mockServer->setCommandReply("count", createCountResponse(1));
@@ -233,7 +258,7 @@ TEST_F(CollectionClonerTest, CollectionClonerResendsListIndexesCommandOnRetriabl
     ASSERT_EQ(2, cloner->getStats().indexes);
 }
 
-TEST_F(CollectionClonerTest, BeginCollection) {
+TEST_F(CollectionClonerTestResumable, BeginCollection) {
     NamespaceString collNss;
     CollectionOptions collOptions;
     BSONObj collIdIndexSpec;
@@ -270,7 +295,7 @@ TEST_F(CollectionClonerTest, BeginCollection) {
     }
 }
 
-TEST_F(CollectionClonerTest, BeginCollectionFailed) {
+TEST_F(CollectionClonerTestResumable, BeginCollectionFailed) {
     _storageInterface.createCollectionForBulkFn = [&](const NamespaceString& theNss,
                                                       const CollectionOptions& theOptions,
                                                       const BSONObj idIndexSpec,
@@ -285,7 +310,7 @@ TEST_F(CollectionClonerTest, BeginCollectionFailed) {
     ASSERT_EQUALS(ErrorCodes::OperationFailed, cloner->run());
 }
 
-TEST_F(CollectionClonerTest, InsertDocumentsSingleBatch) {
+TEST_F(CollectionClonerTestResumable, InsertDocumentsSingleBatch) {
     // Set up data for preliminary stages
     _mockServer->setCommandReply("count", createCountResponse(2));
     _mockServer->setCommandReply("listIndexes",
@@ -305,7 +330,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsSingleBatch) {
     ASSERT_EQUALS(1u, stats.receivedBatches);
 }
 
-TEST_F(CollectionClonerTest, InsertDocumentsMultipleBatches) {
+TEST_F(CollectionClonerTestResumable, InsertDocumentsMultipleBatches) {
     // Set up data for preliminary stages
     _mockServer->setCommandReply("count", createCountResponse(2));
     _mockServer->setCommandReply("listIndexes",
@@ -327,7 +352,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsMultipleBatches) {
     ASSERT_EQUALS(2u, stats.receivedBatches);
 }
 
-TEST_F(CollectionClonerTest, InsertDocumentsScheduleDBWorkFailed) {
+TEST_F(CollectionClonerTestResumable, InsertDocumentsScheduleDBWorkFailed) {
     // Set up data for preliminary stages
     _mockServer->setCommandReply("count", createCountResponse(2));
     _mockServer->setCommandReply("listIndexes",
@@ -364,7 +389,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsScheduleDBWorkFailed) {
     clonerThread.join();
 }
 
-TEST_F(CollectionClonerTest, InsertDocumentsCallbackCanceled) {
+TEST_F(CollectionClonerTestResumable, InsertDocumentsCallbackCanceled) {
     // Set up data for preliminary stages
     _mockServer->setCommandReply("count", createCountResponse(2));
     _mockServer->setCommandReply("listIndexes",
@@ -407,7 +432,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsCallbackCanceled) {
     clonerThread.join();
 }
 
-TEST_F(CollectionClonerTest, InsertDocumentsFailed) {
+TEST_F(CollectionClonerTestResumable, InsertDocumentsFailed) {
     // Set up data for preliminary stages
     _mockServer->setCommandReply("count", createCountResponse(2));
     _mockServer->setCommandReply("listIndexes",
@@ -447,7 +472,7 @@ TEST_F(CollectionClonerTest, InsertDocumentsFailed) {
     clonerThread.join();
 }
 
-TEST_F(CollectionClonerTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
+TEST_F(CollectionClonerTestResumable, DoNotCreateIDIndexIfAutoIndexIdUsed) {
     NamespaceString collNss;
     CollectionOptions collOptions;
     // We initialize collIndexSpecs with fake information to ensure it is overwritten by an empty
@@ -482,11 +507,8 @@ TEST_F(CollectionClonerTest, DoNotCreateIDIndexIfAutoIndexIdUsed) {
     ASSERT_EQ(collNss, _nss);
 }
 
-TEST_F(CollectionClonerTest, NonResumableQuerySuccess) {
+TEST_F(CollectionClonerTestNonResumable, NonResumableQuerySuccess) {
     // Set client wireVersion to 4.2, where we do not yet support resumable cloning.
-    _mockClient->setWireVersions(WireVersion::SHARDED_TRANSACTIONS,
-                                 WireVersion::SHARDED_TRANSACTIONS);
-
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
                                 << "_id_");
@@ -509,11 +531,7 @@ TEST_F(CollectionClonerTest, NonResumableQuerySuccess) {
     ASSERT_EQUALS(3u, stats.documentsCopied);
 }
 
-TEST_F(CollectionClonerTest, NonResumableQueryFailure) {
-    // Set client wireVersion to 4.2, where we do not yet support resumable cloning.
-    _mockClient->setWireVersions(WireVersion::SHARDED_TRANSACTIONS,
-                                 WireVersion::SHARDED_TRANSACTIONS);
-
+TEST_F(CollectionClonerTestNonResumable, NonResumableQueryFailure) {
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
                                 << "_id_");
@@ -553,7 +571,7 @@ TEST_F(CollectionClonerTest, NonResumableQueryFailure) {
 }
 
 // We will retry our query without having yet obtained a resume token.
-TEST_F(CollectionClonerTest, ResumableQueryFailTransientlyBeforeFirstBatchRetrySuccess) {
+TEST_F(CollectionClonerTestResumable, ResumableQueryFailTransientlyBeforeFirstBatchRetrySuccess) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
 
     // Set up data for preliminary stages
@@ -615,9 +633,8 @@ TEST_F(CollectionClonerTest, ResumableQueryFailTransientlyBeforeFirstBatchRetryS
 }
 
 // We will resume our query using the resume token we stored after receiving the first batch.
-TEST_F(CollectionClonerTest, ResumableQueryFailTransientlyAfterFirstBatchRetrySuccess) {
+TEST_F(CollectionClonerTestResumable, ResumableQueryFailTransientlyAfterFirstBatchRetrySuccess) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
-    _mockServer->setCommandReply("killCursors", fromjson("{ok:1}"));
 
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
@@ -672,9 +689,8 @@ TEST_F(CollectionClonerTest, ResumableQueryFailTransientlyAfterFirstBatchRetrySu
     ASSERT_EQUALS(5u, stats.documentsCopied);
 }
 
-TEST_F(CollectionClonerTest, ResumableQueryNonRetriableError) {
+TEST_F(CollectionClonerTestResumable, ResumableQueryNonRetriableError) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
-    _mockServer->setCommandReply("killCursors", fromjson("{ok:1}"));
 
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
@@ -717,9 +733,9 @@ TEST_F(CollectionClonerTest, ResumableQueryNonRetriableError) {
     clonerThread.join();
 }
 
-TEST_F(CollectionClonerTest, ResumableQueryFailNonTransientlyAfterProgressMadeCannotRetry) {
+TEST_F(CollectionClonerTestResumable,
+       ResumableQueryFailNonTransientlyAfterProgressMadeCannotRetry) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
-    _mockServer->setCommandReply("killCursors", fromjson("{ok:1}"));
 
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
@@ -762,122 +778,9 @@ TEST_F(CollectionClonerTest, ResumableQueryFailNonTransientlyAfterProgressMadeCa
     clonerThread.join();
 }
 
-TEST_F(CollectionClonerTest, ResumableQueryKillCursorsNetworkError) {
-    _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
-
-    // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
-    _mockServer->setCommandReply("count", createCountResponse(3));
-    _mockServer->setCommandReply("listIndexes",
-                                 createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
-
-    // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
-
-    // Preliminary setup for hanging failpoint.
-    auto afterBatchFailpoint =
-        globalFailPointRegistry().find("initialSyncHangCollectionClonerAfterHandlingBatchResponse");
-    auto timesEnteredAfterBatch = afterBatchFailpoint->setMode(FailPoint::alwaysOn, 0);
-
-    auto cloner = makeCollectionCloner();
-    cloner->setBatchSize_forTest(2);
-
-    // Run the cloner in a separate thread.
-    stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
-        ASSERT_OK(cloner->run());
-    });
-
-    // Wait for us to process the first batch.
-    afterBatchFailpoint->waitForTimesEntered(timesEnteredAfterBatch + 1);
-
-    // Verify we've only managed to store one batch.
-    auto stats = cloner->getStats();
-    ASSERT_EQUALS(1, stats.receivedBatches);
-
-    // This will cause the next batch to fail once (transiently).
-    auto failNextBatch = globalFailPointRegistry().find("mockCursorThrowErrorOnGetMore");
-    failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'HostUnreachable'}"));
-
-    // Prepare the network error response to 'killCursors'.
-    // This will cause us to retry the query stage.
-    _mockServer->setCommandReply("killCursors",
-                                 Status{ErrorCodes::HostUnreachable, "HostUnreachable for test"});
-
-    // Let the query stage finish.
-    afterBatchFailpoint->setMode(FailPoint::off, 0);
-    clonerThread.join();
-
-    ASSERT_EQUALS(3, _collectionStats->insertCount);
-    ASSERT_TRUE(_collectionStats->commitCalled);
-    stats = cloner->getStats();
-    ASSERT_EQUALS(3u, stats.documentsCopied);
-}
-
-TEST_F(CollectionClonerTest, ResumableQueryKillCursorsOtherError) {
-    _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
-
-    // Set up data for preliminary stages
-    auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
-                                << "_id_");
-    _mockServer->setCommandReply("count", createCountResponse(3));
-    _mockServer->setCommandReply("listIndexes",
-                                 createCursorResponse(_nss.ns(), BSON_ARRAY(idIndexSpec)));
-
-    // Set up documents to be returned from upstream node.
-    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
-    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
-
-    // Preliminary setup for hanging failpoint.
-    auto afterBatchFailpoint =
-        globalFailPointRegistry().find("initialSyncHangCollectionClonerAfterHandlingBatchResponse");
-    auto timesEnteredAfterBatch = afterBatchFailpoint->setMode(FailPoint::alwaysOn, 0);
-
-    auto cloner = makeCollectionCloner();
-    cloner->setBatchSize_forTest(2);
-
-    // Run the cloner in a separate thread.
-    stdx::thread clonerThread([&] {
-        Client::initThread("ClonerRunner");
-        ASSERT_OK(cloner->run());
-    });
-
-    // Wait for us to process the first batch.
-    afterBatchFailpoint->waitForTimesEntered(timesEnteredAfterBatch + 1);
-
-    // Verify we've only managed to store one batch.
-    auto stats = cloner->getStats();
-    ASSERT_EQUALS(1, stats.receivedBatches);
-
-    // This will cause the next batch to fail once (transiently).
-    auto failNextBatch = globalFailPointRegistry().find("mockCursorThrowErrorOnGetMore");
-    failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'HostUnreachable'}"));
-
-    // Prepare the network error response to 'killCursors'.
-    // This will cause us to retry the whole query.
-    _mockServer->setCommandReply("killCursors",
-                                 Status{ErrorCodes::UnknownError, "UnknownError for test"});
-
-    // Let the query stage finish.
-    afterBatchFailpoint->setMode(FailPoint::off, 0);
-    clonerThread.join();
-
-    // We ignored the 'killCursors' request and just resumed the query. We should have cloned every
-    // document exactly once.
-    ASSERT_EQUALS(3, _collectionStats->insertCount);
-    ASSERT_TRUE(_collectionStats->commitCalled);
-    stats = cloner->getStats();
-    ASSERT_EQUALS(3u, stats.documentsCopied);
-}
-
 // We retry the query after a transient error and we immediately encounter a non-retriable one.
-TEST_F(CollectionClonerTest, ResumableQueryNonTransientErrorAtRetry) {
+TEST_F(CollectionClonerTestResumable, ResumableQueryNonTransientErrorAtRetry) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
-    _mockServer->setCommandReply("killCursors", fromjson("{ok:1}"));
 
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
@@ -937,9 +840,8 @@ TEST_F(CollectionClonerTest, ResumableQueryNonTransientErrorAtRetry) {
 
 // We retry the query after a transient error, we make a bit more progress and then we encounter
 // a non-retriable one.
-TEST_F(CollectionClonerTest, ResumableQueryNonTransientErrorAfterPastRetry) {
+TEST_F(CollectionClonerTestResumable, ResumableQueryNonTransientErrorAfterPastRetry) {
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
-    _mockServer->setCommandReply("killCursors", fromjson("{ok:1}"));
 
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
@@ -1006,7 +908,7 @@ TEST_F(CollectionClonerTest, ResumableQueryNonTransientErrorAfterPastRetry) {
 
 // We resume a query, receive some more data, then get a transient error again. The goal of this
 // test is to make sure we don't forget to request the _next_ resume token when resuming a query.
-TEST_F(CollectionClonerTest, ResumableQueryTwoResumes) {
+TEST_F(CollectionClonerTestResumable, ResumableQueryTwoResumes) {
 
     /**
      * Test runs like so:
@@ -1017,7 +919,6 @@ TEST_F(CollectionClonerTest, ResumableQueryTwoResumes) {
      */
 
     _mockServer->setCommandReply("replSetGetRBID", fromjson("{ok:1, rbid:1}"));
-    _mockServer->setCommandReply("killCursors", fromjson("{ok:1}"));
 
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
@@ -1107,11 +1008,7 @@ TEST_F(CollectionClonerTest, ResumableQueryTwoResumes) {
 
 // We receive a QueryPlanKilled error, then a NamespaceNotFound error, indicating that the
 // collection no longer exists in the database.
-TEST_F(CollectionClonerTest, NonResumableCursorErrorDropOK) {
-    // Set client wireVersion to 4.2, where we do not yet support resumable cloning.
-    _mockClient->setWireVersions(WireVersion::SHARDED_TRANSACTIONS,
-                                 WireVersion::SHARDED_TRANSACTIONS);
-
+TEST_F(CollectionClonerTestNonResumable, NonResumableCursorErrorDropOK) {
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
                                 << "_id_");
@@ -1160,11 +1057,7 @@ TEST_F(CollectionClonerTest, NonResumableCursorErrorDropOK) {
 
 // We receive an OperationFailed error, but the next error we receive is _not_ NamespaceNotFound,
 // which means the collection still exists in the database, but we cannot resume the query.
-TEST_F(CollectionClonerTest, NonResumableCursorErrorThenOtherError) {
-    // Set client wireVersion to 4.2, where we do not yet support resumable cloning.
-    _mockClient->setWireVersions(WireVersion::SHARDED_TRANSACTIONS,
-                                 WireVersion::SHARDED_TRANSACTIONS);
-
+TEST_F(CollectionClonerTestNonResumable, NonResumableCursorErrorThenOtherError) {
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
                                 << "_id_");
@@ -1215,11 +1108,7 @@ TEST_F(CollectionClonerTest, NonResumableCursorErrorThenOtherError) {
 
 // We receive a CursorNotFound error, but the next query succeeds, indicating that the
 // collection still exists in the database, but we cannot resume the query.
-TEST_F(CollectionClonerTest, NonResumableCursorErrorThenSuccessEqualsFailure) {
-    // Set client wireVersion to 4.2, where we do not yet support resumable cloning.
-    _mockClient->setWireVersions(WireVersion::SHARDED_TRANSACTIONS,
-                                 WireVersion::SHARDED_TRANSACTIONS);
-
+TEST_F(CollectionClonerTestNonResumable, NonResumableCursorErrorThenSuccessEqualsFailure) {
     // Set up data for preliminary stages
     auto idIndexSpec = BSON("v" << 1 << "key" << BSON("_id" << 1) << "name"
                                 << "_id_");

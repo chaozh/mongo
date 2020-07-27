@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -40,7 +40,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/transaction_participant.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -118,31 +118,34 @@ SessionKiller::Result killSessionsLocal(OperationContext* opCtx,
 void killAllExpiredTransactions(OperationContext* opCtx) {
     SessionKiller::Matcher matcherAllSessions(
         KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
-    killSessionsAction(opCtx,
-                       matcherAllSessions,
-                       [when = opCtx->getServiceContext()->getPreciseClockSource()->now()](
-                           const ObservableSession& session) {
-                           return TransactionParticipant::get(session).expiredAsOf(when);
-                       },
-                       [](OperationContext* opCtx, const SessionToKill& session) {
-                           auto txnParticipant = TransactionParticipant::get(session);
-                           // If the transaction is aborted here, it means it was aborted after
-                           // the filter.  The most likely reason for this is that the transaction
-                           // was active and the session kill aborted it.  We still want to log
-                           // that as aborted due to transactionLifetimeLimitSessions.
-                           if (txnParticipant.transactionIsInProgress() ||
-                               txnParticipant.transactionIsAborted()) {
-                               log() << "Aborting transaction with txnNumber "
-                                     << txnParticipant.getActiveTxnNumber() << " on session "
-                                     << session.getSessionId().getId()
-                                     << " because it has been running for longer than "
-                                        "'transactionLifetimeLimitSeconds'";
-                               if (txnParticipant.transactionIsInProgress()) {
-                                   txnParticipant.abortTransaction(opCtx);
-                               }
-                           }
-                       },
-                       ErrorCodes::TransactionExceededLifetimeLimitSeconds);
+    killSessionsAction(
+        opCtx,
+        matcherAllSessions,
+        [when = opCtx->getServiceContext()->getPreciseClockSource()->now()](
+            const ObservableSession& session) {
+            return TransactionParticipant::get(session).expiredAsOf(when);
+        },
+        [](OperationContext* opCtx, const SessionToKill& session) {
+            auto txnParticipant = TransactionParticipant::get(session);
+            // If the transaction is aborted here, it means it was aborted after
+            // the filter.  The most likely reason for this is that the transaction
+            // was active and the session kill aborted it.  We still want to log
+            // that as aborted due to transactionLifetimeLimitSessions.
+            if (txnParticipant.transactionIsInProgress() || txnParticipant.transactionIsAborted()) {
+                LOGV2(
+                    20707,
+                    "Aborting transaction with session id {sessionId} and txnNumber {txnNumber}  "
+                    "because it has been running for longer than 'transactionLifetimeLimitSeconds'",
+                    "Aborting transaction because it has been running for longer than "
+                    "'transactionLifetimeLimitSeconds'",
+                    "sessionId"_attr = session.getSessionId().getId(),
+                    "txnNumber"_attr = txnParticipant.getActiveTxnNumber());
+                if (txnParticipant.transactionIsInProgress()) {
+                    txnParticipant.abortTransaction(opCtx);
+                }
+            }
+        },
+        ErrorCodes::TransactionExceededLifetimeLimitSeconds);
 }
 
 void killSessionsLocalShutdownAllTransactions(OperationContext* opCtx) {
@@ -196,18 +199,19 @@ void yieldLocksForPreparedTransactions(OperationContext* opCtx) {
                        },
                        [](OperationContext* killerOpCtx, const SessionToKill& session) {
                            auto txnParticipant = TransactionParticipant::get(session);
-                           // Yield locks for prepared transactions.
-                           // When scanning and killing operations, all prepared transactions are
-                           // included in the
-                           // list. Even though new sessions may be created after the scan, none of
-                           // them can become
-                           // prepared during stepdown, since the RSTL has been enqueued, preventing
-                           // any new
-                           // writes.
+                           // Yield locks for prepared transactions. When scanning and killing
+                           // operations, all prepared transactions are included in the list. Even
+                           // though new sessions may be created after the scan, none of them can
+                           // become prepared during stepdown, since the RSTL has been enqueued,
+                           // preventing any new writes.
                            if (txnParticipant.transactionIsPrepared()) {
-                               LOG(3) << "Yielding locks of prepared transaction. SessionId: "
-                                      << session.getSessionId().getId()
-                                      << " TxnNumber: " << txnParticipant.getActiveTxnNumber();
+                               LOGV2_DEBUG(20708,
+                                           3,
+                                           "Yielding locks of prepared transaction. SessionId: "
+                                           "{sessionId} TxnNumber: {txnNumber}",
+                                           "Yielding locks of prepared transaction",
+                                           "sessionId"_attr = session.getSessionId().getId(),
+                                           "txnNumber"_attr = txnParticipant.getActiveTxnNumber());
                                txnParticipant.refreshLocksForPreparedTransaction(killerOpCtx, true);
                            }
                        },

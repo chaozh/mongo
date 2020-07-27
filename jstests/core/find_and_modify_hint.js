@@ -3,8 +3,11 @@
  *   - A bad argument to the hint option should raise an error.
  *   - The hint option should support both the name of the index, and an index spec object.
  *
- * @tags: [assumes_unsharded_collection, requires_non_retryable_writes, requires_find_command,
- * requires_fcv_44]
+ * @tags: [
+ *   assumes_unsharded_collection,
+ *   requires_find_command,
+ *   requires_non_retryable_writes,
+ * ]
  */
 
 (function() {
@@ -42,14 +45,26 @@ const coll = db.jstests_find_and_modify_hint;
     famUpdateCmd =
         {findAndModify: coll.getName(), query: {_id: 1}, update: {$set: {y: 1}}, hint: 'y_-1'};
     assertCommandUsesIndex(famUpdateCmd, {y: -1});
+
+    // Passing a hint with an empty 'update' object should work as expected.
+    famUpdateCmd = {findAndModify: coll.getName(), query: {_id: 1}, update: {}, hint: 'y_-1'};
+    assertCommandUsesIndex(famUpdateCmd, {y: -1});
+
+    // Passing a hint on _id with an empty 'update' object with an IDHACK eligible query should
+    // work as expected.
+    famUpdateCmd = {findAndModify: coll.getName(), query: {_id: 1}, update: {}, hint: {_id: 1}};
+    assertCommandUsesIndex(famUpdateCmd, {_id: 1});
+
+    // Hint using an index name when removing documents.
+    const famRemoveCmd =
+        {findAndModify: coll.getName(), query: {_id: 1}, remove: true, hint: 'y_-1'};
+    assertCommandUsesIndex(famRemoveCmd, {y: -1});
 })();
 
 (function sparseIndexTest() {
     // Create a sparse index which includes only 1 of the 3 documents in the collection.
     coll.drop();
-    assert.commandWorked(coll.insert({_id: 0, x: 1}));
-    assert.commandWorked(coll.insert({_id: 1, x: 1}));
-    assert.commandWorked(coll.insert({_id: 2, x: 1, s: 0}));
+    assert.commandWorked(coll.insert([{_id: 0, x: 1}, {_id: 1, x: 1}, {_id: 2, x: 1, s: 0}]));
     assert.commandWorked(coll.createIndex({x: 1}));
     assert.commandWorked(coll.createIndex({s: 1}, {sparse: true}));
 
@@ -78,13 +93,17 @@ const coll = db.jstests_find_and_modify_hint;
     res = assert.commandWorked(coll.runCommand(famUpdateCmd));
     assert.eq(res.lastErrorObject.upserted, 3);  // value of _id
     assert.docEq(res.value, {_id: 3, x: 2, y: 1});
+
+    // Make sure an indexed document gets deleted when index hint is provided.
+    assert.commandWorked(coll.insert({x: 1}));
+    const famRemoveCmd = {findAndModify: coll.getName(), query: {x: 1}, remove: true, hint: {s: 1}};
+    res = assert.commandWorked(coll.runCommand(famRemoveCmd));
+    assert.docEq(res.value, {_id: 2, x: 1, s: 0, y: 1});
 })();
 
 (function shellHelpersTest() {
     coll.drop();
-    assert.commandWorked(coll.insert({_id: 0, x: 1}));
-    assert.commandWorked(coll.insert({_id: 1, x: 1}));
-    assert.commandWorked(coll.insert({_id: 2, x: 1, s: 0}));
+    assert.commandWorked(coll.insert([{_id: 0, x: 1}, {_id: 1, x: 1}, {_id: 2, x: 1, s: 0}]));
     assert.commandWorked(coll.createIndex({x: 1}));
     assert.commandWorked(coll.createIndex({s: 1}, {sparse: true}));
 
@@ -106,6 +125,10 @@ const coll = db.jstests_find_and_modify_hint;
     newDoc = coll.findOneAndReplace(
         {x: 3}, {_id: 6, y: 2}, {hint: {s: 1}, upsert: true, returnNewDocument: true});
     assert.docEq(newDoc, {_id: 6, y: 2});
+
+    // Make sure an indexed document gets deleted when index hint is provided.
+    newDoc = coll.findOneAndDelete({x: 2}, {hint: {s: 1}});
+    assert.docEq(newDoc, {_id: 3, x: 2});
 })();
 
 (function failedHintTest() {
@@ -129,10 +152,5 @@ const coll = db.jstests_find_and_modify_hint;
         hint: {badHint: 1}
     };
     assert.commandFailedWithCode(coll.runCommand(famUpdateCmd), ErrorCodes.BadValue);
-
-    // Cannot use hint with {remove: true}.
-    const famRemoveCmd =
-        {findAndModify: coll.getName(), query: {_id: 1}, remove: true, hint: {_id: 1}};
-    assert.commandFailedWithCode(coll.runCommand(famRemoveCmd), ErrorCodes.FailedToParse);
 })();
 })();

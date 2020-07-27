@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,6 @@
 #include "mongo/util/decorable.h"
 #include "mongo/util/decoration_container.h"
 #include "mongo/util/decoration_registry.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {

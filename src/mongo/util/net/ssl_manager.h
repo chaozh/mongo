@@ -44,7 +44,9 @@
 #include "mongo/util/decorable.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl/apple.hpp"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
+#include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
 
 // SChannel implementation
@@ -55,6 +57,7 @@
 #endif  // #ifdef MONGO_CONFIG_SSL
 
 namespace mongo {
+
 /*
  * @return the SSL version std::string prefixed with prefix and suffixed with suffix
  */
@@ -115,26 +118,6 @@ public:
     virtual ~SSLConnectionInterface();
 };
 
-class SSLConfiguration {
-public:
-    bool isClusterMember(StringData subjectName) const;
-    bool isClusterMember(SSLX509Name subjectName) const;
-    BSONObj getServerStatusBSON() const;
-    Status setServerSubjectName(SSLX509Name name);
-
-    const SSLX509Name& serverSubjectName() const {
-        return _serverSubjectName;
-    }
-
-    SSLX509Name clientSubjectName;
-    Date_t serverCertificateExpirationDate;
-    bool hasCA = false;
-
-private:
-    SSLX509Name _serverSubjectName;
-    std::vector<SSLX509Name::Entry> _canonicalServerSubjectName;
-};
-
 // These represent the ASN.1 type bytes for strings used in an X509 DirectoryString
 constexpr int kASN1BMPString = 30;
 constexpr int kASN1IA5String = 22;
@@ -173,6 +156,26 @@ struct TLSVersionCounts {
     AtomicWord<long long> tls13;
 
     static TLSVersionCounts& get(ServiceContext* serviceContext);
+};
+
+struct CertInformationToLog {
+    SSLX509Name subject;
+    SSLX509Name issuer;
+    std::vector<char> thumbprint;
+    Date_t validityNotBefore;
+    Date_t validityNotAfter;
+};
+
+struct CRLInformationToLog {
+    std::vector<char> thumbprint;
+    Date_t validityNotBefore;
+    Date_t validityNotAfter;
+};
+
+struct SSLInformationToLog {
+    CertInformationToLog server;
+    boost::optional<CertInformationToLog> cluster;
+    boost::optional<CRLInformationToLog> crl;
 };
 
 class SSLManagerInterface : public Decorable<SSLManagerInterface> {
@@ -258,16 +261,56 @@ public:
      * the `subjectName` will contain  the certificate's subject name, and any roles acquired by
      * X509 authorization will be returned in `roles`.
      * Further, the SNI Name will be captured into the `sni` value, when available.
+     * The reactor is there to continue the execution of the chained statements to the Future
+     * returned by OCSP validation. Can be a nullptr, but will make this function synchronous and
+     * single threaded.
      */
-    virtual Future<SSLPeerInfo> parseAndValidatePeerCertificate(
-        SSLConnectionType ssl,
-        boost::optional<std::string> sni,
-        const std::string& remoteHost,
-        const HostAndPort& hostForLogging) = 0;
+    virtual Future<SSLPeerInfo> parseAndValidatePeerCertificate(SSLConnectionType ssl,
+                                                                boost::optional<std::string> sni,
+                                                                const std::string& remoteHost,
+                                                                const HostAndPort& hostForLogging,
+                                                                const ExecutorPtr& reactor) = 0;
+
+    /**
+     * No-op function for SChannel and SecureTransport. Attaches stapled OCSP response to the
+     * SSL_CTX obect.
+     */
+    virtual Status stapleOCSPResponse(SSLContextType context) = 0;
+
+    /**
+     * Get information about the certificates and CRL that will be used for outgoing and incoming
+     * SSL connecctions.
+     */
+    virtual SSLInformationToLog getSSLInformationToLog() const = 0;
 };
 
-// Access SSL functions through this instance.
-SSLManagerInterface* getSSLManager();
+/**
+ * Manages changes in the SSL configuration, such as certificate rotation, and updates a manager
+ * appropriately.
+ */
+class SSLManagerCoordinator {
+public:
+    SSLManagerCoordinator();
+
+    /**
+     * Get the global SSLManagerCoordinator instance.
+     */
+    static SSLManagerCoordinator* get();
+
+    /**
+     * Access the current SSLManager safely.
+     */
+    std::shared_ptr<SSLManagerInterface> getSSLManager();
+
+    /**
+     * Perform certificate rotation safely.
+     */
+    void rotate();
+
+private:
+    Mutex _lock = MONGO_MAKE_LATCH("SSLManagerCoordinator::_lock");
+    synchronized_value<std::shared_ptr<SSLManagerInterface>> _manager;
+};
 
 extern bool isSSLServer;
 
@@ -281,6 +324,14 @@ bool hostNameMatchForX509Certificates(std::string nameToMatch, std::string certH
  * Parse a binary blob of DER encoded ASN.1 into a set of RoleNames.
  */
 StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExtension);
+
+using DERInteger = std::vector<uint8_t>;
+
+/**
+ * Parse a binary blob of DER encoded ASN.1 into a list of features (integers).
+ * ASN.1 Integers can be very large, so they are stored in a vector of bytes.
+ */
+StatusWith<std::vector<DERInteger>> parseTLSFeature(ConstDataRange cdrExtension);
 
 /**
  * Strip the trailing '.' in FQDN.

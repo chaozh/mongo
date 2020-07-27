@@ -27,14 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/transaction_coordinator_catalog.h"
 
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -46,10 +46,14 @@ TransactionCoordinatorCatalog::~TransactionCoordinatorCatalog() {
 
 void TransactionCoordinatorCatalog::exitStepUp(Status status) {
     if (status.isOK()) {
-        LOG(0) << "Incoming coordinateCommit requests are now enabled";
+        LOGV2(22438, "Incoming coordinateCommit requests are now enabled");
     } else {
-        warning() << "Coordinator recovery failed and coordinateCommit requests will not be allowed"
-                  << causedBy(status);
+        LOGV2_WARNING(22444,
+                      "Coordinator recovery failed and coordinateCommit requests will not be "
+                      "allowed: {error}",
+                      "Coordinator recovery failed and coordinateCommit requests will not be "
+                      "allowed",
+                      "error"_attr = status);
     }
 
     stdx::lock_guard<Latch> lk(_mutex);
@@ -80,8 +84,12 @@ void TransactionCoordinatorCatalog::insert(OperationContext* opCtx,
                                            TxnNumber txnNumber,
                                            std::shared_ptr<TransactionCoordinator> coordinator,
                                            bool forStepUp) {
-    LOG(3) << "Inserting coordinator " << lsid.getId() << ':' << txnNumber
-           << " into in-memory catalog";
+    LOGV2_DEBUG(22439,
+                3,
+                "{sessionId}:{txnNumber} Inserting coordinator into in-memory catalog",
+                "Inserting coordinator into in-memory catalog",
+                "sessionId"_attr = lsid.getId(),
+                "txnNumber"_attr = txnNumber);
 
     stdx::unique_lock<Latch> ul(_mutex);
     if (!forStepUp) {
@@ -153,8 +161,12 @@ TransactionCoordinatorCatalog::getLatestOnSession(OperationContext* opCtx,
 }
 
 void TransactionCoordinatorCatalog::_remove(const LogicalSessionId& lsid, TxnNumber txnNumber) {
-    LOG(3) << "Removing coordinator " << lsid.getId() << ':' << txnNumber
-           << " from in-memory catalog";
+    LOGV2_DEBUG(22440,
+                3,
+                "{sessionId}:{txnNumber} Removing coordinator from in-memory catalog",
+                "Removing coordinator from in-memory catalog",
+                "sessionId"_attr = lsid.getId(),
+                "txnNumber"_attr = txnNumber);
 
     stdx::lock_guard<Latch> lk(_mutex);
 
@@ -175,7 +187,7 @@ void TransactionCoordinatorCatalog::_remove(const LogicalSessionId& lsid, TxnNum
     }
 
     if (_coordinatorsBySession.empty()) {
-        LOG(3) << "Signaling last active coordinator removed";
+        LOGV2_DEBUG(22441, 3, "Signaling last active coordinator removed");
         _noActiveCoordinatorsCV.notify_all();
     }
 }
@@ -185,9 +197,16 @@ void TransactionCoordinatorCatalog::join() {
 
     while (!_noActiveCoordinatorsCV.wait_for(
         ul, stdx::chrono::seconds{5}, [this] { return _coordinatorsBySession.empty(); })) {
-        LOG(0) << "After 5 seconds of wait there are still " << _coordinatorsBySession.size()
-               << " sessions left with active coordinators which have not yet completed";
-        LOG(0) << _toString(ul);
+        LOGV2(22442,
+              "After 5 seconds of wait there are still {numSessionsLeft} sessions left "
+              "with active coordinators which have not yet completed",
+              "After 5 seconds of wait there are still sessions left with active coordinators "
+              "which have not yet completed",
+              "numSessionsLeft"_attr = _coordinatorsBySession.size());
+        LOGV2(22443,
+              "Active coordinators remaining: {activeCoordinators}",
+              "Active coordinators remaining",
+              "activeCoordinators"_attr = _toString(ul));
     }
 }
 

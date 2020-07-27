@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
@@ -45,10 +47,11 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/log_global_settings.h"
 
 namespace mongo {
 namespace {
@@ -56,18 +59,16 @@ namespace {
 class WiredTigerKVHarnessHelper : public KVHarnessHelper, public ScopedGlobalServiceContextForTest {
 public:
     WiredTigerKVHarnessHelper(bool forRepair = false)
-        : _dbpath("wt-kv-harness"), _forRepair(forRepair) {
-        invariant(hasGlobalServiceContext());
-        _engine.reset(makeEngine());
+        : _dbpath("wt-kv-harness"), _forRepair(forRepair), _engine(makeEngine()) {
+        auto context = getGlobalServiceContext();
         repl::ReplicationCoordinator::set(
-            getGlobalServiceContext(),
-            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
-                getGlobalServiceContext(), repl::ReplSettings())));
+            context,
+            std::make_unique<repl::ReplicationCoordinatorMock>(context, repl::ReplSettings()));
     }
 
     virtual KVEngine* restartEngine() override {
         _engine.reset(nullptr);
-        _engine.reset(makeEngine());
+        _engine = makeEngine();
         return _engine.get();
     }
 
@@ -80,17 +81,17 @@ public:
     }
 
 private:
-    WiredTigerKVEngine* makeEngine() {
-        auto engine = new WiredTigerKVEngine(kWiredTigerEngineName,
-                                             _dbpath.path(),
-                                             _cs.get(),
-                                             "",
-                                             1,
-                                             0,
-                                             false,
-                                             false,
-                                             _forRepair,
-                                             false);
+    std::unique_ptr<WiredTigerKVEngine> makeEngine() {
+        auto engine = std::make_unique<WiredTigerKVEngine>(kWiredTigerEngineName,
+                                                           _dbpath.path(),
+                                                           _cs.get(),
+                                                           "",
+                                                           1,
+                                                           0,
+                                                           false,
+                                                           false,
+                                                           _forRepair,
+                                                           false);
         // There are unit tests expecting checkpoints to occur asynchronously.
         engine->startAsyncThreads();
         return engine;
@@ -98,8 +99,8 @@ private:
 
     const std::unique_ptr<ClockSource> _cs = std::make_unique<ClockSourceMock>();
     unittest::TempDir _dbpath;
-    std::unique_ptr<WiredTigerKVEngine> _engine;
     bool _forRepair;
+    std::unique_ptr<WiredTigerKVEngine> _engine;
 };
 
 class WiredTigerKVEngineTest : public unittest::Test, public ScopedGlobalServiceContextForTest {
@@ -253,10 +254,8 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
     wiredTigerGlobalOptions.checkpointDelaySecs = 1;
 
     // To diagnose any intermittent failures, maximize logging from WiredTigerKVEngine and friends.
-    const auto kStorage = logger::LogComponent::kStorage;
-    auto originalVerbosity = getMinimumLogSeverity(kStorage);
-    setMinimumLoggedSeverity(kStorage, logger::LogSeverity::Debug(3));
-    ON_BLOCK_EXIT([&]() { setMinimumLoggedSeverity(kStorage, originalVerbosity); });
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kStorage,
+                                                              logv2::LogSeverity::Debug(3)};
 
     // Simulate the callback that queries config.transactions for the oldest active transaction.
     boost::optional<Timestamp> oldestActiveTxnTimestamp;
@@ -294,8 +293,12 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
             sleepmillis(100);
         }
 
-        unittest::log() << "Expected the pinned oplog to advance. Expected value: " << newPinned
-                        << " Published value: " << _engine->getOplogNeededForCrashRecovery();
+        LOGV2(22367,
+              "Expected the pinned oplog to advance. Expected value: {newPinned} Published value: "
+              "{engine_getOplogNeededForCrashRecovery}",
+              "newPinned"_attr = newPinned,
+              "engine_getOplogNeededForCrashRecovery"_attr =
+                  _engine->getOplogNeededForCrashRecovery());
         FAIL("");
     };
 

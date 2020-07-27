@@ -32,9 +32,16 @@ selector:
   # Induces non-blindly-retriable errors (see SERVER-45767).
   - jstests/concurrency/fsm_workloads/create_database.js
 
+  # These workloads run the reIndex command, which is only allowed on a standalone node.
+  - jstests/concurrency/fsm_workloads/reindex.js
+  - jstests/concurrency/fsm_workloads/reindex_background.js
+  - jstests/concurrency/fsm_workloads/reindex_writeconflict.js
+
   exclude_with_any_tags:
   - does_not_support_causal_consistency
   - requires_sharding
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   # Sharing cursors between state functions will fail in this suite because it will attempt to use
   # the same cursor in multiple transactions.
   - state_functions_share_cursor
@@ -78,4 +85,5 @@ executor:
       oplogSize: 1024
       set_parameters:
         enableTestCommands: 1
+        roleGraphInvalidationIsFatal: 1
     num_nodes: 3

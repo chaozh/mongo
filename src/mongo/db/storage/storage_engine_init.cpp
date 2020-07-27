@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -40,13 +40,14 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/unclean_shutdown.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -78,11 +79,11 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
         if (storageGlobalParams.repair) {
             repairObserver->onRepairStarted();
         } else if (repairObserver->isIncomplete()) {
-            severe()
-                << "An incomplete repair has been detected! This is likely because a repair "
-                   "operation unexpectedly failed before completing. MongoDB will not start up "
-                   "again without --repair.";
-            fassertFailedNoTrace(50922);
+            LOGV2_FATAL_NOTRACE(
+                50922,
+                "An incomplete repair has been detected! This is likely because a repair "
+                "operation unexpectedly failed before completing. MongoDB will not start up "
+                "again without --repair.");
         }
     }
 
@@ -104,9 +105,10 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
             }
         } else {
             // Otherwise set the active storage engine as the contents of the metadata file.
-            log() << "Detected data files in " << dbpath << " created by the '"
-                  << *existingStorageEngine << "' storage engine, so setting the active"
-                  << " storage engine to '" << *existingStorageEngine << "'.";
+            LOGV2(22270,
+                  "Storage engine to use detected by data files",
+                  "dbpath"_attr = boost::filesystem::path(dbpath).generic_string(),
+                  "storageEngine"_attr = *existingStorageEngine);
             storageGlobalParams.engine = *existingStorageEngine;
         }
     }
@@ -175,8 +177,10 @@ void initializeStorageEngine(ServiceContext* service, const StorageEngineInitFla
 }
 
 void shutdownGlobalStorageEngineCleanly(ServiceContext* service) {
-    invariant(service->getStorageEngine());
-    service->getStorageEngine()->cleanShutdown();
+    auto storageEngine = service->getStorageEngine();
+    invariant(storageEngine);
+    StorageControl::stopStorageControls(service);
+    storageEngine->cleanShutdown();
     auto& lockFile = StorageEngineLockFile::get(service);
     if (lockFile) {
         lockFile->clearPidAndUnlock();
@@ -205,11 +209,13 @@ void createLockFile(ServiceContext* service) {
 
     if (wasUnclean) {
         if (storageGlobalParams.readOnly) {
-            severe() << "Attempted to open dbpath in readOnly mode, but the server was "
-                        "previously not shut down cleanly.";
-            fassertFailedNoTrace(34416);
+            LOGV2_FATAL_NOTRACE(34416,
+                                "Attempted to open dbpath in readOnly mode, but the server was "
+                                "previously not shut down cleanly.");
         }
-        warning() << "Detected unclean shutdown - " << lockFile->getFilespec() << " is not empty.";
+        LOGV2_WARNING(22271,
+                      "Detected unclean shutdown - Lock file is not empty",
+                      "lockFile"_attr = lockFile->getFilespec());
         startingAfterUncleanShutdown(service) = true;
     }
 }

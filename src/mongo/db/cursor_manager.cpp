@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,6 @@
 #include "mongo/base/init.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -52,9 +51,9 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -90,7 +89,10 @@ std::pair<Status, int> CursorManager::killCursorsWithMatchingSessions(
     OperationContext* opCtx, const SessionKiller::Matcher& matcher) {
     auto eraser = [&](CursorManager& mgr, CursorId id) {
         uassertStatusOK(mgr.killCursor(opCtx, id, true));
-        log() << "killing cursor: " << id << " as part of killing session(s)";
+        LOGV2(20528,
+              "killing cursor: {id} as part of killing session(s)",
+              "Killing cursor as part of killing session(s)",
+              "cursorId"_attr = id);
     };
 
     auto bySessionCursorKiller = makeKillCursorsBySessionAdaptor(opCtx, matcher, std::move(eraser));
@@ -132,7 +134,10 @@ std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, Date_t now) {
             auto* cursor = it->second;
             if (cursorShouldTimeout_inlock(cursor, now)) {
                 toDisposeWithoutMutex.emplace_back(cursor);
-                lockedPartition->erase(it++);
+                // Advance the iterator first since erasing from the lockedPartition will
+                // invalidate any references to it.
+                ++it;
+                removeCursorFromMap(lockedPartition, cursor);
             } else {
                 ++it;
             }
@@ -141,8 +146,11 @@ std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, Date_t now) {
 
     // Be careful not to dispose of cursors while holding the partition lock.
     for (auto&& cursor : toDisposeWithoutMutex) {
-        log() << "Cursor id " << cursor->cursorid() << " timed out, idle since "
-              << cursor->getLastUseDate();
+        LOGV2(20529,
+              "Cursor id {cursorId} timed out, idle since {idleSince}",
+              "Cursor timed out",
+              "cursorId"_attr = cursor->cursorid(),
+              "idleSince"_attr = cursor->getLastUseDate());
         cursor->dispose(opCtx);
     }
     return toDisposeWithoutMutex.size();
@@ -212,8 +220,11 @@ void CursorManager::unpin(OperationContext* opCtx,
     // proactively delete the cursor. In other cases we preserve the error code so that the client
     // will see the reason the cursor was killed when asking for the next batch.
     if (interruptStatus == ErrorCodes::Interrupted || interruptStatus == ErrorCodes::CursorKilled) {
-        LOG(0) << "removing cursor " << cursor->cursorid()
-               << " after completing batch: " << interruptStatus;
+        LOGV2(20530,
+              "removing cursor {cursor_cursorid} after completing batch: {error}",
+              "Removing cursor after completing batch",
+              "cursorId"_attr = cursor->cursorid(),
+              "error"_attr = interruptStatus);
         return deregisterAndDestroyCursor(std::move(partition), opCtx, std::move(cursor));
     } else if (!interruptStatus.isOK()) {
         cursor->markAsKilled(interruptStatus);
@@ -279,6 +290,18 @@ stdx::unordered_set<CursorId> CursorManager::getCursorsForSession(LogicalSession
     return cursors;
 }
 
+stdx::unordered_set<CursorId> CursorManager::getCursorsForOpKeys(
+    std::vector<OperationKey> opKeys) const {
+    stdx::unordered_set<CursorId> cursors;
+
+    stdx::lock_guard<Latch> lk(_opKeyMutex);
+    for (auto opKey : opKeys) {
+        if (auto it = _opKeyMap.find(opKey); it != _opKeyMap.end())
+            cursors.insert(it->second);
+    }
+    return cursors;
+}
+
 size_t CursorManager::numCursors() const {
     return _cursorMap->size();
 }
@@ -341,11 +364,23 @@ ClientCursorPin CursorManager::registerCursor(OperationContext* opCtx,
     auto partition = _cursorMap->lockOnePartition(cursorId);
     ClientCursor* unownedCursor = clientCursor.release();
     partition->emplace(cursorId, unownedCursor);
+
+    // If set, store the mapping of OperationKey to the generated CursorID.
+    if (auto opKey = opCtx->getOperationKey()) {
+        stdx::lock_guard<Latch> lk(_opKeyMutex);
+        _opKeyMap.emplace(*opKey, cursorId);
+    }
+
+    // Restores the maxTimeMS provided in the cursor generating command in the case it used
+    // maxTimeMSOpOnly. This way the pinned cursor will have the leftover time consistent with the
+    // maxTimeMS.
+    opCtx->restoreMaxTimeMS();
+
     return ClientCursorPin(opCtx, unownedCursor, this);
 }
 
 void CursorManager::deregisterCursor(ClientCursor* cursor) {
-    _cursorMap->erase(cursor->cursorid());
+    removeCursorFromMap(_cursorMap, cursor);
 }
 
 void CursorManager::deregisterAndDestroyCursor(
@@ -354,7 +389,7 @@ void CursorManager::deregisterAndDestroyCursor(
     std::unique_ptr<ClientCursor, ClientCursor::Deleter> cursor) {
     {
         auto lockWithRestrictedScope = std::move(lk);
-        lockWithRestrictedScope->erase(cursor->cursorid());
+        removeCursorFromMap(lockWithRestrictedScope, cursor.get());
     }
     // Dispose of the cursor without holding any cursor manager mutexes. Disposal of a cursor can
     // require taking lock manager locks, which we want to avoid while holding a mutex. If we did

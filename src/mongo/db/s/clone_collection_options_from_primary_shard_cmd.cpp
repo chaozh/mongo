@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -37,7 +37,6 @@
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/s/request_types/clone_collection_options_from_primary_shard_gen.h"
 #include "mongo/s/shard_id.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {

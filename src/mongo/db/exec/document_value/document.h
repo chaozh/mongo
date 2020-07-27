@@ -59,26 +59,6 @@ class MutableDocument;
  */
 class Position;
 
-/**
- * "Sort keys" are stored in memory as a Value with Array type (with an exception for singleton sort
- * keys). When serializing a sort key for storage in document metadata or as part of a
- * {$meta: "sortKey"} projection, there are three possible storage formats:
- */
-enum class SortKeyFormat {
-    // We expect the in-memory sort key to have one object, which has the format:
-    // {_data: ..., _typeBits:...}. This same object becomes the serialized sort key. This format
-    // exists for compatibility with 4.2 and will be deleted in 4.6 (SERVER-43361).
-    k42ChangeStreamSortKey,
-
-    // A sort key with values "a" and "b" would get translated to an object that looks like:
-    // {"": "a", "": "b"}. Also scheduled for deletion in 4.6.
-    k42SortKey,
-
-    // A sort key with values "a" and "b" would get translated to an array that looks like:
-    // ["a", "b"].
-    k44SortKey,
-};
-
 /** A Document is similar to a BSONObj but with a different in-memory representation.
  *
  *  A Document can be treated as a const std::map<std::string, const Value> that is
@@ -172,9 +152,24 @@ public:
     const Value getNestedField(const FieldPath& path,
                                std::vector<Position>* positions = nullptr) const;
 
-    /// Number of fields in this document. O(n)
-    size_t size() const {
-        return storage().size();
+    /**
+     * Returns field at given path as either BSONElement or Value, depending on how it is
+     * stored. If an array is encountered in the middle of the path the TraversesArrayTag is
+     * returned.
+     *
+     * It is possible, however, for the returned BSONElement/Value to be an array if the given path
+     * ends with an array. For example, the document {a: {b:[1,2]}} and the path "a.b" will return
+     * a BSONElement or Value for the array [1, 2].
+     *
+     * If the field is not found, stdx::monostate is returned.
+     */
+    struct TraversesArrayTag {};
+    stdx::variant<BSONElement, Value, TraversesArrayTag, stdx::monostate> getNestedFieldNonCaching(
+        const FieldPath& dottedField) const;
+
+    // Number of fields in this document. Exp. runtime O(n).
+    size_t computeSize() const {
+        return storage().computeSize();
     }
 
     /// True if this document has no fields.
@@ -188,12 +183,15 @@ public:
     /// Convenience type for dealing with fields. Used by FieldIterator.
     typedef std::pair<StringData, Value> FieldPair;
 
-    /** Get the approximate storage size of the document and sub-values in bytes.
-     *  Note: Some memory may be shared with other Documents or between fields within
-     *        a single Document so this can overestimate usage.
+    /**
+     * Get the approximate size of the Document, plus its underlying storage and sub-values. Returns
+     * size in bytes.
      *
-     *  Note: the value returned by this function includes the size of the metadata associated with
-     *  the document.
+     * Note: Some memory may be shared with other Documents or between fields within a single
+     * Document so this can overestimate usage.
+     *
+     * Note: the value returned by this function includes the size of the metadata associated with
+     * the document.
      */
     size_t getApproximateSize() const;
 
@@ -259,16 +257,9 @@ public:
     boost::optional<BSONObj> toBsonIfTriviallyConvertible() const;
 
     /**
-     * Like the 'toBson()' method, but includes metadata at the top-level. When the metadata
-     * includes a sort key, the 'sortKeyFormat' parameter controls how it gets converted from its
-     * in-memory representation as a Value to its serialized representation as either a BSONObj or
-     * BSONArray. The possible formats are described in the comment above the 'SortKeyFormat' enum.
-     *
-     * Note that the 'fromBsonWithMetaData()' function does not need a corresponding 'sortKeyFormat'
-     * parameter, because sort key deserialization is able to infer the sort key format based on the
-     * layout of the object.
+     * Like the 'toBson()' method, but includes metadata as top-level fields.
      */
-    BSONObj toBsonWithMetaData(SortKeyFormat sortKeyFormat) const;
+    BSONObj toBsonWithMetaData() const;
 
     /**
      * Like Document(BSONObj) but treats top-level fields with special names as metadata.
@@ -355,6 +346,10 @@ private:
     const DocumentStorage& storage() const {
         return (_storage ? *_storage : DocumentStorage::emptyDoc());
     }
+
+    stdx::variant<BSONElement, Value, TraversesArrayTag, stdx::monostate>
+    getNestedFieldNonCachingHelper(const FieldPath& dottedField, size_t level) const;
+
     boost::intrusive_ptr<const DocumentStorage> _storage;
 };
 

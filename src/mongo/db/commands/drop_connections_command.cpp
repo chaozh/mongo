@@ -27,15 +27,12 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/drop_connections_gen.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {

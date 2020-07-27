@@ -45,8 +45,7 @@
 
 #include <fmt/format.h>
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
 
 namespace {
 struct BSONValueExtractor {
@@ -78,12 +77,12 @@ struct BSONValueExtractor {
     }
 
     // BSONObj is coming as a pointer, the generic one handles references
-    void operator()(StringData name, const BSONObj* val) {
-        _builder.append(name, *val);
+    void operator()(StringData name, const BSONObj val) {
+        _builder.append(name, val);
     }
 
-    void operator()(StringData name, const BSONArray* val) {
-        _builder.append(name, *val);
+    void operator()(StringData name, const BSONArray val) {
+        _builder.append(name, val);
     }
 
     // BSON is lacking unsigned types, so store unsigned int32 as signed int64
@@ -112,14 +111,12 @@ private:
 };
 }  // namespace
 
-void BSONFormatter::operator()(boost::log::record_view const& rec,
-                               boost::log::formatting_ostream& strm) const {
+void BSONFormatter::operator()(boost::log::record_view const& rec, BSONObjBuilder& builder) const {
     using boost::log::extract;
 
     // Build a JSON object for the user attributes.
     const auto& attrs = extract<TypeErasedAttributeStorage>(attributes::attributes(), rec).get();
 
-    BSONObjBuilder builder;
     builder.append(constants::kTimestampFieldName,
                    extract<Date_t>(attributes::timeStamp(), rec).get());
     builder.append(constants::kSeverityFieldName,
@@ -140,10 +137,20 @@ void BSONFormatter::operator()(boost::log::record_view const& rec,
     if (tags != LogTag::kNone) {
         builder.append(constants::kTagsFieldName, tags.toBSONArray());
     }
+}
 
-    BSONObj obj = builder.obj();
+void BSONFormatter::operator()(boost::log::record_view const& rec,
+                               boost::log::formatting_ostream& strm) const {
+    BSONObjBuilder builder;
+    operator()(rec, builder);
+    BSONObj obj = builder.done();
     strm.write(obj.objdata(), obj.objsize());
 }
 
-}  // namespace logv2
-}  // namespace mongo
+BSONObj BSONFormatter::operator()(boost::log::record_view const& rec) const {
+    BSONObjBuilder builder;
+    operator()(rec, builder);
+    return builder.obj();
+}
+
+}  // namespace mongo::logv2

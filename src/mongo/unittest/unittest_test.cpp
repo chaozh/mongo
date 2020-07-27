@@ -31,6 +31,8 @@
  * Unit tests of the unittest framework itself.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include <functional>
@@ -38,6 +40,7 @@
 #include <string>
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -262,7 +265,7 @@ TEST(UnitTestSelfTest, BSONElementGTE) {
     ASSERT_BSONELT_GTE(obj2.firstElement(), obj1.firstElement());
 }
 
-DEATH_TEST(DeathTestSelfTest, TestDeath, "Invariant failure false") {
+DEATH_TEST_REGEX(DeathTestSelfTest, TestDeath, "Invariant failure.*false") {
     invariant(false);
 }
 
@@ -270,7 +273,7 @@ class DeathTestSelfTestFixture : public ::mongo::unittest::Test {
 public:
     void setUp() override {}
     void tearDown() override {
-        mongo::unittest::log() << "Died in tear-down";
+        LOGV2(24148, "Died in tear-down");
         invariant(false);
     }
 };

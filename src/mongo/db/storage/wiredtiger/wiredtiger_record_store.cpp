@@ -27,9 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
-#define LOG_FOR_RECOVERY(level) \
-    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kStorageRecovery)
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
+#define LOGV2_FOR_RECOVERY(ID, DLEVEL, MESSAGE, ...) \
+    LOGV2_DEBUG_OPTIONS(ID, DLEVEL, {logv2::LogComponent::kStorageRecovery}, MESSAGE, ##__VA_ARGS__)
 
 #include "mongo/platform/basic.h"
 
@@ -42,13 +43,13 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/oplog_hack.h"
@@ -61,12 +62,13 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -78,11 +80,21 @@ using std::unique_ptr;
 
 namespace {
 
+struct RecordIdAndWall {
+    RecordId id;
+    Date_t wall;
+
+    RecordIdAndWall(RecordId lastRecord, Date_t wallTime) : id(lastRecord), wall(wallTime) {}
+};
+
+
 static const int kMinimumRecordStoreVersion = 1;
 static const int kCurrentRecordStoreVersion = 1;  // New record stores use this by default.
 static const int kMaximumRecordStoreVersion = 1;
 MONGO_STATIC_ASSERT(kCurrentRecordStoreVersion >= kMinimumRecordStoreVersion);
 MONGO_STATIC_ASSERT(kCurrentRecordStoreVersion <= kMaximumRecordStoreVersion);
+
+const double kNumMSInHour = 1000 * 60 * 60;
 
 void checkOplogFormatVersion(OperationContext* opCtx, const std::string& uri) {
     StatusWith<BSONObj> appMetadata = WiredTigerUtil::getApplicationMetadata(opCtx, uri);
@@ -114,21 +126,42 @@ class WiredTigerRecordStore::OplogStones::InsertChange final : public RecoveryUn
 public:
     InsertChange(OplogStones* oplogStones,
                  int64_t bytesInserted,
-                 RecordId highestInserted,
-                 int64_t countInserted)
+                 const Record& highestInsertedRecord,
+                 int64_t countInserted,
+                 OperationContext* opCtx)
         : _oplogStones(oplogStones),
           _bytesInserted(bytesInserted),
-          _highestInserted(highestInserted),
-          _countInserted(countInserted) {}
+          _recordId(highestInsertedRecord.id),
+          _countInserted(countInserted),
+          _opCtx(opCtx) {
+        // We only want to initialize _wall by parsing BSONObj when we expect to need it in
+        // OplogStone::createNewStoneIfNeeded.
+        int64_t currBytes = _oplogStones->_currentBytes.load() + _bytesInserted;
+        if (currBytes >= _oplogStones->_minBytesPerStone) {
+            BSONObj obj = highestInsertedRecord.data.toBson();
+            BSONElement ele = obj["wall"];
+            if (!ele) {
+                // This shouldn't happen in normal cases, but this is needed because some tests do
+                // not add wall clock times. Note that, with this addition, it's possible that the
+                // oplog may grow larger than expected if --oplogMinRetentionHours is set.
+                _wall = Date_t::now();
+            } else {
+                _wall = ele.Date();
+            }
+        }
+    }
 
     void commit(boost::optional<Timestamp>) final {
         invariant(_bytesInserted >= 0);
-        invariant(_highestInserted.isValid());
+        invariant(_recordId.isValid());
 
         _oplogStones->_currentRecords.addAndFetch(_countInserted);
         int64_t newCurrentBytes = _oplogStones->_currentBytes.addAndFetch(_bytesInserted);
-        if (newCurrentBytes >= _oplogStones->_minBytesPerStone) {
-            _oplogStones->createNewStoneIfNeeded(_highestInserted);
+        if (_wall != Date_t() && newCurrentBytes >= _oplogStones->_minBytesPerStone) {
+            // When other InsertChanges commit concurrently, an uninitialized wallTime may delay the
+            // creation of a new stone. This delay is limited to the number of concurrently running
+            // transactions, so the size difference should be inconsequential.
+            _oplogStones->createNewStoneIfNeeded(_opCtx, _recordId, _wall);
         }
     }
 
@@ -137,8 +170,10 @@ public:
 private:
     OplogStones* _oplogStones;
     int64_t _bytesInserted;
-    RecordId _highestInserted;
+    RecordId _recordId;
     int64_t _countInserted;
+    OperationContext* _opCtx;
+    Date_t _wall;
 };
 
 class WiredTigerRecordStore::OplogStones::TruncateChange final : public RecoveryUnit::Change {
@@ -161,6 +196,7 @@ private:
 
 WiredTigerRecordStore::OplogStones::OplogStones(OperationContext* opCtx, WiredTigerRecordStore* rs)
     : _rs(rs) {
+    stdx::lock_guard<Latch> reclaimLk(_oplogReclaimMutex);
     stdx::lock_guard<Latch> lk(_mutex);
 
     invariant(rs->isCapped());
@@ -191,10 +227,8 @@ bool WiredTigerRecordStore::OplogStones::isDead() {
 }
 
 void WiredTigerRecordStore::OplogStones::kill() {
-    {
-        stdx::lock_guard<Latch> lk(_oplogReclaimMutex);
-        _isDead = true;
-    }
+    stdx::lock_guard<Latch> lk(_oplogReclaimMutex);
+    _isDead = true;
     _oplogReclaimCv.notify_one();
 }
 
@@ -225,6 +259,33 @@ void WiredTigerRecordStore::OplogStones::awaitHasExcessStonesOrDead() {
     }
 }
 
+bool WiredTigerRecordStore::OplogStones::hasExcessStones_inlock() const {
+    int64_t totalBytes = 0;
+    for (auto&& stone : _stones) {
+        totalBytes += stone.bytes;
+    }
+
+    // check that oplog stones is at capacity
+    if (totalBytes <= _rs->cappedMaxSize()) {
+        return false;
+    }
+
+    double minRetentionHours = storageGlobalParams.oplogMinRetentionHours.load();
+
+    // If we are not checking for time, then yes, there is a stone to be reaped
+    // because oplog is at capacity.
+    if (minRetentionHours == 0.0) {
+        return true;
+    }
+
+    auto nowWall = Date_t::now();
+    auto lastStoneWall = _stones.front().wallTime;
+
+    auto currRetentionMS = durationCount<Milliseconds>(nowWall - lastStoneWall);
+    double currRetentionHours = currRetentionMS / kNumMSInHour;
+    return currRetentionHours >= minRetentionHours;
+}
+
 boost::optional<WiredTigerRecordStore::OplogStones::Stone>
 WiredTigerRecordStore::OplogStones::peekOldestStoneIfNeeded() const {
     stdx::lock_guard<Latch> lk(_mutex);
@@ -241,11 +302,19 @@ void WiredTigerRecordStore::OplogStones::popOldestStone() {
     _stones.pop_front();
 }
 
-void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(RecordId lastRecord) {
+void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(OperationContext* opCtx,
+                                                                RecordId lastRecord,
+                                                                Date_t wallTime) {
+    // Try to lock both mutexes, if we fail to lock a mutex then someone else is either already
+    // creating a new stone or popping the oldest one. In the latter case, we let the next insert
+    // trigger the new stone's creation.
+    stdx::unique_lock<Latch> reclaimLk(_oplogReclaimMutex, stdx::try_to_lock);
+    if (!reclaimLk) {
+        return;
+    }
+
     stdx::unique_lock<Latch> lk(_mutex, stdx::try_to_lock);
     if (!lk) {
-        // Someone else is either already creating a new stone or popping the oldest one. In the
-        // latter case, we let the next insert trigger the new stone's creation.
         return;
     }
 
@@ -261,8 +330,12 @@ void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(RecordId lastRec
         return;
     }
 
-    LOG(2) << "create new oplogStone, current stones:" << _stones.size();
-    OplogStones::Stone stone = {_currentRecords.swap(0), _currentBytes.swap(0), lastRecord};
+    LOGV2_DEBUG(22381,
+                2,
+                "create new oplogStone, current stones:{stones_size}",
+                "stones_size"_attr = _stones.size());
+
+    OplogStones::Stone stone(_currentRecords.swap(0), _currentBytes.swap(0), lastRecord, wallTime);
     _stones.push_back(stone);
 
     _pokeReclaimThreadIfNeeded();
@@ -271,10 +344,10 @@ void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(RecordId lastRec
 void WiredTigerRecordStore::OplogStones::updateCurrentStoneAfterInsertOnCommit(
     OperationContext* opCtx,
     int64_t bytesInserted,
-    RecordId highestInserted,
+    const Record& highestInsertedRecord,
     int64_t countInserted) {
-    opCtx->recoveryUnit()->registerChange(
-        std::make_unique<InsertChange>(this, bytesInserted, highestInserted, countInserted));
+    opCtx->recoveryUnit()->registerChange(std::make_unique<InsertChange>(
+        this, bytesInserted, highestInsertedRecord, countInserted, opCtx));
 }
 
 void WiredTigerRecordStore::OplogStones::clearStonesOnCommit(OperationContext* opCtx) {
@@ -325,14 +398,21 @@ void WiredTigerRecordStore::OplogStones::_calculateStones(OperationContext* opCt
     const std::uint64_t startWaitTime = curTimeMicros64();
     ON_BLOCK_EXIT([&] {
         auto waitTime = curTimeMicros64() - startWaitTime;
-        log() << "WiredTiger record store oplog processing took " << waitTime / 1000 << "ms";
+        LOGV2(22382,
+              "WiredTiger record store oplog processing took {duration}ms",
+              "WiredTiger record store oplog processing finished",
+              "duration"_attr = Milliseconds(static_cast<int64_t>(waitTime / 1000)));
         _totalTimeProcessing.fetchAndAdd(waitTime);
     });
     long long numRecords = _rs->numRecords(opCtx);
     long long dataSize = _rs->dataSize(opCtx);
 
-    log() << "The size storer reports that the oplog contains " << numRecords
-          << " records totaling to " << dataSize << " bytes";
+    LOGV2(22383,
+          "The size storer reports that the oplog contains {numRecords} records totaling to "
+          "{dataSize} bytes",
+          "The size storer reports that the oplog contains",
+          "numRecords"_attr = numRecords,
+          "dataSize"_attr = dataSize);
 
     // Don't calculate stones if this is a new collection. This is to prevent standalones from
     // attempting to get a forward scanning oplog cursor on an explicit create of the oplog
@@ -366,7 +446,7 @@ void WiredTigerRecordStore::OplogStones::_calculateStones(OperationContext* opCt
 
 void WiredTigerRecordStore::OplogStones::_calculateStonesByScanning(OperationContext* opCtx) {
     _processBySampling.store(false);  // process by scanning
-    log() << "Scanning the oplog to determine where to place markers for truncation";
+    LOGV2(22384, "Scanning the oplog to determine where to place markers for truncation");
 
     long long numRecords = 0;
     long long dataSize = 0;
@@ -376,10 +456,13 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesByScanning(OperationCon
         _currentRecords.addAndFetch(1);
         int64_t newCurrentBytes = _currentBytes.addAndFetch(record->data.size());
         if (newCurrentBytes >= _minBytesPerStone) {
-            LOG(1) << "Placing a marker at optime "
-                   << Timestamp(record->id.repr()).toStringPretty();
+            BSONObj obj = record->data.toBson();
+            Date_t wallTime = obj["wall"].Date();
 
-            OplogStones::Stone stone = {_currentRecords.swap(0), _currentBytes.swap(0), record->id};
+            LOGV2_DEBUG(
+                22385, 1, "Marking oplog entry as a potential future oplog truncation point.");
+            OplogStones::Stone stone(
+                _currentRecords.swap(0), _currentBytes.swap(0), record->id, wallTime);
             _stones.push_back(stone);
         }
 
@@ -393,7 +476,7 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesByScanning(OperationCon
 void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationContext* opCtx,
                                                                     int64_t estRecordsPerStone,
                                                                     int64_t estBytesPerStone) {
-    log() << "Sampling the oplog to determine where to place markers for truncation";
+    LOGV2(22386, "Sampling the oplog to determine where to place markers for truncation");
     _processBySampling.store(true);  // process by sampling
     Timestamp earliestOpTime;
     Timestamp latestOpTime;
@@ -405,7 +488,8 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
         if (!record) {
             // This shouldn't really happen unless the size storer values are far off from reality.
             // The collection is probably empty, but fall back to scanning the oplog just in case.
-            log() << "Failed to determine the earliest optime, falling back to scanning the oplog";
+            LOGV2(22387,
+                  "Failed to determine the earliest optime, falling back to scanning the oplog");
             _calculateStonesByScanning(opCtx);
             return;
         }
@@ -419,22 +503,31 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
         if (!record) {
             // This shouldn't really happen unless the size storer values are far off from reality.
             // The collection is probably empty, but fall back to scanning the oplog just in case.
-            log() << "Failed to determine the latest optime, falling back to scanning the oplog";
+            LOGV2(22388,
+                  "Failed to determine the latest optime, falling back to scanning the oplog");
             _calculateStonesByScanning(opCtx);
             return;
         }
         latestOpTime = Timestamp(record->id.repr());
     }
 
-    log() << "Sampling from the oplog between " << earliestOpTime.toStringPretty() << " and "
-          << latestOpTime.toStringPretty() << " to determine where to place markers for truncation";
+    LOGV2(22389,
+          "Sampling from the oplog between {from} and {to} to "
+          "determine where to place markers for truncation",
+          "Sampling from the oplog to determine where to place markers for truncation",
+          "from"_attr = earliestOpTime,
+          "to"_attr = latestOpTime);
 
     int64_t wholeStones = _rs->numRecords(opCtx) / estRecordsPerStone;
     int64_t numSamples = kRandomSamplesPerStone * _rs->numRecords(opCtx) / estRecordsPerStone;
 
-    log() << "Taking " << numSamples << " samples and assuming that each section of oplog contains"
-          << " approximately " << estRecordsPerStone << " records totaling to " << estBytesPerStone
-          << " bytes";
+    LOGV2(22390,
+          "Taking {numSamples} samples and assuming that each section of oplog contains "
+          "approximately {containsNumRecords} records totaling to {containsNumBytes} bytes",
+          "Taking samples and assuming each oplog section contains",
+          "numSamples"_attr = numSamples,
+          "containsNumRecords"_attr = estRecordsPerStone,
+          "containsNumBytes"_attr = estBytesPerStone);
 
     // Inform the random cursor of the number of samples we intend to take. This allows it to
     // account for skew in the tree shape.
@@ -445,7 +538,7 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
     // order of their RecordId, and then choosing the samples expected to be near the right edge of
     // each logical section.
     auto cursor = _rs->getRandomCursorWithOptions(opCtx, extraConfig);
-    std::vector<RecordId> oplogEstimates;
+    std::vector<RecordIdAndWall> oplogEstimates;
     auto lastProgressLog = Date_t::now();
     for (int i = 0; i < numSamples; ++i) {
         auto samplingLogIntervalSeconds = gOplogSamplingLogIntervalSeconds.load();
@@ -455,31 +548,45 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
         if (!record) {
             // This shouldn't really happen unless the size storer values are far off from reality.
             // The collection is probably empty, but fall back to scanning the oplog just in case.
-            log() << "Failed to get enough random samples, falling back to scanning the oplog";
+            LOGV2(22391, "Failed to get enough random samples, falling back to scanning the oplog");
             _calculateStonesByScanning(opCtx);
             return;
         }
-        oplogEstimates.push_back(record->id);
+
+        BSONObj obj = record->data.toBson();
+        Date_t wall = obj["wall"].Date();
+        oplogEstimates.push_back(RecordIdAndWall{record->id, wall});
 
         const auto now = Date_t::now();
         if (samplingLogIntervalSeconds > 0 &&
             now - lastProgressLog >= Seconds(samplingLogIntervalSeconds)) {
-            log() << "Oplog sampling progress: " << (i + 1) << " of " << numSamples
-                  << " samples taken";
+            LOGV2(22392,
+                  "Oplog sampling progress: {current} of {total} samples taken",
+                  "Oplog sampling progress",
+                  "completed"_attr = (i + 1),
+                  "total"_attr = numSamples);
             lastProgressLog = now;
         }
     }
-    std::sort(oplogEstimates.begin(), oplogEstimates.end());
-    log() << "Oplog sampling complete";
+    std::sort(oplogEstimates.begin(),
+              oplogEstimates.end(),
+              [](RecordIdAndWall a, RecordIdAndWall b) { return a.id < b.id; });
+    LOGV2(22393, "Oplog sampling complete");
 
     for (int i = 1; i <= wholeStones; ++i) {
         // Use every (kRandomSamplesPerStone)th sample, starting with the
         // (kRandomSamplesPerStone - 1)th, as the last record for each stone.
+        // If parsing "wall" fails, we crash to allow user to fix their oplog.
         int sampleIndex = kRandomSamplesPerStone * i - 1;
-        RecordId lastRecord = oplogEstimates[sampleIndex];
-
-        log() << "Placing a marker at optime " << Timestamp(lastRecord.repr()).toStringPretty();
-        OplogStones::Stone stone = {estRecordsPerStone, estBytesPerStone, lastRecord};
+        RecordIdAndWall rIdAndWall = oplogEstimates[sampleIndex];
+        LOGV2_DEBUG(22394,
+                    1,
+                    "Marking oplog entry as a potential future oplog truncation point. wall: "
+                    "{wall}, ts: {ts}",
+                    "wall"_attr = rIdAndWall.wall,
+                    "ts"_attr = rIdAndWall.id);
+        OplogStones::Stone stone(
+            estRecordsPerStone, estBytesPerStone, rIdAndWall.id, rIdAndWall.wall);
         _stones.push_back(stone);
     }
 
@@ -495,6 +602,7 @@ void WiredTigerRecordStore::OplogStones::_pokeReclaimThreadIfNeeded() {
 }
 
 void WiredTigerRecordStore::OplogStones::adjust(int64_t maxSize) {
+    stdx::lock_guard<Latch> reclaimLk(_oplogReclaimMutex);
     stdx::lock_guard<Latch> lk(_mutex);
 
     const unsigned int oplogStoneSize =
@@ -576,8 +684,16 @@ public:
         WT_SESSION* session = WiredTigerRecoveryUnit::get(_opCtx)->getSession()->getSession();
 
         if (!_cursor) {
-            invariantWTOK(session->open_cursor(
+            auto status = wtRCToStatus(session->open_cursor(
                 session, _rs->_uri.c_str(), nullptr, _config.c_str(), &_cursor));
+            if (status == ErrorCodes::ObjectIsBusy) {
+                // This can happen if you try to open a cursor on the oplog table and a verify is
+                // currently running on it.
+                uasserted(
+                    4820000,
+                    "Failed to open a cursor on a collection because it was locked by WiredTiger.");
+            }
+            invariantStatusOK(status);
             invariant(_cursor);
         }
         return true;
@@ -755,9 +871,12 @@ WiredTigerRecordStore::~WiredTigerRecordStore() {
     }
 
     if (!isTemp()) {
-        LOG(1) << "~WiredTigerRecordStore for: " << ns();
+        LOGV2_DEBUG(22395, 1, "~WiredTigerRecordStore for: {ns}", "ns"_attr = ns());
     } else {
-        LOG(1) << "~WiredTigerRecordStore for temporary ident: " << getIdent();
+        LOGV2_DEBUG(22396,
+                    1,
+                    "~WiredTigerRecordStore for temporary ident: {getIdent}",
+                    "getIdent"_attr = getIdent());
     }
 
     if (_oplogStones) {
@@ -784,9 +903,13 @@ void WiredTigerRecordStore::checkSize(OperationContext* opCtx) {
         //
         // We mark a RecordStore as needing size adjustment iff its size is accurate at the current
         // time but not as of the top of the oplog.
-        LOG_FOR_RECOVERY(2) << "Record store was empty; setting count metadata to zero but marking "
-                               "record store as needing size adjustment during recovery. ns: "
-                            << (isTemp() ? "(temp)" : ns()) << ", ident: " << _ident;
+        LOGV2_FOR_RECOVERY(23983,
+                           2,
+                           "Record store was empty; setting count metadata to zero but marking "
+                           "record store as needing size adjustment during recovery. ns: "
+                           "{isTemp_temp_ns}, ident: {ident}",
+                           "isTemp_temp_ns"_attr = (isTemp() ? "(temp)" : ns()),
+                           "ident"_attr = _ident);
         sizeRecoveryState(getGlobalServiceContext())
             .markCollectionAsAlwaysNeedsSizeAdjustment(_ident);
         _sizeInfo->dataSize.store(0);
@@ -805,7 +928,7 @@ void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
 
     if (_isOplog) {
         invariant(_kvEngine);
-        _kvEngine->startOplogManager(opCtx, _uri, this);
+        _kvEngine->startOplogManager(opCtx, this);
     }
 }
 
@@ -912,6 +1035,10 @@ bool WiredTigerRecordStore::findRecord(OperationContext* opCtx,
 
 void WiredTigerRecordStore::deleteRecord(OperationContext* opCtx, const RecordId& id) {
     dassert(opCtx->lockState()->isWriteLocked());
+    invariant(opCtx->lockState()->inAWriteUnitOfWork() || opCtx->lockState()->isNoop());
+    // SERVER-48453: Initialize the next record id counter before deleting. This ensures we won't
+    // reuse record ids, which can be problematic for the _mdb_catalog.
+    _initNextIdIfNeeded(opCtx);
 
     // Deletes should never occur on a capped collection because truncation uses
     // WT_SESSION::truncate().
@@ -1174,7 +1301,7 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded_inlock(OperationContext* op
 
             if (ret == ENOENT || ret == WT_NOTFOUND) {
                 // TODO we should remove this case once SERVER-17141 is resolved
-                log() << "Soft failure truncating capped collection. Will try again later.";
+                LOGV2(22397, "Soft failure truncating capped collection. Will try again later.");
                 docsRemoved = 0;
             } else {
                 invariantWTOK(ret);
@@ -1188,7 +1315,7 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded_inlock(OperationContext* op
     } catch (const WriteConflictException&) {
         opCtx->releaseRecoveryUnit();
         opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(realRecoveryUnit), realRUstate);
-        log() << "got conflict truncating capped, ignoring";
+        LOGV2(22398, "got conflict truncating capped, ignoring");
         return 0;
     } catch (...) {
         opCtx->releaseRecoveryUnit();
@@ -1243,9 +1370,15 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
             return;
         }
 
-        LOG(1) << "Truncating the oplog between " << _oplogStones->firstRecord << " and "
-               << stone->lastRecord << " to remove approximately " << stone->records
-               << " records totaling to " << stone->bytes << " bytes";
+        LOGV2_DEBUG(
+            22399,
+            1,
+            "Truncating the oplog between {oplogStones_firstRecord} and {stone_lastRecord} to "
+            "remove approximately {stone_records} records totaling to {stone_bytes} bytes",
+            "oplogStones_firstRecord"_attr = _oplogStones->firstRecord,
+            "stone_lastRecord"_attr = stone->lastRecord,
+            "stone_records"_attr = stone->records,
+            "stone_bytes"_attr = stone->bytes);
 
         WiredTigerRecoveryUnit* ru = WiredTigerRecoveryUnit::get(opCtx);
         WT_SESSION* session = ru->getSession()->getSession();
@@ -1261,8 +1394,12 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
             invariantWTOK(ret);
             RecordId firstRecord = getKey(cursor);
             if (firstRecord < _oplogStones->firstRecord || firstRecord > stone->lastRecord) {
-                warning() << "First oplog record " << firstRecord << " is not in truncation range ("
-                          << _oplogStones->firstRecord << ", " << stone->lastRecord << ")";
+                LOGV2_WARNING(22407,
+                              "First oplog record {firstRecord} is not in truncation range "
+                              "({oplogStones_firstRecord}, {stone_lastRecord})",
+                              "firstRecord"_attr = firstRecord,
+                              "oplogStones_firstRecord"_attr = _oplogStones->firstRecord,
+                              "stone_lastRecord"_attr = stone->lastRecord);
             }
 
             setKey(cursor, stone->lastRecord);
@@ -1277,19 +1414,27 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
 
             // Stash the truncate point for next time to cleanly skip over tombstones, etc.
             _oplogStones->firstRecord = stone->lastRecord;
+            _cappedFirstRecord = stone->lastRecord;
         } catch (const WriteConflictException&) {
-            LOG(1) << "Caught WriteConflictException while truncating oplog entries, retrying";
+            LOGV2_DEBUG(
+                22400, 1, "Caught WriteConflictException while truncating oplog entries, retrying");
         }
     }
 
-    LOG(1) << "Finished truncating the oplog, it now contains approximately "
-           << _sizeInfo->numRecords.load() << " records totaling to " << _sizeInfo->dataSize.load()
-           << " bytes";
+    LOGV2_DEBUG(22401,
+                1,
+                "Finished truncating the oplog, it now contains approximately "
+                "{sizeInfo_numRecords_load} records totaling to {sizeInfo_dataSize_load} bytes",
+                "sizeInfo_numRecords_load"_attr = _sizeInfo->numRecords.load(),
+                "sizeInfo_dataSize_load"_attr = _sizeInfo->dataSize.load());
     auto elapsedMicros = timer.micros();
     auto elapsedMillis = elapsedMicros / 1000;
     _totalTimeTruncating.fetchAndAdd(elapsedMicros);
     _truncateCount.fetchAndAdd(1);
-    log() << "WiredTiger record store oplog truncation finished in: " << elapsedMillis << "ms";
+    LOGV2(22402,
+          "WiredTiger record store oplog truncation finished in: {elapsedMillis}ms",
+          "WiredTiger record store oplog truncation finished",
+          "duration"_attr = Milliseconds(elapsedMillis));
 }
 
 Status WiredTigerRecordStore::insertRecords(OperationContext* opCtx,
@@ -1303,6 +1448,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
                                              const Timestamp* timestamps,
                                              size_t nRecords) {
     dassert(opCtx->lockState()->isWriteLocked());
+    invariant(opCtx->lockState()->inAWriteUnitOfWork() || opCtx->lockState()->isNoop());
 
     // We are kind of cheating on capped collections since we write all of them at once ....
     // Simplest way out would be to just block vector writes for everything except oplog ?
@@ -1319,8 +1465,8 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
     WT_CURSOR* c = curwrap.get();
     invariant(c);
 
-    RecordId highestId = RecordId();
-    dassert(nRecords != 0);
+    Record highestIdRecord;
+    invariant(nRecords != 0);
     for (size_t i = 0; i < nRecords; i++) {
         auto& record = records[i];
         if (_isOplog) {
@@ -1332,8 +1478,8 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
         } else {
             record.id = _nextId(opCtx);
         }
-        dassert(record.id > highestId);
-        highestId = record.id;
+        dassert(record.id > highestIdRecord.id);
+        highestIdRecord = record;
     }
 
     for (size_t i = 0; i < nRecords; i++) {
@@ -1352,7 +1498,7 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
             ts = timestamps[i];
         }
         if (!ts.isNull()) {
-            LOG(4) << "inserting record with timestamp " << ts;
+            LOGV2_DEBUG(22403, 4, "inserting record with timestamp {ts}", "ts"_attr = ts);
             fassert(39001, opCtx->recoveryUnit()->setTimestamp(ts));
         }
         setKey(c, record.id);
@@ -1368,9 +1514,9 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
 
     if (_oplogStones) {
         _oplogStones->updateCurrentStoneAfterInsertOnCommit(
-            opCtx, totalLength, highestId, nRecords);
+            opCtx, totalLength, highestIdRecord, nRecords);
     } else {
-        _cappedDeleteAsNeeded(opCtx, highestId);
+        _cappedDeleteAsNeeded(opCtx, highestIdRecord.id);
     }
 
     return Status::OK();
@@ -1390,7 +1536,7 @@ bool WiredTigerRecordStore::haveCappedWaiters() {
 
 void WiredTigerRecordStore::notifyCappedWaitersIfNeeded() {
     stdx::lock_guard<Latch> cappedCallbackLock(_cappedCallbackMutex);
-    // This wakes up cursors blocking in await_data.
+    // This wakes up cursors blocking for awaitData.
     if (_cappedCallback) {
         _cappedCallback->notifyCappedWaitersIfNeeded();
     }
@@ -1399,13 +1545,15 @@ void WiredTigerRecordStore::notifyCappedWaitersIfNeeded() {
 StatusWith<Timestamp> WiredTigerRecordStore::getLatestOplogTimestamp(
     OperationContext* opCtx) const {
     invariant(_isOplog);
-    invariant(opCtx->lockState()->isReadLocked());
+    dassert(opCtx->lockState()->isReadLocked());
 
     WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
     auto sessRaii = cache->getSession();
-    WT_SESSION* sess = sessRaii->getSession();
-    WT_CURSOR* cursor;
-    invariantWTOK(sess->open_cursor(sess, _uri.c_str(), nullptr, nullptr, &cursor));
+    WT_CURSOR* cursor = writeConflictRetry(opCtx, "getLatestOplogTimestamp", "local.oplog.rs", [&] {
+        auto cachedCursor = sessRaii->getCachedCursor(_uri, _tableId);
+        return cachedCursor ? cachedCursor : sessRaii->getNewCursor(_uri);
+    });
+    ON_BLOCK_EXIT([&] { sessRaii->releaseCursor(_tableId, cursor); });
     int ret = cursor->prev(cursor);
     if (ret == WT_NOTFOUND) {
         return Status(ErrorCodes::CollectionIsEmpty, "oplog is empty");
@@ -1413,9 +1561,35 @@ StatusWith<Timestamp> WiredTigerRecordStore::getLatestOplogTimestamp(
     invariantWTOK(ret);
 
     RecordId recordId = getKey(cursor);
-    invariantWTOK(sess->reset(sess));
 
     return {Timestamp(static_cast<unsigned long long>(recordId.repr()))};
+}
+
+StatusWith<Timestamp> WiredTigerRecordStore::getEarliestOplogTimestamp(OperationContext* opCtx) {
+    invariant(_isOplog);
+    dassert(opCtx->lockState()->isReadLocked());
+
+    stdx::lock_guard<stdx::timed_mutex> lk(_cappedDeleterMutex);
+
+    if (_cappedFirstRecord == RecordId()) {
+        WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
+        auto sessRaii = cache->getSession();
+        WT_CURSOR* cursor =
+            writeConflictRetry(opCtx, "getEarliestOplogTimestamp", "local.oplog.rs", [&] {
+                auto cachedCursor = sessRaii->getCachedCursor(_uri, _tableId);
+                return cachedCursor ? cachedCursor : sessRaii->getNewCursor(_uri);
+            });
+        ON_BLOCK_EXIT([&] { sessRaii->releaseCursor(_tableId, cursor); });
+        auto ret = cursor->next(cursor);
+        if (ret == WT_NOTFOUND) {
+            return Status(ErrorCodes::CollectionIsEmpty, "oplog is empty");
+        }
+        invariantWTOK(ret);
+
+        _cappedFirstRecord = getKey(cursor);
+    }
+
+    return {Timestamp(static_cast<unsigned long long>(_cappedFirstRecord.repr()))};
 }
 
 Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
@@ -1423,6 +1597,7 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
                                            const char* data,
                                            int len) {
     dassert(opCtx->lockState()->isWriteLocked());
+    invariant(opCtx->lockState()->inAWriteUnitOfWork() || opCtx->lockState()->isNoop());
 
     WiredTigerCursor curwrap(_uri, _tableId, true, opCtx);
     curwrap.assertInActiveTxn();
@@ -1562,9 +1737,6 @@ Status WiredTigerRecordStore::compact(OperationContext* opCtx) {
     if (!cache->isEphemeral()) {
         WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
         opCtx->recoveryUnit()->abandonSnapshot();
-        // WT compact prompts WT to take checkpoints, so we need to take the checkpoint lock around
-        // WT compact calls.
-        auto checkpointLock = _kvEngine->getCheckpointLock(opCtx);
         int ret = s->compact(s, getURI().c_str(), "timeout=0");
         invariantWTOK(ret);
     }
@@ -1580,6 +1752,11 @@ void WiredTigerRecordStore::validate(OperationContext* opCtx,
         return;
     }
 
+    if (_isOplog) {
+        results->warnings.push_back("Skipping verification of the WiredTiger table for the oplog.");
+        return;
+    }
+
     int err = WiredTigerUtil::verifyTable(opCtx, _uri, &results->errors);
     if (!err) {
         return;
@@ -1591,15 +1768,22 @@ void WiredTigerRecordStore::validate(OperationContext* opCtx,
             << "This is a transient issue as the collection was actively "
                "in use by other operations.";
 
-        warning() << msg;
+        LOGV2_WARNING(22408,
+                      "Could not complete validation, This is a transient issue as the collection "
+                      "was actively in use by other operations",
+                      "uri"_attr = _uri);
         results->warnings.push_back(msg);
         return;
     }
 
-    std::string msg = str::stream() << "verify() returned " << wiredtiger_strerror(err) << ". "
+    const char* errorStr = wiredtiger_strerror(err);
+    std::string msg = str::stream() << "verify() returned " << errorStr << ". "
                                     << "This indicates structural damage. "
                                     << "Not examining individual documents.";
-    error() << msg;
+    LOGV2_ERROR(22409,
+                "Verification returned error. This indicates structural damage. Not examining "
+                "individual documents",
+                "error"_attr = errorStr);
     results->errors.push_back(msg);
     results->valid = false;
 }
@@ -1752,7 +1936,10 @@ public:
     NumRecordsChange(WiredTigerRecordStore* rs, int64_t diff) : _rs(rs), _diff(diff) {}
     virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
-        LOG(3) << "WiredTigerRecordStore: rolling back NumRecordsChange " << -_diff;
+        LOGV2_DEBUG(22404,
+                    3,
+                    "WiredTigerRecordStore: rolling back NumRecordsChange {diff}",
+                    "diff"_attr = -_diff);
         _rs->_sizeInfo->numRecords.fetchAndAdd(-_diff);
     }
 
@@ -1886,7 +2073,7 @@ void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
         }
 
         _kvEngine->getOplogManager()->setOplogReadTimestamp(truncTs);
-        LOG(1) << "truncation new read timestamp: " << truncTs;
+        LOGV2_DEBUG(22405, 1, "truncation new read timestamp: {truncTs}", "truncTs"_attr = truncTs);
     }
 
     if (_oplogStones) {
@@ -1935,6 +2122,11 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
     if (_eof)
         return {};
 
+    // Ensure an active transaction is open. While WiredTiger supports using cursors on a session
+    // without an active transaction (i.e. an implicit transaction), that would bypass configuration
+    // options we pass when we explicitly start transactions in the RecoveryUnit.
+    WiredTigerRecoveryUnit::get(_opCtx)->getSession();
+
     WT_CURSOR* c = _cursor->get();
 
     RecordId id;
@@ -1966,12 +2158,15 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
     }
 
     if (_forward && _lastReturnedId >= id) {
-        log() << "WTCursor::next -- c->next_key ( " << id
-              << ") was not greater than _lastReturnedId (" << _lastReturnedId
-              << ") which is a bug.";
+        LOGV2(22406,
+              "WTCursor::next -- c->next_key ( {next}) was not greater than _lastReturnedId "
+              "({last}) which is a bug.",
+              "WTCursor::next -- next was not greater than last which is a bug",
+              "next"_attr = id,
+              "last"_attr = _lastReturnedId);
 
-        // Crash when test commands are enabled.
-        invariant(!getTestCommandsEnabled());
+        // Crash when testing diagnostics are enabled.
+        invariant(!TestingProctor::instance().isEnabled());
 
         // Force a retry of the operation from our last known position by acting as-if
         // we received a WT_ROLLBACK error.
@@ -1991,6 +2186,11 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::seekExact(const RecordI
         _eof = true;
         return {};
     }
+
+    // Ensure an active transaction is open. While WiredTiger supports using cursors on a session
+    // without an active transaction (i.e. an implicit transaction), that would bypass configuration
+    // options we pass when we explicitly start transactions in the RecoveryUnit.
+    WiredTigerRecoveryUnit::get(_opCtx)->getSession();
 
     _skipNextAdvance = false;
     WT_CURSOR* c = _cursor->get();

@@ -59,6 +59,13 @@ public:
     enum class IndexVersion { kV1 = 1, kV2 = 2 };
     static constexpr IndexVersion kLatestIndexVersion = IndexVersion::kV2;
 
+    // Used to report the result of a comparison between two indexes.
+    enum class Comparison {
+        kDifferent,   // Indicates that the indexes do not match.
+        kEquivalent,  // Indicates that the options which uniquely identify an index match.
+        kIdentical    // Indicates that all applicable index options match.
+    };
+
     static constexpr StringData k2dIndexBitsFieldName = "bits"_sd;
     static constexpr StringData k2dIndexMinFieldName = "min"_sd;
     static constexpr StringData k2dIndexMaxFieldName = "max"_sd;
@@ -71,6 +78,7 @@ public:
     static constexpr StringData kDropDuplicatesFieldName = "dropDups"_sd;
     static constexpr StringData kExpireAfterSecondsFieldName = "expireAfterSeconds"_sd;
     static constexpr StringData kGeoHaystackBucketSize = "bucketSize"_sd;
+    static constexpr StringData kHiddenFieldName = "hidden"_sd;
     static constexpr StringData kIndexNameFieldName = "name"_sd;
     static constexpr StringData kIndexVersionFieldName = "v"_sd;
     static constexpr StringData kKeyPatternFieldName = "key"_sd;
@@ -147,9 +155,6 @@ public:
         return _indexName;
     }
 
-    // Return the name of the indexed collection.
-    const NamespaceString& parentNS() const;
-
     // Return the name of the access method we must use to access this index's data.
     const std::string& getAccessMethodName() const {
         return _accessMethodName;
@@ -158,6 +163,13 @@ public:
     // Returns the type of the index associated with this descriptor.
     IndexType getIndexType() const {
         return _indexType;
+    }
+
+    /**
+     * Return a pointer to the IndexCatalogEntry that owns this descriptor, or null if orphaned.
+     */
+    IndexCatalogEntry* getEntry() const {
+        return _entry;
     }
 
     //
@@ -174,6 +186,10 @@ public:
         return _unique;
     }
 
+    bool hidden() const {
+        return _hidden;
+    }
+
     // Is this index sparse?
     bool isSparse() const {
         return _sparse;
@@ -183,11 +199,6 @@ public:
     bool isPartial() const {
         return _partial;
     }
-
-    // Is this index multikey?
-    bool isMultikey() const;
-
-    MultikeyPaths getMultikeyPaths(OperationContext* opCtx) const;
 
     bool isIdIndex() const {
         return _isIdIndex;
@@ -203,13 +214,18 @@ public:
         return _infoObj;
     }
 
-    // Both the collection and the catalog must outlive the IndexDescriptor
-    const Collection* getCollection() const {
-        return _collection;
+    BSONObj toBSON() const {
+        return _infoObj;
     }
-    const IndexCatalog* getIndexCatalog() const;
 
-    bool areIndexOptionsEquivalent(const IndexDescriptor* other) const;
+    /**
+     * Compares the current IndexDescriptor against the given index entry. Returns kIdentical if all
+     * index options are logically identical, kEquivalent if all options which uniquely identify an
+     * index are logically identical, and kDifferent otherwise.
+     */
+    Comparison compareIndexOptions(OperationContext* opCtx,
+                                   const NamespaceString& ns,
+                                   const IndexCatalogEntry* other) const;
 
     const BSONObj& collation() const {
         return _collation;
@@ -231,9 +247,6 @@ public:
     }
 
 private:
-    // Related catalog information of the parent collection
-    Collection* _collection;
-
     // What access method should we use for this index?
     std::string _accessMethodName;
 
@@ -251,14 +264,15 @@ private:
     bool _isIdIndex;
     bool _sparse;
     bool _unique;
+    bool _hidden;
     bool _partial;
     IndexVersion _version;
     BSONObj _collation;
     BSONObj _partialFilterExpression;
 
-    // only used by IndexCatalogEntryContainer to do caching for perf
-    // users not allowed to touch, and not part of API
-    IndexCatalogEntry* _cachedEntry;
+    // Many query stages require going from an IndexDescriptor to its IndexCatalogEntry, so for
+    // now we need this.
+    IndexCatalogEntry* _entry = nullptr;
 
     friend class IndexCatalog;
     friend class IndexCatalogEntryImpl;

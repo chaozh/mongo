@@ -1,7 +1,7 @@
 /**
  * Tests that --repair on WiredTiger correctly and gracefully handles inconsistent indexes.
  *
- * @tags: [requires_wiredtiger, requires_fcv_44]
+ * @tags: [requires_wiredtiger]
  */
 
 (function() {
@@ -11,11 +11,6 @@ load('jstests/disk/libs/wt_file_helper.js');
 const baseName = "wt_repair_inconsistent_index";
 const collName = "test";
 const dbpath = MongoRunner.dataPath + baseName + "/";
-
-const forceCheckpoint = () => {
-    assert.commandWorked(db.fsyncLock());
-    assert.commandWorked(db.fsyncUnlock());
-};
 
 /**
  * Run the test by supplying additional paramters to MongoRunner.runMongod with 'mongodOptions'.

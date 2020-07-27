@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -46,8 +46,8 @@
 #include "mongo/db/free_mon/free_mon_storage.h"
 #include "mongo/db/service_context.h"
 #include "mongo/idl/idl_parser.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -259,9 +259,12 @@ void FreeMonProcessor::run() {
         // Stop the queue
         _queue.stop();
 
-        warning() << "Uncaught exception in '" << exceptionToStatus()
-                  << "' in free monitoring subsystem. Shutting down the "
-                     "free monitoring subsystem.";
+        LOGV2_WARNING(20619,
+                      "Uncaught exception in '{error}' in free monitoring subsystem. "
+                      "Shutting down the free monitoring subsystem.",
+                      "Uncaught exception in free monitoring subsystem. "
+                      "Shutting down the free monitoring subsystem.",
+                      "error"_attr = exceptionToStatus());
     }
 }
 
@@ -327,7 +330,7 @@ void FreeMonProcessor::doServerRegister(
     // If we are asked to register now, then kick off a registration request
     const auto regType = msg->getPayload().first;
     if (regType == RegistrationType::RegisterOnStart) {
-        enqueue(FreeMonRegisterCommandMessage::createNow(msg->getPayload().second));
+        enqueue(FreeMonRegisterCommandMessage::createNow({msg->getPayload().second, boost::none}));
     } else {
         invariant((regType == RegistrationType::RegisterAfterOnTransitionToPrimary) ||
                   (regType == RegistrationType::RegisterAfterOnTransitionToPrimaryIfEnabled));
@@ -352,7 +355,8 @@ void FreeMonProcessor::doServerRegister(
             // We are standalone or secondary, if we have a registration id, then send a
             // registration notification, else wait for the user to register us.
             if (state.get().getState() == StorageStateEnum::enabled) {
-                enqueue(FreeMonRegisterCommandMessage::createNow(msg->getPayload().second));
+                enqueue(FreeMonRegisterCommandMessage::createNow(
+                    {msg->getPayload().second, boost::none}));
             }
         }
 
@@ -415,22 +419,26 @@ void FreeMonProcessor::doCommandRegister(Client* client,
 
     FreeMonRegistrationRequest req;
 
-    auto regid = _state->getRegistrationId();
-    if (!regid.empty()) {
-        req.setId(regid);
+    if (msg->getPayload().second) {
+        req.setId(StringData(msg->getPayload().second.get()));
+    } else {
+        auto regid = _state->getRegistrationId();
+        if (!regid.empty()) {
+            req.setId(regid);
+        }
     }
 
     req.setVersion(kMaxProtocolVersion);
 
     req.setLocalTime(client->getServiceContext()->getPreciseClockSource()->now());
 
-    if (!msg->getPayload().empty()) {
+    if (!msg->getPayload().first.empty()) {
         // Cache the tags for subsequent retries
-        _tags = msg->getPayload();
+        _tags = msg->getPayload().first;
     }
 
     if (!_tags.empty()) {
-        req.setTags(transformVector(msg->getPayload()));
+        req.setTags(transformVector(msg->getPayload().first));
     }
 
     // Collect the data
@@ -600,7 +608,10 @@ void FreeMonProcessor::doAsyncRegisterComplete(
 
     Status s = validateRegistrationResponse(resp);
     if (!s.isOK()) {
-        warning() << "Free Monitoring registration halted due to " << s;
+        LOGV2_WARNING(20620,
+                      "Free Monitoring registration halted due to {error}",
+                      "Free Monitoring registration halted due to error",
+                      "error"_attr = s);
 
         // Disable on any error
         _state->setState(StorageStateEnum::disabled);
@@ -646,7 +657,10 @@ void FreeMonProcessor::doAsyncRegisterComplete(
     // Notify waiters
     notifyPendingRegisters(Status::OK());
 
-    log() << "Free Monitoring is Enabled. Frequency: " << resp.getReportingInterval() << " seconds";
+    LOGV2(20615,
+          "Free Monitoring is Enabled. Frequency: {interval} seconds",
+          "Free Moniforing is Enabled",
+          "interval"_attr = resp.getReportingInterval());
 
     // Enqueue next metrics upload immediately to deliver a good experience
     enqueue(FreeMonMessage::createNow(FreeMonMessageType::MetricsSend));
@@ -666,16 +680,20 @@ void FreeMonProcessor::doAsyncRegisterFail(
 
     if (!_registrationRetry->incrementError()) {
         // We have exceeded our retry
-        warning() << "Free Monitoring is abandoning registration after excess retries";
+        LOGV2_WARNING(20621, "Free Monitoring is abandoning registration after excess retries");
         return;
     }
 
-    LOG(1) << "Free Monitoring Registration Failed with status '" << msg->getPayload()
-           << "', retrying in " << _registrationRetry->getNextDuration();
+    LOGV2_DEBUG(20616,
+                1,
+                "Free Monitoring Registration Failed with status '{error}', retrying in {interval}",
+                "Free Monitoring Registration Failed, will retry after interval",
+                "error"_attr = msg->getPayload(),
+                "interval"_attr = _registrationRetry->getNextDuration());
 
     // Enqueue a register retry
     enqueue(FreeMonRegisterCommandMessage::createWithDeadline(
-        _tags, _registrationRetry->getNextDeadline(client)));
+        {_tags, boost::none}, _registrationRetry->getNextDeadline(client)));
 }
 
 void FreeMonProcessor::doCommandUnregister(
@@ -688,7 +706,7 @@ void FreeMonProcessor::doCommandUnregister(
 
     writeState(client);
 
-    log() << "Free Monitoring is Disabled";
+    LOGV2(20617, "Free Monitoring is Disabled");
 
     msg->setStatus(Status::OK());
 }
@@ -778,7 +796,10 @@ void FreeMonProcessor::doAsyncMetricsComplete(
 
     Status s = validateMetricsResponse(resp);
     if (!s.isOK()) {
-        warning() << "Free Monitoring metrics uploading halted due to " << s;
+        LOGV2_WARNING(20622,
+                      "Free Monitoring metrics uploading halted due to {error}",
+                      "Free Monitoring metrics uploading halted due to error",
+                      "error"_attr = s);
 
         // Disable free monitoring on validation errors
         _state->setState(StorageStateEnum::disabled);
@@ -838,7 +859,7 @@ void FreeMonProcessor::doAsyncMetricsComplete(
     _metricsRetry->reset();
 
     if (resp.getResendRegistration().is_initialized() && resp.getResendRegistration()) {
-        enqueue(FreeMonRegisterCommandMessage::createNow(_tags));
+        enqueue(FreeMonRegisterCommandMessage::createNow({_tags, boost::none}));
     } else {
         // Enqueue next metrics upload
         enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
@@ -851,12 +872,16 @@ void FreeMonProcessor::doAsyncMetricsFail(
 
     if (!_metricsRetry->incrementError()) {
         // We have exceeded our retry
-        warning() << "Free Monitoring is abandoning metrics upload after excess retries";
+        LOGV2_WARNING(20623, "Free Monitoring is abandoning metrics upload after excess retries");
         return;
     }
 
-    LOG(1) << "Free Monitoring Metrics upload failed with status " << msg->getPayload()
-           << ", retrying in " << _metricsRetry->getNextDuration();
+    LOGV2_DEBUG(20618,
+                1,
+                "Free Monitoring Metrics upload failed with status {error}, retrying in {interval}",
+                "Free Monitoring Metrics upload failed, will retry after interval",
+                "error"_attr = msg->getPayload(),
+                "interval"_attr = _metricsRetry->getNextDuration());
 
     // Enqueue next metrics upload
     enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
@@ -894,13 +919,15 @@ void FreeMonProcessor::getStatus(OperationContext* opCtx,
 
 void FreeMonProcessor::doOnTransitionToPrimary(Client* client) {
     if (_registerOnTransitionToPrimary == RegistrationType::RegisterAfterOnTransitionToPrimary) {
-        enqueue(FreeMonRegisterCommandMessage::createNow(std::vector<std::string>()));
+        enqueue(
+            FreeMonRegisterCommandMessage::createNow({std::vector<std::string>(), boost::none}));
 
     } else if (_registerOnTransitionToPrimary ==
                RegistrationType::RegisterAfterOnTransitionToPrimaryIfEnabled) {
         readState(client);
         if (_state->getState() == StorageStateEnum::enabled) {
-            enqueue(FreeMonRegisterCommandMessage::createNow(std::vector<std::string>()));
+            enqueue(FreeMonRegisterCommandMessage::createNow(
+                {std::vector<std::string>(), boost::none}));
         }
     }
 
@@ -916,7 +943,8 @@ void FreeMonProcessor::processInMemoryStateChange(const FreeMonStorageState& ori
             newState.getState() == StorageStateEnum::enabled) {
 
             // Secondary needs to start registration
-            enqueue(FreeMonRegisterCommandMessage::createNow(std::vector<std::string>()));
+            enqueue(FreeMonRegisterCommandMessage::createNow(
+                {std::vector<std::string>(), newState.getRegistrationId().toString()}));
         }
     }
 }
@@ -948,9 +976,10 @@ void FreeMonProcessor::doNotifyOnUpsert(
         // Stop the queue
         _queue.stop();
 
-        warning() << "Uncaught exception in '" << exceptionToStatus()
-                  << "' in free monitoring op observer. Shutting down the "
-                     "free monitoring subsystem.";
+        LOGV2_WARNING(20624,
+                      "Uncaught exception in '{exception}' in free monitoring op observer. "
+                      "Shutting down the free monitoring subsystem.",
+                      "exception"_attr = exceptionToStatus());
     }
 }
 

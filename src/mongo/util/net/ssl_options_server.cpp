@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,7 @@
 #include "mongo/base/status.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/text.h"
@@ -138,9 +138,10 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
     }
 
     if (params.count("net.tls.tlsCipherConfig")) {
-        warning()
-            << "net.tls.tlsCipherConfig is deprecated. It will be removed in a future release.";
-        if (!sslGlobalParams.sslCipherConfig.empty()) {
+        LOGV2_WARNING(
+            23286,
+            "net.tls.tlsCipherConfig is deprecated. It will be removed in a future release.");
+        if (sslGlobalParams.sslCipherConfig != kSSLCipherConfigDefault) {
             return {ErrorCodes::BadValue,
                     "net.tls.tlsCipherConfig is incompatible with the openTLSCipherConfig "
                     "setParameter"};
@@ -222,7 +223,7 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
     } else if (sslGlobalParams.sslPEMKeyFile.size() || sslGlobalParams.sslPEMKeyPassword.size() ||
                sslGlobalParams.sslClusterFile.size() || sslGlobalParams.sslClusterPassword.size() ||
                sslGlobalParams.sslCAFile.size() || sslGlobalParams.sslCRLFile.size() ||
-               sslGlobalParams.sslCipherConfig.size() ||
+               sslGlobalParams.sslCipherConfig != kSSLCipherConfigDefault ||
                params.count("net.tls.disabledProtocols") ||
 #ifdef MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS
                params.count("net.tls.certificateSelector") ||
@@ -251,6 +252,7 @@ MONGO_STARTUP_OPTIONS_POST(SSLServerOptions)(InitializerContext*) {
                     "cannot have x.509 cluster authentication in allowTLS mode"};
         }
     }
+
     return Status::OK();
 }
 
@@ -337,8 +339,9 @@ MONGO_STARTUP_OPTIONS_VALIDATE(SSLServerOptions)(InitializerContext*) {
 MONGO_INITIALIZER_WITH_PREREQUISITES(ImplicitDisableTLS10Warning, ("ServerLogRedirection"))
 (InitializerContext*) {
     if (gImplicitDisableTLS10) {
-        log() << "Automatically disabling TLS 1.0, to force-enable TLS 1.0 "
-                 "specify --sslDisabledProtocols 'none'";
+        LOGV2(23285,
+              "Automatically disabling TLS 1.0, to force-enable TLS 1.0 "
+              "specify --sslDisabledProtocols 'none'");
     }
     return Status::OK();
 }

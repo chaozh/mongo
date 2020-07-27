@@ -40,8 +40,9 @@ namespace {
 
 const auto getRegistry = ServiceContext::declareDecoration<ActiveShardCollectionRegistry>();
 
-bool ActiveShardsvrShardCollectionEqualsNewRequest(const ShardsvrShardCollection& activeRequest,
-                                                   const ShardsvrShardCollection& newRequest) {
+bool ActiveShardsvrShardCollectionEqualsNewRequest(
+    const ShardsvrShardCollectionRequest& activeRequest,
+    const ShardsvrShardCollectionRequest& newRequest) {
     if (activeRequest.get_shardsvrShardCollection().get() !=
         newRequest.get_shardsvrShardCollection().get())
         return false;
@@ -90,7 +91,7 @@ ActiveShardCollectionRegistry& ActiveShardCollectionRegistry::get(OperationConte
 }
 
 StatusWith<ScopedShardCollection> ActiveShardCollectionRegistry::registerShardCollection(
-    const ShardsvrShardCollection& request) {
+    const ShardsvrShardCollectionRequest& request) {
     stdx::lock_guard<Latch> lk(_mutex);
     std::string nss = request.get_shardsvrShardCollection().get().ns();
 
@@ -130,30 +131,13 @@ void ActiveShardCollectionRegistry::_setUUIDOrError(std::string nss,
 }
 
 Status ActiveShardCollectionRegistry::ActiveShardCollectionState::constructErrorStatus(
-    const ShardsvrShardCollection& request) const {
+    const ShardsvrShardCollectionRequest& request) const {
     return {ErrorCodes::ConflictingOperationInProgress,
             str::stream() << "Unable to shard collection "
                           << request.get_shardsvrShardCollection().get().ns()
                           << " with arguments:  " << request.toBSON()
                           << " because this shard is currently running shard collection on this "
                           << "collection with arguments: " << activeRequest.toBSON()};
-}
-
-void ActiveShardCollectionRegistry::waitForActiveShardCollectionsToComplete(
-    OperationContext* opCtx) {
-    // Take a snapshot of the currently active shard collections.
-    std::vector<SharedSemiFuture<boost::optional<UUID>>> shardCollectionFutures;
-    {
-        stdx::lock_guard<Latch> lk(_mutex);
-        for (const auto& it : _activeShardCollectionMap) {
-            shardCollectionFutures.emplace_back(it.second->_uuidPromise.getFuture());
-        }
-    }
-
-    // Synchronously wait for all futures to resolve.
-    for (const auto& fut : shardCollectionFutures) {
-        fut.wait(opCtx);
-    }
 }
 
 ScopedShardCollection::ScopedShardCollection(std::string nss,

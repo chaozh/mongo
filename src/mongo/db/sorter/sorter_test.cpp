@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/sorter/sorter.h"
@@ -44,6 +46,7 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/str.h"
 
+#include "mongo/logv2/log.h"
 #include <memory>
 
 namespace mongo {
@@ -204,8 +207,10 @@ void _assertIteratorsEquivalent(It1 it1, It2 it2, int line) {
         it1->closeSource();
         it2->closeSource();
     } catch (...) {
-        mongo::unittest::log() << "Failure from line " << line << " on iteration " << iteration
-                               << std::endl;
+        LOGV2(22047,
+              "Failure from line {line} on iteration {iteration}",
+              "line"_attr = line,
+              "iteration"_attr = iteration);
         it1->closeSource();
         it2->closeSource();
         throw;
@@ -390,11 +395,13 @@ public:
         {  // test all data ASC
             std::shared_ptr<IWSorter> sorter = makeSorter(opts, IWComparator(ASC));
             addData(sorter);
+            assertRangeInfo(sorter, opts);
             ASSERT_ITERATORS_EQUIVALENT(done(sorter), correct());
         }
         {  // test all data DESC
             std::shared_ptr<IWSorter> sorter = makeSorter(opts, IWComparator(DESC));
             addData(sorter);
+            assertRangeInfo(sorter, opts);
             ASSERT_ITERATORS_EQUIVALENT(done(sorter), correctReverse());
         }
 
@@ -408,6 +415,9 @@ public:
             addData(sorters[0]);
             addData(sorters[1]);
 
+            assertRangeInfo(sorters[0], opts);
+            assertRangeInfo(sorters[1], opts);
+
             std::shared_ptr<IWIterator> iters1[] = {done(sorters[0]), done(sorters[1])};
             std::shared_ptr<IWIterator> iters2[] = {correct(), correct()};
             ASSERT_ITERATORS_EQUIVALENT(mergeIterators(iters1, ASC), mergeIterators(iters2, ASC));
@@ -419,6 +429,9 @@ public:
             stdx::thread inBackground(&Basic::addData, this, sorters[0]);
             addData(sorters[1]);
             inBackground.join();
+
+            assertRangeInfo(sorters[0], opts);
+            assertRangeInfo(sorters[1], opts);
 
             std::shared_ptr<IWIterator> iters1[] = {done(sorters[0]), done(sorters[1])};
             std::shared_ptr<IWIterator> iters2[] = {correctReverse(), correctReverse()};
@@ -447,6 +460,10 @@ public:
         return make_shared<IntIterator>(4, -1, -1);  // 4, 3, ... 0
     }
 
+    virtual boost::optional<size_t> correctNumRanges() const {
+        return 0;
+    }
+
     // It is safe to ignore / overwrite any part of options
     virtual SortOptions adjustSortOptions(SortOptions opts) {
         return opts;
@@ -460,6 +477,17 @@ private:
 
     std::shared_ptr<IWIterator> done(unowned_ptr<IWSorter> sorter) {
         return std::shared_ptr<IWIterator>(sorter->done());
+    }
+
+    void assertRangeInfo(unowned_ptr<IWSorter> sorter, const SortOptions& opts) {
+        auto state = sorter->getState();
+        if (opts.extSortAllowed) {
+            ASSERT_EQ(state.tempDir, opts.tempDir);
+            ASSERT_NE(state.fileName, "");
+        }
+        if (auto numRanges = correctNumRanges()) {
+            ASSERT_EQ(state.ranges.size(), *numRanges);
+        }
     }
 };
 
@@ -544,6 +572,10 @@ public:
         return make_shared<IntIterator>(NUM_ITEMS - 1, -1, -1);
     }
 
+    boost::optional<size_t> correctNumRanges() const override {
+        return NUM_ITEMS * sizeof(IWPair) / MEM_LIMIT;
+    }
+
     enum Constants {
         NUM_ITEMS = 500 * 1000,
         MEM_LIMIT = 64 * 1024,
@@ -573,6 +605,12 @@ class LotsOfDataWithLimit : public LotsOfDataLittleMemory<Random> {
     }
     std::shared_ptr<IWIterator> correctReverse() override {
         return make_shared<LimitIterator>(Limit, Parent::correctReverse());
+    }
+    boost::optional<size_t> correctNumRanges() const override {
+        // For the TopKSorter, unless we know that it will not need to spill at all, the number of
+        // ranges depends on the specific composition of the data being sorted.
+        return Limit * sizeof(IWPair) / MEM_LIMIT == 0 ? boost::make_optional(size_t(0))
+                                                       : boost::none;
     }
     enum { MEM_LIMIT = 32 * 1024 };
 };

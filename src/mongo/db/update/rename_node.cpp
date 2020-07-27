@@ -171,7 +171,7 @@ UpdateExecutor::ApplyResult RenameNode::apply(ApplyParams applyParams,
 
     mutablebson::Document& document = applyParams.element.getDocument();
 
-    size_t fromIdxFound;
+    FieldIndex fromIdxFound;
     mutablebson::Element fromElement(document.end());
     auto status =
         pathsupport::findLongestPrefix(*fromFieldRef, document.root(), &fromIdxFound, &fromElement);
@@ -240,9 +240,8 @@ UpdateExecutor::ApplyResult RenameNode::apply(ApplyParams applyParams,
     ApplyParams unsetParams(applyParams);
     unsetParams.element = fromElement;
 
-    UpdateNodeApplyParams unsetUpdateNodeApplyParams;
-    unsetUpdateNodeApplyParams.pathToCreate = std::make_shared<FieldRef>();
-    unsetUpdateNodeApplyParams.pathTaken = fromFieldRef;
+    UpdateNodeApplyParams unsetUpdateNodeApplyParams{
+        std::make_shared<FieldRef>(), fromFieldRef, updateNodeApplyParams.logBuilder};
 
     UnsetNode unsetElement;
     auto unsetElementApplyResult = unsetElement.apply(unsetParams, unsetUpdateNodeApplyParams);

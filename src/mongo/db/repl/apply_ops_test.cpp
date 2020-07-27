@@ -42,7 +42,7 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/logger/logger.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/util/log_global_settings.h"
+#include "mongo/unittest/log_test.h"
 
 namespace mongo {
 namespace repl {
@@ -81,6 +81,9 @@ private:
     void tearDown() override;
 
 protected:
+    // Reset default log level when each test is over in case it was changed.
+    unittest::MinimumLoggedSeverityGuard _verbosityGuard{logv2::LogComponent::kReplication};
+
     OpObserverMock* _opObserver = nullptr;
     std::unique_ptr<StorageInterface> _storage;
 };
@@ -114,9 +117,6 @@ void ApplyOpsTest::setUp() {
 void ApplyOpsTest::tearDown() {
     _storage = {};
     _opObserver = nullptr;
-
-    // Reset default log level in case it was changed.
-    setMinimumLoggedSeverity(logger::LogComponent::kReplication, logger::LogSeverity::Debug(0));
 
     ServiceContextMongoDTest::tearDown();
 }
@@ -290,7 +290,8 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
     auto opCtx = cc().makeOperationContext();
 
     // Increase log component verbosity to check for op application messages.
-    setMinimumLoggedSeverity(logger::LogComponent::kReplication, logger::LogSeverity::Debug(3));
+    auto verbosityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kReplication,
+                                                               logv2::LogSeverity::Debug(3)};
 
     // Test that the 'applyOps' function passes the oplog application mode through correctly to the
     // underlying op application functions.
@@ -315,7 +316,9 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
                        cmdObj,
                        OplogApplication::Mode::kInitialSync,
                        &resultBuilder));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("oplog application mode: InitialSync"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("oplogApplicationMode"
+                                                                      << "InitialSync"))));
 
     auto docToInsert1 = BSON("_id" << 1);
     cmdObj = makeApplyOpsWithInsertOperation(nss, uuid, docToInsert1);
@@ -325,7 +328,9 @@ TEST_F(ApplyOpsTest, ApplyOpsPropagatesOplogApplicationMode) {
                        cmdObj,
                        OplogApplication::Mode::kSecondary,
                        &resultBuilder));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("oplog application mode: Secondary"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("oplogApplicationMode"
+                                                                      << "Secondary"))));
 
     stopCapturingLogMessages();
 }

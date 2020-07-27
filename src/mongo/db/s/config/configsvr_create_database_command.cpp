@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -46,7 +46,6 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/create_database_gen.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -82,8 +81,7 @@ public:
 
             uassert(ErrorCodes::InvalidNamespace,
                     str::stream() << "invalid db name specified: " << dbname,
-                    NamespaceString::validDBName(dbname,
-                                                 NamespaceString::DollarInDbNameBehavior::Allow));
+                    NamespaceString::validDBName(dbname));
 
             // Make sure to force update of any stale metadata
             ON_BLOCK_EXIT(

@@ -49,22 +49,26 @@ using std::vector;
 // static
 const char* IDHackStage::kStageType = "IDHACK";
 
-IDHackStage::IDHackStage(OperationContext* opCtx,
+IDHackStage::IDHackStage(ExpressionContext* expCtx,
                          CanonicalQuery* query,
                          WorkingSet* ws,
+                         const Collection* collection,
                          const IndexDescriptor* descriptor)
-    : RequiresIndexStage(kStageType, opCtx, descriptor, ws),
+    : RequiresIndexStage(kStageType, expCtx, collection, descriptor, ws),
       _workingSet(ws),
       _key(query->getQueryObj()["_id"].wrap()) {
     _specificStats.indexName = descriptor->indexName();
     _addKeyMetadata = query->getQueryRequest().returnKey();
 }
 
-IDHackStage::IDHackStage(OperationContext* opCtx,
+IDHackStage::IDHackStage(ExpressionContext* expCtx,
                          const BSONObj& key,
                          WorkingSet* ws,
+                         const Collection* collection,
                          const IndexDescriptor* descriptor)
-    : RequiresIndexStage(kStageType, opCtx, descriptor, ws), _workingSet(ws), _key(key) {
+    : RequiresIndexStage(kStageType, expCtx, collection, descriptor, ws),
+      _workingSet(ws),
+      _key(key) {
     _specificStats.indexName = descriptor->indexName();
 }
 
@@ -82,7 +86,7 @@ PlanStage::StageState IDHackStage::doWork(WorkingSetID* out) {
     WorkingSetID id = WorkingSet::INVALID_ID;
     try {
         // Look up the key by going directly to the index.
-        RecordId recordId = indexAccessMethod()->findSingle(getOpCtx(), _key);
+        RecordId recordId = indexAccessMethod()->findSingle(opCtx(), _key);
 
         // Key not found.
         if (recordId.isNull()) {
@@ -100,11 +104,10 @@ PlanStage::StageState IDHackStage::doWork(WorkingSetID* out) {
         _workingSet->transitionToRecordIdAndIdx(id);
 
         if (!_recordCursor)
-            _recordCursor = collection()->getCursor(getOpCtx());
+            _recordCursor = collection()->getCursor(opCtx());
 
         // Find the document associated with 'id' in the collection's record store.
-        if (!WorkingSetCommon::fetch(
-                getOpCtx(), _workingSet, id, _recordCursor, collection()->ns())) {
+        if (!WorkingSetCommon::fetch(opCtx(), _workingSet, id, _recordCursor, collection()->ns())) {
             // We didn't find a document with RecordId 'id'.
             _workingSet->free(id);
             _commonStats.isEOF = true;
@@ -156,17 +159,7 @@ void IDHackStage::doDetachFromOperationContext() {
 
 void IDHackStage::doReattachToOperationContext() {
     if (_recordCursor)
-        _recordCursor->reattachToOperationContext(getOpCtx());
-}
-
-// static
-bool IDHackStage::supportsQuery(Collection* collection, const CanonicalQuery& query) {
-    return !query.getQueryRequest().showRecordId() && query.getQueryRequest().getHint().isEmpty() &&
-        query.getQueryRequest().getMin().isEmpty() && query.getQueryRequest().getMax().isEmpty() &&
-        !query.getQueryRequest().getSkip() &&
-        CanonicalQuery::isSimpleIdQuery(query.getQueryRequest().getFilter()) &&
-        !query.getQueryRequest().isTailable() &&
-        CollatorInterface::collatorsMatch(query.getCollator(), collection->getDefaultCollator());
+        _recordCursor->reattachToOperationContext(opCtx());
 }
 
 unique_ptr<PlanStageStats> IDHackStage::getStats() {

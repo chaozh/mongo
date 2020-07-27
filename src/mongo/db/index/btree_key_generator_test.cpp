@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -39,8 +39,8 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 using namespace mongo;
 using std::cout;
@@ -94,6 +94,16 @@ bool keysetsEqual(const KeyStringSet& expectedKeys, const KeyStringSet& actualKe
     return true;
 }
 
+bool containsArrayElement(const BSONObj& obj) {
+    for (auto&& elem : obj) {
+        if (elem.type() == BSONType::Array ||
+            (elem.type() == BSONType::Object && containsArrayElement(elem.Obj()))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool testKeygen(const BSONObj& kp,
                 const BSONObj& obj,
                 const KeyStringSet& expectedKeys,
@@ -103,8 +113,7 @@ bool testKeygen(const BSONObj& kp,
     invariant(expectedMultikeyPaths.size() == static_cast<size_t>(kp.nFields()));
 
     //
-    // Step 1: construct the btree key generator object, using the
-    // index key pattern.
+    // Construct the btree key generator object, using the index key pattern.
     //
     vector<const char*> fieldNames;
     vector<BSONElement> fixed;
@@ -123,32 +132,54 @@ bool testKeygen(const BSONObj& kp,
                                                       KeyString::Version::kLatestVersion,
                                                       Ordering::make(BSONObj()));
 
-    //
-    // Step 2: ask 'keyGen' to generate index keys for the object 'obj' and report any prefixes of
-    // the indexed fields that would cause the index to be multikey as a result of inserting
-    // 'actualKeys'.
-    //
-    KeyStringSet actualKeys;
-    MultikeyPaths actualMultikeyPaths;
-    keyGen->getKeys(obj, &actualKeys, &actualMultikeyPaths);
+    auto runTest = [&](bool skipMultikey) {
+        //
+        // Ask 'keyGen' to generate index keys for the object 'obj' and report any prefixes of the
+        // indexed fields that would cause the index to be multikey as a result of inserting
+        // 'actualKeys'.
+        //
+        SharedBufferFragmentBuilder allocator(BufBuilder::kDefaultInitSizeBytes);
+        KeyStringSet actualKeys;
+        MultikeyPaths actualMultikeyPaths;
+        keyGen->getKeys(allocator, obj, skipMultikey, &actualKeys, &actualMultikeyPaths);
 
-    //
-    // Step 3: check that the results match the expected result.
-    //
-    bool match = keysetsEqual(expectedKeys, actualKeys);
-    if (!match) {
-        log() << "Expected: " << dumpKeyset(expectedKeys) << ", "
-              << "Actual: " << dumpKeyset(actualKeys);
-        return false;
+        //
+        // Check that the results match the expected result.
+        //
+        bool match = keysetsEqual(expectedKeys, actualKeys);
+        if (!match) {
+            LOGV2(20647,
+                  "Expected: {dumpKeyset_expectedKeys}, Actual: {dumpKeyset_actualKeys}",
+                  "dumpKeyset_expectedKeys"_attr = dumpKeyset(expectedKeys),
+                  "dumpKeyset_actualKeys"_attr = dumpKeyset(actualKeys));
+            return false;
+        }
+
+        match = (expectedMultikeyPaths == actualMultikeyPaths);
+        if (!match) {
+            LOGV2(20648,
+                  "Expected: {dumpMultikeyPaths_expectedMultikeyPaths}, Actual: "
+                  "{dumpMultikeyPaths_actualMultikeyPaths}",
+                  "dumpMultikeyPaths_expectedMultikeyPaths"_attr =
+                      dumpMultikeyPaths(expectedMultikeyPaths),
+                  "dumpMultikeyPaths_actualMultikeyPaths"_attr =
+                      dumpMultikeyPaths(actualMultikeyPaths));
+            return false;
+        }
+
+        return true;
+    };
+
+    // If it is correct to do so, then test that the fast key generation path for the non-multikey
+    // case works as expected.
+    if (!containsArrayElement(obj)) {
+        if (!runTest(true)) {
+            return false;
+        }
     }
 
-    match = (expectedMultikeyPaths == actualMultikeyPaths);
-    if (!match) {
-        log() << "Expected: " << dumpMultikeyPaths(expectedMultikeyPaths) << ", "
-              << "Actual: " << dumpMultikeyPaths(actualMultikeyPaths);
-    }
-
-    return match;
+    // Test that fully general key generation path works as expected.
+    return runTest(false);
 }
 
 //
@@ -162,7 +193,7 @@ TEST(BtreeKeyGeneratorTest, GetIdKeyFromObject) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': 'foo'}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -172,7 +203,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromObjectSimple) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': 5}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -182,7 +213,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromObjectDotted) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': 4}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -230,7 +261,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromArrayFirstElement) {
     KeyString::HeapBuilder keyString3(
         KeyString::Version::kLatestVersion, fromjson("{'': 3, '': 2}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.release(), keyString2.release(), keyString3.release()};
-    MultikeyPaths expectedMultikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{{0U}, MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -244,7 +275,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromArraySecondElement) {
     KeyString::HeapBuilder keyString3(
         KeyString::Version::kLatestVersion, fromjson("{'': 5, '': 3}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.release(), keyString2.release(), keyString3.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}, {0U}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -307,7 +338,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysArraySubobjectCompoundIndex) {
     KeyString::HeapBuilder keyString3(
         KeyString::Version::kLatestVersion, fromjson("{'': 3, '': 99}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.release(), keyString2.release(), keyString3.release()};
-    MultikeyPaths expectedMultikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{{0U}, MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -344,7 +375,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysMissingField) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': null}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -365,7 +396,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromCompound) {
                                      fromjson("{'': 'a', '': 'b'}"),
                                      Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}, MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -376,7 +407,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromCompoundMissing) {
                                      fromjson("{'': 'a', '': null}"),
                                      Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}, MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -522,7 +553,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromMultiEmptyArray) {
                                       fromjson("{'': 1, '': undefined}"),
                                       Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.getValueCopy(), keyString2.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}, {0U}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 
     genKeysFrom = fromjson("{a: 1, b: [1]}");
@@ -613,7 +644,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromSparseEmptyArray) {
     BSONObj keyPattern = fromjson("{'a.b': 1}");
     BSONObj genKeysFrom = fromjson("{a:1}");
     KeyStringSet expectedKeys;
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, sparse));
 
     genKeysFrom = fromjson("{a:[]}");
@@ -629,7 +660,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromSparseEmptyArraySecond) {
     BSONObj keyPattern = fromjson("{z: 1, 'a.b': 1}");
     BSONObj genKeysFrom = fromjson("{a:1}");
     KeyStringSet expectedKeys;
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}, MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, sparse));
 
     genKeysFrom = fromjson("{a:[]}");
@@ -669,7 +700,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromIndexedArrayIndex) {
     KeyString::HeapBuilder keyString3(
         KeyString::Version::kLatestVersion, fromjson("{'': undefined}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.getValueCopy()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 
     genKeysFrom = fromjson("{a:[[1]]}");
@@ -712,7 +743,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromDoubleIndexedArrayIndex) {
     KeyString::HeapBuilder keyString3(
         KeyString::Version::kLatestVersion, fromjson("{'': undefined}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 
     genKeysFrom = fromjson("{a:[[]]}");
@@ -732,7 +763,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromDoubleIndexedArrayIndex) {
     genKeysFrom = fromjson("{a:[[[]]]}");
     expectedKeys.clear();
     expectedKeys.insert(keyString3.release());
-    expectedMultikeyPaths = {std::set<size_t>{}};
+    expectedMultikeyPaths = {MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -746,7 +777,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromObjectWithinArray) {
     KeyString::HeapBuilder keyString3(
         KeyString::Version::kLatestVersion, fromjson("{'': undefined}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.getValueCopy()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 
     genKeysFrom = fromjson("{a:[{b:[1]}]}");
@@ -802,7 +833,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysTrailingPositionalElementIsSingletonArray) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': [3]}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -812,7 +843,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysTrailingPositionalElementIsEmptyArray) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': undefined}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -832,7 +863,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFromArrayWithinObjectWithinArray) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': 1}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -979,7 +1010,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysPositionalKeyPatternNestedArray2) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': [0, 1, 2]}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -1014,7 +1045,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysPositionalKeyPatternNestedArray5) {
     KeyString::HeapBuilder keyString2(
         KeyString::Version::kLatestVersion, fromjson("{'': 6}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.release(), keyString2.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{0U}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{0U}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -1057,7 +1088,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysRepeatedFieldName) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': 2}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -1085,7 +1116,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysLastPathPieceEmpty) {
     KeyString::HeapBuilder keyString2(
         KeyString::Version::kLatestVersion, fromjson("{'': {'': 2}}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString1.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 
     genKeysFrom = fromjson("{a: {'': 2}}");
@@ -1100,7 +1131,7 @@ TEST(BtreeKeyGeneratorTest, GetKeysFirstPathPieceEmpty) {
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': null}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -1143,7 +1174,7 @@ TEST(BtreeKeyGeneratorTest, KeyPattern_a_0_0_b_Extracts_b_ElementInsideSingleton
     KeyString::HeapBuilder keyString(
         KeyString::Version::kLatestVersion, fromjson("{'': 1}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -1224,7 +1255,7 @@ TEST(BtreeKeyGeneratorTest, PositionalKeyPatternNestedArrays6) {
                                       Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{
         keyString1.release(), keyString2.release(), keyString3.release(), keyString4.release()};
-    MultikeyPaths expectedMultikeyPaths{{0U}, {0U, 1U}, {2U}, {0U}, std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{{0U}, {0U, 1U}, {2U}, {0U}, MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -1248,7 +1279,7 @@ TEST(BtreeKeyGeneratorTest, PositionalKeyPatternNestedArrays7) {
                                       Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{
         keyString1.release(), keyString2.release(), keyString3.release(), keyString4.release()};
-    MultikeyPaths expectedMultikeyPaths{{0U}, {0U, 1U}, {2U}, {0U}, std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{{0U}, {0U, 1U}, {2U}, {0U}, MultikeyComponents{}};
     ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
 }
 
@@ -1259,7 +1290,7 @@ TEST(BtreeKeyGeneratorTest, GetCollationAwareIdKeyFromObject) {
         KeyString::Version::kLatestVersion, fromjson("{'': 'oof'}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(
         testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, false, &collator));
 }
@@ -1271,7 +1302,7 @@ TEST(BtreeKeyGeneratorTest, GetCollationAwareKeysFromObjectSimple) {
         KeyString::Version::kLatestVersion, fromjson("{'': 'oof'}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(
         testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, false, &collator));
 }
@@ -1283,7 +1314,7 @@ TEST(BtreeKeyGeneratorTest, GetCollationAwareKeysFromObjectDotted) {
         KeyString::Version::kLatestVersion, fromjson("{'': 'oof'}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(
         testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, false, &collator));
 }
@@ -1311,7 +1342,7 @@ TEST(BtreeKeyGeneratorTest, CollatorDoesNotAffectNonStringIdKey) {
         KeyString::Version::kLatestVersion, fromjson("{'': 5}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(
         testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, false, &collator));
 }
@@ -1323,7 +1354,7 @@ TEST(BtreeKeyGeneratorTest, CollatorDoesNotAffectNonStringKeys) {
         KeyString::Version::kLatestVersion, fromjson("{'': 5}"), Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(
         testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, false, &collator));
 }
@@ -1336,7 +1367,7 @@ TEST(BtreeKeyGeneratorTest, GetCollationAwareKeysFromNestedObject) {
                                      Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(
         testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, false, &collator));
 }
@@ -1349,7 +1380,7 @@ TEST(BtreeKeyGeneratorTest, GetCollationAwareKeysFromNestedArray) {
                                      Ordering::make(BSONObj()));
     KeyStringSet expectedKeys{keyString.release()};
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    MultikeyPaths expectedMultikeyPaths{MultikeyComponents{}};
     ASSERT(
         testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, false, &collator));
 }

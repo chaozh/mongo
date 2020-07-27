@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,10 +36,10 @@
 #include <random>
 
 #include "mongo/db/s/balancer/type_migration.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -342,8 +342,12 @@ MigrateInfo chooseRandomMigration(const ShardStatisticsVector& shardStats,
     const int destIndex = indices[choice];
     const auto& destShardId = shardStats[destIndex].shardId;
 
-    LOG(1) << "balancerShouldReturnRandomMigrations: source: " << sourceShardId
-           << " dest: " << destShardId;
+    LOGV2_DEBUG(21880,
+                1,
+                "balancerShouldReturnRandomMigrations: source: {fromShardId} dest: {toShardId}",
+                "balancerShouldReturnRandomMigrations",
+                "fromShardId"_attr = sourceShardId,
+                "toShardId"_attr = destShardId);
 
     const auto& chunks = distribution.getChunks(sourceShardId);
 
@@ -361,7 +365,7 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
 
     if (MONGO_unlikely(balancerShouldReturnRandomMigrations.shouldFail()) &&
         !distribution.nss().isConfigDB()) {
-        LOG(1) << "balancerShouldReturnRandomMigrations failpoint is set";
+        LOGV2_DEBUG(21881, 1, "balancerShouldReturnRandomMigrations failpoint is set");
 
         if (shardStats.size() < 2)
             return migrations;
@@ -402,8 +406,12 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                     _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
                 if (!to.isValid()) {
                     if (migrations.empty()) {
-                        warning() << "Chunk " << redact(chunk.toString())
-                                  << " is on a draining shard, but no appropriate recipient found";
+                        LOGV2_WARNING(21889,
+                                      "Chunk {chunk} is on a draining shard, but no appropriate "
+                                      "recipient found",
+                                      "Chunk is on a draining shard, but no appropriate "
+                                      "recipient found",
+                                      "chunk"_attr = redact(chunk.toString()));
                     }
                     continue;
                 }
@@ -417,8 +425,12 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
             }
 
             if (migrations.empty()) {
-                warning() << "Unable to find any chunk to move from draining shard " << stat.shardId
-                          << ". numJumboChunks: " << numJumboChunks;
+                LOGV2_WARNING(21890,
+                              "Unable to find any chunk to move from draining shard "
+                              "{shardId}. numJumboChunks: {numJumboChunks}",
+                              "Unable to find any chunk to move from draining shard",
+                              "shardId"_attr = stat.shardId,
+                              "numJumboChunks"_attr = numJumboChunks);
             }
         }
     }
@@ -441,8 +453,12 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                     continue;
 
                 if (chunk.getJumbo()) {
-                    warning() << "Chunk " << redact(chunk.toString()) << " violates zone "
-                              << redact(tag) << ", but it is jumbo and cannot be moved";
+                    LOGV2_WARNING(
+                        21891,
+                        "Chunk {chunk} violates zone {zone}, but it is jumbo and cannot be moved",
+                        "Chunk violates zone, but it is jumbo and cannot be moved",
+                        "chunk"_attr = redact(chunk.toString()),
+                        "zone"_attr = redact(tag));
                     continue;
                 }
 
@@ -450,8 +466,12 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
                     _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
                 if (!to.isValid()) {
                     if (migrations.empty()) {
-                        warning() << "Chunk " << redact(chunk.toString()) << " violates zone "
-                                  << redact(tag) << ", but no appropriate recipient found";
+                        LOGV2_WARNING(21892,
+                                      "Chunk {chunk} violates zone {zone}, but no appropriate "
+                                      "recipient found",
+                                      "Chunk violates zone, but no appropriate recipient found",
+                                      "chunk"_attr = redact(chunk.toString()),
+                                      "zone"_attr = redact(tag));
                     }
                     continue;
                 }
@@ -490,10 +510,16 @@ vector<MigrateInfo> BalancerPolicy::balance(const ShardStatisticsVector& shardSt
         // should not be possible so warn the operator to correct it.
         if (totalNumberOfShardsWithTag == 0) {
             if (!tag.empty()) {
-                warning() << "Zone " << redact(tag) << " in collection " << distribution.nss()
-                          << " has no assigned shards and chunks which fall into it cannot be "
-                             "balanced. This should be corrected by either assigning shards to the "
-                             "zone or by deleting it.";
+                LOGV2_WARNING(
+                    21893,
+                    "Zone {zone} in collection {namespace} has no assigned shards and chunks "
+                    "which fall into it cannot be balanced. This should be corrected by either "
+                    "assigning shards to the zone or by deleting it.",
+                    "Zone in collection has no assigned shards and chunks which fall into it "
+                    "cannot be balanced. This should be corrected by either assigning shards "
+                    "to the zone or by deleting it.",
+                    "zone"_attr = redact(tag),
+                    "namespace"_attr = distribution.nss());
             }
             continue;
         }
@@ -552,7 +578,10 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
     const ShardId to = _getLeastLoadedReceiverShard(shardStats, distribution, tag, *usedShards);
     if (!to.isValid()) {
         if (migrations->empty()) {
-            log() << "No available shards to take chunks for zone [" << tag << "]";
+            LOGV2(21882,
+                  "No available shards to take chunks for zone {zone}",
+                  "No available shards to take chunks for zone",
+                  "zone"_attr = tag);
         }
         return false;
     }
@@ -565,12 +594,21 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
 
     const size_t imbalance = max - idealNumberOfChunksPerShardForTag;
 
-    LOG(1) << "collection : " << distribution.nss().ns();
-    LOG(1) << "zone       : " << tag;
-    LOG(1) << "donor      : " << from << " chunks on " << max;
-    LOG(1) << "receiver   : " << to << " chunks on " << min;
-    LOG(1) << "ideal      : " << idealNumberOfChunksPerShardForTag;
-    LOG(1) << "threshold  : " << kDefaultImbalanceThreshold;
+    LOGV2_DEBUG(
+        21883,
+        1,
+        "collection: {namespace}, zone: {zone}, donor: {fromShardId} chunks on "
+        " {fromShardChunkCount}, receiver: {toShardId} chunks on {toShardChunkCount}, "
+        "ideal: {idealNumberOfChunksPerShardForTag}, threshold: {chunkCountImbalanceThreshold}",
+        "Balancing single zone",
+        "namespace"_attr = distribution.nss().ns(),
+        "zone"_attr = tag,
+        "fromShardId"_attr = from,
+        "fromShardChunkCount"_attr = max,
+        "toShardId"_attr = to,
+        "toShardChunkCount"_attr = min,
+        "idealNumberOfChunksPerShardForTag"_attr = idealNumberOfChunksPerShardForTag,
+        "chunkCountImbalanceThreshold"_attr = kDefaultImbalanceThreshold);
 
     // Check whether it is necessary to balance within this zone
     if (imbalance < kDefaultImbalanceThreshold)
@@ -596,9 +634,15 @@ bool BalancerPolicy::_singleZoneBalance(const ShardStatisticsVector& shardStats,
     }
 
     if (numJumboChunks) {
-        warning() << "Shard: " << from << ", collection: " << distribution.nss().ns()
-                  << " has only jumbo chunks for zone \'" << tag
-                  << "\' and cannot be balanced. Jumbo chunks count: " << numJumboChunks;
+        LOGV2_WARNING(
+            21894,
+            "Shard: {shardId}, collection: {namespace} has only jumbo chunks for "
+            "zone \'{zone}\' and cannot be balanced. Jumbo chunks count: {numJumboChunks}",
+            "Shard has only jumbo chunks for and cannot be balanced",
+            "shardId"_attr = from,
+            "namespace"_attr = distribution.nss().ns(),
+            "zone"_attr = tag,
+            "numJumboChunks"_attr = numJumboChunks);
     }
 
     return false;

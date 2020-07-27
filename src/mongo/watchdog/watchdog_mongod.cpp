@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -43,21 +43,19 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/clock_source_mock.h"
-#include "mongo/util/log.h"
 #include "mongo/util/tick_source_mock.h"
 #include "mongo/watchdog/watchdog.h"
 #include "mongo/watchdog/watchdog_mongod_gen.h"
 #include "mongo/watchdog/watchdog_register.h"
 
 namespace mongo {
+namespace {
 
 // Run the watchdog checks at a fixed interval regardless of user choice for monitoring period.
 constexpr Seconds watchdogCheckPeriod = Seconds{10};
-
-namespace {
 
 const auto getWatchdogMonitor =
     ServiceContext::declareDecoration<std::unique_ptr<WatchdogMonitor>>();
@@ -130,7 +128,7 @@ public:
     }
 } watchdogServerStatusSection;
 
-void startWatchdog() {
+void startWatchdog(ServiceContext* service) {
     // Check three paths if set
     // 1. storage directory - optional for inmemory?
     // 2. log path - optional
@@ -162,9 +160,11 @@ void startWatchdog() {
 
             checks.push_back(std::move(journalCheck));
         } else {
-            warning()
-                << "Watchdog is skipping check for journal directory since it does not exist: '"
-                << journalDirectory.generic_string() << "'";
+            LOGV2_WARNING(23835,
+                          "Watchdog is skipping check for journal directory since it does not "
+                          "exist: '{journalDirectory_generic_string}'",
+                          "journalDirectory_generic_string"_attr =
+                              journalDirectory.generic_string());
         }
     }
 
@@ -191,7 +191,7 @@ void startWatchdog() {
         std::move(checks), watchdogCheckPeriod, period, watchdogTerminate);
 
     // Install the new WatchdogMonitor
-    auto& staticMonitor = getWatchdogMonitor(getGlobalServiceContext());
+    auto& staticMonitor = getWatchdogMonitor(service);
 
     staticMonitor = std::move(monitor);
 

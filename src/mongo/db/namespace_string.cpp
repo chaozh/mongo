@@ -69,6 +69,9 @@ const NamespaceString NamespaceString::kTransactionCoordinatorsNamespace(
 const NamespaceString NamespaceString::kMigrationCoordinatorsNamespace(NamespaceString::kConfigDb,
                                                                        "migrationCoordinators");
 
+const NamespaceString NamespaceString::kMigrationDonorsNamespace(NamespaceString::kConfigDb,
+                                                                 "migrationDonors");
+
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
 const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
@@ -84,6 +87,9 @@ const NamespaceString NamespaceString::kRangeDeletionNamespace(NamespaceString::
                                                                "rangeDeletions");
 const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
                                                                 "settings");
+const NamespaceString NamespaceString::kVectorClockNamespace(NamespaceString::kConfigDb,
+                                                             "vectorClock");
+
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -94,32 +100,31 @@ bool NamespaceString::isCollectionlessAggregateNS() const {
 }
 
 bool NamespaceString::isLegalClientSystemNS() const {
-    if (db() == "admin") {
-        if (ns() == "admin.system.roles")
+    if (db() == kAdminDb) {
+        if (coll() == "system.roles")
             return true;
-        if (ns() == kServerConfigurationNamespace.ns())
+        if (coll() == kServerConfigurationNamespace.coll())
             return true;
-        if (ns() == kSystemKeysNamespace.ns())
+        if (coll() == kSystemKeysNamespace.coll())
             return true;
-        if (ns() == "admin.system.new_users")
+        if (coll() == "system.backup_users")
             return true;
-        if (ns() == "admin.system.backup_users")
+    } else if (db() == kConfigDb) {
+        if (coll() == "system.sessions")
             return true;
-    } else if (db() == "config") {
-        if (ns() == "config.system.sessions")
+        if (coll() == kIndexBuildEntryNamespace.coll())
             return true;
-        if (ns() == kIndexBuildEntryNamespace.ns())
+    } else if (db() == kLocalDb) {
+        if (coll() == kSystemReplSetNamespace.coll())
+            return true;
+        if (coll() == "system.healthlog")
             return true;
     }
-
-    if (ns() == "local.system.replset")
-        return true;
 
     if (coll() == "system.users")
         return true;
     if (coll() == "system.js")
         return true;
-
     if (coll() == kSystemDotViewsCollectionName)
         return true;
 
@@ -147,25 +152,6 @@ std::string NamespaceString::getSisterNS(StringData local) const {
 
 bool NamespaceString::isDropPendingNamespace() const {
     return coll().startsWith(dropPendingNSPrefix);
-}
-
-bool NamespaceString::checkLengthForFCV() const {
-    // Prior to longer collection names, the limit in older versions was 120 characters.
-    const size_t previousMaxNSLength = 120U;
-    if (size() <= previousMaxNSLength) {
-        return true;
-    }
-
-    if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
-        return false;
-    }
-
-    if (serverGlobalParams.featureCompatibility.getVersion() ==
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44) {
-        return true;
-    }
-
-    return false;
 }
 
 NamespaceString NamespaceString::makeDropPendingNamespace(const repl::OpTime& opTime) const {
@@ -233,10 +219,15 @@ bool NamespaceString::isNamespaceAlwaysUnsharded() const {
         return true;
 
     // Certain config collections can never be sharded
-    if (ns() == kSessionTransactionsTableNamespace.ns())
+    if (ns() == kSessionTransactionsTableNamespace.ns() || ns() == kRangeDeletionNamespace.ns() ||
+        ns() == kTransactionCoordinatorsNamespace.ns() || ns() == kVectorClockNamespace.ns() ||
+        ns() == kMigrationCoordinatorsNamespace.ns() || ns() == kIndexBuildEntryNamespace.ns())
         return true;
 
     if (isSystemDotProfile())
+        return true;
+
+    if (isSystemDotViews())
         return true;
 
     if (ns() == "config.cache.databases" || ns() == "config.cache.collections" ||

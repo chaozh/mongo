@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,6 @@
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/util/errno_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 using namespace fmt::literals;

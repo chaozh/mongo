@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,6 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -76,31 +75,6 @@ public:
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-        const auto cm = routingInfo.cm();
-
-        BSONObj min = cmdObj.getObjectField("min");
-        BSONObj max = cmdObj.getObjectField("max");
-
-        if (cm) {
-            auto keyPattern = cmdObj["keyPattern"];
-
-            uassert(ErrorCodes::BadValue,
-                    "keyPattern must be empty or must be an object that equals the shard key",
-                    !keyPattern ||
-                        (keyPattern.type() == Object &&
-                         SimpleBSONObjComparator::kInstance.evaluate(
-                             cm->getShardKeyPattern().toBSON() == keyPattern.Obj())));
-
-            uassert(ErrorCodes::BadValue,
-                    str::stream() << "min value " << min << " does not have shard key",
-                    cm->getShardKeyPattern().isShardKey(min));
-            min = cm->getShardKeyPattern().normalizeShardKey(min);
-
-            uassert(ErrorCodes::BadValue,
-                    str::stream() << "max value " << max << " does not have shard key",
-                    cm->getShardKeyPattern().isShardKey(max));
-            max = cm->getShardKeyPattern().normalizeShardKey(max);
-        }
 
         auto shardResults = scatterGatherVersionedTargetByRoutingTable(
             opCtx,

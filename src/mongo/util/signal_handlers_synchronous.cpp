@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -44,8 +44,7 @@
 #include <typeinfo>
 
 #include "mongo/base/string_data.h"
-#include "mongo/logger/log_domain.h"
-#include "mongo/logger/logger.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/exception.h"
 #include "mongo/stdx/thread.h"
@@ -55,7 +54,6 @@
 #include "mongo/util/debugger.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/exit_code.h"
-#include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/stacktrace.h"
@@ -76,8 +74,31 @@ const char* strsignal(int signalNum) {
     }
 }
 
+int sehExceptionFilter(unsigned int code, struct _EXCEPTION_POINTERS* excPointers) {
+    exceptionFilter(excPointers);
+
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Follow SEH conventions by defining a status code per their conventions
+// Bit 31-30: 11 = ERROR
+// Bit 29:     1 = Client bit, i.e. a user-defined code
+#define STATUS_EXIT_ABRUPT 0xE0000001
+
+// Historically we relied on raising SEH exception and letting the unhandled exception handler then
+// handle it to that we can dump the process. This works in all but one case.
+// The C++ terminate handler runs the terminate handler in a SEH __try/__catch. Therefore, any SEH
+// exceptions we raise become handled. Now, we setup our own SEH handler to quick catch the SEH
+// exception and take the dump bypassing the unhandled exception handler.
+//
 void endProcessWithSignal(int signalNum) {
-    RaiseException(EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+
+    __try {
+        RaiseException(STATUS_EXIT_ABRUPT, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    } __except (sehExceptionFilter(GetExceptionCode(), GetExceptionInformation())) {
+        // The exception filter exits the process
+        quickExit(EXIT_ABRUPT);
+    }
 }
 
 #else
@@ -170,21 +191,20 @@ thread_local int MallocFreeOStreamGuard::terminateDepth = 0;
 
 // must hold MallocFreeOStreamGuard to call
 void writeMallocFreeStreamToLog() {
-    logger::globalLogDomain()
-        ->append(logger::MessageEventEphemeral(Date_t::now(),
-                                               logger::LogSeverity::Severe(),
-                                               getThreadName(),
-                                               mallocFreeOStream.str())
-                     .setIsTruncatable(false))
-        .transitional_ignore();
+    LOGV2_FATAL_OPTIONS(
+        4757800,
+        logv2::LogOptions(logv2::FatalMode::kContinue, logv2::LogTruncation::Disabled),
+        "{message}",
+        "Writing fatal message",
+        "message"_attr = mallocFreeOStream.str());
     mallocFreeOStream.rewind();
 }
 
 // must hold MallocFreeOStreamGuard to call
 void printSignalAndBacktrace(int signalNum) {
     mallocFreeOStream << "Got signal: " << signalNum << " (" << strsignal(signalNum) << ").\n";
-    printStackTrace(mallocFreeOStream);
     writeMallocFreeStreamToLog();
+    printStackTrace();
 }
 
 // this will be called in certain c++ error cases, for example if there are two active
@@ -231,9 +251,8 @@ void myTerminate() {
     } else {
         mallocFreeOStream << "terminate() called. No exception is active";
     }
-
-    printStackTrace(mallocFreeOStream);
     writeMallocFreeStreamToLog();
+    printStackTrace();
     breakpoint();
     endProcessWithSignal(SIGABRT);
 }
@@ -252,17 +271,22 @@ void myInvalidParameterHandler(const wchar_t* expression,
                                const wchar_t* file,
                                unsigned int line,
                                uintptr_t pReserved) {
-    severe() << "Invalid parameter detected in function " << toUtf8String(function)
-             << " File: " << toUtf8String(file) << " Line: " << line;
-    severe() << "Expression: " << toUtf8String(expression);
-    severe() << "immediate exit due to invalid parameter";
+    LOGV2_FATAL_CONTINUE(
+        23815,
+        "Invalid parameter detected in function {function} in {file} at line {line} "
+        "with expression '{expression}'",
+        "Invalid parameter detected",
+        "function"_attr = toUtf8String(function),
+        "file"_attr = toUtf8String(file),
+        "line"_attr = line,
+        "expression"_attr = toUtf8String(expression));
 
     abruptQuit(SIGABRT);
 }
 
 void myPureCallHandler() {
-    severe() << "Pure call handler invoked";
-    severe() << "immediate exit due to invalid pure call";
+    LOGV2_FATAL_CONTINUE(23818,
+                         "Pure call handler invoked. Immediate exit due to invalid pure call");
     abruptQuit(SIGABRT);
 }
 
@@ -331,11 +355,11 @@ void setupSynchronousSignalHandlers() {
         }
         if (sigaction(spec.signal, &sa, nullptr) != 0) {
             int savedErr = errno;
-            severe() << format(
-                FMT_STRING("Failed to install signal handler for signal {} with sigaction: {}"),
-                spec.signal,
-                strerror(savedErr));
-            fassertFailed(31334);
+            LOGV2_FATAL(31334,
+                        "Failed to install sigaction for signal {signal}: {error}",
+                        "Failed to install sigaction for signal",
+                        "signal"_attr = spec.signal,
+                        "error"_attr = strerror(savedErr));
         }
     }
     setupSIGTRAPforDebugger();
@@ -347,8 +371,9 @@ void setupSynchronousSignalHandlers() {
 
 void reportOutOfMemoryErrorAndExit() {
     MallocFreeOStreamGuard lk{};
-    printStackTrace(mallocFreeOStream << "out of memory.\n");
+    mallocFreeOStream << "out of memory.\n";
     writeMallocFreeStreamToLog();
+    printStackTrace();
     quickExit(EXIT_ABRUPT);
 }
 
@@ -361,12 +386,10 @@ void clearSignalMask() {
 #endif
 }
 
-#ifdef __linux__
-
+#if defined(MONGO_STACKTRACE_HAS_SIGNAL)
 int stackTraceSignal() {
     return SIGUSR2;
 }
-
 #endif
 
 }  // namespace mongo

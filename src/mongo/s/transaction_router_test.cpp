@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/logger/logger.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -48,10 +48,10 @@
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/unittest/log_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/tick_source_mock.h"
 
@@ -108,21 +108,25 @@ protected:
 
     const NamespaceString kViewNss = NamespaceString("test.foo");
 
+    const Status kStaleConfigStatus = {
+        StaleConfigInfo(kViewNss, ChunkVersion::UNSHARDED(), boost::none, shard1),
+        "The metadata for the collection is not loaded"};
+
     void setUp() override {
         ShardingTestFixture::setUp();
         configTargeter()->setFindHostReturnValue(kTestConfigShardHost);
 
-        ShardingTestFixture::addRemoteShards({std::make_tuple(shard1, hostAndPort1),
-                                              std::make_tuple(shard2, hostAndPort2),
-                                              std::make_tuple(shard3, hostAndPort3)});
+        addRemoteShards({std::make_tuple(shard1, hostAndPort1),
+                         std::make_tuple(shard2, hostAndPort2),
+                         std::make_tuple(shard3, hostAndPort3)});
 
         repl::ReadConcernArgs::get(operationContext()) =
             repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern);
 
         // Set up a logical clock with an initial time.
         auto logicalClock = std::make_unique<LogicalClock>(getServiceContext());
-        logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
         LogicalClock::set(getServiceContext(), std::move(logicalClock));
+        VectorClock::get(getServiceContext())->advanceClusterTime_forTest(kInMemoryLogicalTime);
 
         // Set up a tick source for transaction metrics.
         auto tickSource = std::make_unique<TickSourceMock<Microseconds>>();
@@ -733,7 +737,7 @@ TEST_F(TransactionRouterTestWithDefaultSession, CannotSpecifyReadConcernAfterFir
         ErrorCodes::InvalidOptions);
 }
 
-TEST_F(TransactionRouterTestWithDefaultSession, PassesThroughNoReadConcernToParticipants) {
+TEST_F(TransactionRouterTestWithDefaultSession, PassesThroughEmptyReadConcernToParticipants) {
     repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
 
     TxnNumber txnNum{3};
@@ -745,8 +749,9 @@ TEST_F(TransactionRouterTestWithDefaultSession, PassesThroughNoReadConcernToPart
 
     BSONObj expectedNewObj = BSON("insert"
                                   << "test"
-                                  << "startTransaction" << true << "coordinator" << true
-                                  << "autocommit" << false << "txnNumber" << txnNum);
+                                  << "readConcern" << BSONObj() << "startTransaction" << true
+                                  << "coordinator" << true << "autocommit" << false << "txnNumber"
+                                  << txnNum);
 
     auto newCmd = txnRouter.attachTxnFieldsIfNeeded(operationContext(),
                                                     shard1,
@@ -1007,8 +1012,9 @@ TEST_F(TransactionRouterTestWithDefaultSession,
     ASSERT(expectedHostAndPorts == seenHostAndPorts);
 }
 
+// TODO (SERVER-48340): Re-enable the single-write-shard transaction commit optimization.
 TEST_F(TransactionRouterTestWithDefaultSession,
-       SendCommitDirectlyToReadOnlyShardsThenWriteShardForMultipleParticipantsOnlyOneDidAWrite) {
+       SendCoordinateCommitForMultipleParticipantsOnlyOneDidAWrite) {
     TxnNumber txnNum{3};
 
     auto txnRouter = TransactionRouter::get(operationContext());
@@ -1035,25 +1041,22 @@ TEST_F(TransactionRouterTestWithDefaultSession,
         ASSERT_EQ("admin", request.dbname);
 
         auto cmdName = request.cmdObj.firstElement().fieldNameStringData();
-        ASSERT_EQ(cmdName, "commitTransaction");
+        ASSERT_EQ(cmdName, "coordinateCommitTransaction");
+
+        std::set<std::string> expectedParticipants = {shard1.toString(), shard2.toString()};
+        auto participantElements = request.cmdObj["participants"].Array();
+        ASSERT_EQ(expectedParticipants.size(), participantElements.size());
+
+        for (const auto& element : participantElements) {
+            auto shardId = element["shardId"].valuestr();
+            ASSERT_EQ(1ull, expectedParticipants.count(shardId));
+            expectedParticipants.erase(shardId);
+        }
 
         checkSessionDetails(request.cmdObj, getSessionId(), txnNum, true);
 
         return BSON("ok" << 1);
     });
-
-    onCommand([&](const RemoteCommandRequest& request) {
-        ASSERT_EQ(hostAndPort2, request.target);
-        ASSERT_EQ("admin", request.dbname);
-
-        auto cmdName = request.cmdObj.firstElement().fieldNameStringData();
-        ASSERT_EQ(cmdName, "commitTransaction");
-
-        checkSessionDetails(request.cmdObj, getSessionId(), txnNum, false);
-
-        return BSON("ok" << 1);
-    });
-
 
     future.default_timed_get();
 }
@@ -1425,7 +1428,7 @@ TEST_F(TransactionRouterTestWithDefaultSession, SnapshotErrorsResetAtClusterTime
     // Advance the latest time in the logical clock so the retry attempt will pick a later time.
     LogicalTime laterTime(Timestamp(1000, 1));
     ASSERT_GT(laterTime, kInMemoryLogicalTime);
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(laterTime);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTime);
 
     // Simulate a snapshot error.
 
@@ -1474,7 +1477,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     LogicalTime laterTimeSameStmt(Timestamp(100, 1));
     ASSERT_GT(laterTimeSameStmt, kInMemoryLogicalTime);
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(laterTimeSameStmt);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTimeSameStmt);
 
     txnRouter.setDefaultAtClusterTime(operationContext());
 
@@ -1498,7 +1501,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     LogicalTime laterTimeNewStmt(Timestamp(1000, 1));
     ASSERT_GT(laterTimeNewStmt, laterTimeSameStmt);
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(laterTimeNewStmt);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTimeNewStmt);
 
     txnRouter.setDefaultAtClusterTime(operationContext());
 
@@ -1656,7 +1659,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     // Simulate stale error and internal retry that only re-targets one of the original shards.
 
-    ASSERT(txnRouter.canContinueOnStaleShardOrDbError("find"));
+    ASSERT(txnRouter.canContinueOnStaleShardOrDbError("find", kDummyStatus));
     auto future = launchAsync(
         [&] { txnRouter.onStaleShardOrDbError(operationContext(), "find", kDummyStatus); });
     expectAbortTransactions({hostAndPort1, hostAndPort2}, getSessionId(), txnNum);
@@ -1707,7 +1710,7 @@ TEST_F(TransactionRouterTestWithDefaultSession, OnlyNewlyCreatedParticipantsClea
     txnRouter.attachTxnFieldsIfNeeded(operationContext(), shard2, {});
     txnRouter.attachTxnFieldsIfNeeded(operationContext(), shard3, {});
 
-    ASSERT(txnRouter.canContinueOnStaleShardOrDbError("find"));
+    ASSERT(txnRouter.canContinueOnStaleShardOrDbError("find", kDummyStatus));
     auto future = launchAsync(
         [&] { txnRouter.onStaleShardOrDbError(operationContext(), "find", kDummyStatus); });
     expectAbortTransactions({hostAndPort2, hostAndPort3}, getSessionId(), txnNum);
@@ -1746,9 +1749,9 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     LogicalTime laterTime(Timestamp(1000, 1));
     ASSERT_GT(laterTime, kInMemoryLogicalTime);
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(laterTime);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTime);
 
-    ASSERT(txnRouter.canContinueOnStaleShardOrDbError("find"));
+    ASSERT(txnRouter.canContinueOnStaleShardOrDbError("find", kDummyStatus));
     txnRouter.onStaleShardOrDbError(operationContext(), "find", kDummyStatus);
     txnRouter.setDefaultAtClusterTime(operationContext());
 
@@ -1788,11 +1791,11 @@ TEST_F(TransactionRouterTestWithDefaultSession, WritesCanOnlyBeRetriedIfFirstOve
     txnRouter.setDefaultAtClusterTime(operationContext());
 
     for (auto writeCmd : writeCmds) {
-        ASSERT(txnRouter.canContinueOnStaleShardOrDbError(writeCmd));
+        ASSERT(txnRouter.canContinueOnStaleShardOrDbError(writeCmd, kDummyStatus));
     }
 
     for (auto cmd : otherCmds) {
-        ASSERT(txnRouter.canContinueOnStaleShardOrDbError(cmd));
+        ASSERT(txnRouter.canContinueOnStaleShardOrDbError(cmd, kDummyStatus));
     }
 
     // Advance to the next command.
@@ -1802,11 +1805,11 @@ TEST_F(TransactionRouterTestWithDefaultSession, WritesCanOnlyBeRetriedIfFirstOve
         operationContext(), txnNum, TransactionRouter::TransactionActions::kContinue);
 
     for (auto writeCmd : writeCmds) {
-        ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError(writeCmd));
+        ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError(writeCmd, kDummyStatus));
     }
 
     for (auto cmd : otherCmds) {
-        ASSERT(txnRouter.canContinueOnStaleShardOrDbError(cmd));
+        ASSERT(txnRouter.canContinueOnStaleShardOrDbError(cmd, kDummyStatus));
     }
 }
 
@@ -2209,26 +2212,56 @@ TEST_F(TransactionRouterTestWithDefaultSession, AbortPropagatesWriteConcern) {
     auto response = future.default_timed_get();
 }
 
-TEST_F(TransactionRouterTestWithDefaultSession,
-       CannotContinueOnSnapshotOrStaleVersionErrorsWithoutFailpoint) {
+TEST_F(TransactionRouterTestWithDefaultSession, ContinueOnlyOnStaleVersionOnFirstOp) {
     TxnNumber txnNum{3};
 
     auto txnRouter = TransactionRouter::get(operationContext());
     txnRouter.beginOrContinueTxn(
         operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
     txnRouter.setDefaultAtClusterTime(operationContext());
+    txnRouter.attachTxnFieldsIfNeeded(operationContext(), shard1, {});
 
     disableRouterRetriesFailPoint();
 
     // Cannot retry on snapshot errors on the first statement.
     ASSERT_FALSE(txnRouter.canContinueOnSnapshotError());
 
-    // Cannot retry on stale shard or db version errors for read or write commands.
-    ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError("find"));
-    ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError("insert"));
+    // Retry only on first op on stale shard or db version errors for read or write commands.
+    ASSERT_TRUE(txnRouter.canContinueOnStaleShardOrDbError("find", kStaleConfigStatus));
+    ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError("insert", kDummyStatus));
+
+    // It shouldn't hang because there won't be any abort transaction sent at this time
+    txnRouter.onStaleShardOrDbError(operationContext(), "find", kStaleConfigStatus);
+
+    // Readd the initial participant removed on onStaleShardOrDbError
+    txnRouter.attachTxnFieldsIfNeeded(operationContext(), shard1, {});
+
+    // Add another participant
+    txnRouter.attachTxnFieldsIfNeeded(operationContext(), shard2, {});
+
+    // Check that the transaction cannot continue on stale config with more than one participant
+    ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError("update", kStaleConfigStatus));
 
     // Can still continue on view resolution errors.
-    txnRouter.onViewResolutionError(operationContext(), kViewNss);  // Should not throw.
+    auto future = launchAsync([&] {
+        // Should not throw.
+        txnRouter.onViewResolutionError(operationContext(), kViewNss);
+    });
+
+    // Expect abort on pending operation
+    expectAbortTransactions({hostAndPort1, hostAndPort2}, getSessionId(), txnNum);
+
+    future.default_timed_get();
+
+    // Start a new transaction statement.
+    repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kContinue);
+
+    // Cannot retry on a stale config error with one participant after the first statement.
+    txnRouter.attachTxnFieldsIfNeeded(operationContext(), shard1, {});
+
+    ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError("update", kStaleConfigStatus));
 }
 
 TEST_F(TransactionRouterTestWithDefaultSession, ContinuingTransactionPlacesItsReadConcernOnOpCtx) {
@@ -2282,7 +2315,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
     LogicalTime laterTimeSameStmt(Timestamp(100, 1));
     ASSERT_GT(laterTimeSameStmt, kInMemoryLogicalTime);
-    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(laterTimeSameStmt);
+    VectorClock::get(operationContext())->advanceClusterTime_forTest(laterTimeSameStmt);
 
     txnRouter.setDefaultAtClusterTime(operationContext());
 
@@ -2993,8 +3026,7 @@ protected:
         startCapturingLogMessages();
         auto future = launchAsync(
             [&] { txnRouter().commitTransaction(operationContext(), kDummyRecoveryToken); });
-        expectCommitTransaction();
-        expectCommitTransaction();
+        expectCoordinateCommitTransaction();
         future.default_timed_get();
         stopCapturingLogMessages();
     }
@@ -3055,11 +3087,11 @@ protected:
     }
 
     void assertPrintedExactlyOneSlowLogLine() {
-        ASSERT_EQUALS(1, countTextFormatLogLinesContaining("transaction parameters:"));
+        ASSERT_EQUALS(1, countTextFormatLogLinesContaining("transaction"));
     }
 
     void assertDidNotPrintSlowLogLine() {
-        ASSERT_EQUALS(0, countTextFormatLogLinesContaining("transaction parameters:"));
+        ASSERT_EQUALS(0, countTextFormatLogLinesContaining("transaction"));
     }
 
     auto routerTxnMetrics() {
@@ -3098,7 +3130,17 @@ protected:
 //
 
 TEST_F(TransactionRouterMetricsTest, DoesNotLogTransactionsUnderSlowMSThreshold) {
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     serverGlobalParams.slowMS = 100;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
 
     beginTxnWithDefaultTxnNumber();
     tickSource()->advance(Milliseconds(99));
@@ -3107,12 +3149,41 @@ TEST_F(TransactionRouterMetricsTest, DoesNotLogTransactionsUnderSlowMSThreshold)
 }
 
 TEST_F(TransactionRouterMetricsTest, LogsTransactionsOverSlowMSThreshold) {
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
     serverGlobalParams.slowMS = 100;
+    serverGlobalParams.sampleRate = 1;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
 
     beginTxnWithDefaultTxnNumber();
     tickSource()->advance(Milliseconds(101));
     runCommit(kDummyOkRes);
     assertPrintedExactlyOneSlowLogLine();
+}
+
+TEST_F(TransactionRouterMetricsTest, DoesNotLogTransactionsWithSampleRateZero) {
+    const auto originalSlowMS = serverGlobalParams.slowMS;
+    const auto originalSampleRate = serverGlobalParams.sampleRate;
+
+    serverGlobalParams.slowMS = 100;
+    serverGlobalParams.sampleRate = 0;
+
+    // Reset the global parameters to their original values after this test exits.
+    ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
+        serverGlobalParams.slowMS = originalSlowMS;
+        serverGlobalParams.sampleRate = originalSampleRate;
+    });
+
+    beginTxnWithDefaultTxnNumber();
+    tickSource()->advance(Milliseconds(101));
+    runCommit(kDummyOkRes);
+    assertDidNotPrintSlowLogLine();
 }
 
 TEST_F(TransactionRouterMetricsTest, OnlyLogSlowTransactionsOnce) {
@@ -3131,15 +3202,16 @@ TEST_F(TransactionRouterMetricsTest, OnlyLogSlowTransactionsOnce) {
 }
 
 TEST_F(TransactionRouterMetricsTest, NoTransactionsLoggedAtDefaultTransactionLogLevel) {
-    // Set verbosity level of transaction components to the default, i.e. debug level 0.
-    setMinimumLoggedSeverity(logger::LogComponent::kTransaction, logger::LogSeverity::Log());
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kTransaction,
+                                                              logv2::LogSeverity::Log()};
     beginTxnWithDefaultTxnNumber();
     runSingleShardCommit();
     assertDidNotPrintSlowLogLine();
 }
 
 TEST_F(TransactionRouterMetricsTest, AllTransactionsLoggedAtTransactionLogLevelOne) {
-    setMinimumLoggedSeverity(logger::LogComponent::kTransaction, logger::LogSeverity::Debug(1));
+    auto severityGuard = unittest::MinimumLoggedSeverityGuard{logv2::LogComponent::kTransaction,
+                                                              logv2::LogSeverity::Debug(1)};
     beginTxnWithDefaultTxnNumber();
     runSingleShardCommit();
     assertPrintedExactlyOneSlowLogLine();
@@ -3155,10 +3227,12 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingPrintsTransactionParameters) {
 
     BSONObjBuilder lsidBob;
     getSessionId().serialize(&lsidBob);
-    ASSERT_EQUALS(1,
-                  countTextFormatLogLinesContaining(
-                      str::stream() << "parameters:{ lsid: " << lsidBob.done().toString()
-                                    << ", txnNumber: " << kTxnNumber << ", autocommit: false"));
+
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON(
+            "attr" << BSON("parameters" << BSON("lsid" << lsidBob.obj() << "txnNumber" << kTxnNumber
+                                                       << "autocommit" << false)))));
 }
 
 TEST_F(TransactionRouterMetricsTest, SlowLoggingPrintsDurationAtEnd) {
@@ -3166,27 +3240,28 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingPrintsDurationAtEnd) {
     tickSource()->advance(Milliseconds(111));
     assertDurationIs(Milliseconds(111));
     runCommit(kDummyOkRes);
-    const auto& logs = getCapturedTextFormatLogMessages();
-    ASSERT_EQUALS(1, std::count_if(logs.begin(), logs.end(), [](const std::string& line) {
-                      return StringData(line).endsWith(" 111ms");
-                  }));
+
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("durationMillis" << 111))));
 }
 
 TEST_F(TransactionRouterMetricsTest, SlowLoggingPrintsTimeActiveAndInactive) {
     beginTxnWithDefaultTxnNumber();
-    tickSource()->advance(Microseconds(111));
-    assertTimeActiveIs(Microseconds(111));
+    tickSource()->advance(Microseconds(111111));
+    assertTimeActiveIs(Microseconds(111111));
 
     txnRouter().stash(operationContext());
-    tickSource()->advance(Microseconds(222));
-    assertTimeInactiveIs(Microseconds(222));
+    tickSource()->advance(Microseconds(222222));
+    assertTimeInactiveIs(Microseconds(222222));
 
     txnRouter().beginOrContinueTxn(
         operationContext(), kTxnNumber, TransactionRouter::TransactionActions::kCommit);
     runCommit(kDummyOkRes);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("timeActiveMicros:111,"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("timeInactiveMicros:222,"));
+    ASSERT_EQUALS(
+        1, countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("timeActiveMicros" << 111111))));
+    ASSERT_EQUALS(
+        1, countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("timeInactiveMicros" << 222222))));
 }
 
 //
@@ -3211,7 +3286,11 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingReadConcern_Local) {
     beginSlowTxnWithDefaultTxnNumber();
     runCommit(kDummyOkRes);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(readConcern.toBSON()["readConcern"]));
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON(
+            "attr" << BSON("parameters"
+                           << BSON("readConcern" << readConcern.toBSON()["readConcern"].Obj())))));
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("globalReadTimestamp:"));
 }
 
@@ -3222,7 +3301,11 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingReadConcern_Majority) {
     beginSlowTxnWithDefaultTxnNumber();
     runCommit(kDummyOkRes);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(readConcern.toBSON()["readConcern"]));
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON(
+            "attr" << BSON("parameters"
+                           << BSON("readConcern" << readConcern.toBSON()["readConcern"].Obj())))));
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("globalReadTimestamp:"));
 }
 
@@ -3233,8 +3316,12 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingReadConcern_Snapshot) {
     beginSlowTxnWithDefaultTxnNumber();
     runCommit(kDummyOkRes);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(readConcern.toBSON()["readConcern"]));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("globalReadTimestamp:"));
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(
+            BSON("attr" << BSON("parameters"
+                                << BSON("readConcern" << readConcern.toBSON()["readConcern"].Obj()))
+                        << "globalReadTimestamp" << BSONUndefined)));
 }
 
 //
@@ -3245,9 +3332,12 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingCommitType_NoShards) {
     beginSlowTxnWithDefaultTxnNumber();
     runNoShardCommit();
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:noShards,"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:0"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON(
+            "attr" << BSON("commitType"
+                           << "noShards"
+                           << "numParticipants" << 0 << "commitDurationMicros" << BSONUndefined))));
 
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("coordinator:"));
 }
@@ -3256,31 +3346,39 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingCommitType_SingleShard) {
     beginSlowTxnWithDefaultTxnNumber();
     runSingleShardCommit();
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:singleShard,"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:1"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON(
+            "attr" << BSON("commitType"
+                           << "singleShard"
+                           << "numParticipants" << 1 << "commitDurationMicros" << BSONUndefined))));
 
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("coordinator:"));
 }
 
+// TODO (SERVER-48340): Re-enable the single-write-shard transaction commit optimization.
 TEST_F(TransactionRouterMetricsTest, SlowLoggingCommitType_SingleWriteShard) {
     beginSlowTxnWithDefaultTxnNumber();
     runSingleWriteShardCommit();
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:singleWriteShard,"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:2"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
-
-    ASSERT_EQUALS(0, countTextFormatLogLinesContaining("coordinator:"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(
+                      BSON("attr" << BSON("commitType"
+                                          << "twoPhaseCommit"
+                                          << "numParticipants" << 2 << "commitDurationMicros"
+                                          << BSONUndefined << "coordinator" << BSONUndefined))));
 }
 
 TEST_F(TransactionRouterMetricsTest, SlowLoggingCommitType_ReadOnly) {
     beginSlowTxnWithDefaultTxnNumber();
     runReadOnlyCommit();
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:readOnly,"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:2"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON(
+            "attr" << BSON("commitType"
+                           << "readOnly"
+                           << "numParticipants" << 2 << "commitDurationMicros" << BSONUndefined))));
 
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("coordinator:"));
 }
@@ -3289,18 +3387,23 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingCommitType_TwoPhase) {
     beginSlowTxnWithDefaultTxnNumber();
     runTwoPhaseCommit();
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:twoPhaseCommit,"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("coordinator:"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:2"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(
+                      BSON("attr" << BSON("commitType"
+                                          << "twoPhaseCommit"
+                                          << "numParticipants" << 2 << "commitDurationMicros"
+                                          << BSONUndefined << "coordinator" << BSONUndefined))));
 }
 
 TEST_F(TransactionRouterMetricsTest, SlowLoggingCommitType_Recovery) {
     beginSlowRecoverCommitWithDefaultTxnNumber();
     runRecoverWithTokenCommit(shard1);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:recoverWithToken,"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(
+                      BSON("attr" << BSON("commitType"
+                                          << "recoverWithToken"
+                                          << "commitDurationMicros" << BSONUndefined))));
 
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("numParticipants:"));
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("coordinator:"));
@@ -3323,9 +3426,12 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingOnTerminate_ImplicitAbort) {
     beginSlowTxnWithDefaultTxnNumber();
     implicitAbortInProgress();
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("terminationCause:aborted"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("abortCause:" + kDummyStatus.codeString()));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:1"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(
+                      BSON("attr" << BSON("terminationCause"
+                                          << "aborted"
+                                          << "abortCause" << kDummyStatus.codeString()
+                                          << "numParticipants" << 1))));
 
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("commitType:"));
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("commitDurationMicros:"));
@@ -3335,9 +3441,12 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingOnTerminate_ExplicitAbort) {
     beginSlowTxnWithDefaultTxnNumber();
     explicitAbortInProgress();
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("terminationCause:aborted"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("abortCause:abort"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:1"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(BSON("attr" << BSON("terminationCause"
+                                                                      << "aborted"
+                                                                      << "abortCause"
+                                                                      << "abort"
+                                                                      << "numParticipants" << 1))));
 
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("commitType:"));
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining("commitDurationMicros:"));
@@ -3347,21 +3456,30 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingOnTerminate_SuccessfulCommit) {
     beginSlowTxnWithDefaultTxnNumber();
     runCommit(kDummyOkRes);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("terminationCause:committed"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:singleShard"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:1"));
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON(
+            "attr" << BSON("terminationCause"
+                           << "committed"
+                           << "commitType"
+                           << "singleShard"
+                           << "numParticipants" << 1 << "commitDurationMicros" << BSONUndefined))));
 }
 
 TEST_F(TransactionRouterMetricsTest, SlowLoggingOnTerminate_FailedCommit) {
     beginSlowTxnWithDefaultTxnNumber();
     runCommit(kDummyErrorRes);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("terminationCause:aborted"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("abortCause:" + kDummyStatus.codeString()));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("numParticipants:1"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(
+                      BSON("attr" << BSON("terminationCause"
+                                          << "aborted"
+                                          << "abortCause" << kDummyStatus.codeString()
+                                          << "numParticipants" << 1 << "commitDurationMicros"
+                                          << BSONUndefined << "commitType" << BSONUndefined))));
+
+    // ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:"));
+    // ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
 }
 
 //
@@ -3473,9 +3591,12 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingAfterUnknownCommitResult_Success
 
     retryCommit(kDummyOkRes);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("terminationCause:committed"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(
+                      BSON("attr" << BSON("terminationCause"
+                                          << "committed"
+                                          << "commitDurationMicros" << BSONUndefined << "commitType"
+                                          << BSONUndefined))));
 }
 
 TEST_F(TransactionRouterMetricsTest, SlowLoggingAfterUnknownCommitResult_Abort) {
@@ -3486,9 +3607,12 @@ TEST_F(TransactionRouterMetricsTest, SlowLoggingAfterUnknownCommitResult_Abort) 
 
     retryCommit(kDummyErrorRes);
 
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("terminationCause:aborted"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitType:"));
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining("commitDurationMicros:"));
+    ASSERT_EQUALS(1,
+                  countBSONFormatLogLinesIsSubset(
+                      BSON("attr" << BSON("terminationCause"
+                                          << "aborted"
+                                          << "commitDurationMicros" << BSONUndefined << "commitType"
+                                          << BSONUndefined))));
 }
 
 TEST_F(TransactionRouterMetricsTest, SlowLoggingAfterUnknownCommitResult_Unknown) {
@@ -4230,21 +4354,21 @@ TEST_F(TransactionRouterTest, RouterMetricsCurrent_ReapForUnstartedTxn) {
 // The following three tests verify that the methods that end metrics tracking for a transaction
 // can't be called for an unstarted one.
 
-DEATH_TEST_F(TransactionRouterMetricsTest,
-             ImplicitlyAbortingUnstartedTxnCrashes,
-             "Invariant failure isInitialized()") {
+DEATH_TEST_REGEX_F(TransactionRouterMetricsTest,
+                   ImplicitlyAbortingUnstartedTxnCrashes,
+                   R"#(Invariant failure.*isInitialized\(\))#") {
     txnRouter().implicitlyAbortTransaction(operationContext(), kDummyStatus);
 }
 
-DEATH_TEST_F(TransactionRouterMetricsTest,
-             AbortingUnstartedTxnCrashes,
-             "Invariant failure isInitialized()") {
+DEATH_TEST_REGEX_F(TransactionRouterMetricsTest,
+                   AbortingUnstartedTxnCrashes,
+                   R"#(Invariant failure.*isInitialized\(\))#") {
     txnRouter().abortTransaction(operationContext());
 }
 
-DEATH_TEST_F(TransactionRouterMetricsTest,
-             CommittingUnstartedTxnCrashes,
-             "Invariant failure isInitialized()") {
+DEATH_TEST_REGEX_F(TransactionRouterMetricsTest,
+                   CommittingUnstartedTxnCrashes,
+                   R"#(Invariant failure.*isInitialized\(\))#") {
     txnRouter().commitTransaction(operationContext(), boost::none);
 }
 

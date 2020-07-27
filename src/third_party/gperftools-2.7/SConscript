@@ -10,7 +10,6 @@ env = env.Clone()
 if use_libunwind:
     env.Append(
         CPPDEFINES=[
-            "NO_FRAME_POINTER",
             ("HAVE_LIBUNWIND_H", "1"),
             'HAVE_UCONTEXT_H'
         ],
@@ -65,6 +64,9 @@ else:
     else:
         files += ['src/debugallocation.cc']
 
+    # gperftools has some sloppy write calls that emit warnings
+    env.Append(CXXFLAGS=["-Wno-unused-result"])
+
 env.Append(
     CPPDEFINES=["NO_HEAP_CHECK"],
 )
@@ -104,6 +106,11 @@ def removeIfPresent(lst, item):
 for to_remove in ['-Werror', "-Wsign-compare","-Wall","-Werror=unused-result"]:
     removeIfPresent(env['CCFLAGS'], to_remove)
 
+if not env.TargetOSIs('windows'):
+    env.Append(CXXFLAGS=['-Wno-unused-result'])
+    if env.ToolchainIs('GCC'):
+        env.Append(CXXFLAGS=['-Wno-attribute-alias'])
+
 # GCC on PowerPC under C++11 mode does not define __linux which gperftools depends on
 if env['TARGET_ARCH'] == 'ppc64le':
     env.Append( CPPDEFINES=[ "__linux"] )
@@ -113,8 +120,10 @@ env.Library(
     source=[
         env.Dir('dist').File(f) for f in files
     ],
-    LIBDEPS=[
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/third_party/shim_unwind' if use_libunwind else [],
-
-    ]
+    ],
+    # We don't want the shim_allocator hack to apply to this library, since
+    # otherwise we would create a loop.
+    DISABLE_ALLOCATOR_SHIM_INJECTION=True,
 )

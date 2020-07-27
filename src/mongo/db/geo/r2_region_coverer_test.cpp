@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kGeo
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include <chrono>
 #include <memory>
@@ -38,9 +38,9 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/db/geo/geometry_container.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace {
 
@@ -58,7 +58,7 @@ MONGO_INITIALIZER(R2CellUnion_Test)(InitializerContext* context) {
         }
     }
     generator.seed(seed);
-    log() << "R2CellUnion Test - Random Number Generator Seed: " << seed;
+    LOGV2(20640, "R2CellUnion Test - Random Number Generator Seed: {seed}", "seed"_attr = seed);
     return Status::OK();
 }
 
@@ -179,8 +179,10 @@ private:
 };
 
 TEST(R2RegionCoverer, RandomCells) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(1);
     // Test random cell ids at all levels.
     for (int i = 0; i < 10000; ++i) {
@@ -188,7 +190,7 @@ TEST(R2RegionCoverer, RandomCells) {
             random(std::numeric_limits<long long>::lowest(), std::numeric_limits<long long>::max()),
             random(0U, GeoHash::kMaxBits));
         vector<GeoHash> covering;
-        Box box = converter.unhashToBoxCovering(id);
+        Box box = coverer.getHashConverter().unhashToBoxCovering(id);
         // Since the unhashed box is expanded by the error 8Mu, we need to shrink it.
         box.fudge(-GeoHashConverter::kMachinePrecision * MAXBOUND * 20);
         HashBoxRegion region(box);
@@ -226,8 +228,8 @@ void checkCellIdCovering(const GeoHashConverter& converter,
 
     // The covering doesn't contain this cell, so the region shouldn't contain this cell.
     if (region.fastContains(cell)) {
-        log() << "covering " << covering.toString();
-        log() << "cellId " << cellId;
+        LOGV2(20641, "covering {covering}", "covering"_attr = covering.toString());
+        LOGV2(20642, "cellId {cellId}", "cellId"_attr = cellId);
     }
     ASSERT_FALSE(region.fastContains(cell));
 
@@ -288,8 +290,10 @@ GeometryContainer* getRandomCircle(double radius) {
 
 // Test the covering for arbitrary random circle.
 TEST(R2RegionCoverer, RandomCircles) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(8);
 
     for (int i = 0; i < 1000; i++) {
@@ -305,14 +309,16 @@ TEST(R2RegionCoverer, RandomCircles) {
 
         vector<GeoHash> covering;
         coverer.getCovering(region, &covering);
-        checkCovering(converter, region, coverer, covering);
+        checkCovering(coverer.getHashConverter(), region, coverer, covering);
     }
 }
 
 // Test the covering for very small circles, since the above test doesn't cover finest cells.
 TEST(R2RegionCoverer, RandomTinyCircles) {
-    GeoHashConverter converter(getConverterParams());
-    R2RegionCoverer coverer(&converter);
+    auto result = GeoHashConverter::createFromParams(getConverterParams());
+    ASSERT_OK(result.getStatus());
+
+    R2RegionCoverer coverer(std::move(result.getValue()));
     coverer.setMaxCells(random(1, 20));  // [1, 20]
 
     for (int i = 0; i < 10000; i++) {
@@ -328,7 +334,7 @@ TEST(R2RegionCoverer, RandomTinyCircles) {
 
         vector<GeoHash> covering;
         coverer.getCovering(region, &covering);
-        checkCovering(converter, region, coverer, covering);
+        checkCovering(coverer.getHashConverter(), region, coverer, covering);
     }
 }
 
@@ -726,8 +732,12 @@ TEST(R2CellUnion, Normalize) {
             ASSERT_EQUALS(expected[i], cellUnion.cellIds()[i]);
         }
     }
-    log() << "Average Unnormalized Size: " << unnormalizedSum * 1.0 / kIters;
-    log() << "Average Normalized Size: " << normalizedSum * 1.0 / kIters;
+    LOGV2(20643,
+          "Average Unnormalized Size: {unnormalizedSum_1_0_kIters}",
+          "unnormalizedSum_1_0_kIters"_attr = unnormalizedSum * 1.0 / kIters);
+    LOGV2(20644,
+          "Average Normalized Size: {normalizedSum_1_0_kIters}",
+          "normalizedSum_1_0_kIters"_attr = normalizedSum * 1.0 / kIters);
 }
 
 void testContains(const R2CellUnion& cellUnion, GeoHash id, int num) {

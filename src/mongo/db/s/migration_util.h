@@ -29,11 +29,13 @@
 
 #pragma once
 
+#include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/migration_coordinator_document_gen.h"
-#include "mongo/db/s/persistent_task_store.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/s/catalog/type_chunk.h"
+#include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 
@@ -65,6 +67,20 @@ BSONObj makeMigrationStatusDocument(const NamespaceString& nss,
                                     const BSONObj& max);
 
 /**
+ * Returns a chunk range with extended or truncated boundaries to match the number of fields in the
+ * given metadata's shard key pattern.
+ */
+ChunkRange extendOrTruncateBoundsForMetadata(const CollectionMetadata& metadata,
+                                             const ChunkRange& range);
+
+/**
+ * Returns an executor to be used to run commands related to submitting tasks to the range deleter.
+ * The executor is initialized on the first call to this function. Uses a shared_ptr
+ * because a shared_ptr is required to work with ExecutorFutures.
+ */
+std::shared_ptr<ThreadPool> getMigrationUtilExecutor();
+
+/**
  * Creates a query object that can used to find overlapping ranges in the pending range deletions
  * collection.
  */
@@ -74,20 +90,22 @@ Query overlappingRangeQuery(const ChunkRange& range, const UUID& uuid);
  * Checks the pending range deletions collection to see if there are any pending ranges that
  * conflict with the passed in range.
  */
-bool checkForConflictingDeletions(OperationContext* opCtx,
-                                  const ChunkRange& range,
-                                  const UUID& uuid);
+size_t checkForConflictingDeletions(OperationContext* opCtx,
+                                    const ChunkRange& range,
+                                    const UUID& uuid);
 
 /**
  * Asynchronously attempts to submit the RangeDeletionTask for processing.
  *
  * Note that if the current filtering metadata's UUID does not match the task's UUID, the filtering
  * metadata will be refreshed once. If the UUID's still don't match, the task will be deleted from
- * disk. If the UUID's do match, the task will be submitted for processing.
+ * disk. If the UUID's do match, the range will be submitted for deletion.
  *
- * The returned future will contain whether the task was submitted for processing.
+ * If the range is submitted for deletion, the returned future is set when the range deletion
+ * completes. If the range is not submitted for deletion, the returned future is set with an error
+ * explaining why.
  */
-ExecutorFuture<bool> submitRangeDeletionTask(OperationContext* oppCtx,
+ExecutorFuture<void> submitRangeDeletionTask(OperationContext* oppCtx,
                                              const RangeDeletionTask& deletionTask);
 
 /**
@@ -120,7 +138,8 @@ void persistMigrationCoordinatorLocally(OperationContext* opCtx,
  * concern.
  */
 void persistRangeDeletionTaskLocally(OperationContext* opCtx,
-                                     const RangeDeletionTask& deletionTask);
+                                     const RangeDeletionTask& deletionTask,
+                                     const WriteConcernOptions& writeConcern);
 
 /**
  * Updates the migration coordinator document to set the decision field to "committed" and waits for
@@ -144,19 +163,21 @@ void deleteRangeDeletionTaskLocally(
     const WriteConcernOptions& writeConcern = WriteConcerns::kMajorityWriteConcern);
 
 /**
- * Deletes all range deletion task documents with the specified collection UUID from
- * config.rangeDeletions and waits for majority write concern.
- */
-void deleteRangeDeletionTasksForCollectionLocally(OperationContext* opCtx,
-                                                  const UUID& collectionUuid);
-
-/**
  * Deletes the range deletion task document with the specified id from config.rangeDeletions on the
  * specified shard and waits for majority write concern.
  */
 void deleteRangeDeletionTaskOnRecipient(OperationContext* opCtx,
                                         const ShardId& recipientId,
                                         const UUID& migrationId);
+
+/**
+ * Advances the optime for the current transaction by performing a write operation as a retryable
+ * write. This is to prevent a write of the deletion task once the decision has been recorded.
+ */
+void advanceTransactionOnRecipient(OperationContext* opCtx,
+                                   const ShardId& recipientId,
+                                   const LogicalSessionId& lsid,
+                                   TxnNumber txnNumber);
 
 /**
  * Removes the 'pending' flag from the range deletion task document with the specified id from
@@ -199,7 +220,13 @@ void refreshFilteringMetadataUntilSuccess(OperationContext* opCtx, const Namespa
  * Submits an asynchronous task to scan config.migrationCoordinators and drive each unfinished
  * migration coordination to completion.
  */
-void resumeMigrationCoordinationsOnStepUp(ServiceContext* serviceContext);
+void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx);
+
+/**
+ * Drive each unfished migration coordination in the given namespace to completion.
+ * Assumes the caller to have entered CollectionCriticalSection.
+ */
+void recoverMigrationCoordinations(OperationContext* opCtx, NamespaceString nss);
 
 }  // namespace migrationutil
 }  // namespace mongo

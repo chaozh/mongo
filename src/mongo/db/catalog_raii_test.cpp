@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -41,8 +41,8 @@
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -79,7 +79,7 @@ void failsWithLockTimeout(std::function<void()> func, Milliseconds timeoutMillis
         func();
         FAIL("Should have gotten an exception due to timeout");
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>& ex) {
-        log() << ex;
+        LOGV2(20396, "{ex}", "ex"_attr = ex);
         Date_t t2 = Date_t::now();
         ASSERT_GTE(t2 - t1, timeoutMillis);
     }
@@ -94,8 +94,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetDBDeadline) {
 }
 
 TEST_F(CatalogRAIITestFixture, AutoGetDBGlobalLockDeadline) {
-    Lock::GlobalLock gLock1(
-        client1.second.get(), MODE_X, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    Lock::GlobalLock gLock1(client1.second.get(), MODE_X);
     ASSERT(gLock1.isLocked());
     failsWithLockTimeout(
         [&] { AutoGetDb db(client2.second.get(), nss.db(), MODE_X, Date_t::now() + timeoutMs); },
@@ -105,7 +104,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetDBGlobalLockDeadline) {
 TEST_F(CatalogRAIITestFixture, AutoGetDBDeadlineNow) {
     Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
     ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
-    AutoGetDb db(client2.second.get(), nss.db(), MODE_IX, Date_t::now());
+    AutoGetDb db(client2.second.get(), nss.db(), MODE_IX);
     failsWithLockTimeout(
         [&] { AutoGetDb db(client2.second.get(), nss.db(), MODE_X, Date_t::now()); },
         Milliseconds(0));
@@ -114,10 +113,9 @@ TEST_F(CatalogRAIITestFixture, AutoGetDBDeadlineNow) {
 TEST_F(CatalogRAIITestFixture, AutoGetDBDeadlineMin) {
     Lock::DBLock dbLock1(client1.second.get(), nss.db(), MODE_IX);
     ASSERT(client1.second->lockState()->isDbLockedForMode(nss.db(), MODE_IX));
-    AutoGetDb db(client2.second.get(), nss.db(), MODE_IX, Date_t::now());
-    failsWithLockTimeout(
-        [&] { AutoGetDb db(client2.second.get(), nss.db(), MODE_X, Date_t::now()); },
-        Milliseconds(0));
+    AutoGetDb db(client2.second.get(), nss.db(), MODE_IX);
+    failsWithLockTimeout([&] { AutoGetDb db(client2.second.get(), nss.db(), MODE_X, Date_t{}); },
+                         Milliseconds(0));
 }
 
 TEST_F(CatalogRAIITestFixture, AutoGetOrCreateDbDeadline) {
@@ -161,8 +159,7 @@ TEST_F(CatalogRAIITestFixture, AutoGetCollectionDBLockDeadline) {
 }
 
 TEST_F(CatalogRAIITestFixture, AutoGetCollectionGlobalLockDeadline) {
-    Lock::GlobalLock gLock1(
-        client1.second.get(), MODE_X, Date_t::now(), Lock::InterruptBehavior::kThrow);
+    Lock::GlobalLock gLock1(client1.second.get(), MODE_X);
     ASSERT(client1.second->lockState()->isLocked());
     failsWithLockTimeout(
         [&] {
@@ -263,8 +260,8 @@ TEST_F(ReadSourceScopeTest, RestoreReadSource) {
         ReadSourceScope scope(opCtx());
         ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kUnset);
 
-        opCtx()->recoveryUnit()->setTimestampReadSource(ReadSource::kLastApplied);
-        ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kLastApplied);
+        opCtx()->recoveryUnit()->setTimestampReadSource(ReadSource::kNoOverlap);
+        ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kNoOverlap);
         ASSERT_EQ(opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(), boost::none);
     }
     ASSERT_EQ(opCtx()->recoveryUnit()->getTimestampReadSource(), ReadSource::kProvided);

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/query/planner_ixselect.h"
 
@@ -47,7 +47,7 @@
 #include "mongo/db/query/indexability.h"
 #include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/query_planner_common.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -185,14 +185,11 @@ static double fieldWithDefault(const BSONObj& infoObj, const string& name, doubl
  * 2d indices don't handle wrapping so we can't use them for queries that wrap.
  */
 static bool twoDWontWrap(const Circle& circle, const IndexEntry& index) {
-    GeoHashConverter::Parameters hashParams;
-    Status paramStatus = GeoHashConverter::parseParameters(index.infoObj, &hashParams);
-    verify(paramStatus.isOK());  // we validated the params on index creation
-
-    GeoHashConverter conv(hashParams);
+    auto conv = GeoHashConverter::createFromDoc(index.infoObj);
+    uassertStatusOK(conv.getStatus());  // We validated the parameters when creating the index.
 
     // FYI: old code used flat not spherical error.
-    double yscandist = rad2deg(circle.radius) + conv.getErrorSphere();
+    double yscandist = rad2deg(circle.radius) + conv.getValue()->getErrorSphere();
     double xscandist = computeXScanDistance(circle.center.y, yscandist);
     bool ret = circle.center.x + xscandist < 180 && circle.center.x - xscandist > -180 &&
         circle.center.y + yscandist < 90 && circle.center.y - yscandist > -90;
@@ -287,15 +284,24 @@ std::vector<IndexEntry> QueryPlannerIXSelect::findIndexesByHint(
         auto hintName = firstHintElt.valueStringData();
         for (auto&& entry : allIndices) {
             if (entry.identifier.catalogName == hintName) {
-                LOG(5) << "Hint by name specified, restricting indices to "
-                       << entry.keyPattern.toString();
+                LOGV2_DEBUG(20952,
+                            5,
+                            "Hint by name specified, restricting indices to {keyPattern}",
+                            "Hint by name specified, restricting indices",
+                            "name"_attr = entry.identifier.catalogName,
+                            "keyPattern"_attr = entry.keyPattern);
                 out.push_back(entry);
             }
         }
     } else {
         for (auto&& entry : allIndices) {
             if (SimpleBSONObjComparator::kInstance.evaluate(entry.keyPattern == hintedIndex)) {
-                LOG(5) << "Hint specified, restricting indices to " << hintedIndex.toString();
+                LOGV2_DEBUG(20953,
+                            5,
+                            "Hint specified, restricting indices to {keyPattern}",
+                            "Hint specified, restricting indices",
+                            "name"_attr = entry.identifier.catalogName,
+                            "keyPattern"_attr = entry.keyPattern);
                 out.push_back(entry);
             }
         }
@@ -579,8 +585,11 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
     } else if (IndexNames::GEO_HAYSTACK == indexedFieldType) {
         return false;
     } else {
-        warning() << "Unknown indexing for node " << node->debugString() << " and field "
-                  << keyPatternElt.toString();
+        LOGV2_WARNING(20954,
+                      "Unknown indexing for node {node} and field {field}",
+                      "Unknown indexing for given node and field",
+                      "node"_attr = node->debugString(),
+                      "field"_attr = keyPatternElt.toString());
         verify(0);
     }
 }

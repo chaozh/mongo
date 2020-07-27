@@ -97,10 +97,6 @@ public:
         return true;
     }
 
-    virtual bool isCacheUnderPressure(OperationContext* opCtx) const override;
-
-    virtual void setCachePressureForTest(int pressure) override;
-
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) {
         return 1;
     }
@@ -139,7 +135,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+    virtual StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override {}

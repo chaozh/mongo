@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -46,8 +46,8 @@
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 using namespace std::chrono_literals;
 
@@ -106,15 +106,24 @@ void generateSystemIndexForExistingCollection(OperationContext* opCtx,
             opCtx, spec.toBSON(), serverGlobalParams.featureCompatibility);
         BSONObj indexSpec = fassert(40452, indexSpecStatus);
 
-        log() << "No authorization index detected on " << ns
-              << " collection. Attempting to recover by creating an index with spec: " << indexSpec;
+        LOGV2(22488,
+              "No authorization index detected on {namespace} collection. Attempting to recover by "
+              "creating an index with spec: {indexSpec}",
+              "No authorization index detected. Attempting to recover by "
+              "creating an index",
+              logAttrs(ns),
+              "indexSpec"_attr = indexSpec);
 
         auto indexConstraints = IndexBuildsManager::IndexConstraints::kEnforce;
         auto fromMigrate = false;
-        IndexBuildsCoordinator::get(opCtx)->createIndexes(
-            opCtx, collectionUUID, {indexSpec}, indexConstraints, fromMigrate);
+        IndexBuildsCoordinator::get(opCtx)->createIndex(
+            opCtx, collectionUUID, indexSpec, indexConstraints, fromMigrate);
     } catch (const DBException& e) {
-        severe() << "Failed to regenerate index for " << ns << ". Exception: " << e.what();
+        LOGV2_FATAL_CONTINUE(22490,
+                             "Failed to regenerate index for {namespace}. Exception: {error}",
+                             "Failed to regenerate index",
+                             logAttrs(ns),
+                             "error"_attr = e.what());
         throw;
     }
 }
@@ -124,23 +133,19 @@ void generateSystemIndexForExistingCollection(OperationContext* opCtx,
 Status verifySystemIndexes(OperationContext* opCtx) {
     // Do not try and generate any system indexes in read only mode.
     if (storageGlobalParams.readOnly) {
-        warning() << "Running in queryable backup mode. Unable to create authorization indexes";
+        LOGV2_WARNING(22489,
+                      "Running in queryable backup mode. Unable to create authorization indexes");
         return Status::OK();
     }
 
     const NamespaceString& systemUsers = AuthorizationManager::usersCollectionNamespace;
     const NamespaceString& systemRoles = AuthorizationManager::rolesCollectionNamespace;
 
-    // Create indexes for collections on the admin db
+    // Create indexes for the admin.system.users collection.
     {
-        AutoGetDb autoDb(opCtx, systemUsers.db(), MODE_X);
-        if (!autoDb.getDb()) {
-            return Status::OK();
-        }
+        AutoGetCollection autoColl(opCtx, systemUsers, MODE_X);
 
-        Collection* collection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, systemUsers);
-        if (collection) {
+        if (Collection* collection = autoColl.getCollection()) {
             IndexCatalog* indexCatalog = collection->getIndexCatalog();
             invariant(indexCatalog);
 
@@ -156,7 +161,7 @@ Status verifySystemIndexes(OperationContext* opCtx) {
                               "running authSchemaUpgrade on a 2.6 server.");
             }
 
-            // Ensure that system indexes exist for the user collection
+            // Ensure that system indexes exist for the user collection.
             indexCatalog->findIndexesByKeyPattern(opCtx, v3SystemUsersKeyPattern, false, &indexes);
             if (indexes.empty()) {
                 try {
@@ -167,10 +172,14 @@ Status verifySystemIndexes(OperationContext* opCtx) {
                 }
             }
         }
+    }
+
+    // Create indexes for the admin.system.roles collection.
+    {
+        AutoGetCollection autoColl(opCtx, systemRoles, MODE_X);
 
         // Ensure that system indexes exist for the roles collection, if it exists.
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, systemRoles);
-        if (collection) {
+        if (Collection* collection = autoColl.getCollection()) {
             IndexCatalog* indexCatalog = collection->getIndexCatalog();
             invariant(indexCatalog);
 

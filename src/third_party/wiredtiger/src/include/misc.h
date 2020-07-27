@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -52,6 +52,10 @@
 #define WT_TERABYTE ((uint64_t)1099511627776)
 #define WT_PETABYTE ((uint64_t)1125899906842624)
 #define WT_EXABYTE ((uint64_t)1152921504606846976)
+
+/* Strings used for indicating failed string buffer construction. */
+#define WT_ERR_STRING "[Error]"
+#define WT_NO_ADDR_STRING "[NoAddr]"
 
 /*
  * Sizes that cannot be larger than 2**32 are stored in uint32_t fields in common structures to save
@@ -110,12 +114,13 @@
  *     Common case allocate-and-grow function. Starts by allocating the requested number of items
  *     (at least 10), then doubles each time the list needs to grow.
  */
-#define __wt_realloc_def(session, sizep, number, addr)                                      \
-    (((number) * sizeof(**(addr)) <= *(sizep)) ?                                            \
-        0 :                                                                                 \
-        __wt_realloc(session, sizep, (F_ISSET(S2C(session), WT_CONN_DEBUG_REALLOC_EXACT)) ? \
-            (number) * sizeof(**(addr)) :                                                   \
-            WT_MAX(*(sizep)*2, WT_MAX(10, (number)) * sizeof(**(addr))),                    \
+#define __wt_realloc_def(session, sizep, number, addr)                          \
+    (((number) * sizeof(**(addr)) <= *(sizep)) ?                                \
+        0 :                                                                     \
+        __wt_realloc(session, sizep,                                            \
+          (FLD_ISSET(S2C(session)->debug_flags, WT_CONN_DEBUG_REALLOC_EXACT)) ? \
+            (number) * sizeof(**(addr)) :                                       \
+            WT_MAX(*(sizep)*2, WT_MAX(10, (number)) * sizeof(**(addr))),        \
           addr))
 
 /*
@@ -231,9 +236,6 @@
         }                                                              \
     } while (0)
 
-/* Verbose messages. */
-#define WT_VERBOSE_ISSET(session, f) (FLD_ISSET(S2C(session)->verbose, f))
-
 #define WT_CLEAR(s) memset(&(s), 0, sizeof(s))
 
 /* Check if a string matches a prefix. */
@@ -290,12 +292,15 @@
  * acquired.
  */
 #ifdef HAVE_DIAGNOSTIC
+#define __wt_hazard_set(session, walk, busyp) \
+    __wt_hazard_set_func(session, walk, busyp, __func__, __LINE__)
 #define __wt_scr_alloc(session, size, scratchp) \
     __wt_scr_alloc_func(session, size, scratchp, __func__, __LINE__)
 #define __wt_page_in(session, ref, flags) __wt_page_in_func(session, ref, flags, __func__, __LINE__)
 #define __wt_page_swap(session, held, want, flags) \
     __wt_page_swap_func(session, held, want, flags, __func__, __LINE__)
 #else
+#define __wt_hazard_set(session, walk, busyp) __wt_hazard_set_func(session, walk, busyp)
 #define __wt_scr_alloc(session, size, scratchp) __wt_scr_alloc_func(session, size, scratchp)
 #define __wt_page_in(session, ref, flags) __wt_page_in_func(session, ref, flags)
 #define __wt_page_swap(session, held, want, flags) __wt_page_swap_func(session, held, want, flags)

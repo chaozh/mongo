@@ -56,14 +56,34 @@ class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
 class WiredTigerEngineRuntimeConfigParameter;
-class WiredTigerMaxCacheOverflowSizeGBParameter;
 
 struct WiredTigerFileVersion {
-    enum class StartupVersion { IS_34, IS_36, IS_40, IS_42, IS_44 };
+    // MongoDB 4.4+ will not open on datafiles left behind by 4.2.5 and earlier. MongoDB 4.4
+    // shutting down in FCV 4.2 will leave data files that 4.2.6+ will understand
+    // (IS_44_FCV_42). MongoDB 4.2.x always writes out IS_42.
+    enum class StartupVersion { IS_42, IS_44_FCV_42, IS_44_FCV_44 };
 
     StartupVersion _startupVersion;
     bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
     std::string getDowngradeString();
+};
+
+struct WiredTigerBackup {
+    WT_CURSOR* cursor = nullptr;
+    WT_CURSOR* dupCursor = nullptr;
+    std::set<std::string> logFilePathsSeenByExtendBackupCursor;
+    std::set<std::string> logFilePathsSeenByGetNextBatch;
+
+    // 'wtBackupCursorMutex' provides concurrency control between beginNonBlockingBackup(),
+    // endNonBlockingBackup(), and getNextBatch() because we stream the output of the backup cursor.
+    Mutex wtBackupCursorMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::wtBackupCursorMutex");
+
+    // 'wtBackupDupCursorMutex' provides concurrency control between getNextBatch() and
+    // extendBackupCursor() because WiredTiger only allows one duplicate cursor to be open at a
+    // time. extendBackupCursor() blocks on condition variable 'wtBackupDupCursorCV' if a duplicate
+    // cursor is already open.
+    Mutex wtBackupDupCursorMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::wtBackupDupCursorMutex");
+    stdx::condition_variable wtBackupDupCursorCV;
 };
 
 class WiredTigerKVEngine final : public KVEngine {
@@ -75,7 +95,7 @@ public:
                        ClockSource* cs,
                        const std::string& extraOpenOptions,
                        size_t cacheSizeMB,
-                       size_t maxCacheOverflowFileSizeMB,
+                       size_t maxHistoryFileSizeMB,
                        bool durable,
                        bool ephemeral,
                        bool repair,
@@ -173,7 +193,7 @@ public:
                       StringData ident,
                       const RecordStore* originalRecordStore) const override;
 
-    int flushAllFiles(OperationContext* opCtx, bool sync) override;
+    void flushAllFiles(OperationContext* opCtx, bool callerHoldsReadLock) override;
 
     Status beginBackup(OperationContext* opCtx) override;
 
@@ -181,7 +201,7 @@ public:
 
     Status disableIncrementalBackup(OperationContext* opCtx) override;
 
-    StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+    StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const StorageEngine::BackupOptions& options) override;
 
     void endNonBlockingBackup(OperationContext* opCtx) override;
@@ -213,6 +233,8 @@ public:
     void setStableTimestamp(Timestamp stableTimestamp, bool force) override;
 
     void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
+
+    Timestamp getInitialDataTimestamp() override;
 
     void setOldestTimestampFromStable() override;
 
@@ -253,10 +275,6 @@ public:
 
     bool supportsOplogStones() const final override;
 
-    void triggerJournalFlush() const override;
-
-    bool isCacheUnderPressure(OperationContext* opCtx) const override;
-
     bool supportsReadConcernMajority() const final;
 
     // wiredtiger specific
@@ -275,17 +293,14 @@ public:
     void syncSizeInfo(bool sync) const;
 
     /*
-     * An oplog manager is always accessible, but this method will start the background thread to
+     * The oplog manager is always accessible, but this method will start the background thread to
      * control oplog entry visibility for reads.
      *
-     * On mongod, the background thread will be started when the first oplog record store is
-     * created, and stopped when the last oplog record store is destroyed, at shutdown time. For
-     * unit tests, the background thread may be started and stopped multiple times as tests create
-     * and destroy oplog record stores.
+     * On mongod, the background thread will be started when the oplog record store is created, and
+     * stopped when the oplog record store is destroyed. For unit tests, the background thread may
+     * be started and stopped multiple times as tests create and destroy the oplog record store.
      */
-    void startOplogManager(OperationContext* opCtx,
-                           const std::string& uri,
-                           WiredTigerRecordStore* oplogRecordStore);
+    void startOplogManager(OperationContext* opCtx, WiredTigerRecordStore* oplogRecordStore);
     void haltOplogManager();
 
     /*
@@ -296,7 +311,7 @@ public:
      * `waitForAllEarlierOplogWritesToBeVisible`, is advised to first see if the oplog manager is
      * running with a call to `isRunning`.
      *
-     * A caller that simply wants to call `triggerJournalFlush` may do so without concern.
+     * A caller that simply wants to call `triggerOplogVisibilityUpdate` may do so without concern.
      */
     WiredTigerOplogManager* getOplogManager() const {
         return _oplogManager.get();
@@ -349,25 +364,8 @@ public:
         return _clockSource;
     }
 
-    /**
-     * Returns a CheckpointLockImpl RAII instance holding the _checkpointMutex.
-     */
-    std::unique_ptr<StorageEngine::CheckpointLock> getCheckpointLock(
-        OperationContext* opCtx) override;
-
-    void addIndividuallyCheckpointedIndexToList(const std::string& ident) override {
-        _checkpointedIndexes.push_back(ident);
-    }
-
-    void clearIndividuallyCheckpointedIndexesList() override {
-        _checkpointedIndexes.clear();
-    }
-
-    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const override;
-
 private:
     class WiredTigerSessionSweeper;
-    class WiredTigerJournalFlusher;
     class WiredTigerCheckpointThread;
 
     /**
@@ -396,7 +394,7 @@ private:
     std::string _uri(StringData ident) const;
 
     /**
-     * Uses the 'stableTimestamp', the 'targetSnapshotHistoryWindowInSeconds' setting and the
+     * Uses the 'stableTimestamp', the 'minSnapshotHistoryWindowInSeconds' setting and the
      * current _oldestTimestamp to calculate what the new oldest_timestamp should be, in order to
      * maintain a window of available snapshots on the storage engine from oldest to stable
      * timestamp.
@@ -457,7 +455,6 @@ private:
     const bool _keepDataHistory = true;
 
     std::unique_ptr<WiredTigerSessionSweeper> _sessionSweeper;
-    std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
     std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
 
     std::string _rsOptions;
@@ -470,7 +467,8 @@ private:
     mutable Date_t _previousCheckedDropsQueued;
 
     std::unique_ptr<WiredTigerSession> _backupSession;
-    WT_CURSOR* _backupCursor;
+    WiredTigerBackup _wtBackup;
+
     mutable Mutex _oplogPinnedByBackupMutex =
         MONGO_MAKE_LATCH("WiredTigerKVEngine::_oplogPinnedByBackupMutex");
     boost::optional<Timestamp> _oplogPinnedByBackup;
@@ -484,18 +482,10 @@ private:
     // timestamp. Provided by replication layer because WT does not persist timestamps.
     AtomicWord<std::uint64_t> _initialDataTimestamp;
 
-    // Required for taking a checkpoint; and can be used to ensure multiple checkpoint cursors
-    // target the same checkpoint.
-    Lock::ResourceMutex _checkpointMutex = Lock::ResourceMutex("checkpointCursorMutex");
-
-    // A list of indexes that were individually checkpoint'ed and are not consistent with the rest
-    // of the checkpoint's PIT view of the storage data. This list is reset when a storage-wide WT
-    // checkpoint is taken that makes the PIT view consistent again.
-    //
-    // Access must be protected by the CheckpointLock.
-    std::list<std::string> _checkpointedIndexes;
-
     std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
-    std::unique_ptr<WiredTigerMaxCacheOverflowSizeGBParameter> _maxCacheOverflowParam;
+
+    mutable Mutex _highestDurableTimestampMutex =
+        MONGO_MAKE_LATCH("WiredTigerKVEngine::_highestDurableTimestampMutex");
+    mutable unsigned long long _highestSeenDurableTimestamp = StorageEngine::kMinimumTimestamp;
 };
 }  // namespace mongo

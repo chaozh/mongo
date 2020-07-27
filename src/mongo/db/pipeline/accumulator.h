@@ -51,23 +51,28 @@ namespace mongo {
  * This enum indicates which documents an accumulator needs to see in order to compute its output.
  */
 enum class AccumulatorDocumentsNeeded {
-    // Accumulator needs to see all documents in a group.
+    // AccumulatorState needs to see all documents in a group.
     kAllDocuments,
 
-    // Accumulator only needs to see one document in a group, and when there is a sort order, that
-    // document must be the first document.
+    // AccumulatorState only needs to see one document in a group, and when there is a sort order,
+    // that document must be the first document.
     kFirstDocument,
 
-    // Accumulator only needs to see one document in a group, and when there is a sort order, that
-    // document must be the last document.
+    // AccumulatorState only needs to see one document in a group, and when there is a sort order,
+    // that document must be the last document.
     kLastDocument,
 };
 
-class Accumulator : public RefCountable {
+class AccumulatorState : public RefCountable {
 public:
-    using Factory = std::function<boost::intrusive_ptr<Accumulator>()>;
+    using Factory = std::function<boost::intrusive_ptr<AccumulatorState>()>;
 
-    Accumulator(const boost::intrusive_ptr<ExpressionContext>& expCtx) : _expCtx(expCtx) {}
+    AccumulatorState(ExpressionContext* const expCtx) : _expCtx(expCtx) {}
+
+    /** Marks the beginning of a new group. The input is the result of evaluating
+     *  AccumulatorExpression::initializer, which can read from the group key.
+     */
+    virtual void startNewGroup(const Value& input) {}
 
     /** Process input and update internal state.
      *  merging should be true when processing outputs from getValue(true).
@@ -89,7 +94,7 @@ public:
         return _memUsageBytes;
     }
 
-    /// Reset this accumulator to a fresh state ready to receive input.
+    /// Reset this accumulator to a fresh state, ready for a new call to startNewGroup.
     virtual void reset() = 0;
 
     virtual bool isAssociative() const {
@@ -109,9 +114,19 @@ public:
      *
      * When executing on a sharded cluster, the result of this function will be sent to each
      * individual shard.
+     *
+     * This implementation assumes the accumulator has the simple syntax { <name>: <argument> },
+     * such as { $sum: <argument> }. This syntax has no room for an initializer. Subclasses with a
+     * more elaborate syntax such should override this method.
      */
-    virtual Document serialize(boost::intrusive_ptr<Expression> expression, bool explain) const {
-        return DOC(getOpName() << expression->serialize(explain));
+    virtual Document serialize(boost::intrusive_ptr<Expression> initializer,
+                               boost::intrusive_ptr<Expression> argument,
+                               bool explain) const {
+        ExpressionConstant const* ec = dynamic_cast<ExpressionConstant const*>(initializer.get());
+        invariant(ec);
+        invariant(ec->getValue().nullish());
+
+        return DOC(getOpName() << argument->serialize(explain));
     }
 
     virtual AccumulatorDocumentsNeeded documentsNeeded() const {
@@ -122,7 +137,7 @@ protected:
     /// Update subclass's internal state based on input
     virtual void processInternal(const Value& input, bool merging) = 0;
 
-    const boost::intrusive_ptr<ExpressionContext>& getExpressionContext() const {
+    auto getExpressionContext() const {
         return _expCtx;
     }
 
@@ -130,29 +145,16 @@ protected:
     int _memUsageBytes = 0;
 
 private:
-    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    ExpressionContext* _expCtx;
 };
 
-/**
- * A default parser for any accumulator that only takes a single expression as an argument. Returns
- * the expression to be evaluated by the accumulator and an Accumulator::Factory.
- */
-template <class AccName>
-std::pair<boost::intrusive_ptr<Expression>, Accumulator::Factory>
-genericParseSingleExpressionAccumulator(boost::intrusive_ptr<ExpressionContext> expCtx,
-                                        BSONElement elem,
-                                        VariablesParseState vps) {
-    auto exprValue = Expression::parseOperand(expCtx, elem, vps);
-    return {exprValue, [expCtx]() { return AccName::create(expCtx); }};
-}
-
-class AccumulatorAddToSet final : public Accumulator {
+class AccumulatorAddToSet final : public AccumulatorState {
 public:
     /**
      * Creates a new $addToSet accumulator. If no memory limit is given, defaults to the value of
      * the server parameter 'internalQueryMaxAddToSetBytes'.
      */
-    AccumulatorAddToSet(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    AccumulatorAddToSet(ExpressionContext* const expCtx,
                         boost::optional<int> maxMemoryUsageBytes = boost::none);
 
     void processInternal(const Value& input, bool merging) final;
@@ -160,8 +162,7 @@ public:
     const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 
     bool isAssociative() const final {
         return true;
@@ -176,17 +177,16 @@ private:
     int _maxMemUsageBytes;
 };
 
-class AccumulatorFirst final : public Accumulator {
+class AccumulatorFirst final : public AccumulatorState {
 public:
-    explicit AccumulatorFirst(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    explicit AccumulatorFirst(ExpressionContext* const expCtx);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
     const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 
     AccumulatorDocumentsNeeded documentsNeeded() const final {
         return AccumulatorDocumentsNeeded::kFirstDocument;
@@ -197,17 +197,16 @@ private:
     Value _first;
 };
 
-class AccumulatorLast final : public Accumulator {
+class AccumulatorLast final : public AccumulatorState {
 public:
-    explicit AccumulatorLast(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    explicit AccumulatorLast(ExpressionContext* const expCtx);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
     const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 
     AccumulatorDocumentsNeeded documentsNeeded() const final {
         return AccumulatorDocumentsNeeded::kLastDocument;
@@ -217,17 +216,16 @@ private:
     Value _last;
 };
 
-class AccumulatorSum final : public Accumulator {
+class AccumulatorSum final : public AccumulatorState {
 public:
-    explicit AccumulatorSum(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    explicit AccumulatorSum(ExpressionContext* const expCtx);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
     const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 
     bool isAssociative() const final {
         return true;
@@ -243,14 +241,14 @@ private:
     Decimal128 decimalTotal;
 };
 
-class AccumulatorMinMax : public Accumulator {
+class AccumulatorMinMax : public AccumulatorState {
 public:
     enum Sense : int {
         MIN = 1,
         MAX = -1,  // Used to "scale" comparison.
     };
 
-    AccumulatorMinMax(const boost::intrusive_ptr<ExpressionContext>& expCtx, Sense sense);
+    AccumulatorMinMax(ExpressionContext* const expCtx, Sense sense);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
@@ -272,27 +270,23 @@ private:
 
 class AccumulatorMax final : public AccumulatorMinMax {
 public:
-    explicit AccumulatorMax(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : AccumulatorMinMax(expCtx, MAX) {}
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    explicit AccumulatorMax(ExpressionContext* const expCtx) : AccumulatorMinMax(expCtx, MAX) {}
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 };
 
 class AccumulatorMin final : public AccumulatorMinMax {
 public:
-    explicit AccumulatorMin(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : AccumulatorMinMax(expCtx, MIN) {}
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    explicit AccumulatorMin(ExpressionContext* const expCtx) : AccumulatorMinMax(expCtx, MIN) {}
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 };
 
-class AccumulatorPush final : public Accumulator {
+class AccumulatorPush final : public AccumulatorState {
 public:
     /**
      * Creates a new $push accumulator. If no memory limit is given, defaults to the value of the
      * server parameter 'internalQueryMaxPushBytes'.
      */
-    AccumulatorPush(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    AccumulatorPush(ExpressionContext* const expCtx,
                     boost::optional<int> maxMemoryUsageBytes = boost::none);
 
     void processInternal(const Value& input, bool merging) final;
@@ -300,25 +294,23 @@ public:
     const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 
 private:
     std::vector<Value> _array;
     int _maxMemUsageBytes;
 };
 
-class AccumulatorAvg final : public Accumulator {
+class AccumulatorAvg final : public AccumulatorState {
 public:
-    explicit AccumulatorAvg(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    explicit AccumulatorAvg(ExpressionContext* const expCtx);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
     const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 
 private:
     /**
@@ -333,9 +325,9 @@ private:
     long long _count;
 };
 
-class AccumulatorStdDev : public Accumulator {
+class AccumulatorStdDev : public AccumulatorState {
 public:
-    AccumulatorStdDev(const boost::intrusive_ptr<ExpressionContext>& expCtx, bool isSamp);
+    AccumulatorStdDev(ExpressionContext* const expCtx, bool isSamp);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
@@ -351,31 +343,28 @@ private:
 
 class AccumulatorStdDevPop final : public AccumulatorStdDev {
 public:
-    explicit AccumulatorStdDevPop(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    explicit AccumulatorStdDevPop(ExpressionContext* const expCtx)
         : AccumulatorStdDev(expCtx, false) {}
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 };
 
 class AccumulatorStdDevSamp final : public AccumulatorStdDev {
 public:
-    explicit AccumulatorStdDevSamp(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    explicit AccumulatorStdDevSamp(ExpressionContext* const expCtx)
         : AccumulatorStdDev(expCtx, true) {}
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 };
 
-class AccumulatorMergeObjects : public Accumulator {
+class AccumulatorMergeObjects : public AccumulatorState {
 public:
-    AccumulatorMergeObjects(const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    AccumulatorMergeObjects(ExpressionContext* const expCtx);
 
     void processInternal(const Value& input, bool merging) final;
     Value getValue(bool toBeMerged) final;
     const char* getOpName() const final;
     void reset() final;
 
-    static boost::intrusive_ptr<Accumulator> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<AccumulatorState> create(ExpressionContext* const expCtx);
 
 private:
     MutableDocument _output;

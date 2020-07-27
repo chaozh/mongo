@@ -1,11 +1,11 @@
 // Tests the behavior of an $merge stage which encounters an error in the middle of processing. We
 // don't guarantee any particular behavior in this scenario, but this test exists to make sure
 // nothing horrendous happens and to characterize the current behavior.
-// @tags: [assumes_unsharded_collection]
 (function() {
 "use strict";
 
-load("jstests/aggregation/extras/merge_helpers.js");  // For withEachMergeMode.
+load("jstests/aggregation/extras/merge_helpers.js");  // For withEachMergeMode and
+                                                      // dropWithoutImplicitRecreate.
 load("jstests/aggregation/extras/utils.js");          // For assertErrorCode.
 
 const coll = db.batch_writes;
@@ -46,7 +46,7 @@ for (let i = 0; i < 10; i++) {
 // running the $merge. The second document to be written ({_id: 1, a: 1}) will conflict with the
 // existing document in the output collection. We use a unique index on a field other than _id
 // because whenMatched: "replace" will not change _id when one already exists.
-outColl.drop();
+dropWithoutImplicitRecreate(outColl.getName());
 assert.commandWorked(outColl.insert({_id: 2, a: 1}));
 assert.commandWorked(outColl.createIndex({a: 1}, {unique: true}));
 
@@ -61,9 +61,17 @@ assert.soon(() => {
     return outColl.find().itcount() == 9;
 });
 
+// Note that a $sort comes before the $merge to guarantee that {_id: 1, a: 1} will always be
+// seen before {_id: 2, a: 2}. If {_id: 1, a: 1} is seen first, it gets inserted and will
+// trigger a DuplicateKeyError since a's value is duplicated by {_id: 2, a: 1}. If {_id: 2, a:
+// 2} is seen first, then it will make the replacement {_id: 2, a: 1} => {_id: 2, a: 2},
+// preventing a duplicate key error from arising later on.
 assertErrorCode(
     coll,
-    [{$merge: {into: outColl.getName(), whenMatched: "replace", whenNotMatched: "insert"}}],
+    [
+        {$sort: {a: 1}},
+        {$merge: {into: outColl.getName(), whenMatched: "replace", whenNotMatched: "insert"}}
+    ],
     ErrorCodes.DuplicateKey);
 assert.soon(() => {
     return outColl.find().itcount() == 9;

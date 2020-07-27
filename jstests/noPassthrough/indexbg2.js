@@ -44,8 +44,8 @@ let waitParallel = function() {
 };
 
 let turnFailPointOn = function(failPointName, i) {
-    assert.commandWorked(
-        conn.adminCommand({configureFailPoint: failPointName, mode: "alwaysOn", data: {"i": i}}));
+    assert.commandWorked(conn.adminCommand(
+        {configureFailPoint: failPointName, mode: "alwaysOn", data: {fieldsToMatch: {i: i}}}));
 };
 
 let turnFailPointOff = function(failPointName) {
@@ -71,17 +71,24 @@ let failOnExistingDuplicateValue = function(coll) {
 let failOnInsertedDuplicateValue = function(coll) {
     let duplicateKey = 7;
 
-    turnFailPointOn("hangBeforeIndexBuildOf", duplicateKey);
+    turnFailPointOn("hangIndexBuildDuringCollectionScanPhaseBeforeInsertion", duplicateKey);
 
     let bgIndexBuildPid;
     try {
         bgIndexBuildPid = indexBuild();
-        jsTestLog("Waiting to hang before index build of i=" + duplicateKey);
-        checkLog.contains(conn, "Hanging before index build of i=" + duplicateKey);
+
+        jsTestLog("Waiting to hang index build during collection scan before insertion of {i: " +
+                  duplicateKey + "}");
+        checkLog.containsJson(conn, 20386, {
+            where: "before",
+            doc: function(doc) {
+                return doc.i === duplicateKey;
+            }
+        });
 
         assert.commandWorked(coll.save({i: duplicateKey}));
     } finally {
-        turnFailPointOff("hangBeforeIndexBuildOf");
+        turnFailPointOff("hangIndexBuildDuringCollectionScanPhaseBeforeInsertion");
     }
 
     waitProgram(bgIndexBuildPid);
@@ -99,14 +106,20 @@ let failOnInsertedDuplicateValue = function(coll) {
 let succeedWithoutWriteErrors = function(coll, newKey) {
     let duplicateKey = 3;
 
-    turnFailPointOn("hangAfterIndexBuildOf", duplicateKey);
+    turnFailPointOn("hangIndexBuildDuringCollectionScanPhaseAfterInsertion", duplicateKey);
 
     let bgIndexBuildPid;
     try {
         bgIndexBuildPid = indexBuild();
 
-        jsTestLog("Waiting to hang after index build of i=" + duplicateKey);
-        checkLog.contains(conn, "Hanging after index build of i=" + duplicateKey);
+        jsTestLog("Waiting to hang index build during collection scan after insertion of {i: " +
+                  duplicateKey + "}");
+        checkLog.containsJson(conn, 20386, {
+            where: "after",
+            doc: function(doc) {
+                return doc.i === duplicateKey;
+            }
+        });
 
         assert.commandWorked(coll.insert({i: duplicateKey, n: true}));
 
@@ -118,7 +131,7 @@ let succeedWithoutWriteErrors = function(coll, newKey) {
         assert.commandWorked(coll.deleteOne({i: newKey, n: true}));
 
     } finally {
-        turnFailPointOff("hangAfterIndexBuildOf");
+        turnFailPointOff("hangIndexBuildDuringCollectionScanPhaseAfterInsertion");
     }
 
     waitProgram(bgIndexBuildPid);

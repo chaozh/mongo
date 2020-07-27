@@ -27,20 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -99,10 +100,17 @@ public:
                     "prepareTransaction must be run within a transaction",
                     txnParticipant);
 
-            LOG(3)
-                << "Participant shard received prepareTransaction for transaction with txnNumber "
-                << opCtx->getTxnNumber() << " on session "
-                << opCtx->getLogicalSessionId()->toBSON();
+            LOGV2_DEBUG(22483,
+                        3,
+                        "{sessionId}:{txnNumber} Participant shard received prepareTransaction",
+                        "Participant shard received prepareTransaction",
+                        "sessionId"_attr = opCtx->getLogicalSessionId()->toBSON(),
+                        "txnNumber"_attr = opCtx->getTxnNumber());
+
+            // TODO(SERVER-46105) remove
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    "Cannot create new collections inside distributed transactions",
+                    UncommittedCollections::get(opCtx).isEmpty());
 
             uassert(ErrorCodes::NoSuchTransaction,
                     "Transaction isn't in progress",
@@ -199,10 +207,15 @@ std::set<ShardId> validateParticipants(OperationContext* opCtx,
     }
     ss << ']';
 
-    LOG(3) << "Coordinator shard received request to coordinate commit with "
-              "participant list "
-           << ss.str() << " for " << opCtx->getLogicalSessionId()->getId() << ':'
-           << opCtx->getTxnNumber();
+    LOGV2_DEBUG(
+        22484,
+        3,
+        "{sessionId}:{txnNumber} Coordinator shard received request to coordinate commit with "
+        "participant list {participantList}",
+        "Coordinator shard received request to coordinate commit",
+        "sessionId"_attr = opCtx->getLogicalSessionId()->getId(),
+        "txnNumber"_attr = opCtx->getTxnNumber(),
+        "participantList"_attr = ss.str());
 
     return participantsSet;
 }
@@ -234,7 +247,7 @@ public:
                                         validateParticipants(opCtx, cmd.getParticipants()));
 
             if (MONGO_unlikely(hangAfterStartingCoordinateCommit.shouldFail())) {
-                LOG(0) << "Hit hangAfterStartingCoordinateCommit failpoint";
+                LOGV2(22485, "Hit hangAfterStartingCoordinateCommit failpoint");
                 hangAfterStartingCoordinateCommit.pauseWhileSet(opCtx);
             }
 
@@ -248,8 +261,7 @@ public:
 
             if (coordinatorDecisionFuture) {
                 auto swCommitDecision = coordinatorDecisionFuture->getNoThrow(opCtx);
-                // The coordinator can only throw NoSuchTransaction (as opposed to propagating an
-                // Abort decision due to NoSuchTransaction reported by a shard) if
+                // The coordinator can throw TransactionCoordinatorCanceled if
                 // cancelIfCommitNotYetStarted was called, which can happen in one of 3 cases:
                 //
                 //  1) The deadline to receive coordinateCommit passed
@@ -261,21 +273,28 @@ public:
                 // Even though only (3) requires recovering the commit decision from the local
                 // participant, since these cases cannot be differentiated currently, we always
                 // recover from the local participant.
-                if (swCommitDecision != ErrorCodes::NoSuchTransaction) {
-                    auto commitDecision = uassertStatusOK(std::move(swCommitDecision));
-                    switch (commitDecision) {
-                        case txn::CommitDecision::kCommit:
-                            return;
-                        case txn::CommitDecision::kAbort:
-                            uasserted(ErrorCodes::NoSuchTransaction, "Transaction was aborted");
+                if (swCommitDecision != ErrorCodes::TransactionCoordinatorCanceled) {
+                    if (swCommitDecision.isOK()) {
+                        invariant(swCommitDecision.getValue() == txn::CommitDecision::kCommit);
+                        return;
                     }
+
+                    invariant(swCommitDecision != ErrorCodes::TransactionCoordinatorSteppingDown);
+                    invariant(swCommitDecision !=
+                              ErrorCodes::TransactionCoordinatorReachedAbortDecision);
+
+                    uassertStatusOKWithContext(swCommitDecision, "Transaction was aborted");
                 }
             }
 
             // No coordinator was found in memory. Recover the decision from the local participant.
 
-            LOG(3) << "Going to recover decision from local participant for "
-                   << opCtx->getLogicalSessionId()->getId() << ':' << opCtx->getTxnNumber();
+            LOGV2_DEBUG(22486,
+                        3,
+                        "{sessionId}:{txnNumber} Going to recover decision from local participant",
+                        "Going to recover decision from local participant",
+                        "sessionId"_attr = opCtx->getLogicalSessionId()->getId(),
+                        "txnNumber"_attr = opCtx->getTxnNumber());
 
             boost::optional<SharedSemiFuture<void>> participantExitPrepareFuture;
             {

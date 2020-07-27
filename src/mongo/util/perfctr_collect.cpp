@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kFTDC
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kFTDC
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/util/log.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"

@@ -35,6 +35,7 @@
 #include "mongo/base/data_type_validated.h"
 #include "mongo/bson/bson_depth.h"
 #include "mongo/client/dbclient_base.h"
+#include "mongo/config.h"
 #include "mongo/crypto/aead_encryption.h"
 #include "mongo/crypto/fle_data_frames.h"
 #include "mongo/crypto/symmetric_crypto.h"
@@ -500,15 +501,23 @@ JS::Value EncryptedDBClientBase::getCollection() const {
 }
 
 
-std::unique_ptr<DBClientCursor> EncryptedDBClientBase::query(const NamespaceStringOrUUID& nsOrUuid,
-                                                             Query query,
-                                                             int nToReturn,
-                                                             int nToSkip,
-                                                             const BSONObj* fieldsToReturn,
-                                                             int queryOptions,
-                                                             int batchSize) {
-    return _conn->query(
-        nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
+std::unique_ptr<DBClientCursor> EncryptedDBClientBase::query(
+    const NamespaceStringOrUUID& nsOrUuid,
+    Query query,
+    int nToReturn,
+    int nToSkip,
+    const BSONObj* fieldsToReturn,
+    int queryOptions,
+    int batchSize,
+    boost::optional<BSONObj> readConcernObj) {
+    return _conn->query(nsOrUuid,
+                        query,
+                        nToReturn,
+                        nToSkip,
+                        fieldsToReturn,
+                        queryOptions,
+                        batchSize,
+                        readConcernObj);
 }
 
 bool EncryptedDBClientBase::isFailed() const {
@@ -636,6 +645,12 @@ std::shared_ptr<SymmetricKey> EncryptedDBClientBase::getDataKeyFromDisk(const UU
     return std::make_shared<SymmetricKey>(
         std::move(decryptedKey), crypto::aesAlgorithm, "kms_encryption");
 }
+
+#ifdef MONGO_CONFIG_SSL
+const SSLConfiguration* EncryptedDBClientBase::getSSLConfiguration() {
+    return _conn->getSSLConfiguration();
+}
+#endif
 
 namespace {
 

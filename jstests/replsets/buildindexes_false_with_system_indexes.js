@@ -64,6 +64,7 @@ assert.eq(["_id_"], hiddenAdminDb.system.users.getIndexes().map(x => x.name).sor
 assert.eq(["_id_"], hiddenAdminDb.system.roles.getIndexes().map(x => x.name).sort());
 
 secondary = rst.restart(secondary, {}, true /* wait for node to become healthy */);
+rst.awaitSecondaryNodes();
 secondaryAdminDb = secondary.getDB("admin");
 assert.eq(["_id_"], secondaryAdminDb.system.users.getIndexes().map(x => x.name).sort());
 assert.eq(["_id_"], secondaryAdminDb.system.roles.getIndexes().map(x => x.name).sort());
@@ -72,8 +73,8 @@ jsTestLog("Now restarting primary; indexes should be created.");
 rst.restart(primary);
 primary = rst.getPrimary();
 rst.awaitReplication();
-rst.waitForAllIndexBuildsToFinish("admin", "system.users");
-rst.waitForAllIndexBuildsToFinish("admin", "system.roles");
+rst.awaitReplication();
+rst.awaitReplication();
 adminDb = primary.getDB("admin");
 assert.eq(["_id_", "user_1_db_1"], adminDb.system.users.getIndexes().map(x => x.name).sort());
 assert.eq(["_id_", "role_1_db_1"], adminDb.system.roles.getIndexes().map(x => x.name).sort());

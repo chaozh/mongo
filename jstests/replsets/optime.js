@@ -59,7 +59,11 @@ function optimesAndWallTimesAreEqual(replTest, isPersistent) {
 var replTest = new ReplSetTest(
     {name: "replStatus", nodes: 3, oplogSize: 1, waitForKeys: true, nodeOptions: {syncdelay: 1}});
 
-replTest.startSet();
+const nodes = replTest.startSet();
+
+// Tests that serverStatus oplog returns an error if the oplog collection doesn't exist.
+assert.commandFailedWithCode(nodes[0].getDB('admin').serverStatus({oplog: true}), 17347);
+
 replTest.initiate();
 var master = replTest.getPrimary();
 replTest.awaitReplication();
@@ -77,23 +81,39 @@ let initialReplStatusInfo = master.getDB('admin').runCommand({replSetGetStatus: 
 // Do an insert to increment optime, but without rolling the oplog
 // latestOptime should be updated, but earliestOptime should be unchanged
 var options = {writeConcern: {w: replTest.nodes.length}};
+if (isPersistent) {
+    // Ensure the durable optime is advanced.
+    options.writeConcern.j = true;
+}
 assert.commandWorked(master.getDB('test').foo.insert({a: 1}, options));
 assert.soon(function() {
     return optimesAndWallTimesAreEqual(replTest, isPersistent);
 });
 
 var info = master.getDB('admin').serverStatus({oplog: true}).oplog;
+var entry = master.getDB('local').oplog.rs.findOne().ts;
+jsTest.log("First entry's timestamp is " + tojson(entry));
 let replStatusInfo = master.getDB('admin').runCommand({replSetGetStatus: 1});
-assert.gt(timestampCompare(info.latestOptime, initialInfo.latestOptime), 0);
+
+const dumpInfoFn = function() {
+    jsTestLog("Initial server status: " + tojsononeline(initialInfo));
+    jsTestLog("Initial replSetGetStatus: " + tojsononeline(initialReplStatusInfo));
+    jsTestLog("Final server status: " + tojsononeline(info));
+    jsTestLog("Final replSetGetStatus: " + tojsononeline(replStatusInfo));
+};
+
+assert.gt(timestampCompare(info.latestOptime, initialInfo.latestOptime), 0, dumpInfoFn);
 assert.gt(wallTimeCompare(replStatusInfo.optimes.lastAppliedWallTime,
                           initialReplStatusInfo.optimes.lastAppliedWallTime),
-          0);
+          0,
+          dumpInfoFn);
 if (isPersistent) {
     assert.gt(wallTimeCompare(replStatusInfo.optimes.lastDurableWallTime,
                               initialReplStatusInfo.optimes.lastDurableWallTime),
-              0);
+              0,
+              dumpInfoFn);
 }
-assert.eq(timestampCompare(info.earliestOptime, initialInfo.earliestOptime), 0);
+assert.eq(timestampCompare(info.earliestOptime, initialInfo.earliestOptime), 0, dumpInfoFn);
 
 // Insert some large documents to force the oplog to roll over
 var largeString = new Array(1024 * 10).toString();
@@ -103,11 +123,15 @@ for (var i = 0; i < 2000; i++) {
 assert.soon(function() {
     return optimesAndWallTimesAreEqual(replTest, isPersistent);
 });
+entry = master.getDB('local').oplog.rs.findOne().ts;
+jsTest.log("First entry's timestamp is now " + tojson(entry) + " after oplog rollover");
 
 // This block requires a fresh stable checkpoint.
 assert.soon(function() {
     // Test that earliestOptime was updated
     info = master.getDB('admin').serverStatus({oplog: true}).oplog;
+    jsTest.log("Earliest optime is now " + tojson(info.earliestOptime) +
+               "; looking for it to be different from " + tojson(initialInfo.earliestOptime));
     replStatusInfo = master.getDB('admin').runCommand({replSetGetStatus: 1});
     return timestampCompare(info.latestOptime, initialInfo.latestOptime) > 0 &&
         wallTimeCompare(replStatusInfo.optimes.lastAppliedWallTime,

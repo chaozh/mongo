@@ -32,6 +32,8 @@
 #include <deque>
 
 #include "mongo/db/pipeline/document_source_queue.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/pipeline/stage_constraints.h"
 
 namespace mongo {
 
@@ -41,22 +43,24 @@ namespace mongo {
  */
 class DocumentSourceMock : public DocumentSourceQueue {
 public:
-    // Constructors which create their own ExpressionContextForTest. Do _not_ use these outside of
-    // tests, as they will spin up ServiceContexts (TODO SERVER-41060).
-    static boost::intrusive_ptr<DocumentSourceMock> createForTest();
-
-    static boost::intrusive_ptr<DocumentSourceMock> createForTest(Document doc);
-
-    static boost::intrusive_ptr<DocumentSourceMock> createForTest(const GetNextResult& result);
     static boost::intrusive_ptr<DocumentSourceMock> createForTest(
-        std::deque<GetNextResult> results);
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    static boost::intrusive_ptr<DocumentSourceMock> createForTest(const char* json);
     static boost::intrusive_ptr<DocumentSourceMock> createForTest(
-        const std::initializer_list<const char*>& jsons);
+        Document doc, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    using DocumentSourceQueue::DocumentSourceQueue;
-    DocumentSourceMock(std::deque<GetNextResult>);
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        const GetNextResult& result, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        std::deque<GetNextResult> results, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        const char* json, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+    static boost::intrusive_ptr<DocumentSourceMock> createForTest(
+        const std::initializer_list<const char*>& jsons,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    DocumentSourceMock(std::deque<GetNextResult>, const boost::intrusive_ptr<ExpressionContext>&);
 
     Value serialize(
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override {
@@ -79,6 +83,10 @@ public:
         return this;
     }
 
+    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
+        return mockConstraints;
+    }
+
     /**
      * This stage does not modify anything.
      */
@@ -93,6 +101,8 @@ public:
     bool isDisposed = false;
     bool isDetachedFromOpCtx = false;
     bool isOptimized = false;
+    StageConstraints mockConstraints;
+
 
 protected:
     GetNextResult doGetNext() override {

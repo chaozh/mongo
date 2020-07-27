@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +38,7 @@
 
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/executor/remote_command_request.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
@@ -45,7 +46,6 @@
 #include "mongo/transport/baton.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 using namespace fmt::literals;
@@ -56,6 +56,9 @@ namespace {
 
 // Maximum number of retries for network and replication notMaster errors (per host).
 const int kMaxNumFailedHostRetryAttempts = 3;
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeSchedulingRemoteCommand);
+MONGO_FAIL_POINT_DEFINE(hangBeforePollResponse);
 
 }  // namespace
 
@@ -86,6 +89,17 @@ AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
 
 AsyncRequestsSender::Response AsyncRequestsSender::next() noexcept {
     invariant(!done());
+
+    hangBeforePollResponse.executeIf(
+        [&](const BSONObj& data) {
+            while (MONGO_unlikely(hangBeforePollResponse.shouldFail())) {
+                LOGV2(4840900, "Hanging in ARS::next due to 'hangBeforePollResponse' failpoint");
+                sleepmillis(100);
+            }
+        },
+        [&](const BSONObj& data) {
+            return MONGO_unlikely(_remotesLeft == (size_t)data.getIntField("remotesLeft"));
+        });
 
     _remotesLeft--;
 
@@ -182,7 +196,22 @@ SemiFuture<std::vector<HostAndPort>> AsyncRequestsSender::RemoteData::resolveSha
 
 auto AsyncRequestsSender::RemoteData::scheduleRemoteCommand(std::vector<HostAndPort>&& hostAndPorts)
     -> SemiFuture<RemoteCommandOnAnyCallbackArgs> {
-    auto hedgeOptions = extractHedgeOptions(_ars->_opCtx, _cmdObj);
+    hangBeforeSchedulingRemoteCommand.executeIf(
+        [&](const BSONObj& data) {
+            while (MONGO_unlikely(hangBeforeSchedulingRemoteCommand.shouldFail())) {
+                LOGV2(4625505,
+                      "Hanging in ARS due to "
+                      "'hangBeforeSchedulingRemoteCommand' failpoint");
+                sleepmillis(100);
+            }
+        },
+        [&](const BSONObj& data) {
+            return MONGO_unlikely(std::count(hostAndPorts.begin(),
+                                             hostAndPorts.end(),
+                                             HostAndPort(data.getStringField("hostAndPort"))));
+        });
+
+    auto hedgeOptions = extractHedgeOptions(_cmdObj, _ars->_readPreference);
     executor::RemoteCommandRequestOnAny request(std::move(hostAndPorts),
                                                 _ars->_db,
                                                 _cmdObj,
@@ -243,18 +272,18 @@ auto AsyncRequestsSender::RemoteData::handleResponse(RemoteCommandOnAnyCallbackA
         }
 
         shard->updateReplSetMonitor(failedTargets.front(), status);
-
+        bool isStartingTransaction = _cmdObj.getField("startTransaction").booleanSafe();
         if (!_ars->_stopRetrying && shard->isRetriableError(status.code(), _ars->_retryPolicy) &&
-            _retryCount < kMaxNumFailedHostRetryAttempts) {
+            _retryCount < kMaxNumFailedHostRetryAttempts && !isStartingTransaction) {
 
-            LOG(1) << "Command to remote " << _shardId
-                   << (failedTargets.empty()
-                           ? " "
-                           : (failedTargets.size() > 1 ? " for hosts " : " at host "))
-                   << "{}"_format(fmt::join(failedTargets, ", "))
-                   << "failed with retriable error and will be retried "
-                   << causedBy(redact(status));
-
+            LOGV2_DEBUG(4615637,
+                        1,
+                        "Command to remote {shardId} for hosts {hosts} failed with retryable error "
+                        "{error} and will be retried",
+                        "Command to remote shard failed with retryable error and will be retried",
+                        "shardId"_attr = _shardId,
+                        "hosts"_attr = failedTargets,
+                        "error"_attr = redact(status));
             ++_retryCount;
             _shardHostAndPort.reset();
             // retry through recursion

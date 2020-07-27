@@ -143,6 +143,14 @@ public:
      */
     Collection* lookupCollectionByUUID(OperationContext* opCtx, CollectionUUID uuid) const;
 
+    void makeCollectionVisible(CollectionUUID uuid);
+
+    /**
+     * Returns true if the collection has been registered in the CollectionCatalog but not yet made
+     * visible.
+     */
+    bool isCollectionAwaitingVisibility(CollectionUUID uuid) const;
+
     /**
      * This function gets the Collection pointer that corresponds to the NamespaceString.
      * The required locks must be obtained prior to calling this function, or else the found
@@ -211,6 +219,23 @@ public:
     std::vector<std::string> getAllDbNames() const;
 
     /**
+     * Sets 'newProfileLevel' as the profiling level for the database 'dbName'.
+     */
+    void setDatabaseProfileLevel(StringData dbName, int newProfileLevel);
+
+    /**
+     * Fetches the profiling level for database 'dbName'.
+     *
+     * Returns the server's default database profile level if the database does not exist.
+     */
+    int getDatabaseProfileLevel(StringData dbName) const;
+
+    /**
+     * Clears the database profile level entry for 'dbName'.
+     */
+    void clearDatabaseProfileLevel(StringData dbName);
+
+    /**
      * Puts the catalog in closed state. In this state, the lookupNSSByUUID method will fall back
      * to the pre-close state to resolve queries for currently unknown UUIDs. This allows processes,
      * like authorization and replication, which need to do lookups outside of database locks, to
@@ -226,6 +251,17 @@ public:
      * Must be called with the global lock acquired in exclusive mode.
      */
     void onOpenCatalog(OperationContext* opCtx);
+
+    /**
+     * The epoch is incremented whenever the catalog is closed and re-opened.
+     *
+     * Callers of this method must hold the global lock in at least MODE_IS.
+     *
+     * This allows callers to detect an intervening catalog close. For example, closing the catalog
+     * must kill all active queries. This is implemented by checking that the epoch has not changed
+     * during query yield recovery.
+     */
+    uint64_t getEpoch() const;
 
     iterator begin(StringData db) const;
     iterator end() const;
@@ -264,10 +300,12 @@ private:
         mongo::stdx::unordered_map<CollectionUUID, NamespaceString, CollectionUUID::Hash>>
         _shadowCatalog;
 
-    using CollectionCatalogMap = mongo::stdx::
-        unordered_map<CollectionUUID, std::unique_ptr<Collection>, CollectionUUID::Hash>;
+    using CollectionCatalogMap =
+        stdx::unordered_map<CollectionUUID, std::unique_ptr<Collection>, CollectionUUID::Hash>;
     using OrderedCollectionMap = std::map<std::pair<std::string, CollectionUUID>, Collection*>;
-    using NamespaceCollectionMap = mongo::stdx::unordered_map<NamespaceString, Collection*>;
+    using NamespaceCollectionMap = stdx::unordered_map<NamespaceString, Collection*>;
+    using DatabaseProfileLevelMap = StringMap<int>;
+
     CollectionCatalogMap _catalog;
     OrderedCollectionMap _orderedCollections;  // Ordered by <dbName, collUUID> pair
     NamespaceCollectionMap _collections;
@@ -277,10 +315,32 @@ private:
      */
     uint64_t _generationNumber;
 
+    // Incremented whenever the CollectionCatalog gets closed and reopened (onCloseCatalog and
+    // onOpenCatalog).
+    //
+    // Catalog objects are destroyed and recreated when the catalog is closed and re-opened. We
+    // increment this counter to track when the catalog is reopened. This permits callers to detect
+    // after yielding whether their catalog pointers are still valid. Collection UUIDs are not
+    // sufficient, since they remain stable across catalog re-opening.
+    //
+    // A thread must hold the global exclusive lock to write to this variable, and must hold the
+    // global lock in at least MODE_IS to read it.
+    uint64_t _epoch = 0;
+
     // Protects _resourceInformation.
     mutable Mutex _resourceLock = MONGO_MAKE_LATCH("CollectionCatalog::_resourceLock");
 
     // Mapping from ResourceId to a set of strings that contains collection and database namespaces.
     std::map<ResourceId, std::set<std::string>> _resourceInformation;
+
+    // Protects _databaseProfileLevels.
+    mutable Mutex _profileLevelsLock = MONGO_MAKE_LATCH("CollectionCatalog::_profileLevelsLock");
+
+    /**
+     * Contains non-default database profile levels. New collections, current collections and views
+     * must all be able to access the correct profile level for the database in which they reside.
+     * Simple database name to integer profile level map. Access protected by the _catalogLock.
+     */
+    DatabaseProfileLevelMap _databaseProfileLevels;
 };
 }  // namespace mongo

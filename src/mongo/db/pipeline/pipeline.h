@@ -54,6 +54,7 @@ class CollatorInterface;
 class DocumentSource;
 class ExpressionContext;
 class OperationContext;
+class Pipeline;
 class PipelineDeleter;
 
 /**
@@ -62,6 +63,15 @@ class PipelineDeleter;
  * nor DocumentSource::optimize() will be attempted.
  */
 extern FailPoint disablePipelineOptimization;
+
+using PipelineValidatorCallback = std::function<void(const Pipeline&)>;
+
+struct MakePipelineOptions {
+    bool optimize = true;
+    bool attachCursorSource = true;
+    bool allowTargetingShards = true;
+    PipelineValidatorCallback validator = nullptr;
+};
 
 /**
  * A Pipeline object represents a list of DocumentSources and is responsible for optimizing the
@@ -83,7 +93,8 @@ public:
     static constexpr MatchExpressionParser::AllowedFeatureSet kAllowedMatcherFeatures =
         MatchExpressionParser::AllowedFeatures::kText |
         MatchExpressionParser::AllowedFeatures::kExpr |
-        MatchExpressionParser::AllowedFeatures::kJSONSchema;
+        MatchExpressionParser::AllowedFeatures::kJSONSchema |
+        MatchExpressionParser::AllowedFeatures::kEncryptKeywords;
 
     /**
      * The match expression features allowed when running a pipeline with $geoNear.
@@ -92,31 +103,24 @@ public:
         MatchExpressionParser::AllowedFeatures::kText |
         MatchExpressionParser::AllowedFeatures::kExpr |
         MatchExpressionParser::AllowedFeatures::kJSONSchema |
+        MatchExpressionParser::AllowedFeatures::kEncryptKeywords |
         MatchExpressionParser::AllowedFeatures::kGeoNear;
 
     /**
-     * Parses a Pipeline from a vector of BSONObjs. Returns a non-OK status if it failed to parse.
-     * The returned pipeline is not optimized, but the caller may convert it to an optimized
-     * pipeline by calling optimizePipeline().
+     * Parses a Pipeline from a vector of BSONObjs then invokes the optional 'validator' callback
+     * with a reference to the newly created Pipeline. If no validator callback is given, this
+     * method assumes that we're parsing a top-level pipeline. Throws an exception if it failed to
+     * parse or if any exception occurs in the validator. The returned pipeline is not optimized,
+     * but the caller may convert it to an optimized pipeline by calling optimizePipeline().
      *
      * It is illegal to create a pipeline using an ExpressionContext which contains a collation that
      * will not be used during execution of the pipeline. Doing so may cause comparisons made during
      * parse-time to return the wrong results.
      */
-    static StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> parse(
+    static std::unique_ptr<Pipeline, PipelineDeleter> parse(
         const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
-     * Parses a $facet Pipeline from a vector of BSONObjs. Validation checks which are only relevant
-     * to top-level pipelines are skipped, and additional checks applicable to $facet pipelines are
-     * performed. Returns a non-OK status if it failed to parse. The returned pipeline is not
-     * optimized, but the caller may convert it to an optimized pipeline by calling
-     * optimizePipeline().
-     */
-    static StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> parseFacetPipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx);
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        PipelineValidatorCallback validator = nullptr);
 
     /**
      * Creates a Pipeline from an existing SourceContainer.
@@ -124,16 +128,7 @@ public:
      * Returns a non-OK status if any stage is in an invalid position. For example, if an $out stage
      * is present but is not the last stage.
      */
-    static StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> create(
-        SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
-
-    /**
-     * Creates a $facet Pipeline from an existing SourceContainer.
-     *
-     * Returns a non-OK status if any stage is invalid. For example, if the pipeline is empty or if
-     * any stage is an initial source.
-     */
-    static StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> createFacetPipeline(
+    static std::unique_ptr<Pipeline, PipelineDeleter> create(
         SourceContainer sources, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     /**
@@ -141,23 +136,35 @@ public:
      */
     static bool aggHasWriteStage(const BSONObj& cmd);
 
+    /**
+     * Parses a Pipeline from a vector of BSONObjs representing DocumentSources. The state of the
+     * returned pipeline will depend upon the supplied MakePipelineOptions:
+     * - The boolean opts.optimize determines whether the pipeline will be optimized.
+     * - If opts.attachCursorSource is false, the pipeline will be returned without attempting to
+     * add an initial cursor source.
+     *
+     * This function throws if parsing the pipeline failed.
+     */
+    static std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
+        const std::vector<BSONObj>& rawPipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const MakePipelineOptions opts = MakePipelineOptions{});
+
+    std::unique_ptr<Pipeline, PipelineDeleter> clone() const;
+
     const boost::intrusive_ptr<ExpressionContext>& getContext() const {
         return pCtx;
     }
 
     /**
-     * Sets the OperationContext of 'pCtx' to nullptr.
-     *
-     * The PipelineProxyStage is responsible for detaching the OperationContext and releasing any
-     * storage-engine state of the DocumentSourceCursor that may be present in '_sources'.
+     * Sets the OperationContext of 'pCtx' to nullptr and calls 'detachFromOperationContext()' on
+     * all underlying DocumentSources.
      */
     void detachFromOperationContext();
 
     /**
-     * Sets the OperationContext of 'pCtx' to 'opCtx'.
-     *
-     * The PipelineProxyStage is responsible for reattaching the OperationContext and reacquiring
-     * any storage-engine state of the DocumentSourceCursor that may be present in '_sources'.
+     * Sets the OperationContext of 'pCtx' to 'opCtx', and reattaches all underlying DocumentSources
+     * to 'opCtx'.
      */
     void reattachToOperationContext(OperationContext* opCtx);
 
@@ -174,6 +181,10 @@ public:
      *    deleting the Pipeline.
      */
     void dispose(OperationContext* opCtx);
+
+    bool isDisposed() const {
+        return _disposed;
+    }
 
     /**
      * Checks to see if disk is ever used within the pipeline.
@@ -237,6 +248,7 @@ public:
      * Serializes the pipeline into a form that can be parsed into an equivalent pipeline.
      */
     std::vector<Value> serialize() const;
+    std::vector<BSONObj> serializeToBson() const;
 
     // The initial source is special since it varies between mongos and mongod.
     void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
@@ -315,24 +327,6 @@ public:
 private:
     friend class PipelineDeleter;
 
-    /**
-     * Used by both Pipeline::parse() and Pipeline::parseFacetPipeline() to build and validate the
-     * pipeline.
-     */
-    static StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> parseTopLevelOrFacetPipeline(
-        const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const bool isFacetPipeline);
-
-    /**
-     * Used by both Pipeline::create() and Pipeline::createFacetPipeline() to build and validate the
-     * pipeline.
-     */
-    static StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> createTopLevelOrFacetPipeline(
-        SourceContainer sources,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const bool isSubPipeline);
-
     Pipeline(const boost::intrusive_ptr<ExpressionContext>& pCtx);
     Pipeline(SourceContainer stages, const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
@@ -350,25 +344,6 @@ private:
      * optimization process, where we might swap or destroy stages.
      */
     void unstitch();
-
-    /**
-     * Throws if the pipeline fails any of a set of semantic checks. For example, if an $out stage
-     * is present then it must come last in the pipeline, while initial stages such as $indexStats
-     * must be at the start.
-     */
-    void validate(bool isFacetPipeline) const;
-
-    /**
-     * Performs validation checking specific to top-level pipelines. Throws if the pipeline is
-     * invalid.
-     */
-    void validateTopLevelPipeline() const;
-
-    /**
-     * Performs validation checking specific to nested $facet pipelines. Throws if the pipeline is
-     * invalid.
-     */
-    void validateFacetPipeline() const;
 
     /**
      * Performs common validation for top-level or facet pipelines. Throws if the pipeline is

@@ -38,10 +38,11 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/service_context.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
@@ -58,7 +59,8 @@ static const NamespaceString nss("unittests.PlanExecutorInvalidationTest");
  */
 class PlanExecutorInvalidationTest : public unittest::Test {
 public:
-    PlanExecutorInvalidationTest() : _client(&_opCtx) {
+    PlanExecutorInvalidationTest()
+        : _client(&_opCtx), _expCtx(make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss)) {
         _ctx.reset(new dbtests::WriteContextForTests(&_opCtx, nss.ns()));
         _client.dropCollection(nss.ns());
 
@@ -76,7 +78,7 @@ public:
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = false;
         unique_ptr<CollectionScan> scan(
-            new CollectionScan(&_opCtx, collection(), params, ws.get(), nullptr));
+            new CollectionScan(_expCtx.get(), collection(), params, ws.get(), nullptr));
 
         // Create a plan executor to hold it
         auto qr = std::make_unique<QueryRequest>(nss);
@@ -85,12 +87,12 @@ public:
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         // Takes ownership of 'ws', 'scan', and 'cq'.
-        auto statusWithPlanExecutor = PlanExecutor::make(
+        auto statusWithPlanExecutor = plan_executor_factory::make(
             std::move(cq),
             std::move(ws),
             std::move(scan),
             CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss),
-            PlanExecutor::YIELD_MANUAL);
+            PlanYieldPolicy::YieldPolicy::YIELD_MANUAL);
 
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         return std::move(statusWithPlanExecutor.getValue());
@@ -99,9 +101,8 @@ public:
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeIxscanPlan(BSONObj keyPattern,
                                                                         BSONObj startKey,
                                                                         BSONObj endKey) {
-        auto indexDescriptor =
-            collection()->getIndexCatalog()->findIndexByKeyPatternAndCollationSpec(
-                &_opCtx, keyPattern, {});
+        auto indexDescriptor = collection()->getIndexCatalog()->findIndexByKeyPatternAndOptions(
+            &_opCtx, keyPattern, _makeMinimalIndexSpec(keyPattern));
         ASSERT(indexDescriptor);
         return InternalPlanner::indexScan(&_opCtx,
                                           collection(),
@@ -109,7 +110,7 @@ public:
                                           startKey,
                                           endKey,
                                           BoundInclusion::kIncludeBothStartAndEndKeys,
-                                          PlanExecutor::YIELD_MANUAL);
+                                          PlanYieldPolicy::YieldPolicy::YIELD_MANUAL);
     }
 
     int N() {
@@ -131,6 +132,15 @@ public:
     OperationContext& _opCtx = *_opCtxPtr;
     unique_ptr<dbtests::WriteContextForTests> _ctx;
     DBDirectClient _client;
+
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+private:
+    BSONObj _makeMinimalIndexSpec(BSONObj keyPattern) {
+        return BSON(IndexDescriptor::kKeyPatternFieldName
+                    << keyPattern << IndexDescriptor::kIndexVersionFieldName
+                    << IndexDescriptor::getDefaultIndexVersion());
+    }
 };
 
 TEST_F(PlanExecutorInvalidationTest, ExecutorToleratesDeletedDocumentsDuringYield) {
@@ -384,30 +394,6 @@ TEST_F(PlanExecutorInvalidationTest, IxscanDiesOnCollectionRenameWithinDatabase)
                                                            << "dropTarget" << true),
                                    info));
 
-    ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
-}
-
-TEST_F(PlanExecutorInvalidationTest, CollScanDiesOnRestartCatalog) {
-    // TODO: SERVER-40588. Avoid restarting the catalog on the Biggie storage engine as it
-    // currently does not support this feature.
-    if (storageGlobalParams.engine == "biggie") {
-        return;
-    }
-
-    auto exec = getCollscan();
-
-    // Partially scan the collection.
-    BSONObj obj;
-    for (int i = 0; i < 10; ++i) {
-        ASSERT_EQUALS(PlanExecutor::ADVANCED, exec->getNext(&obj, nullptr));
-        ASSERT_EQUALS(i, obj["foo"].numberInt());
-    }
-
-    // Restart the catalog during yield. Verify that yield recovery throws with the expected error
-    // code.
-    exec->saveState();
-    BSONObj info;
-    ASSERT_TRUE(_client.runCommand("admin", BSON("restartCatalog" << 1), info));
     ASSERT_THROWS_CODE(exec->restoreState(), DBException, ErrorCodes::QueryPlanKilled);
 }
 

@@ -35,6 +35,14 @@ function runTest(collName, shardKey) {
     const mongosColl = mongosDB[collName];
 
     //
+    // Test that the config server is running with {periodicNoopIntervalSecs: 1}. This ensures that
+    // the config server does not unduly delay a change stream despite its low write rate.
+    //
+    const noopPeriod = assert.commandWorked(
+        st.configRS.getPrimary().adminCommand({getParameter: 1, periodicNoopIntervalSecs: 1}));
+    assert.eq(noopPeriod.periodicNoopIntervalSecs, 1, noopPeriod);
+
+    //
     // Sanity tests
     //
 
@@ -128,22 +136,33 @@ function runTest(collName, shardKey) {
 
     assert.commandWorked(mongosColl.update({a: 0}, {$set: {b: 2}}, {multi: true}));
 
-    assert.soon(() => changeStream.hasNext());
-    assertChangeStreamEventEq(changeStream.next(), {
+    const expectedEvent1 = {
         operationType: "update",
         ns: {db: mongosDB.getName(), coll: mongosColl.getName()},
         documentKey: makeShardKeyDocument(-10),
         updateDescription: {updatedFields: {b: 2}, removedFields: []},
-    });
+    };
 
-    assert.soon(() => changeStream.hasNext());
-    assertChangeStreamEventEq(changeStream.next(), {
+    const expectedEvent2 = {
         operationType: "update",
         ns: {db: mongosDB.getName(), coll: mongosColl.getName()},
         documentKey: makeShardKeyDocument(10),
         updateDescription: {updatedFields: {b: 2}, removedFields: []},
-    });
+    };
+
+    // The multi-update events can be observed in any order, depending on the clusterTime at which
+    // they are written on each shard.
+    const expectedEvents = [expectedEvent1, expectedEvent2];
+
+    const actualEvents = [];
+    for (let expectedEvent of expectedEvents) {
+        assert.soon(() => changeStream.hasNext());
+        const actualEvent = changeStream.next();
+        actualEvents.push(pruneOptionalFields(actualEvent, expectedEvent));
+    }
     changeStream.close();
+
+    assert.sameMembers(actualEvents, expectedEvents);
 
     // Test that it is legal to open a change stream, even if the
     // 'internalQueryProhibitMergingOnMongos' parameter is set.

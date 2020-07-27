@@ -38,8 +38,11 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/execution_context.h"
+#include "mongo/db/storage/storage_debug_util.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace ValidateTests {
@@ -47,7 +50,10 @@ namespace ValidateTests {
 using std::unique_ptr;
 
 namespace {
+
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
+const bool kTurnOnExtraLoggingForTest = true;
+
 }  // namespace
 
 static const char* const _ns = "unittests.validate_tests";
@@ -83,26 +89,26 @@ public:
 
 protected:
     ValidateResults runValidate() {
-        // validate() will set a kCheckpoint read source. Callers continue to do operations after
-        // running validate, so we must reset the read source back to normal before returning.
+        // Callers continue to do operations after running validate, so we must reset the read
+        // source back to normal before returning.
         auto originalReadSource = _opCtx.recoveryUnit()->getTimestampReadSource();
         ON_BLOCK_EXIT([&] {
             _opCtx.recoveryUnit()->abandonSnapshot();
             _opCtx.recoveryUnit()->setTimestampReadSource(originalReadSource);
         });
 
-        // This function will force a checkpoint, so background validation can then read from that
-        // checkpoint and see all the new data.
-        _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
-
-        auto options = (_full) ? CollectionValidation::ValidateOptions::kFullValidation
-                               : CollectionValidation::ValidateOptions::kNoFullValidation;
-
+        auto mode = [&] {
+            if (_background)
+                return CollectionValidation::ValidateMode::kBackground;
+            return _full ? CollectionValidation::ValidateMode::kForegroundFull
+                         : CollectionValidation::ValidateMode::kForeground;
+        }();
+        auto repairMode = CollectionValidation::RepairMode::kNone;
         ValidateResults results;
         BSONObjBuilder output;
 
-        ASSERT_OK(
-            CollectionValidation::validate(&_opCtx, _nss, options, _background, &results, &output));
+        ASSERT_OK(CollectionValidation::validate(
+            &_opCtx, _nss, mode, repairMode, &results, &output, kTurnOnExtraLoggingForTest));
 
         //  Check if errors are reported if and only if valid is set to false.
         ASSERT_EQ(results.valid, results.errors.empty());
@@ -120,44 +126,30 @@ protected:
         return results;
     }
 
-    std::string parseValidateResults(const ValidateResults& results) {
-        str::stream ss;
-
-        ss << "ValidateResults:\nValid: " << results.valid << "\n"
-           << "Errors:\n";
-
-        for (const std::string& error : results.errors) {
-            ss << "\t" << error << "\n";
-        }
-
-        ss << "Warnings:\n";
-        for (const std::string& warning : results.warnings) {
-            ss << "\t" << warning << "\n";
-        }
-
-        ss << "Extra index entries:\n";
-        for (const BSONObj& obj : results.extraIndexEntries) {
-            ss << "\t" << obj << "\n";
-        }
-
-        ss << "Missing index entries:\n";
-        for (const BSONObj& obj : results.missingIndexEntries) {
-            ss << "\t" << obj << "\n";
-        }
-
-        return ss;
-    }
-
     void ensureValidateWorked() {
         ValidateResults results = runValidate();
-        ASSERT_TRUE(results.valid)
-            << "Validation failed when it should've worked: " << parseValidateResults(results);
+
+        auto dumpOnErrorGuard = makeGuard([&] {
+            StorageDebugUtil::printValidateResults(results);
+            StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, _nss);
+        });
+
+        ASSERT_TRUE(results.valid) << "Validation failed when it should've worked.";
+
+        dumpOnErrorGuard.dismiss();
     }
 
     void ensureValidateFailed() {
         ValidateResults results = runValidate();
-        ASSERT_FALSE(results.valid)
-            << "Validation worked when it should've failed: " << parseValidateResults(results);
+
+        auto dumpOnErrorGuard = makeGuard([&] {
+            StorageDebugUtil::printValidateResults(results);
+            StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, _nss);
+        });
+
+        ASSERT_FALSE(results.valid) << "Validation worked when it should've failed.";
+
+        dumpOnErrorGuard.dismiss();
     }
 
     void lockDb(LockMode mode) {
@@ -842,6 +834,8 @@ public:
             return;
         }
 
+        auto& executionCtx = StorageExecutionContext::get(&_opCtx);
+
         // Create a new collection, insert three records and check it's valid.
         lockDb(MODE_X);
         OpDebug* const nullOpDebug = nullptr;
@@ -884,7 +878,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             int64_t numDeleted;
-            InsertResult insertResult;
+            int64_t numInserted;
             const BSONObj actualKey = BSON("a" << 1);
             const BSONObj badKey = BSON("a" << -1);
             InsertDeleteOptions options;
@@ -892,20 +886,23 @@ public:
             options.logIfError = true;
 
             KeyStringSet keys;
-            iam->getKeys(actualKey,
+            iam->getKeys(executionCtx.pooledBufferBuilder(),
+                         actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
-                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
+                         IndexAccessMethod::GetKeysContext::kAddingKeys,
                          &keys,
                          nullptr,
                          nullptr,
                          id1,
                          IndexAccessMethod::kNoopOnSuppressedErrorFn);
+
             auto removeStatus =
                 iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, id1, options, &numDeleted);
-            auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, &insertResult);
+            auto insertStatus =
+                iam->insert(&_opCtx, coll, badKey, id1, options, nullptr, &numInserted);
 
             ASSERT_EQUALS(numDeleted, 1);
-            ASSERT_EQUALS(insertResult.numInserted, 1);
+            ASSERT_EQUALS(numInserted, 1);
             ASSERT_OK(removeStatus);
             ASSERT_OK(insertStatus);
             wunit.commit();
@@ -1202,26 +1199,30 @@ public:
         releaseDb();
 
         {
-            // This function will force a checkpoint, so background validation can then read from
-            // that checkpoint and see all the new data.
-            _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
-
             ValidateResults results;
             BSONObjBuilder output;
 
-            ASSERT_OK(CollectionValidation::validate(
-                &_opCtx,
-                _nss,
-                CollectionValidation::ValidateOptions::kFullValidation,
-                _background,
-                &results,
-                &output));
+            ASSERT_OK(
+                CollectionValidation::validate(&_opCtx,
+                                               _nss,
+                                               CollectionValidation::ValidateMode::kForegroundFull,
+                                               CollectionValidation::RepairMode::kNone,
+                                               &results,
+                                               &output,
+                                               kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
             ASSERT_EQ(static_cast<size_t>(2), results.warnings.size());
             ASSERT_EQ(static_cast<size_t>(1), results.extraIndexEntries.size());
             ASSERT_EQ(static_cast<size_t>(1), results.missingIndexEntries.size());
+
+            dumpOnErrorGuard.dismiss();
         }
     }
 };
@@ -1238,6 +1239,8 @@ public:
         if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
+
+        auto& executionCtx = StorageExecutionContext::get(&_opCtx);
 
         // Create a new collection.
         lockDb(MODE_X);
@@ -1295,9 +1298,10 @@ public:
             options.dupsAllowed = true;
 
             KeyStringSet keys;
-            iam->getKeys(actualKey,
+            iam->getKeys(executionCtx.pooledBufferBuilder(),
+                         actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
-                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
+                         IndexAccessMethod::GetKeysContext::kAddingKeys,
                          &keys,
                          nullptr,
                          nullptr,
@@ -1314,26 +1318,30 @@ public:
         }
 
         {
-            // This function will force a checkpoint, so background validation can then read from
-            // that checkpoint and see all the new data.
-            _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
-
             ValidateResults results;
             BSONObjBuilder output;
 
-            ASSERT_OK(CollectionValidation::validate(
-                &_opCtx,
-                _nss,
-                CollectionValidation::ValidateOptions::kFullValidation,
-                _background,
-                &results,
-                &output));
+            ASSERT_OK(
+                CollectionValidation::validate(&_opCtx,
+                                               _nss,
+                                               CollectionValidation::ValidateMode::kForegroundFull,
+                                               CollectionValidation::RepairMode::kNone,
+                                               &results,
+                                               &output,
+                                               kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
             ASSERT_EQ(static_cast<size_t>(1), results.warnings.size());
             ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
             ASSERT_EQ(static_cast<size_t>(1), results.missingIndexEntries.size());
+
+            dumpOnErrorGuard.dismiss();
         }
     }
 };
@@ -1402,26 +1410,30 @@ public:
         }
 
         {
-            // This function will force a checkpoint, so background validation can then read from
-            // that checkpoint and see all the new data.
-            _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
-
             ValidateResults results;
             BSONObjBuilder output;
 
-            ASSERT_OK(CollectionValidation::validate(
-                &_opCtx,
-                _nss,
-                CollectionValidation::ValidateOptions::kFullValidation,
-                _background,
-                &results,
-                &output));
+            ASSERT_OK(
+                CollectionValidation::validate(&_opCtx,
+                                               _nss,
+                                               CollectionValidation::ValidateMode::kForegroundFull,
+                                               CollectionValidation::RepairMode::kNone,
+                                               &results,
+                                               &output,
+                                               kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
 
             ASSERT_EQ(false, results.valid);
             ASSERT_EQ(static_cast<size_t>(2), results.errors.size());
             ASSERT_EQ(static_cast<size_t>(1), results.warnings.size());
             ASSERT_EQ(static_cast<size_t>(2), results.extraIndexEntries.size());
             ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+
+            dumpOnErrorGuard.dismiss();
         }
     }
 };
@@ -1437,6 +1449,8 @@ public:
         if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
             return;
         }
+
+        auto& executionCtx = StorageExecutionContext::get(&_opCtx);
 
         // Create a new collection.
         lockDb(MODE_X);
@@ -1506,9 +1520,10 @@ public:
             options.dupsAllowed = true;
 
             KeyStringSet keys;
-            iam->getKeys(actualKey,
+            iam->getKeys(executionCtx.pooledBufferBuilder(),
+                         actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
-                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
+                         IndexAccessMethod::GetKeysContext::kAddingKeys,
                          &keys,
                          nullptr,
                          nullptr,
@@ -1542,9 +1557,10 @@ public:
             options.dupsAllowed = true;
 
             KeyStringSet keys;
-            iam->getKeys(actualKey,
+            iam->getKeys(executionCtx.pooledBufferBuilder(),
+                         actualKey,
                          IndexAccessMethod::GetKeysMode::kRelaxConstraintsUnfiltered,
-                         IndexAccessMethod::GetKeysContext::kReadOrAddKeys,
+                         IndexAccessMethod::GetKeysContext::kAddingKeys,
                          &keys,
                          nullptr,
                          nullptr,
@@ -1561,13 +1577,436 @@ public:
         }
 
         {
-            // This function will force a checkpoint, so background validation can then read from
-            // that checkpoint and see all the new data.
-            _opCtx.recoveryUnit()->waitUntilUnjournaledWritesDurable(&_opCtx);
-
             // Now we have two missing index entries with the keys { : 1 } since the KeyStrings
             // aren't hydrated with their field names.
             ensureValidateFailed();
+        }
+    }
+};
+
+template <bool full, bool background>
+class ValidateDuplicateKeysUniqueIndex : public ValidateBase {
+public:
+    ValidateDuplicateKeysUniqueIndex() : ValidateBase(full, background) {}
+
+    void run() {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
+            return;
+        }
+
+        auto& executionCtx = StorageExecutionContext::get(&_opCtx);
+
+        // Create a new collection.
+        lockDb(MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
+            wunit.commit();
+        }
+
+        // Create a unique index.
+        const auto indexName = "a";
+        {
+            const auto indexKey = BSON("a" << 1);
+            auto status = dbtests::createIndexFromSpec(
+                &_opCtx,
+                coll->ns().ns(),
+                BSON("name" << indexName << "key" << indexKey << "v"
+                            << static_cast<int>(kIndexVersion) << "background" << false << "unique"
+                            << true));
+            ASSERT_OK(status);
+        }
+
+        // Insert a document.
+        OpDebug* const nullOpDebug = nullptr;
+        lockDb(MODE_X);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(coll->insertDocument(
+                &_opCtx, InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, true));
+            wunit.commit();
+        }
+
+        // Confirm that inserting a document with the same value for "a" fails, verifying the
+        // uniqueness constraint.
+        BSONObj dupObj = BSON("_id" << 2 << "a" << 1);
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_NOT_OK(
+                coll->insertDocument(&_opCtx, InsertStatement(dupObj), nullOpDebug, true));
+        }
+        releaseDb();
+        ensureValidateWorked();
+
+        // Insert a document with a duplicate key for "a".
+        {
+            lockDb(MODE_X);
+
+            IndexCatalog* indexCatalog = coll->getIndexCatalog();
+
+            InsertDeleteOptions options;
+            options.logIfError = true;
+            options.dupsAllowed = true;
+
+            WriteUnitOfWork wunit(&_opCtx);
+
+            // Insert a record and its keys separately. We do this to bypass duplicate constraint
+            // checking. Inserting a record and all of its keys ensures that validation fails
+            // because there are duplicate keys, and not just because there are keys without
+            // corresponding records.
+            auto swRecordId = coll->getRecordStore()->insertRecord(
+                &_opCtx, dupObj.objdata(), dupObj.objsize(), Timestamp());
+            ASSERT_OK(swRecordId);
+
+            wunit.commit();
+
+            // Insert the key on _id.
+            {
+                WriteUnitOfWork wunit(&_opCtx);
+
+                auto descriptor = indexCatalog->findIdIndex(&_opCtx);
+                auto entry = const_cast<IndexCatalogEntry*>(indexCatalog->getEntry(descriptor));
+                auto iam = entry->accessMethod();
+                auto interceptor = std::make_unique<IndexBuildInterceptor>(&_opCtx, entry);
+
+                KeyStringSet keys;
+                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                             dupObj,
+                             IndexAccessMethod::GetKeysMode::kRelaxConstraints,
+                             IndexAccessMethod::GetKeysContext::kAddingKeys,
+                             &keys,
+                             nullptr,
+                             nullptr,
+                             swRecordId.getValue(),
+                             IndexAccessMethod::kNoopOnSuppressedErrorFn);
+                ASSERT_EQ(1, keys.size());
+
+                int64_t numInserted;
+                auto insertStatus = iam->insertKeys(
+                    &_opCtx,
+                    coll,
+                    {keys.begin(), keys.end()},
+                    {},
+                    MultikeyPaths{},
+                    swRecordId.getValue(),
+                    options,
+                    [this, &interceptor](const KeyString::Value& duplicateKey) {
+                        return interceptor->recordDuplicateKey(&_opCtx, duplicateKey);
+                    },
+                    &numInserted);
+
+                wunit.commit();
+
+                ASSERT_OK(interceptor->checkDuplicateKeyConstraints(&_opCtx));
+                ASSERT_EQUALS(numInserted, 1);
+                ASSERT_OK(insertStatus);
+
+                interceptor->finalizeTemporaryTables(
+                    &_opCtx, TemporaryRecordStore::FinalizationAction::kDelete);
+            }
+
+            // Insert the key on "a".
+            {
+                WriteUnitOfWork wunit(&_opCtx);
+
+                auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
+                auto entry = const_cast<IndexCatalogEntry*>(indexCatalog->getEntry(descriptor));
+                auto iam = entry->accessMethod();
+                auto interceptor = std::make_unique<IndexBuildInterceptor>(&_opCtx, entry);
+
+                KeyStringSet keys;
+                int64_t numInserted;
+                iam->getKeys(executionCtx.pooledBufferBuilder(),
+                             dupObj,
+                             IndexAccessMethod::GetKeysMode::kRelaxConstraints,
+                             IndexAccessMethod::GetKeysContext::kAddingKeys,
+                             &keys,
+                             nullptr,
+                             nullptr,
+                             swRecordId.getValue(),
+                             IndexAccessMethod::kNoopOnSuppressedErrorFn);
+                ASSERT_EQ(1, keys.size());
+                auto insertStatus = iam->insertKeys(
+                    &_opCtx,
+                    coll,
+                    {keys.begin(), keys.end()},
+                    {},
+                    MultikeyPaths{},
+                    swRecordId.getValue(),
+                    options,
+                    [this, &interceptor](const KeyString::Value& duplicateKey) {
+                        return interceptor->recordDuplicateKey(&_opCtx, duplicateKey);
+                    },
+                    &numInserted);
+
+                wunit.commit();
+
+                ASSERT_NOT_OK(interceptor->checkDuplicateKeyConstraints(&_opCtx));
+                ASSERT_EQUALS(numInserted, 1);
+                ASSERT_OK(insertStatus);
+
+                interceptor->finalizeTemporaryTables(
+                    &_opCtx, TemporaryRecordStore::FinalizationAction::kDelete);
+            }
+
+            releaseDb();
+        }
+
+        ValidateResults results = runValidate();
+
+        auto dumpOnErrorGuard = makeGuard([&] {
+            StorageDebugUtil::printValidateResults(results);
+            StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+        });
+
+        ASSERT_FALSE(results.valid) << "Validation worked when it should have failed.";
+        ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
+        ASSERT_EQ(static_cast<size_t>(0), results.warnings.size());
+        ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
+        ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+
+        dumpOnErrorGuard.dismiss();
+    }
+};
+
+template <bool full, bool background>
+class ValidateInvalidBSONResults : public ValidateBase {
+public:
+    ValidateInvalidBSONResults() : ValidateBase(full, background) {}
+
+    void run() {
+        // Cannot run validate with {background:true} if either
+        //  - the RecordStore cursor does not retrieve documents in RecordId order
+        //  - or the storage engine does not support checkpoints.
+        if (_background && (!_isInRecordIdOrder || !_engineSupportsCheckpoints)) {
+            return;
+        }
+
+        // Create a new collection.
+        lockDb(MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
+            wunit.commit();
+        }
+
+        // Encode an invalid BSON Object with an invalid type, x90 and insert record
+        const char* buffer = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00";
+        BSONObj obj(buffer);
+        lockDb(MODE_X);
+        RecordStore* rs = coll->getRecordStore();
+        RecordId rid;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            auto swRecordId = rs->insertRecord(&_opCtx, obj.objdata(), obj.objsize(), Timestamp());
+            ASSERT_OK(swRecordId);
+            rid = swRecordId.getValue();
+            wunit.commit();
+        }
+        releaseDb();
+
+        {
+            auto mode = _background ? CollectionValidation::ValidateMode::kBackground
+                                    : CollectionValidation::ValidateMode::kForeground;
+
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            ASSERT_OK(CollectionValidation::validate(&_opCtx,
+                                                     _nss,
+                                                     mode,
+                                                     CollectionValidation::RepairMode::kNone,
+                                                     &results,
+                                                     &output,
+                                                     kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
+
+            ASSERT_EQ(false, results.valid);
+            ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.corruptRecords.size());
+            ASSERT_EQ(rid, results.corruptRecords[0]);
+
+            dumpOnErrorGuard.dismiss();
+        }
+    }
+};
+class ValidateInvalidBSONRepair : public ValidateBase {
+public:
+    // No need to test with background validation as repair mode is not supported in background
+    // validation.
+    ValidateInvalidBSONRepair() : ValidateBase(/*full=*/false, /*background=*/false) {}
+
+    void run() {
+        // Create a new collection.
+        lockDb(MODE_X);
+        Collection* coll;
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(_db->dropCollection(&_opCtx, _nss));
+            coll = _db->createCollection(&_opCtx, _nss);
+            wunit.commit();
+        }
+
+        // Encode BSON Objects with invalid type x90, size less than 5 bytes, and BSON length and
+        // object size mismatch, respectively. Insert invalid BSON objects into record store.
+        const char* buf1 = "\x0c\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00";
+        const char* buf2 = "\x04\x00\x00\x00\x90\x41\x00\x10\x00\x00\x00\x00";
+        const char* buf3 = "\x0f\x00\x00\x00\x00\x41\x00\x10\x00\x00\x00\x00";
+        BSONObj obj1(buf1);
+        BSONObj obj2(buf2);
+        BSONObj obj3(buf3);
+        lockDb(MODE_X);
+        RecordStore* rs = coll->getRecordStore();
+        {
+            WriteUnitOfWork wunit(&_opCtx);
+            ASSERT_OK(rs->insertRecord(&_opCtx, obj1.objdata(), 12ULL, Timestamp()));
+            ASSERT_OK(rs->insertRecord(&_opCtx, obj2.objdata(), 12ULL, Timestamp()));
+            ASSERT_OK(rs->insertRecord(&_opCtx, obj3.objdata(), 12ULL, Timestamp()));
+            wunit.commit();
+        }
+        releaseDb();
+
+        // Confirm all of the different corrupt records previously inserted are detected by
+        // validate.
+        {
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            ASSERT_OK(
+                CollectionValidation::validate(&_opCtx,
+                                               _nss,
+                                               CollectionValidation::ValidateMode::kForeground,
+                                               CollectionValidation::RepairMode::kNone,
+                                               &results,
+                                               &output,
+                                               kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
+
+            ASSERT_EQ(false, results.valid);
+            ASSERT_EQ(false, results.repaired);
+            ASSERT_EQ(static_cast<size_t>(1), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(3), results.corruptRecords.size());
+            ASSERT_EQ(0, results.numRemovedCorruptRecords);
+
+            dumpOnErrorGuard.dismiss();
+        }
+
+        // Run validate with repair, expect corrupted records are removed.
+        {
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            ASSERT_OK(
+                CollectionValidation::validate(&_opCtx,
+                                               _nss,
+                                               CollectionValidation::ValidateMode::kForeground,
+                                               CollectionValidation::RepairMode::kRepair,
+                                               &results,
+                                               &output,
+                                               kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
+
+            ASSERT_EQ(true, results.valid);
+            ASSERT_EQ(true, results.repaired);
+            ASSERT_EQ(static_cast<size_t>(0), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(1), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.corruptRecords.size());
+            ASSERT_EQ(3, results.numRemovedCorruptRecords);
+
+            // Check that the corrupted records have been removed from the record store.
+            ASSERT_EQ(0, rs->numRecords(&_opCtx));
+
+            dumpOnErrorGuard.dismiss();
+        }
+
+        // Confirm corrupt records have been removed such that repair does not need to run and
+        // results are valid.
+        {
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            ASSERT_OK(
+                CollectionValidation::validate(&_opCtx,
+                                               _nss,
+                                               CollectionValidation::ValidateMode::kForeground,
+                                               CollectionValidation::RepairMode::kRepair,
+                                               &results,
+                                               &output,
+                                               kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
+
+            ASSERT_EQ(true, results.valid);
+            ASSERT_EQ(false, results.repaired);
+            ASSERT_EQ(static_cast<size_t>(0), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.corruptRecords.size());
+            ASSERT_EQ(0, results.numRemovedCorruptRecords);
+
+            dumpOnErrorGuard.dismiss();
+        }
+
+        // Confirm repair mode does not silently suppress validation errors.
+        {
+            ValidateResults results;
+            BSONObjBuilder output;
+
+            ASSERT_OK(
+                CollectionValidation::validate(&_opCtx,
+                                               _nss,
+                                               CollectionValidation::ValidateMode::kForeground,
+                                               CollectionValidation::RepairMode::kNone,
+                                               &results,
+                                               &output,
+                                               kTurnOnExtraLoggingForTest));
+
+            auto dumpOnErrorGuard = makeGuard([&] {
+                StorageDebugUtil::printValidateResults(results);
+                StorageDebugUtil::printCollectionAndIndexTableEntries(&_opCtx, coll->ns());
+            });
+
+            ASSERT_EQ(true, results.valid);
+            ASSERT_EQ(false, results.repaired);
+            ASSERT_EQ(static_cast<size_t>(0), results.errors.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.warnings.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.extraIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.missingIndexEntries.size());
+            ASSERT_EQ(static_cast<size_t>(0), results.corruptRecords.size());
+            ASSERT_EQ(0, results.numRemovedCorruptRecords);
+
+            dumpOnErrorGuard.dismiss();
         }
     }
 };
@@ -1601,7 +2040,9 @@ public:
         add<ValidatePartialIndexOnCollectionWithNonIndexableFields<false, false>>();
         add<ValidatePartialIndexOnCollectionWithNonIndexableFields<false, true>>();
         add<ValidateWildCardIndex<false, false>>();
+        add<ValidateWildCardIndex<false, true>>();
         add<ValidateWildCardIndexWithProjection<false, false>>();
+        add<ValidateWildCardIndexWithProjection<false, true>>();
 
         // Tests for index validation.
         add<ValidateIndexEntry<false, false>>();
@@ -1614,6 +2055,13 @@ public:
         add<ValidateExtraIndexEntryResults<false, false>>();
 
         add<ValidateDuplicateDocumentIndexKeySet>();
+
+        add<ValidateDuplicateKeysUniqueIndex<false, false>>();
+        add<ValidateDuplicateKeysUniqueIndex<false, true>>();
+
+        add<ValidateInvalidBSONResults<false, false>>();
+        add<ValidateInvalidBSONResults<false, true>>();
+        add<ValidateInvalidBSONRepair>();
     }
 };
 

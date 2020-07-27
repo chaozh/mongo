@@ -48,6 +48,7 @@ const char kHintField[] = "hint";
 const char kCollationField[] = "collation";
 const char kArrayFiltersField[] = "arrayFilters";
 const char kRuntimeConstantsField[] = "runtimeConstants";
+const char kLetField[] = "let";
 const char kRemoveField[] = "remove";
 const char kUpdateField[] = "update";
 const char kNewField[] = "new";
@@ -135,6 +136,12 @@ BSONObj FindAndModifyRequest::toBSON(const BSONObj& commandPassthroughFields) co
         rtcBuilder.doneFast();
     }
 
+    if (_letParameters) {
+        if (auto letParams = _letParameters.get(); !letParams.isEmpty()) {
+            builder.append(kLetField, _letParameters.get());
+        }
+    }
+
     if (_shouldReturnNew) {
         builder.append(kNewField, _shouldReturnNew);
     }
@@ -168,9 +175,9 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
     bool isRemove = false;
     bool bypassDocumentValidation = false;
     bool arrayFiltersSet = false;
-    bool hintSet = false;
     std::vector<BSONObj> arrayFilters;
     boost::optional<RuntimeConstants> runtimeConstants;
+    BSONObj letParameters;
     bool writeConcernOptionsSet = false;
     WriteConcernOptions writeConcernOptions;
 
@@ -195,7 +202,6 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
             sort = sortElement.embeddedObject();
         } else if (field == kHintField) {
             hint = parseHint(cmdObj[kHintField]);
-            hintSet = true;
         } else if (field == kRemoveField) {
             isRemove = cmdObj[kRemoveField].trueValue();
         } else if (field == kUpdateField) {
@@ -247,6 +253,14 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
             runtimeConstants =
                 RuntimeConstants::parse(IDLParserErrorContext(kRuntimeConstantsField),
                                         cmdObj.getObjectField(kRuntimeConstantsField));
+        } else if (field == kLetField) {
+            BSONElement letElt;
+            if (Status letEltStatus =
+                    bsonExtractTypedField(cmdObj, kLetField, BSONType::Object, &letElt);
+                !letEltStatus.isOK()) {
+                return letEltStatus;
+            }
+            letParameters = letElt.embeddedObject();
         } else if (field == kWriteConcernField) {
             BSONElement writeConcernElt;
             Status writeConcernEltStatus = bsonExtractTypedField(
@@ -261,6 +275,10 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
                 writeConcernOptionsSet = true;
                 writeConcernOptions = sw.getValue();
             }
+        } else if (isMongocryptdArgument(field)) {
+            return {ErrorCodes::FailedToParse,
+                    str::stream() << "unrecognized field '" << field
+                                  << "'. This command may be meant for a mongocryptd process."};
         } else if (!isGenericArgument(field) &&
                    !std::count(_knownFields.begin(), _knownFields.end(), field)) {
             return {ErrorCodes::Error(51177),
@@ -287,10 +305,6 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
                     " 'remove' always returns the deleted document"};
         }
 
-        if (hintSet) {
-            return {ErrorCodes::FailedToParse, "Cannot specify a hint with remove=true"};
-        }
-
         if (arrayFiltersSet) {
             return {ErrorCodes::FailedToParse, "Cannot specify arrayFilters and remove=true"};
         }
@@ -307,6 +321,7 @@ StatusWith<FindAndModifyRequest> FindAndModifyRequest::parseFromBSON(NamespaceSt
     request.setHint(hint);
     request.setCollation(collation);
     request.setBypassDocumentValidation(bypassDocumentValidation);
+    request.setLetParameters(letParameters);
     if (arrayFiltersSet) {
         request.setArrayFilters(std::move(arrayFilters));
     }

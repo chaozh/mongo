@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -44,11 +44,11 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/recovery_unit_noop.h"
+#include "mongo/logv2/log.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/system_clock_source.h"
 #include "mongo/util/system_tick_source.h"
@@ -110,8 +110,11 @@ ServiceContext::ServiceContext()
 ServiceContext::~ServiceContext() {
     stdx::lock_guard<Latch> lk(_mutex);
     for (const auto& client : _clients) {
-        severe() << "Client " << client->desc() << " still exists while destroying ServiceContext@"
-                 << reinterpret_cast<uint64_t>(this);
+        LOGV2_ERROR(23828,
+                    "{client} exists while destroying {serviceContext}",
+                    "Non-empty client list when destroying service context",
+                    "client"_attr = client->desc(),
+                    "serviceContext"_attr = reinterpret_cast<uint64_t>(this));
     }
     invariant(_clients.empty());
 }
@@ -279,20 +282,12 @@ ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Clie
 
 void ServiceContext::OperationContextDeleter::operator()(OperationContext* opCtx) const {
     auto client = opCtx->getClient();
-    if (client->session()) {
-        _numCurrentOps.subtractAndFetch(1);
-    }
+    invariant(client);
+
     auto service = client->getServiceContext();
+    invariant(service);
 
-    {
-        stdx::lock_guard lk(service->_mutex);
-        service->_clientByOperationId.erase(opCtx->getOpID());
-    }
-
-    {
-        stdx::lock_guard<Client> lk(*client);
-        client->resetOperationContext();
-    }
+    service->_delistOperation(opCtx);
     opCtx->getBaton()->detach();
 
     onDestroy(opCtx, service->_clientObservers);
@@ -329,6 +324,7 @@ void ServiceContext::setKillAllOperations() {
 
     // Ensure that all newly created operation contexts will immediately be in the interrupted state
     _globalKill.store(true);
+    auto opsKilled = 0;
 
     // Interrupt all active operations
     for (auto&& client : _clients) {
@@ -336,8 +332,12 @@ void ServiceContext::setKillAllOperations() {
         auto opCtxToKill = client->getOperationContext();
         if (opCtxToKill) {
             killOperation(lk, opCtxToKill, ErrorCodes::InterruptedAtShutdown);
+            opsKilled++;
         }
     }
+
+    // Shared by mongos and mongod shutdown code paths
+    LOGV2(4695300, "Interrupted all currently running operations", "opsKilled"_attr = opsKilled);
 
     // Notify any listeners who need to reach to the server shutting down
     for (const auto listener : _killOpListeners) {
@@ -359,6 +359,49 @@ void ServiceContext::killOperation(WithLock, OperationContext* opCtx, ErrorCodes
             std::terminate();
         }
     }
+}
+
+void ServiceContext::_delistOperation(OperationContext* opCtx) noexcept {
+    // Removing `opCtx` from `_clientByOperationId` must always precede removing the `opCtx` from
+    // its client to prevent situations that another thread could use the service context to get a
+    // hold of an `opCtx` that has been removed from its client.
+    {
+        stdx::lock_guard lk(_mutex);
+        if (_clientByOperationId.erase(opCtx->getOpID()) != 1) {
+            // Another thread has already delisted this `opCtx`.
+            return;
+        }
+    }
+
+    auto client = opCtx->getClient();
+    stdx::lock_guard clientLock(*client);
+    // Reaching here implies this call was able to remove the `opCtx` from ServiceContext.
+
+    // Assigning a new opCtx to the client must never precede the destruction of any existing opCtx
+    // that references the client.
+    invariant(client->getOperationContext() == opCtx);
+    client->resetOperationContext();
+
+    if (client->session()) {
+        _numCurrentOps.subtractAndFetch(1);
+    }
+
+    opCtx->releaseOperationKey();
+}
+
+void ServiceContext::killAndDelistOperation(OperationContext* opCtx,
+                                            ErrorCodes::Error killCode) noexcept {
+
+    auto client = opCtx->getClient();
+    invariant(client);
+
+    auto service = client->getServiceContext();
+    invariant(service == this);
+
+    _delistOperation(opCtx);
+
+    stdx::lock_guard clientLock(*client);
+    killOperation(clientLock, opCtx, killCode);
 }
 
 void ServiceContext::unsetKillAllOperations() {
@@ -408,6 +451,15 @@ ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
     std::string name,
     std::vector<std::string> prereqs,
     ConstructorAction constructor,
+    DestructorAction destructor)
+    : ConstructorActionRegisterer(
+          std::move(name), prereqs, {}, std::move(constructor), std::move(destructor)) {}
+
+ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
+    std::string name,
+    std::vector<std::string> prereqs,
+    std::vector<std::string> dependents,
+    ConstructorAction constructor,
     DestructorAction destructor) {
     if (!destructor)
         destructor = [](ServiceContext*) {};
@@ -423,7 +475,8 @@ ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
                             registeredConstructorActions().erase(_iter);
                             return Status::OK();
                         },
-                        std::move(prereqs));
+                        std::move(prereqs),
+                        std::move(dependents));
 }
 
 ServiceContext::UniqueServiceContext ServiceContext::make() {

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -44,18 +44,19 @@
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_shard_collection.h"
 #include "mongo/s/catalog/type_shard_database.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
 
-const auto getDocumentKey = OperationContext::declareDecoration<BSONObj>();
+const auto documentIdDecoration = OperationContext::declareDecoration<BSONObj>();
 
 bool isStandaloneOrPrimary(OperationContext* opCtx) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -82,7 +83,8 @@ public:
 
         // Force subsequent uses of the namespace to refresh the filtering metadata so they can
         // synchronize with any work happening on the primary (e.g., migration critical section).
-        CollectionShardingRuntime::get(_opCtx, _nss)->clearFilteringMetadata();
+        UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
+        CollectionShardingRuntime::get(_opCtx, _nss)->clearFilteringMetadata(_opCtx);
     }
 
     void rollback() override {}
@@ -115,6 +117,27 @@ private:
     OperationContext* _opCtx;
     const ShardIdentityType _shardIdentity;
 };
+
+/**
+ * Used to submit a range deletion task once it is certain that the update/insert to
+ * config.rangeDeletions is committed.
+ */
+class SubmitRangeDeletionHandler final : public RecoveryUnit::Change {
+public:
+    SubmitRangeDeletionHandler(OperationContext* opCtx, RangeDeletionTask task)
+        : _opCtx(opCtx), _task(std::move(task)) {}
+
+    void commit(boost::optional<Timestamp>) override {
+        migrationutil::submitRangeDeletionTask(_opCtx, _task).getAsync([](auto) {});
+    }
+
+    void rollback() override {}
+
+private:
+    OperationContext* _opCtx;
+    RangeDeletionTask _task;
+};
+
 
 /**
  * Invalidates the in-memory routing table cache when a collection is dropped, so the next caller
@@ -189,15 +212,15 @@ void incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
 }
 
 /**
- * Aborts any ongoing migration for the given namespace. Should only be called when observing index
- * operations.
+ * Aborts any ongoing migration for the given namespace. Should only be called when observing
+ * index operations.
  */
-void abortOngoingMigration(OperationContext* opCtx, const NamespaceString nss) {
+void abortOngoingMigrationIfNeeded(OperationContext* opCtx, const NamespaceString nss) {
     auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
     auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
     auto msm = MigrationSourceManager::get(csr, csrLock);
     if (msm) {
-        msm->abortDueToConflictingIndexOperation();
+        msm->abortDueToConflictingIndexOperation(opCtx);
     }
 }
 
@@ -213,8 +236,7 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
                                       std::vector<InsertStatement>::const_iterator begin,
                                       std::vector<InsertStatement>::const_iterator end,
                                       bool fromMigrate) {
-    auto* const css = CollectionShardingState::get(opCtx, nss);
-    const auto metadata = css->getCurrentMetadata();
+    const auto metadata = CollectionShardingRuntime::get(opCtx, nss)->getCurrentMetadataIfKnown();
 
     for (auto it = begin; it != end; ++it) {
         const auto& insertedDoc = it->doc;
@@ -233,14 +255,20 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
         }
 
         if (nss == NamespaceString::kRangeDeletionNamespace) {
+            if (!isStandaloneOrPrimary(opCtx)) {
+                return;
+            }
+
             auto deletionTask = RangeDeletionTask::parse(
                 IDLParserErrorContext("ShardServerOpObserver"), insertedDoc);
 
-            if (!deletionTask.getPending())
-                migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+            if (!deletionTask.getPending()) {
+                opCtx->recoveryUnit()->registerChange(
+                    std::make_unique<SubmitRangeDeletionHandler>(opCtx, deletionTask));
+            }
         }
 
-        if (metadata->isSharded()) {
+        if (metadata && metadata->isSharded()) {
             incrementChunkOnInsertOrUpdate(opCtx,
                                            nss,
                                            *metadata->getChunkManager(),
@@ -252,9 +280,6 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
 }
 
 void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    auto* const css = CollectionShardingState::get(opCtx, args.nss);
-    const auto metadata = css->getCurrentMetadata();
-
     if (args.nss == NamespaceString::kShardConfigCollectionsNamespace) {
         // Notification of routing table changes are only needed on secondaries
         if (isStandaloneOrPrimary(opCtx)) {
@@ -304,7 +329,7 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
                 // Force subsequent uses of the namespace to refresh the filtering metadata so they
                 // can synchronize with any work happening on the primary (e.g., migration critical
                 // section).
-                CollectionShardingRuntime::get(opCtx, updatedNss)->clearFilteringMetadata();
+                CollectionShardingRuntime::get(opCtx, updatedNss)->clearFilteringMetadata(opCtx);
             }
         }
     }
@@ -356,11 +381,18 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             auto deletionTask = RangeDeletionTask::parse(
                 IDLParserErrorContext("ShardServerOpObserver"), args.updateArgs.updatedDoc);
 
-            migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
+            if (deletionTask.getDonorShardId() != ShardingState::get(opCtx)->shardId()) {
+                // Range deletion tasks for moved away chunks are scheduled through the
+                // MigrationCoordinator, so only schedule a task for received chunks.
+                opCtx->recoveryUnit()->registerChange(
+                    std::make_unique<SubmitRangeDeletionHandler>(opCtx, deletionTask));
+            }
         }
     }
 
-    if (metadata->isSharded()) {
+    auto* const csr = CollectionShardingRuntime::get(opCtx, args.nss);
+    const auto metadata = csr->getCurrentMetadataIfKnown();
+    if (metadata && metadata->isSharded()) {
         incrementChunkOnInsertOrUpdate(opCtx,
                                        args.nss,
                                        *metadata->getChunkManager(),
@@ -373,7 +405,9 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
 void ShardServerOpObserver::aboutToDelete(OperationContext* opCtx,
                                           NamespaceString const& nss,
                                           BSONObj const& doc) {
-    getDocumentKey(opCtx) = OpObserverImpl::getDocumentKey(opCtx, nss, doc);
+    // Extract the _id field from the document. If it does not have an _id, use the
+    // document itself as the _id.
+    documentIdDecoration(opCtx) = doc["_id"] ? doc["_id"].wrap() : doc;
 }
 
 void ShardServerOpObserver::onDelete(OperationContext* opCtx,
@@ -382,11 +416,13 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
                                      StmtId stmtId,
                                      bool fromMigrate,
                                      const boost::optional<BSONObj>& deletedDoc) {
-    auto& documentKey = getDocumentKey(opCtx);
+    auto& documentId = documentIdDecoration(opCtx);
+    invariant(!documentId.isEmpty());
 
     if (nss == NamespaceString::kShardConfigCollectionsNamespace) {
-        onConfigDeleteInvalidateCachedCollectionMetadataAndNotify(opCtx, documentKey);
+        onConfigDeleteInvalidateCachedCollectionMetadataAndNotify(opCtx, documentId);
     }
+
     if (nss == NamespaceString::kShardConfigDatabasesNamespace) {
         if (isStandaloneOrPrimary(opCtx)) {
             return;
@@ -396,7 +432,7 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
         std::string deletedDatabase;
         fassert(
             50772,
-            bsonExtractStringField(documentKey, ShardDatabaseType::name.name(), &deletedDatabase));
+            bsonExtractStringField(documentId, ShardDatabaseType::name.name(), &deletedDatabase));
 
         AutoGetDb autoDb(opCtx, deletedDatabase, MODE_X);
         auto dss = DatabaseShardingState::get(opCtx, deletedDatabase);
@@ -405,20 +441,35 @@ void ShardServerOpObserver::onDelete(OperationContext* opCtx,
     }
 
     if (nss == NamespaceString::kServerConfigurationNamespace) {
-        if (auto idElem = documentKey["_id"]) {
+        if (auto idElem = documentId.firstElement()) {
             auto idStr = idElem.str();
             if (idStr == ShardIdentityType::IdName) {
                 if (!repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
                     uasserted(40070,
                               "cannot delete shardIdentity document while in --shardsvr mode");
                 } else {
-                    warning() << "Shard identity document rolled back.  Will shut down after "
-                                 "finishing rollback.";
+                    LOGV2_WARNING(23779,
+                                  "Shard identity document rolled back.  Will shut down after "
+                                  "finishing rollback.");
                     ShardIdentityRollbackNotifier::get(opCtx)->recordThatRollbackHappened();
                 }
             }
         }
     }
+}
+
+void ShardServerOpObserver::onCreateCollection(OperationContext* opCtx,
+                                               Collection* coll,
+                                               const NamespaceString& collectionName,
+                                               const CollectionOptions& options,
+                                               const BSONObj& idIndex,
+                                               const OplogSlot& createOpTime) {
+    // By the time the collection is being created, the caller has already determined whether it is
+    // sharded or unsharded and set it on the CSR. If this method is called with the metadata as
+    // UNKNOWN, this means an internal collection creation, which can only be UNSHARDED
+    auto* csr = CollectionShardingRuntime::get(opCtx, collectionName);
+    if (!csr->getCurrentMetadataIfKnown())
+        csr->setFilteringMetadata(opCtx, CollectionMetadata());
 }
 
 repl::OpTime ShardServerOpObserver::onDropCollection(OperationContext* opCtx,
@@ -433,8 +484,9 @@ repl::OpTime ShardServerOpObserver::onDropCollection(OperationContext* opCtx,
 
         // Can't confirm whether there was a ShardIdentity document or not yet, so assume there was
         // one and shut down the process to clear the in-memory sharding state
-        warning() << "admin.system.version collection rolled back. Will shut down after finishing "
-                     "rollback";
+        LOGV2_WARNING(23780,
+                      "admin.system.version collection rolled back. Will shut down after finishing "
+                      "rollback");
 
         ShardIdentityRollbackNotifier::get(opCtx)->recordThatRollbackHappened();
     }
@@ -448,12 +500,12 @@ void ShardServerOpObserver::onStartIndexBuild(OperationContext* opCtx,
                                               const UUID& indexBuildUUID,
                                               const std::vector<BSONObj>& indexes,
                                               bool fromMigrate) {
-    abortOngoingMigration(opCtx, nss);
+    abortOngoingMigrationIfNeeded(opCtx, nss);
 };
 
 void ShardServerOpObserver::onStartIndexBuildSinglePhase(OperationContext* opCtx,
                                                          const NamespaceString& nss) {
-    abortOngoingMigration(opCtx, nss);
+    abortOngoingMigrationIfNeeded(opCtx, nss);
 }
 
 void ShardServerOpObserver::onDropIndex(OperationContext* opCtx,
@@ -461,7 +513,7 @@ void ShardServerOpObserver::onDropIndex(OperationContext* opCtx,
                                         OptionalCollectionUUID uuid,
                                         const std::string& indexName,
                                         const BSONObj& indexInfo) {
-    abortOngoingMigration(opCtx, nss);
+    abortOngoingMigrationIfNeeded(opCtx, nss);
 };
 
 void ShardServerOpObserver::onCollMod(OperationContext* opCtx,
@@ -469,8 +521,8 @@ void ShardServerOpObserver::onCollMod(OperationContext* opCtx,
                                       OptionalCollectionUUID uuid,
                                       const BSONObj& collModCmd,
                                       const CollectionOptions& oldCollOptions,
-                                      boost::optional<TTLCollModInfo> ttlInfo) {
-    abortOngoingMigration(opCtx, nss);
+                                      boost::optional<IndexCollModInfo> indexInfo) {
+    abortOngoingMigrationIfNeeded(opCtx, nss);
 };
 
 

@@ -29,7 +29,7 @@
 
 // CHECK_LOG_REDACTION
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -38,6 +38,7 @@
 #include <iomanip>
 
 #include "mongo/bson/mutable/document.h"
+#include "mongo/config.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -48,13 +49,15 @@
 #include "mongo/db/prepare_conflict_tracker.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
+#include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/str.h"
+#include "mongo/util/system_tick_source.h"
 #include <mongo/db/stats/timer_stats.h>
 
 namespace mongo {
@@ -315,6 +318,7 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
         CurOp::get(clientOpCtx)->reportState(clientOpCtx, infoBuilder, truncateOps);
     }
 
+#ifndef MONGO_CONFIG_USE_RAW_LATCHES
     if (auto diagnostic = DiagnosticInfo::get(*client)) {
         BSONObjBuilder waitingForLatchBuilder(infoBuilder->subobjStart("waitingForLatch"));
         waitingForLatchBuilder.append("timestamp", diagnostic->getTimestamp());
@@ -330,6 +334,7 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
             */
         }
     }
+#endif
 }
 
 void CurOp::setGenericCursor_inlock(GenericCursor gc) {
@@ -344,6 +349,8 @@ CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {
 }
 
 CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
+    _tickSource = SystemTickSource::get();
+
     if (opCtx) {
         _stack->push(opCtx, this);
     } else {
@@ -379,7 +386,11 @@ void CurOp::setGenericOpRequestDetails(OperationContext* opCtx,
 
 void CurOp::setMessage_inlock(StringData message) {
     if (_progressMeter.isActive()) {
-        error() << "old _message: " << redact(_message) << " new message:" << redact(message);
+        LOGV2_ERROR(20527,
+                    "Changing message from {old} to {new}",
+                    "Updating message",
+                    "old"_attr = redact(_message),
+                    "new"_attr = redact(message));
         verify(!_progressMeter.isActive());
     }
     _message = message.toString();  // copy
@@ -400,16 +411,14 @@ void CurOp::setNS_inlock(StringData ns) {
 
 void CurOp::ensureStarted() {
     if (_start == 0) {
-        _start = curTimeMicros64();
+        _start = _tickSource->getTicks();
     }
 }
 
-void CurOp::enter_inlock(const char* ns, boost::optional<int> dbProfileLevel) {
+void CurOp::enter_inlock(const char* ns, int dbProfileLevel) {
     ensureStarted();
     _ns = ns;
-    if (dbProfileLevel) {
-        raiseDbProfileLevel(*dbProfileLevel);
-    }
+    raiseDbProfileLevel(dbProfileLevel);
 }
 
 void CurOp::raiseDbProfileLevel(int dbProfileLevel) {
@@ -417,15 +426,11 @@ void CurOp::raiseDbProfileLevel(int dbProfileLevel) {
 }
 
 bool CurOp::completeAndLogOperation(OperationContext* opCtx,
-                                    logger::LogComponent component,
+                                    logv2::LogComponent component,
                                     boost::optional<size_t> responseLength,
                                     boost::optional<long long> slowMsOverride,
                                     bool forceLog) {
-    // Log the operation if it is eligible according to the current slowMS and sampleRate settings.
-    const bool shouldLogOp = (forceLog || shouldLog(component, logger::LogSeverity::Debug(1)));
     const long long slowMs = slowMsOverride.value_or(serverGlobalParams.slowMS);
-
-    const auto client = opCtx->getClient();
 
     // Record the size of the response returned to the client, if applicable.
     if (responseLength) {
@@ -433,17 +438,22 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
     }
 
     // Obtain the total execution time of this operation.
-    _end = curTimeMicros64();
-    _debug.executionTimeMicros = durationCount<Microseconds>(elapsedTimeExcludingPauses());
+    _end = _tickSource->getTicks();
+    _debug.executionTime = duration_cast<Microseconds>(elapsedTimeExcludingPauses());
 
-    if (_debug.isReplOplogFetching) {
-        oplogGetMoreStats.recordMillis(_debug.executionTimeMicros / 1000);
+    const auto executionTimeMillis = durationCount<Milliseconds>(_debug.executionTime);
+
+    if (_debug.isReplOplogGetMore) {
+        oplogGetMoreStats.recordMillis(executionTimeMillis);
     }
 
-    const bool shouldSample =
-        client->getPrng().nextCanonicalDouble() < serverGlobalParams.sampleRate;
+    bool shouldLogSlowOp, shouldSample;
 
-    if (shouldLogOp || (shouldSample && _debug.executionTimeMicros > slowMs * 1000LL)) {
+    // Log the operation if it is eligible according to the current slowMS and sampleRate settings.
+    std::tie(shouldLogSlowOp, shouldSample) = shouldLogSlowOpWithSampling(
+        opCtx, component, Milliseconds(executionTimeMillis), Milliseconds(slowMs));
+
+    if (forceLog || shouldLogSlowOp) {
         auto lockerInfo = opCtx->lockState()->getLockerInfo(_lockStatsBase);
         if (_debug.storageStats == nullptr && opCtx->lockState()->wasGlobalLockTaken() &&
             opCtx->getServiceContext()->getStorageEngine()) {
@@ -465,12 +475,22 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
                 if (lk.isLocked()) {
                     _debug.storageStats = opCtx->recoveryUnit()->getOperationStatistics();
                 } else {
-                    warning(component) << "Unable to gather storage statistics for a slow "
-                                          "operation due to lock aquire timeout";
+                    LOGV2_WARNING_OPTIONS(
+                        20525,
+                        {component},
+                        "Failed to gather storage statistics for {opId} due to {reason}",
+                        "Failed to gather storage statistics for slow operation",
+                        "opId"_attr = opCtx->getOpID(),
+                        "error"_attr = "lock acquire timeout"_sd);
                 }
-            } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-                warning(component) << "Unable to gather storage statistics for a slow "
-                                      "operation due to interrupt";
+            } catch (const ExceptionForCat<ErrorCategory::Interruption>& ex) {
+                LOGV2_WARNING_OPTIONS(
+                    20526,
+                    {component},
+                    "Failed to gather storage statistics for {opId} due to {reason}",
+                    "Failed to gather storage statistics for slow operation",
+                    "opId"_attr = opCtx->getOpID(),
+                    "error"_attr = redact(ex));
             }
         }
 
@@ -480,7 +500,9 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
         _debug.prepareConflictDurationMillis =
             duration_cast<Milliseconds>(prepareConflictDurationMicros);
 
-        log(component) << _debug.report(opCtx, (lockerInfo ? &lockerInfo->stats : nullptr));
+        logv2::DynamicAttributes attr;
+        _debug.report(opCtx, (lockerInfo ? &lockerInfo->stats : nullptr), &attr);
+        LOGV2_OPTIONS(51803, {component}, "Slow query", attr);
     }
 
     // Return 'true' if this operation should also be added to the profiler.
@@ -523,9 +545,11 @@ void appendAsObjOrString(StringData name,
     if (!maxSize || static_cast<size_t>(obj.objsize()) <= *maxSize) {
         builder->append(name, obj);
     } else {
-        // Generate an abbreviated serialization for the object, by passing false as the
-        // "full" argument to obj.toString().
-        std::string objToString = obj.toString();
+        // Generate an abbreviated serialization for the object, by passing false as the "full"
+        // argument to obj.toString(). Remove "comment" field from the object, if present, since
+        // this will be promoted to a top-level field in the output.
+        std::string objToString =
+            (obj.hasField("comment") ? obj.removeField("comment") : obj).toString();
         if (objToString.size() > *maxSize) {
             // objToString is still too long, so we append to the builder a truncated form
             // of objToString concatenated with "...".  Instead of creating a new string
@@ -626,6 +650,10 @@ void CurOp::reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool t
         }
     }
 
+    if (!_failPointMessage.empty()) {
+        builder->append("failpointMsg", _failPointMessage);
+    }
+
     if (auto n = _debug.additiveMetrics.prepareReadConflicts.load(); n > 0) {
         builder->append("prepareReadConflicts", n);
     }
@@ -634,6 +662,14 @@ void CurOp::reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool t
     }
 
     builder->append("numYields", _numYields);
+
+    if (_debug.dataThroughputLastSecond) {
+        builder->append("dataThroughputLastSecond", *_debug.dataThroughputLastSecond);
+    }
+
+    if (_debug.dataThroughputAverage) {
+        builder->append("dataThroughputAverage", *_debug.dataThroughputAverage);
+    }
 }
 
 namespace {
@@ -726,7 +762,7 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
     OPDEBUG_TOSTRING_HELP(nShards);
     OPDEBUG_TOSTRING_HELP(cursorid);
     if (mongotCursorId) {
-        s << " mongot: " << makeSearchBetaObject().toString();
+        s << " mongot: " << makeMongotDebugStatsObject().toString();
     }
     OPDEBUG_TOSTRING_HELP(ntoreturn);
     OPDEBUG_TOSTRING_HELP(ntoskip);
@@ -806,10 +842,182 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
         s << " protocol:" << getProtoString(networkOp);
     }
 
-    s << " " << (executionTimeMicros / 1000) << "ms";
+    if (remoteOpWaitTime) {
+        s << " remoteOpWaitMillis:" << durationCount<Milliseconds>(*remoteOpWaitTime);
+    }
+
+    s << " " << durationCount<Milliseconds>(executionTime) << "ms";
 
     return s.str();
 }
+
+#define OPDEBUG_TOATTR_HELP(x) \
+    if (x >= 0)                \
+    pAttrs->add(#x, x)
+#define OPDEBUG_TOATTR_HELP_BOOL(x) \
+    if (x)                          \
+    pAttrs->add(#x, x)
+#define OPDEBUG_TOATTR_HELP_ATOMIC(x, y) \
+    if (auto __y = y.load(); __y > 0)    \
+    pAttrs->add(x, __y)
+#define OPDEBUG_TOATTR_HELP_OPTIONAL(x, y) \
+    if (y)                                 \
+    pAttrs->add(x, *y)
+
+void OpDebug::report(OperationContext* opCtx,
+                     const SingleThreadedLockStats* lockStats,
+                     logv2::DynamicAttributes* pAttrs) const {
+    Client* client = opCtx->getClient();
+    auto& curop = *CurOp::get(opCtx);
+    auto flowControlStats = opCtx->lockState()->getFlowControlStats();
+
+    if (iscommand) {
+        pAttrs->add("type", "command");
+    } else {
+        pAttrs->add("type", networkOpToString(networkOp));
+    }
+
+    pAttrs->addDeepCopy("ns", curop.getNS());
+
+    const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
+    if (clientMetadata) {
+        StringData appName = clientMetadata.get().getApplicationName();
+        if (!appName.empty()) {
+            pAttrs->add("appName", appName);
+        }
+    }
+
+    auto query = appendCommentField(opCtx, curop.opDescription());
+    if (!query.isEmpty()) {
+        if (iscommand) {
+            const Command* curCommand = curop.getCommand();
+            if (curCommand) {
+                mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
+                curCommand->snipForLogging(&cmdToLog);
+                pAttrs->add("command", redact(cmdToLog.getObject()));
+            } else {
+                // Should not happen but we need to handle curCommand == NULL gracefully.
+                // We don't know what the request payload is intended to be, so it might be
+                // sensitive, and we don't know how to redact it properly without a 'Command*'.
+                // So we just don't log it at all.
+                pAttrs->add("command", "unrecognized");
+            }
+        } else {
+            pAttrs->add("command", redact(query));
+        }
+    }
+
+    auto originatingCommand = curop.originatingCommand();
+    if (!originatingCommand.isEmpty()) {
+        pAttrs->add("originatingCommand", redact(originatingCommand));
+    }
+
+    if (!curop.getPlanSummary().empty()) {
+        pAttrs->addDeepCopy("planSummary", curop.getPlanSummary().toString());
+    }
+
+    if (prepareConflictDurationMillis > Milliseconds::zero()) {
+        pAttrs->add("prepareConflictDuration", prepareConflictDurationMillis);
+    }
+
+    if (dataThroughputLastSecond) {
+        pAttrs->add("dataThroughputLastSecondMBperSec", *dataThroughputLastSecond);
+    }
+
+    if (dataThroughputAverage) {
+        pAttrs->add("dataThroughputAverageMBPerSec", *dataThroughputAverage);
+    }
+
+    OPDEBUG_TOATTR_HELP(nShards);
+    OPDEBUG_TOATTR_HELP(cursorid);
+    if (mongotCursorId) {
+        pAttrs->add("mongot", makeMongotDebugStatsObject());
+    }
+    OPDEBUG_TOATTR_HELP(ntoreturn);
+    OPDEBUG_TOATTR_HELP(ntoskip);
+    OPDEBUG_TOATTR_HELP_BOOL(exhaust);
+
+    OPDEBUG_TOATTR_HELP_OPTIONAL("keysExamined", additiveMetrics.keysExamined);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("docsExamined", additiveMetrics.docsExamined);
+    OPDEBUG_TOATTR_HELP_BOOL(hasSortStage);
+    OPDEBUG_TOATTR_HELP_BOOL(usedDisk);
+    OPDEBUG_TOATTR_HELP_BOOL(fromMultiPlanner);
+    if (replanReason) {
+        bool replanned = true;
+        OPDEBUG_TOATTR_HELP_BOOL(replanned);
+        pAttrs->add("replanReason", redact(*replanReason));
+    }
+    OPDEBUG_TOATTR_HELP_OPTIONAL("nMatched", additiveMetrics.nMatched);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("nModified", additiveMetrics.nModified);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("ninserted", additiveMetrics.ninserted);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("ndeleted", additiveMetrics.ndeleted);
+    OPDEBUG_TOATTR_HELP_BOOL(upsert);
+    OPDEBUG_TOATTR_HELP_BOOL(cursorExhausted);
+
+    OPDEBUG_TOATTR_HELP_OPTIONAL("keysInserted", additiveMetrics.keysInserted);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("keysDeleted", additiveMetrics.keysDeleted);
+    OPDEBUG_TOATTR_HELP_ATOMIC("prepareReadConflicts", additiveMetrics.prepareReadConflicts);
+    OPDEBUG_TOATTR_HELP_ATOMIC("writeConflicts", additiveMetrics.writeConflicts);
+
+    pAttrs->add("numYields", curop.numYields());
+    OPDEBUG_TOATTR_HELP(nreturned);
+
+    if (queryHash) {
+        pAttrs->addDeepCopy("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+        invariant(planCacheKey);
+        pAttrs->addDeepCopy("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKey));
+    }
+
+    if (!errInfo.isOK()) {
+        pAttrs->add("ok", 0);
+        if (!errInfo.reason().empty()) {
+            pAttrs->add("errMsg", redact(errInfo.reason()));
+        }
+        pAttrs->addDeepCopy("errName", errInfo.codeString());
+        pAttrs->add("errCode", static_cast<int>(errInfo.code()));
+    }
+
+    if (responseLength > 0) {
+        pAttrs->add("reslen", responseLength);
+    }
+
+    if (lockStats) {
+        BSONObjBuilder locks;
+        lockStats->report(&locks);
+        pAttrs->add("locks", locks.obj());
+    }
+
+    BSONObj flowControlObj = makeFlowControlObject(flowControlStats);
+    if (flowControlObj.nFields() > 0) {
+        pAttrs->add("flowControl", flowControlObj);
+    }
+
+    {
+        const auto& readConcern = repl::ReadConcernArgs::get(opCtx);
+        if (readConcern.isSpecified()) {
+            pAttrs->add("readConcern", readConcern.toBSONInner());
+        }
+    }
+
+    if (writeConcern && !writeConcern->usedDefault) {
+        pAttrs->add("writeConcern", writeConcern->toBSON());
+    }
+
+    if (storageStats) {
+        pAttrs->add("storage", storageStats->toBSON());
+    }
+
+    if (iscommand) {
+        pAttrs->add("protocol", getProtoString(networkOp));
+    }
+
+    if (remoteOpWaitTime) {
+        pAttrs->add("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
+    }
+
+    pAttrs->add("durationMillis", durationCount<Milliseconds>(executionTime));
+}
+
 
 #define OPDEBUG_APPEND_NUMBER(x) \
     if (x != -1)                 \
@@ -847,7 +1055,7 @@ void OpDebug::append(OperationContext* opCtx,
     OPDEBUG_APPEND_NUMBER(nShards);
     OPDEBUG_APPEND_NUMBER(cursorid);
     if (mongotCursorId) {
-        b.append("mongot", makeSearchBetaObject());
+        b.append("mongot", makeMongotDebugStatsObject());
     }
     OPDEBUG_APPEND_BOOL(exhaust);
 
@@ -924,7 +1132,12 @@ void OpDebug::append(OperationContext* opCtx,
     if (iscommand) {
         b.append("protocol", getProtoString(networkOp));
     }
-    b.appendIntOrLL("millis", executionTimeMicros / 1000);
+
+    if (remoteOpWaitTime) {
+        b.append("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
+    }
+
+    b.appendIntOrLL("millis", durationCount<Milliseconds>(executionTime));
 
     if (!curop.getPlanSummary().empty()) {
         b.append("planSummary", curop.getPlanSummary());
@@ -961,7 +1174,7 @@ BSONObj OpDebug::makeFlowControlObject(FlowControlTicketholder::CurOp stats) con
     return builder.obj();
 }
 
-BSONObj OpDebug::makeSearchBetaObject() const {
+BSONObj OpDebug::makeMongotDebugStatsObject() const {
     BSONObjBuilder cursorBuilder;
     invariant(mongotCursorId);
     cursorBuilder.append("cursorid", mongotCursorId.get());
@@ -1067,6 +1280,34 @@ string OpDebug::AdditiveMetrics::report() const {
     OPDEBUG_TOSTRING_HELP_ATOMIC("writeConflicts", writeConflicts);
 
     return s.str();
+}
+
+void OpDebug::AdditiveMetrics::report(logv2::DynamicAttributes* pAttrs) const {
+    OPDEBUG_TOATTR_HELP_OPTIONAL("keysExamined", keysExamined);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("docsExamined", docsExamined);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("nMatched", nMatched);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("nModified", nModified);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("ninserted", ninserted);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("ndeleted", ndeleted);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("keysInserted", keysInserted);
+    OPDEBUG_TOATTR_HELP_OPTIONAL("keysDeleted", keysDeleted);
+    OPDEBUG_TOATTR_HELP_ATOMIC("prepareReadConflicts", prepareReadConflicts);
+    OPDEBUG_TOATTR_HELP_ATOMIC("writeConflicts", writeConflicts);
+}
+
+BSONObj OpDebug::AdditiveMetrics::reportBSON() const {
+    BSONObjBuilder b;
+    OPDEBUG_APPEND_OPTIONAL("keysExamined", keysExamined);
+    OPDEBUG_APPEND_OPTIONAL("docsExamined", docsExamined);
+    OPDEBUG_APPEND_OPTIONAL("nMatched", nMatched);
+    OPDEBUG_APPEND_OPTIONAL("nModified", nModified);
+    OPDEBUG_APPEND_OPTIONAL("ninserted", ninserted);
+    OPDEBUG_APPEND_OPTIONAL("ndeleted", ndeleted);
+    OPDEBUG_APPEND_OPTIONAL("keysInserted", keysInserted);
+    OPDEBUG_APPEND_OPTIONAL("keysDeleted", keysDeleted);
+    OPDEBUG_APPEND_ATOMIC("prepareReadConflicts", prepareReadConflicts);
+    OPDEBUG_APPEND_ATOMIC("writeConflicts", writeConflicts);
+    return b.obj();
 }
 
 }  // namespace mongo

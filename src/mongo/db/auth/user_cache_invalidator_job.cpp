@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -42,6 +42,7 @@
 #include "mongo/db/auth/user_cache_invalidator_job_parameters_gen.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -49,21 +50,26 @@
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 namespace {
 
-class ThreadSleepInterval {
+using OIDorTimestamp = UserCacheInvalidator::OIDorTimestamp;
 
+class ThreadSleepInterval {
 public:
     explicit ThreadSleepInterval(Seconds interval) : _interval(interval) {}
 
     void setInterval(Seconds interval) {
         {
             stdx::lock_guard<Latch> twiddle(_mutex);
-            LOG(5) << "setInterval: old=" << _interval << ", new=" << interval;
+            LOGV2_DEBUG(20259,
+                        5,
+                        "setInterval: old={previousInterval}, new={newInterval}",
+                        "setInterval",
+                        "previousInterval"_attr = _interval,
+                        "newInterval"_attr = interval);
             _interval = interval;
         }
         _condition.notify_all();
@@ -94,15 +100,22 @@ public:
 
             Date_t now = Date_t::now();
             Date_t expiry = _last + _interval;
-            LOG(5) << "wait: now=" << now << ", expiry=" << expiry;
+            LOGV2_DEBUG(20260,
+                        5,
+                        "wait: now={now}, expiry={expiry}",
+                        "wait",
+                        "now"_attr = now,
+                        "expiry"_attr = expiry);
 
-            if (now >= expiry) {
+            // The second clause in the if statement is if we've jumped back in time due to an NTP
+            // sync; we should always trigger a cache refresh in that case.
+            if (now >= expiry || _last > now) {
                 _last = now;
-                LOG(5) << "wait: done";
+                LOGV2_DEBUG(20261, 5, "wait: done");
                 return true;
             }
 
-            LOG(5) << "wait: blocking";
+            LOGV2_DEBUG(20262, 5, "wait: blocking");
             MONGO_IDLE_THREAD_BLOCK;
             _condition.wait_until(lock, expiry.toSystemTimePoint());
         }
@@ -125,7 +138,7 @@ ThreadSleepInterval* globalInvalidationInterval() {
     return p;
 }
 
-StatusWith<OID> getCurrentCacheGeneration(OperationContext* opCtx) {
+StatusWith<OIDorTimestamp> getCurrentCacheGeneration(OperationContext* opCtx) {
     try {
         BSONObjBuilder result;
         const bool ok = Grid::get(opCtx)->catalogClient()->runUserManagementReadCommand(
@@ -133,12 +146,32 @@ StatusWith<OID> getCurrentCacheGeneration(OperationContext* opCtx) {
         if (!ok) {
             return getStatusFromCommandResult(result.obj());
         }
-        return result.obj()["cacheGeneration"].OID();
+
+        const auto resultObj = result.obj();
+        const auto cacheGenerationElem = resultObj["cacheGeneration"];
+        const auto authInfoOpTimeElem = resultObj["authInfoOpTime"];
+        uassert(4664500,
+                "It is illegal to include both 'cacheGeneration' and 'authInfoOpTime'",
+                !cacheGenerationElem || !authInfoOpTimeElem);
+
+        if (cacheGenerationElem)
+            return OIDorTimestamp(cacheGenerationElem.OID());
+
+        uassert(
+            4664501, "Must include 'authInfoOpTime'", authInfoOpTimeElem.type() == bsonTimestamp);
+        return authInfoOpTimeElem.timestamp();
     } catch (const DBException& e) {
-        return StatusWith<OID>(e.toStatus());
-    } catch (const std::exception& e) {
-        return StatusWith<OID>(ErrorCodes::UnknownError, e.what());
+        return e.toStatus();
     }
+}
+
+std::string oidOrTimestampToString(const OIDorTimestamp& oidOrTimestamp) {
+    if (oidOrTimestamp.index() == 0) {  // OID
+        return stdx::get<OID>(oidOrTimestamp).toString();
+    } else if (oidOrTimestamp.index() == 1) {  // Timestamp
+        return stdx::get<Timestamp>(oidOrTimestamp).toString();
+    }
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace
@@ -158,22 +191,17 @@ UserCacheInvalidator::~UserCacheInvalidator() {
 }
 
 void UserCacheInvalidator::initialize(OperationContext* opCtx) {
-    StatusWith<OID> currentGeneration = getCurrentCacheGeneration(opCtx);
-    if (currentGeneration.isOK()) {
-        _previousCacheGeneration = currentGeneration.getValue();
+    auto swCurrentGeneration = getCurrentCacheGeneration(opCtx);
+    if (swCurrentGeneration.isOK()) {
+        _previousGeneration = swCurrentGeneration.getValue();
         return;
     }
 
-    if (currentGeneration.getStatus().code() == ErrorCodes::CommandNotFound) {
-        warning() << "_getUserCacheGeneration command not found while fetching initial user "
-                     "cache generation from the config server(s).  This most likely means you are "
-                     "running an outdated version of mongod on the config servers";
-    } else {
-        warning() << "An error occurred while fetching initial user cache generation from "
-                     "config servers: "
-                  << currentGeneration.getStatus();
-    }
-    _previousCacheGeneration = OID();
+    LOGV2_WARNING(20265,
+                  "An error occurred while fetching initial user cache generation from config "
+                  "servers",
+                  "error"_attr = swCurrentGeneration.getStatus());
+    _previousGeneration = OID();
 }
 
 void UserCacheInvalidator::run() {
@@ -182,31 +210,36 @@ void UserCacheInvalidator::run() {
     interval->start();
     while (interval->wait()) {
         auto opCtx = cc().makeOperationContext();
-        StatusWith<OID> currentGeneration = getCurrentCacheGeneration(opCtx.get());
-        if (!currentGeneration.isOK()) {
-            warning() << "An error occurred while fetching current user cache generation "
-                         "to check if user cache needs invalidation: "
-                      << currentGeneration.getStatus();
+        auto swCurrentGeneration = getCurrentCacheGeneration(opCtx.get());
+        if (!swCurrentGeneration.isOK()) {
+            LOGV2_WARNING(20266,
+                          "An error occurred while fetching current user cache generation from "
+                          "config servers",
+                          "error"_attr = swCurrentGeneration.getStatus());
 
             // When in doubt, invalidate the cache
             try {
                 _authzManager->invalidateUserCache(opCtx.get());
             } catch (const DBException& e) {
-                warning() << "Error invalidating user cache: " << e.toStatus();
+                LOGV2_WARNING(20267, "Error invalidating user cache", "error"_attr = e.toStatus());
             }
             continue;
         }
 
-        if (currentGeneration.getValue() != _previousCacheGeneration) {
-            log() << "User cache generation changed from " << _previousCacheGeneration << " to "
-                  << currentGeneration.getValue() << "; invalidating user cache";
+        if (swCurrentGeneration.getValue() != _previousGeneration) {
+            LOGV2(20263,
+                  "User cache generation changed from {previousGeneration} to "
+                  "{currentGeneration}; invalidating user cache",
+                  "User cache generation changed; invalidating user cache",
+                  "previousGeneration"_attr = oidOrTimestampToString(_previousGeneration),
+                  "currentGeneration"_attr =
+                      oidOrTimestampToString(swCurrentGeneration.getValue()));
             try {
                 _authzManager->invalidateUserCache(opCtx.get());
             } catch (const DBException& e) {
-                warning() << "Error invalidating user cache: " << e.toStatus();
+                LOGV2_WARNING(20268, "Error invalidating user cache", "error"_attr = e.toStatus());
             }
-
-            _previousCacheGeneration = currentGeneration.getValue();
+            _previousGeneration = swCurrentGeneration.getValue();
         }
     }
 }

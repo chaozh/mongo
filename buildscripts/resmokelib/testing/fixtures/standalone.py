@@ -7,11 +7,11 @@ import time
 import pymongo
 import pymongo.errors
 
-from . import interface
-from ... import config
-from ... import core
-from ... import errors
-from ... import utils
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.testing.fixtures import interface
 
 
 class MongoDFixture(interface.Fixture):
@@ -24,13 +24,14 @@ class MongoDFixture(interface.Fixture):
             preserve_dbpath=False):
         """Initialize MongoDFixture with different options for the mongod process."""
 
+        self.mongod_options = utils.default_if_none(mongod_options, {})
         interface.Fixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
 
-        if "dbpath" in mongod_options and dbpath_prefix is not None:
+        if "dbpath" in self.mongod_options and dbpath_prefix is not None:
             raise ValueError("Cannot specify both mongod_options.dbpath and dbpath_prefix")
 
-        # Command line options override the YAML configuration.
-        self.mongod_executable = utils.default_if_none(config.MONGOD_EXECUTABLE, mongod_executable)
+        # Default to command line options if the YAML configuration is not passed in.
+        self.mongod_executable = utils.default_if_none(mongod_executable, config.MONGOD_EXECUTABLE)
 
         self.mongod_options = utils.default_if_none(mongod_options, {}).copy()
 

@@ -27,23 +27,23 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/commands/cluster_command_test_fixture.h"
 
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
+#include "mongo/util/options_parser/startup_option_init.h"
 #include "mongo/util/tick_source_mock.h"
 
 namespace mongo {
@@ -54,8 +54,8 @@ void ClusterCommandTestFixture::setUp() {
 
     // Set up a logical clock with an initial time.
     auto logicalClock = std::make_unique<LogicalClock>(getServiceContext());
-    logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
     LogicalClock::set(getServiceContext(), std::move(logicalClock));
+    VectorClock::get(getServiceContext())->advanceClusterTime_forTest(kInMemoryLogicalTime);
 
     auto keysCollectionClient = std::make_unique<KeysCollectionClientSharded>(
         Grid::get(operationContext())->catalogClient());
@@ -106,6 +106,10 @@ void ClusterCommandTestFixture::expectReturnsError(ErrorCodes::Error code) {
 }
 
 DbResponse ClusterCommandTestFixture::runCommand(BSONObj cmd) {
+    // TODO SERVER-48142 should remove the following fail-point usage.
+    // Skip appending required fields in unit-tests
+    FailPointEnableBlock skipAppendingReqFields("allowSkippingAppendRequiredFieldsToResponse");
+
     // Create a new client/operation context per command
     auto client = getServiceContext()->makeClient("ClusterCmdClient");
     auto opCtx = client->makeOperationContext();
@@ -303,6 +307,11 @@ void ClusterCommandTestFixture::appendTxnResponseMetadata(BSONObjBuilder& bob) {
     // Set readOnly to false to avoid opting in to the read-only optimization.
     TxnResponseMetadata txnResponseMetadata(false);
     txnResponseMetadata.serialize(&bob);
+}
+
+// Satisfies dependency from StoreSASLOPtions.
+MONGO_STARTUP_OPTIONS_STORE(CoreOptions)(InitializerContext*) {
+    return Status::OK();
 }
 
 }  // namespace mongo

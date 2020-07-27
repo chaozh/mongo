@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -64,7 +64,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/ops/delete_request.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/get_executor.h"
@@ -74,15 +74,18 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/rollback_gen.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/oplog_cap_maintainer_thread.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
+
+MONGO_FAIL_POINT_DEFINE(holdStableTimestampAtSpecificTimestamp);
 
 const char StorageInterfaceImpl::kDefaultRollbackIdNamespace[] = "local.system.rollback.id";
 const char StorageInterfaceImpl::kRollbackIdFieldName[] = "rollbackId";
@@ -93,9 +96,6 @@ using UniqueLock = stdx::unique_lock<Latch>;
 
 const auto kIdIndexName = "_id_"_sd;
 
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
-}
 }  // namespace
 
 StorageInterfaceImpl::StorageInterfaceImpl()
@@ -115,7 +115,7 @@ StatusWith<int> StorageInterfaceImpl::getRollbackID(OperationContext* opCtx) {
         auto rbid = RollbackID::parse(IDLParserErrorContext("RollbackID"), rbidDoc.getValue());
         invariant(rbid.get_id() == kRollbackIdDocumentId);
         return rbid.getRollbackId();
-    } catch (...) {
+    } catch (const DBException&) {
         return exceptionToStatus();
     }
 
@@ -190,7 +190,11 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
     const BSONObj idIndexSpec,
     const std::vector<BSONObj>& secondaryIndexSpecs) {
 
-    LOG(2) << "StorageInterfaceImpl::createCollectionForBulkLoading called for ns: " << nss.ns();
+    LOGV2_DEBUG(21753,
+                2,
+                "StorageInterfaceImpl::createCollectionForBulkLoading called for ns: {namespace}",
+                "StorageInterfaceImpl::createCollectionForBulkLoading called",
+                "namespace"_attr = nss.ns());
 
     class StashClient {
     public:
@@ -322,14 +326,27 @@ Status insertDocumentsSingleBatch(OperationContext* opCtx,
                                   const NamespaceStringOrUUID& nsOrUUID,
                                   std::vector<InsertStatement>::const_iterator begin,
                                   std::vector<InsertStatement>::const_iterator end) {
-    AutoGetCollection autoColl(opCtx, nsOrUUID, MODE_IX);
+    boost::optional<AutoGetCollection> autoColl;
+    boost::optional<AutoGetOplog> autoOplog;
+    Collection* collection;
 
-    auto collectionResult =
-        getCollection(autoColl, nsOrUUID, "The collection must exist before inserting documents.");
-    if (!collectionResult.isOK()) {
-        return collectionResult.getStatus();
+    auto nss = nsOrUUID.nss();
+    if (nss && nss->isOplog()) {
+        // Simplify locking rules for oplog collection.
+        autoOplog.emplace(opCtx, OplogAccessMode::kWrite);
+        collection = autoOplog->getCollection();
+        if (!collection) {
+            return {ErrorCodes::NamespaceNotFound, "Oplog collection does not exist"};
+        }
+    } else {
+        autoColl.emplace(opCtx, nsOrUUID, MODE_IX);
+        auto collectionResult = getCollection(
+            autoColl.get(), nsOrUUID, "The collection must exist before inserting documents.");
+        if (!collectionResult.isOK()) {
+            return collectionResult.getStatus();
+        }
+        collection = collectionResult.getValue();
     }
-    auto collection = collectionResult.getValue();
 
     WriteUnitOfWork wunit(opCtx);
     OpDebug* const nullOpDebug = nullptr;
@@ -384,7 +401,10 @@ Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
     std::vector<std::string> dbNames =
         opCtx->getServiceContext()->getStorageEngine()->listDatabases();
     invariant(!dbNames.empty());
-    log() << "dropReplicatedDatabases - dropping " << dbNames.size() << " databases";
+    LOGV2(21754,
+          "dropReplicatedDatabases - dropping {numDatabases} databases",
+          "dropReplicatedDatabases - dropping databases",
+          "numDatabases"_attr = dbNames.size());
 
     ReplicationCoordinator::get(opCtx)->dropAllSnapshots();
 
@@ -401,14 +421,20 @@ Status StorageInterfaceImpl::dropReplicatedDatabases(OperationContext* opCtx) {
             } else {
                 // This is needed since dropDatabase can't be rolled back.
                 // This is safe be replaced by "invariant(db);dropDatabase(opCtx, db);" once fixed.
-                log() << "dropReplicatedDatabases - database disappeared after retrieving list of "
-                         "database names but before drop: "
-                      << dbName;
+                LOGV2(21755,
+                      "dropReplicatedDatabases - database disappeared after retrieving list of "
+                      "database names but before drop: {dbName}",
+                      "dropReplicatedDatabases - database disappeared after retrieving list of "
+                      "database names but before drop",
+                      "dbName"_attr = dbName);
             }
         });
     }
     invariant(hasLocalDatabase, "local database missing");
-    log() << "dropReplicatedDatabases - dropped " << dbNames.size() << " databases";
+    LOGV2(21756,
+          "dropReplicatedDatabases - dropped {numDatabases} databases",
+          "dropReplicatedDatabases - dropped databases",
+          "numDatabases"_attr = dbNames.size());
 
     return Status::OK();
 }
@@ -418,23 +444,25 @@ Status StorageInterfaceImpl::createOplog(OperationContext* opCtx, const Namespac
     return Status::OK();
 }
 
-StatusWith<size_t> StorageInterfaceImpl::getOplogMaxSize(OperationContext* opCtx,
-                                                         const NamespaceString& nss) {
+StatusWith<size_t> StorageInterfaceImpl::getOplogMaxSize(OperationContext* opCtx) {
     // This writeConflictRetry loop protects callers from WriteConflictExceptions thrown by the
     // storage engine running out of cache space, despite this operation not performing any writes.
     return writeConflictRetry(
-        opCtx, "StorageInterfaceImpl::getOplogMaxSize", nss.ns(), [&]() -> StatusWith<size_t> {
-            AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-            auto collectionResult = getCollection(autoColl, nss, "Your oplog doesn't exist.");
-            if (!collectionResult.isOK()) {
-                return collectionResult.getStatus();
+        opCtx,
+        "StorageInterfaceImpl::getOplogMaxSize",
+        NamespaceString::kRsOplogNamespace.ns(),
+        [&]() -> StatusWith<size_t> {
+            AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+            auto oplog = oplogRead.getCollection();
+            if (!oplog) {
+                return {ErrorCodes::NamespaceNotFound, "Your oplog doesn't exist."};
             }
-
-            const auto options = DurableCatalog::get(opCtx)->getCollectionOptions(
-                opCtx, collectionResult.getValue()->getCatalogId());
+            const auto options =
+                DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, oplog->getCatalogId());
             if (!options.capped)
-                return {ErrorCodes::BadValue, str::stream() << nss.ns() << " isn't capped"};
-
+                return {ErrorCodes::BadValue,
+                        str::stream()
+                            << NamespaceString::kRsOplogNamespace.ns() << " isn't capped"};
             return options.cappedSize;
         });
 }
@@ -564,7 +592,7 @@ Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
                           str::stream() << "Could not find index " << indexName << " in "
                                         << nss.ns() << " to set to multikey.");
         }
-        collection->getIndexCatalog()->setMultikeyPaths(opCtx, idx, paths);
+        collection->getIndexCatalog()->setMultikeyPaths(opCtx, collection, idx, paths);
         wunit.commit();
         return Status::OK();
     });
@@ -632,13 +660,16 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                 }
                 // Use collection scan.
                 planExecutor = isFind
-                    ? InternalPlanner::collectionScan(
-                          opCtx, nsOrUUID.toString(), collection, PlanExecutor::NO_YIELD, direction)
+                    ? InternalPlanner::collectionScan(opCtx,
+                                                      nsOrUUID.toString(),
+                                                      collection,
+                                                      PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                      direction)
                     : InternalPlanner::deleteWithCollectionScan(
                           opCtx,
                           collection,
                           makeDeleteStageParamsForDeleteDocuments(),
-                          PlanExecutor::NO_YIELD,
+                          PlanYieldPolicy::YieldPolicy::NO_YIELD,
                           direction);
             } else {
                 // Use index scan.
@@ -670,46 +701,47 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
                 if (!endKey.isEmpty()) {
                     bounds.second = endKey;
                 }
-                planExecutor = isFind ? InternalPlanner::indexScan(opCtx,
-                                                                   collection,
-                                                                   indexDescriptor,
-                                                                   bounds.first,
-                                                                   bounds.second,
-                                                                   boundInclusion,
-                                                                   PlanExecutor::NO_YIELD,
-                                                                   direction,
-                                                                   InternalPlanner::IXSCAN_FETCH)
-                                      : InternalPlanner::deleteWithIndexScan(
-                                            opCtx,
-                                            collection,
-                                            makeDeleteStageParamsForDeleteDocuments(),
-                                            indexDescriptor,
-                                            bounds.first,
-                                            bounds.second,
-                                            boundInclusion,
-                                            PlanExecutor::NO_YIELD,
-                                            direction);
+                planExecutor = isFind
+                    ? InternalPlanner::indexScan(opCtx,
+                                                 collection,
+                                                 indexDescriptor,
+                                                 bounds.first,
+                                                 bounds.second,
+                                                 boundInclusion,
+                                                 PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                 direction,
+                                                 InternalPlanner::IXSCAN_FETCH)
+                    : InternalPlanner::deleteWithIndexScan(
+                          opCtx,
+                          collection,
+                          makeDeleteStageParamsForDeleteDocuments(),
+                          indexDescriptor,
+                          bounds.first,
+                          bounds.second,
+                          boundInclusion,
+                          PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                          direction);
             }
 
             std::vector<BSONObj> docs;
-            BSONObj out;
-            PlanExecutor::ExecState state = PlanExecutor::ExecState::ADVANCED;
-            while (state == PlanExecutor::ExecState::ADVANCED && docs.size() < limit) {
-                state = planExecutor->getNext(&out, nullptr);
-                if (state == PlanExecutor::ExecState::ADVANCED) {
-                    docs.push_back(out.getOwned());
+
+            try {
+                BSONObj out;
+                PlanExecutor::ExecState state = PlanExecutor::ExecState::ADVANCED;
+                while (state == PlanExecutor::ExecState::ADVANCED && docs.size() < limit) {
+                    state = planExecutor->getNext(&out, nullptr);
+                    if (state == PlanExecutor::ExecState::ADVANCED) {
+                        docs.push_back(out.getOwned());
+                    }
                 }
+            } catch (const WriteConflictException&) {
+                // Re-throw the WCE, since it will get caught be a retry loop at a higher level.
+                throw;
+            } catch (const DBException&) {
+                return exceptionToStatus();
             }
 
-            switch (state) {
-                case PlanExecutor::ADVANCED:
-                case PlanExecutor::IS_EOF:
-                    return Result(docs);
-                case PlanExecutor::FAILURE:
-                    return WorkingSetCommon::getMemberObjectStatus(out);
-                default:
-                    MONGO_UNREACHABLE;
-            }
+            return Result{docs};
         });
 }
 
@@ -841,7 +873,7 @@ Status _updateWithQuery(OperationContext* opCtx,
                         const Timestamp& ts) {
     invariant(!request.isMulti());  // We only want to update one document for performance.
     invariant(!request.shouldReturnAnyDocs());
-    invariant(PlanExecutor::NO_YIELD == request.getYieldPolicy());
+    invariant(PlanYieldPolicy::YieldPolicy::NO_YIELD == request.getYieldPolicy());
 
     auto& nss = request.getNamespaceString();
     return writeConflictRetry(opCtx, "_updateWithQuery", nss.ns(), [&] {
@@ -868,18 +900,26 @@ Status _updateWithQuery(OperationContext* opCtx,
         WriteUnitOfWork wuow(opCtx);
         if (!ts.isNull()) {
             uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(ts));
+            opCtx->recoveryUnit()->setOrderedCommit(false);
         }
 
         auto planExecutorResult = mongo::getExecutorUpdate(
-            opCtx, nullptr, collection, &parsedUpdate, boost::none /* verbosity */);
+            nullptr, collection, &parsedUpdate, boost::none /* verbosity */);
         if (!planExecutorResult.isOK()) {
             return planExecutorResult.getStatus();
         }
         auto planExecutor = std::move(planExecutorResult.getValue());
 
-        auto ret = planExecutor->executePlan();
+        try {
+            planExecutor->executePlan();
+        } catch (const WriteConflictException&) {
+            // Re-throw the WCE, since it will get caught and retried at a higher level.
+            throw;
+        } catch (const DBException&) {
+            return exceptionToStatus();
+        }
         wuow.commit();
-        return ret;
+        return Status::OK();
     });
 }
 
@@ -907,13 +947,14 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
 
         // We can create an UpdateRequest now that the collection's namespace has been resolved, in
         // the event it was specified as a UUID.
-        UpdateRequest request(collection->ns());
+        auto request = UpdateRequest();
+        request.setNamespaceString(collection->ns());
         request.setQuery(query);
         request.setUpdateModification(update);
         request.setUpsert(true);
         invariant(!request.isMulti());  // This follows from using an exact _id query.
         invariant(!request.shouldReturnAnyDocs());
-        invariant(PlanExecutor::NO_YIELD == request.getYieldPolicy());
+        invariant(PlanYieldPolicy::YieldPolicy::NO_YIELD == request.getYieldPolicy());
 
         // ParsedUpdate needs to be inside the write conflict retry loop because it contains
         // the UpdateDriver whose state may be modified while we are applying the update.
@@ -941,14 +982,23 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
                                                               idKey.wrap(""),
                                                               parsedUpdate.yieldPolicy());
 
-        return planExecutor->executePlan();
+        try {
+            planExecutor->executePlan();
+        } catch (const WriteConflictException&) {
+            // Re-throw the WCE, since it will get caught and retried at a higher level.
+            throw;
+        } catch (const DBException&) {
+            return exceptionToStatus();
+        }
+        return Status::OK();
     });
 }
 
 Status StorageInterfaceImpl::putSingleton(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const TimestampedBSONObj& update) {
-    UpdateRequest request(nss);
+    auto request = UpdateRequest();
+    request.setNamespaceString(nss);
     request.setQuery({});
     request.setUpdateModification(update.obj);
     request.setUpsert(true);
@@ -959,7 +1009,8 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
                                              const NamespaceString& nss,
                                              const BSONObj& query,
                                              const TimestampedBSONObj& update) {
-    UpdateRequest request(nss);
+    auto request = UpdateRequest();
+    request.setNamespaceString(nss);
     request.setQuery(query);
     request.setUpdateModification(update.obj);
     invariant(!request.isUpsert());
@@ -969,14 +1020,15 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
 Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
                                             const NamespaceString& nss,
                                             const BSONObj& filter) {
-    DeleteRequest request(nss);
+    auto request = DeleteRequest{};
+    request.setNsString(nss);
     request.setQuery(filter);
     request.setMulti(true);
-    request.setYieldPolicy(PlanExecutor::NO_YIELD);
+    request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::NO_YIELD);
 
     // This disables the isLegalClientSystemNS() check in getExecutorDelete() which is used to
     // disallow client deletes from unrecognized system collections.
-    request.setGod();
+    request.setGod(true);
 
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::deleteByFilter", nss.ns(), [&] {
         // ParsedDelete needs to be inside the write conflict retry loop because it may create a
@@ -1000,14 +1052,120 @@ Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
         auto collection = collectionResult.getValue();
 
         auto planExecutorResult = mongo::getExecutorDelete(
-            opCtx, nullptr, collection, &parsedDelete, boost::none /* verbosity */);
+            nullptr, collection, &parsedDelete, boost::none /* verbosity */);
         if (!planExecutorResult.isOK()) {
             return planExecutorResult.getStatus();
         }
         auto planExecutor = std::move(planExecutorResult.getValue());
 
-        return planExecutor->executePlan();
+        try {
+            planExecutor->executePlan();
+        } catch (const WriteConflictException&) {
+            // Re-throw the WCE, since it will get caught and retried at a higher level.
+            throw;
+        } catch (const DBException&) {
+            return exceptionToStatus();
+        }
+        return Status::OK();
     });
+}
+
+boost::optional<BSONObj> StorageInterfaceImpl::findOplogEntryLessThanOrEqualToTimestamp(
+    OperationContext* opCtx, Collection* oplog, const Timestamp& timestamp) {
+    invariant(oplog);
+    invariant(opCtx->lockState()->isLocked());
+
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec =
+        InternalPlanner::collectionScan(opCtx,
+                                        NamespaceString::kRsOplogNamespace.ns(),
+                                        oplog,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                        InternalPlanner::BACKWARD);
+
+    // A record id in the oplog collection is equivalent to the document's timestamp field.
+    RecordId desiredRecordId = RecordId(timestamp.asULL());
+
+    // Iterate the collection in reverse until the desiredRecordId, or one less than, is found.
+    BSONObj bson;
+    RecordId recordId;
+    PlanExecutor::ExecState state;
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&bson, &recordId))) {
+        if (recordId <= desiredRecordId) {
+            invariant(!bson.isEmpty(),
+                      "An empty oplog entry was returned while searching for an oplog entry <= " +
+                          timestamp.toString());
+            return bson.getOwned();
+        }
+    }
+
+    return boost::none;
+}
+
+boost::optional<BSONObj> StorageInterfaceImpl::findOplogEntryLessThanOrEqualToTimestampRetryOnWCE(
+    OperationContext* opCtx, Collection* oplogCollection, const Timestamp& timestamp) {
+    // Oplog reads are specially done under only MODE_IS global locks, without database or
+    // collection level intent locks. Therefore, reads can run concurrently with validate cmds that
+    // take collection MODE_X locks. Validate with {full:true} set calls WT::verify on the
+    // collection, which causes concurrent readers to hit WT EBUSY errors that MongoDB converts
+    // into WriteConflictException errors.
+    //
+    // Consequently, this code must be resilient to WCE errors and retry until the validate cmd
+    // finishes. The greater operation using this helper cannot simply fail because it would cause
+    // correctness errors.
+
+    int retries = 0;
+    while (true) {
+        try {
+            return findOplogEntryLessThanOrEqualToTimestamp(opCtx, oplogCollection, timestamp);
+        } catch (const WriteConflictException&) {
+            // This will log a message about the conflict initially and then every 5 seconds, with
+            // the current rather arbitrary settings.
+            if (retries % 10 == 0) {
+                LOGV2(4795900,
+                      "Reading the oplog collection conflicts with a validate cmd. Continuing to "
+                      "retry.",
+                      "retries"_attr = retries);
+            }
+
+            ++retries;
+
+            // Sleep a bit so we do not keep hammering the system with retries while the validate
+            // cmd finishes.
+            opCtx->sleepFor(Milliseconds(500));
+        }
+    }
+}
+
+Timestamp StorageInterfaceImpl::getLatestOplogTimestamp(OperationContext* opCtx) {
+    auto statusWithTimestamp = [&]() {
+        AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+        return oplogRead.getCollection()->getRecordStore()->getLatestOplogTimestamp(opCtx);
+    }();
+
+    // If the storage engine does not support getLatestOplogTimestamp, then fall back to higher
+    // level (above the storage engine) logic to fetch the latest oplog entry timestamp.
+    if (statusWithTimestamp.getStatus() == ErrorCodes::OplogOperationUnsupported) {
+        // Reset the snapshot so that it is ensured to see the latest oplog entries.
+        opCtx->recoveryUnit()->abandonSnapshot();
+
+        // Helpers::getLast will bypass the oplog visibility rules by doing a backwards collection
+        // scan.
+        BSONObj oplogEntryBSON;
+        invariant(Helpers::getLast(
+            opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntryBSON));
+
+        auto optime = OpTime::parseFromOplogEntry(oplogEntryBSON);
+        invariant(optime.isOK(),
+                  str::stream() << "Found an invalid oplog entry: " << oplogEntryBSON
+                                << ", error: " << optime.getStatus());
+        return optime.getValue().getTimestamp();
+    }
+
+    invariant(statusWithTimestamp.isOK(),
+              str::stream() << "Expected oplog entries to exist: "
+                            << statusWithTimestamp.getStatus());
+
+    return statusWithTimestamp.getValue();
 }
 
 StatusWith<StorageInterface::CollectionSize> StorageInterfaceImpl::getCollectionSize(
@@ -1072,7 +1230,18 @@ StatusWith<OptionalCollectionUUID> StorageInterfaceImpl::getCollectionUUID(
 }
 
 void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
-    serviceCtx->getStorageEngine()->setStableTimestamp(snapshotName);
+    auto newStableTimestamp = snapshotName;
+    // Hold the stable timestamp back if this failpoint is enabled.
+    holdStableTimestampAtSpecificTimestamp.execute([&](const BSONObj& dataObj) {
+        const auto holdStableTimestamp = dataObj["timestamp"].timestamp();
+        if (newStableTimestamp > holdStableTimestamp) {
+            newStableTimestamp = holdStableTimestamp;
+            LOGV2(4784410,
+                  "holdStableTimestampAtSpecificTimestamp holding the stable timestamp",
+                  "holdStableTimestamp"_attr = holdStableTimestamp);
+        }
+    });
+    serviceCtx->getStorageEngine()->setStableTimestamp(newStableTimestamp);
 }
 
 void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
@@ -1080,8 +1249,17 @@ void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
     serviceCtx->getStorageEngine()->setInitialDataTimestamp(snapshotName);
 }
 
-StatusWith<Timestamp> StorageInterfaceImpl::recoverToStableTimestamp(OperationContext* opCtx) {
-    return opCtx->getServiceContext()->getStorageEngine()->recoverToStableTimestamp(opCtx);
+Timestamp StorageInterfaceImpl::recoverToStableTimestamp(OperationContext* opCtx) {
+    auto serviceContext = opCtx->getServiceContext();
+
+    StorageControl::stopStorageControls(serviceContext);
+
+    auto swStableTimestamp = serviceContext->getStorageEngine()->recoverToStableTimestamp(opCtx);
+    fassert(31049, swStableTimestamp);
+
+    StorageControl::startStorageControls(serviceContext);
+
+    return swStableTimestamp.getValue();
 }
 
 bool StorageInterfaceImpl::supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const {
@@ -1169,20 +1347,11 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
 
 void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx,
                                                                    bool primaryOnly) {
-    Lock::GlobalLock lk(opCtx, MODE_IS);
+    AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
     if (primaryOnly &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(opCtx, "admin"))
         return;
-    Collection* oplog;
-    {
-        // We don't want to be holding the collection lock while blocking, to avoid deadlocks.
-        // It is safe to store and access the oplog's Collection object with just the global IS
-        // lock because of the special concurrency rules for the oplog.
-        // TODO(spencer): It should be possible to get the pointer to the oplog Collection object
-        // without ever having to take the collection lock.
-        AutoGetCollection oplogLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
-        oplog = oplogLock.getCollection();
-    }
+    auto oplog = oplogRead.getCollection();
     uassert(ErrorCodes::NotYetInitialized, "The oplog does not exist", oplog);
     oplog->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 }
@@ -1190,10 +1359,10 @@ void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationCont
 void StorageInterfaceImpl::oplogDiskLocRegister(OperationContext* opCtx,
                                                 const Timestamp& ts,
                                                 bool orderedCommit) {
-    AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
-    fassert(
-        28557,
-        oplog.getCollection()->getRecordStore()->oplogDiskLocRegister(opCtx, ts, orderedCommit));
+    AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+    fassert(28557,
+            oplogRead.getCollection()->getRecordStore()->oplogDiskLocRegister(
+                opCtx, ts, orderedCommit));
 }
 
 boost::optional<Timestamp> StorageInterfaceImpl::getLastStableRecoveryTimestamp(

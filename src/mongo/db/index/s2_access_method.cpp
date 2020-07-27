@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/db/index/s2_access_method.h"
 
@@ -41,7 +41,7 @@
 #include "mongo/db/index/expression_params.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -77,7 +77,10 @@ S2AccessMethod::S2AccessMethod(IndexCatalogEntry* btreeState,
             geoFields >= 1);
 
     if (descriptor->isSparse()) {
-        warning() << "Sparse option ignored for index spec " << descriptor->keyPattern().toString();
+        LOGV2_WARNING(23742,
+                      "Sparse option ignored for index spec {descriptor_keyPattern}",
+                      "Sparse option ignored for index spec",
+                      "indexSpec"_attr = descriptor->keyPattern());
     }
 }
 
@@ -124,13 +127,15 @@ StatusWith<BSONObj> S2AccessMethod::fixSpec(const BSONObj& specObj) {
     return specObj;
 }
 
-void S2AccessMethod::doGetKeys(const BSONObj& obj,
+void S2AccessMethod::doGetKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
+                               const BSONObj& obj,
                                GetKeysContext context,
                                KeyStringSet* keys,
                                KeyStringSet* multikeyMetadataKeys,
                                MultikeyPaths* multikeyPaths,
                                boost::optional<RecordId> id) const {
-    ExpressionKeysPrivate::getS2Keys(obj,
+    ExpressionKeysPrivate::getS2Keys(pooledBufferBuilder,
+                                     obj,
                                      _descriptor->keyPattern(),
                                      _params,
                                      keys,

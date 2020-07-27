@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/catalog/collection_compact.h"
 
@@ -41,12 +41,12 @@
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
-using logger::LogComponent;
+using logv2::LogComponent;
 
 namespace {
 
@@ -103,7 +103,11 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
         recordStore = collection->getRecordStore();
     }
 
-    log(LogComponent::kCommand) << "compact " << collectionNss << " begin";
+    LOGV2_OPTIONS(20284,
+                  {LogComponent::kCommand},
+                  "compact {namespace} begin",
+                  "Compact begin",
+                  "namespace"_attr = collectionNss);
 
     auto oldTotalSize = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
     auto indexCatalog = collection->getIndexCatalog();
@@ -119,8 +123,11 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
 
     auto totalSizeDiff =
         oldTotalSize - recordStore->storageSize(opCtx) - collection->getIndexSize(opCtx);
-    log() << "compact " << collectionNss << " bytes freed: " << totalSizeDiff;
-    log() << "compact " << collectionNss << " end";
+    LOGV2(20286,
+          "compact {namespace} end, bytes freed: {freedBytes}",
+          "Compact end",
+          "namespace"_attr = collectionNss,
+          "freedBytes"_attr = totalSizeDiff);
     return totalSizeDiff;
 }
 

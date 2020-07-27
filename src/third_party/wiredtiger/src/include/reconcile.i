@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,26 +13,214 @@
     (WT_CROSSING_MIN_BND(r, next_len) || WT_CROSSING_SPLIT_BND(r, next_len))
 
 /*
+ * WT_REC_SPLIT_MIN_ITEMS_USE_MEM
+ *     The minimum number of page items (entries on the disk image or saved updates) associated with
+ *     a page required to consider in-memory updates in the split calculation.
+ */
+#define WT_REC_SPLIT_MIN_ITEMS_USE_MEM 10
+
+/*
+ * __rec_cell_addr_stats --
+ *     Track statistics for time values associated with an address.
+ */
+static inline void
+__rec_cell_addr_stats(WT_RECONCILE *r, WT_TIME_AGGREGATE *ta)
+{
+    if (ta->newest_start_durable_ts != WT_TS_NONE)
+        FLD_SET(r->ts_usage_flags, WT_REC_TIME_NEWEST_START_DURABLE_TS);
+    if (ta->newest_stop_durable_ts != WT_TS_NONE)
+        FLD_SET(r->ts_usage_flags, WT_REC_TIME_NEWEST_STOP_DURABLE_TS);
+    if (ta->oldest_start_ts != WT_TS_NONE)
+        FLD_SET(r->ts_usage_flags, WT_REC_TIME_OLDEST_START_TS);
+    if (ta->oldest_start_txn != WT_TXN_NONE)
+        FLD_SET(r->ts_usage_flags, WT_REC_TIME_OLDEST_START_TXN);
+    if (ta->newest_stop_ts != WT_TS_MAX)
+        FLD_SET(r->ts_usage_flags, WT_REC_TIME_NEWEST_STOP_TS);
+    if (ta->newest_stop_txn != WT_TXN_MAX)
+        FLD_SET(r->ts_usage_flags, WT_REC_TIME_NEWEST_STOP_TXN);
+    if (ta->prepare != 0)
+        FLD_SET(r->ts_usage_flags, WT_REC_TIME_PREPARE);
+}
+
+/*
+ * __rec_cell_tw_stats --
+ *     Gather statistics about this cell.
+ */
+static inline void
+__rec_cell_tw_stats(WT_RECONCILE *r, WT_TIME_WINDOW *tw)
+{
+    if (tw->durable_start_ts != WT_TS_NONE)
+        ++r->count_durable_start_ts;
+    if (tw->start_ts != WT_TS_NONE)
+        ++r->count_start_ts;
+    if (tw->start_txn != WT_TXN_NONE)
+        ++r->count_start_txn;
+    if (tw->durable_stop_ts != WT_TS_NONE)
+        ++r->count_durable_stop_ts;
+    if (tw->stop_ts != WT_TS_MAX)
+        ++r->count_stop_ts;
+    if (tw->stop_txn != WT_TXN_MAX)
+        ++r->count_stop_txn;
+    if (tw->prepare)
+        ++r->count_prepare;
+}
+
+/*
+ * __rec_page_time_stats_clear --
+ *     Clear page statistics.
+ */
+static inline void
+__rec_page_time_stats_clear(WT_RECONCILE *r)
+{
+    r->count_durable_start_ts = 0;
+    r->count_start_ts = 0;
+    r->count_start_txn = 0;
+    r->count_durable_stop_ts = 0;
+    r->count_stop_ts = 0;
+    r->count_stop_txn = 0;
+    r->count_prepare = 0;
+
+    r->ts_usage_flags = 0;
+}
+
+/*
+ * __rec_page_time_stats --
+ *     Update statistics about this page.
+ */
+static inline void
+__rec_page_time_stats(WT_SESSION_IMPL *session, WT_RECONCILE *r)
+{
+    /* Time window statistics */
+    if (r->count_durable_start_ts != 0) {
+        WT_STAT_CONN_INCRV(
+          session, rec_time_window_bytes_ts, r->count_durable_start_ts * sizeof(wt_timestamp_t));
+        WT_STAT_DATA_INCRV(
+          session, rec_time_window_bytes_ts, r->count_durable_start_ts * sizeof(wt_timestamp_t));
+        WT_STAT_CONN_INCRV(session, rec_time_window_durable_start_ts, r->count_durable_start_ts);
+        WT_STAT_DATA_INCRV(session, rec_time_window_durable_start_ts, r->count_durable_start_ts);
+        WT_STAT_CONN_INCR(session, rec_time_window_pages_durable_start_ts);
+        WT_STAT_DATA_INCR(session, rec_time_window_pages_durable_start_ts);
+        r->rec_page_cell_with_ts = true;
+    }
+    if (r->count_start_ts != 0) {
+        WT_STAT_CONN_INCRV(
+          session, rec_time_window_bytes_ts, r->count_start_ts * sizeof(wt_timestamp_t));
+        WT_STAT_DATA_INCRV(
+          session, rec_time_window_bytes_ts, r->count_start_ts * sizeof(wt_timestamp_t));
+        WT_STAT_CONN_INCRV(session, rec_time_window_start_ts, r->count_start_ts);
+        WT_STAT_DATA_INCRV(session, rec_time_window_start_ts, r->count_start_ts);
+        WT_STAT_CONN_INCR(session, rec_time_window_pages_start_ts);
+        WT_STAT_DATA_INCR(session, rec_time_window_pages_start_ts);
+        r->rec_page_cell_with_ts = true;
+    }
+    if (r->count_start_txn != 0) {
+        WT_STAT_CONN_INCRV(
+          session, rec_time_window_bytes_txn, r->count_start_txn * sizeof(uint64_t));
+        WT_STAT_DATA_INCRV(
+          session, rec_time_window_bytes_txn, r->count_start_txn * sizeof(uint64_t));
+        WT_STAT_CONN_INCRV(session, rec_time_window_start_txn, r->count_start_txn);
+        WT_STAT_DATA_INCRV(session, rec_time_window_start_txn, r->count_start_txn);
+        WT_STAT_CONN_INCR(session, rec_time_window_pages_start_txn);
+        WT_STAT_DATA_INCR(session, rec_time_window_pages_start_txn);
+        r->rec_page_cell_with_txn_id = true;
+    }
+    if (r->count_durable_stop_ts != 0) {
+        WT_STAT_CONN_INCRV(
+          session, rec_time_window_bytes_ts, r->count_durable_stop_ts * sizeof(wt_timestamp_t));
+        WT_STAT_DATA_INCRV(
+          session, rec_time_window_bytes_ts, r->count_durable_stop_ts * sizeof(wt_timestamp_t));
+        WT_STAT_CONN_INCRV(session, rec_time_window_durable_stop_ts, r->count_durable_stop_ts);
+        WT_STAT_DATA_INCRV(session, rec_time_window_durable_stop_ts, r->count_durable_stop_ts);
+        WT_STAT_CONN_INCR(session, rec_time_window_pages_durable_stop_ts);
+        WT_STAT_DATA_INCR(session, rec_time_window_pages_durable_stop_ts);
+        r->rec_page_cell_with_ts = true;
+    }
+    if (r->count_stop_ts != 0) {
+        WT_STAT_CONN_INCRV(
+          session, rec_time_window_bytes_ts, r->count_stop_ts * sizeof(wt_timestamp_t));
+        WT_STAT_DATA_INCRV(
+          session, rec_time_window_bytes_ts, r->count_stop_ts * sizeof(wt_timestamp_t));
+        WT_STAT_CONN_INCRV(session, rec_time_window_stop_ts, r->count_stop_ts);
+        WT_STAT_DATA_INCRV(session, rec_time_window_stop_ts, r->count_stop_ts);
+        WT_STAT_CONN_INCR(session, rec_time_window_pages_stop_ts);
+        WT_STAT_DATA_INCR(session, rec_time_window_pages_stop_ts);
+        r->rec_page_cell_with_ts = true;
+    }
+    if (r->count_stop_txn != 0) {
+        WT_STAT_CONN_INCRV(
+          session, rec_time_window_bytes_txn, r->count_stop_txn * sizeof(uint64_t));
+        WT_STAT_DATA_INCRV(
+          session, rec_time_window_bytes_txn, r->count_stop_txn * sizeof(uint64_t));
+        WT_STAT_CONN_INCRV(session, rec_time_window_stop_txn, r->count_stop_txn);
+        WT_STAT_DATA_INCRV(session, rec_time_window_stop_txn, r->count_stop_txn);
+        WT_STAT_CONN_INCR(session, rec_time_window_pages_stop_txn);
+        WT_STAT_DATA_INCR(session, rec_time_window_pages_stop_txn);
+        r->rec_page_cell_with_txn_id = true;
+    }
+
+    if (r->count_prepare != 0) {
+        WT_STAT_CONN_INCRV(session, rec_time_window_prepared, r->count_prepare);
+        WT_STAT_DATA_INCRV(session, rec_time_window_prepared, r->count_prepare);
+        WT_STAT_CONN_INCR(session, rec_time_window_pages_prepared);
+        WT_STAT_DATA_INCR(session, rec_time_window_pages_prepared);
+        r->rec_page_cell_with_prepared_txn = true;
+    }
+
+    /* Time aggregate statistics */
+    if (FLD_ISSET(r->ts_usage_flags, WT_REC_TIME_NEWEST_START_DURABLE_TS)) {
+        WT_STAT_CONN_INCR(session, rec_time_aggr_newest_start_durable_ts);
+        WT_STAT_DATA_INCR(session, rec_time_aggr_newest_start_durable_ts);
+    }
+    if (FLD_ISSET(r->ts_usage_flags, WT_REC_TIME_NEWEST_STOP_DURABLE_TS)) {
+        WT_STAT_CONN_INCR(session, rec_time_aggr_newest_stop_durable_ts);
+        WT_STAT_DATA_INCR(session, rec_time_aggr_newest_stop_durable_ts);
+    }
+    if (FLD_ISSET(r->ts_usage_flags, WT_REC_TIME_OLDEST_START_TS)) {
+        WT_STAT_CONN_INCR(session, rec_time_aggr_oldest_start_ts);
+        WT_STAT_DATA_INCR(session, rec_time_aggr_oldest_start_ts);
+    }
+    if (FLD_ISSET(r->ts_usage_flags, WT_REC_TIME_OLDEST_START_TXN)) {
+        WT_STAT_CONN_INCR(session, rec_time_aggr_oldest_start_txn);
+        WT_STAT_DATA_INCR(session, rec_time_aggr_oldest_start_txn);
+    }
+    if (FLD_ISSET(r->ts_usage_flags, WT_REC_TIME_NEWEST_STOP_TS)) {
+        WT_STAT_CONN_INCR(session, rec_time_aggr_newest_stop_ts);
+        WT_STAT_DATA_INCR(session, rec_time_aggr_newest_stop_ts);
+    }
+    if (FLD_ISSET(r->ts_usage_flags, WT_REC_TIME_NEWEST_STOP_TXN)) {
+        WT_STAT_CONN_INCR(session, rec_time_aggr_newest_stop_txn);
+        WT_STAT_DATA_INCR(session, rec_time_aggr_newest_stop_txn);
+    }
+    if (FLD_ISSET(r->ts_usage_flags, WT_REC_TIME_PREPARE)) {
+        WT_STAT_CONN_INCR(session, rec_time_aggr_prepared);
+        WT_STAT_DATA_INCR(session, rec_time_aggr_prepared);
+    }
+}
+
+/*
  * __wt_rec_need_split --
  *     Check whether adding some bytes to the page requires a split.
  */
 static inline bool
 __wt_rec_need_split(WT_RECONCILE *r, size_t len)
 {
+    uint32_t page_items;
+
+    page_items = r->entries + r->supd_next;
+
     /*
-     * In the case of a row-store leaf page, trigger a split if a threshold number of saved updates
-     * is reached. This allows pages to split for update/restore and lookaside eviction when there
-     * is no visible data causing the disk image to grow.
+     * In the case of a row-store leaf page, we want to encourage a split if we see lots of
+     * in-memory content. This allows pages to be split for update/restore and history store
+     * eviction even when the disk image itself isn't growing.
      *
-     * In the case of small pages or large keys, we might try to split when a page has no updates or
-     * entries, which isn't possible. To consider update/restore or lookaside information, require
-     * either page entries or updates that will be attached to the image. The limit is one of
-     * either, but it doesn't make sense to create pages or images with few entries or updates, even
-     * where page sizes are small (especially as updates that will eventually become overflow items
-     * can throw off our calculations). Bound the combination at something reasonable.
+     * Make sure that there are a reasonable number of items (entries on the disk image or saved
+     * updates) associated with the page. If there are barely any items on the page, then it's not
+     * worth splitting. We also want to temper this effect to avoid in-memory updates from
+     * dominating the calculation and causing excessive splitting. Therefore, we'll limit the impact
+     * to a tenth of the cache usage occupied by those updates.
      */
-    if (r->page->type == WT_PAGE_ROW_LEAF && r->entries + r->supd_next > 10)
-        len += r->supd_memsize;
+    if (r->page->type == WT_PAGE_ROW_LEAF && page_items > WT_REC_SPLIT_MIN_ITEMS_USE_MEM)
+        len += r->supd_memsize / 10;
 
     /* Check for the disk image crossing a boundary. */
     return (WT_CHECK_CROSSING_BND(r, len));
@@ -43,44 +231,18 @@ __wt_rec_need_split(WT_RECONCILE *r, size_t len)
  *     Initialize an address timestamp triplet.
  */
 static inline void
-__wt_rec_addr_ts_init(WT_RECONCILE *r, wt_timestamp_t *newest_durable_ts,
-  wt_timestamp_t *oldest_start_tsp, uint64_t *oldest_start_txnp, wt_timestamp_t *newest_stop_tsp,
-  uint64_t *newest_stop_txnp)
+__wt_rec_addr_ts_init(WT_RECONCILE *r, WT_TIME_AGGREGATE *ta)
 {
     /*
-     * If the page format supports address timestamps (and not fixed-length column-store, where we
-     * don't maintain timestamps at all), set the oldest/newest timestamps to values at the end of
-     * their expected range so they're corrected as we process key/value items. Otherwise, set the
-     * oldest/newest timestamps to simple durability.
+     * If the page is not fixed-length column-store, where we don't maintain timestamps at all, set
+     * the oldest/newest timestamps to values at the end of their expected range so they're
+     * corrected as we process key/value items. Otherwise, set the oldest/newest timestamps to
+     * simple durability.
      */
-    *newest_durable_ts = WT_TS_NONE;
-    *oldest_start_tsp = WT_TS_MAX;
-    *oldest_start_txnp = WT_TXN_MAX;
-    *newest_stop_tsp = WT_TS_NONE;
-    *newest_stop_txnp = WT_TXN_NONE;
-    if (!__wt_process.page_version_ts || r->page->type == WT_PAGE_COL_FIX) {
-        *newest_durable_ts = WT_TS_NONE;
-        *oldest_start_tsp = WT_TS_NONE;
-        *oldest_start_txnp = WT_TXN_NONE;
-        *newest_stop_tsp = WT_TS_MAX;
-        *newest_stop_txnp = WT_TXN_MAX;
-    }
-}
-
-/*
- * __wt_rec_addr_ts_update --
- *     Update the chunk's timestamp information.
- */
-static inline void
-__wt_rec_addr_ts_update(WT_RECONCILE *r, wt_timestamp_t newest_durable_ts,
-  wt_timestamp_t oldest_start_ts, uint64_t oldest_start_txn, wt_timestamp_t newest_stop_ts,
-  uint64_t newest_stop_txn)
-{
-    r->cur_ptr->newest_durable_ts = WT_MAX(newest_durable_ts, r->cur_ptr->newest_durable_ts);
-    r->cur_ptr->oldest_start_ts = WT_MIN(oldest_start_ts, r->cur_ptr->oldest_start_ts);
-    r->cur_ptr->oldest_start_txn = WT_MIN(oldest_start_txn, r->cur_ptr->oldest_start_txn);
-    r->cur_ptr->newest_stop_ts = WT_MAX(newest_stop_ts, r->cur_ptr->newest_stop_ts);
-    r->cur_ptr->newest_stop_txn = WT_MAX(newest_stop_txn, r->cur_ptr->newest_stop_txn);
+    if (r->page->type == WT_PAGE_COL_FIX)
+        WT_TIME_AGGREGATE_INIT(ta);
+    else
+        WT_TIME_AGGREGATE_INIT_MAX(ta);
 }
 
 /*
@@ -144,11 +306,11 @@ __wt_rec_image_copy(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_REC_KV *kv)
 
 /*
  * __wt_rec_cell_build_addr --
- *     Process an address reference and return a cell structure to be stored on the page.
+ *     Process an address or unpack reference and return a cell structure to be stored on the page.
  */
 static inline void
-__wt_rec_cell_build_addr(
-  WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_ADDR *addr, bool proxy_cell, uint64_t recno)
+__wt_rec_cell_build_addr(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_ADDR *addr,
+  WT_CELL_UNPACK_ADDR *vpack, bool proxy_cell, uint64_t recno)
 {
     WT_REC_KV *val;
     u_int cell_type;
@@ -161,6 +323,8 @@ __wt_rec_cell_build_addr(
      */
     if (proxy_cell)
         cell_type = WT_CELL_ADDR_DEL;
+    else if (vpack != NULL)
+        cell_type = vpack->type;
     else {
         switch (addr->type) {
         case WT_ADDR_INT:
@@ -177,6 +341,8 @@ __wt_rec_cell_build_addr(
         WT_ASSERT(session, addr->size != 0);
     }
 
+    __rec_cell_addr_stats(r, vpack == NULL ? &addr->ta : &vpack->ta);
+
     /*
      * We don't check the address size because we can't store an address on an overflow page: if the
      * address won't fit, the overflow page's address won't fit either. This possibility must be
@@ -188,11 +354,20 @@ __wt_rec_cell_build_addr(
      * We don't copy the data into the buffer, it's not necessary; just re-point the buffer's
      * data/length fields.
      */
-    val->buf.data = addr->addr;
-    val->buf.size = addr->size;
-    val->cell_len = __wt_cell_pack_addr(session, &val->cell, cell_type, recno,
-      addr->newest_durable_ts, addr->oldest_start_ts, addr->oldest_start_txn, addr->newest_stop_ts,
-      addr->newest_stop_txn, val->buf.size);
+    if (vpack == NULL) {
+        WT_ASSERT(session, addr != NULL);
+        val->buf.data = addr->addr;
+        val->buf.size = addr->size;
+        val->cell_len =
+          __wt_cell_pack_addr(session, &val->cell, cell_type, recno, &addr->ta, val->buf.size);
+    } else {
+        WT_ASSERT(session, addr == NULL);
+        val->buf.data = vpack->data;
+        val->buf.size = vpack->size;
+        val->cell_len =
+          __wt_cell_pack_addr(session, &val->cell, cell_type, recno, &vpack->ta, val->buf.size);
+    }
+
     val->len = val->cell_len + val->buf.size;
 }
 
@@ -202,19 +377,17 @@ __wt_rec_cell_build_addr(
  */
 static inline int
 __wt_rec_cell_build_val(WT_SESSION_IMPL *session, WT_RECONCILE *r, const void *data, size_t size,
-  wt_timestamp_t start_ts, uint64_t start_txn, wt_timestamp_t stop_ts, uint64_t stop_txn,
-  uint64_t rle)
+  WT_TIME_WINDOW *tw, uint64_t rle)
 {
     WT_BTREE *btree;
     WT_REC_KV *val;
 
     btree = S2BT(session);
-
     val = &r->v;
 
     /*
-     * We don't copy the data into the buffer, it's not necessary; just re-point the buffer's
-     * data/length fields.
+     * Unless necessary we don't copy the data into the buffer; start by just re-pointing the
+     * buffer's data/length fields.
      */
     val->buf.data = data;
     val->buf.size = size;
@@ -230,12 +403,12 @@ __wt_rec_cell_build_val(WT_SESSION_IMPL *session, WT_RECONCILE *r, const void *d
         if (val->buf.size > btree->maxleafvalue) {
             WT_STAT_DATA_INCR(session, rec_overflow_value);
 
-            return (__wt_rec_cell_build_ovfl(
-              session, r, val, WT_CELL_VALUE_OVFL, start_ts, start_txn, stop_ts, stop_txn, rle));
+            return (__wt_rec_cell_build_ovfl(session, r, val, WT_CELL_VALUE_OVFL, tw, rle));
         }
     }
-    val->cell_len = __wt_cell_pack_value(
-      session, &val->cell, start_ts, start_txn, stop_ts, stop_txn, rle, val->buf.size);
+    __rec_cell_tw_stats(r, tw);
+
+    val->cell_len = __wt_cell_pack_value(session, &val->cell, tw, rle, val->buf.size);
     val->len = val->cell_len + val->buf.size;
 
     return (0);
@@ -246,8 +419,8 @@ __wt_rec_cell_build_val(WT_SESSION_IMPL *session, WT_RECONCILE *r, const void *d
  *     Check for a dictionary match.
  */
 static inline int
-__wt_rec_dict_replace(WT_SESSION_IMPL *session, WT_RECONCILE *r, wt_timestamp_t start_ts,
-  uint64_t start_txn, wt_timestamp_t stop_ts, uint64_t stop_txn, uint64_t rle, WT_REC_KV *val)
+__wt_rec_dict_replace(
+  WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_TIME_WINDOW *tw, uint64_t rle, WT_REC_KV *val)
 {
     WT_REC_DICTIONARY *dp;
     uint64_t offset;
@@ -283,8 +456,7 @@ __wt_rec_dict_replace(WT_SESSION_IMPL *session, WT_RECONCILE *r, wt_timestamp_t 
          * offset from the beginning of the page.
          */
         offset = (uint64_t)WT_PTRDIFF(r->first_free, (uint8_t *)r->cur_ptr->image.mem + dp->offset);
-        val->len = val->cell_len = __wt_cell_pack_copy(
-          session, &val->cell, start_ts, start_txn, stop_ts, stop_txn, rle, offset);
+        val->len = val->cell_len = __wt_cell_pack_copy(session, &val->cell, tw, rle, offset);
         val->buf.data = NULL;
         val->buf.size = 0;
     }

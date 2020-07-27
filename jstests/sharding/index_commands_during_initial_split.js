@@ -1,7 +1,6 @@
 /*
  * Test that the index commands are correctly propagated if they are executed
  * either before, during, or after the initial split critical section.
- * @tags: [requires_fcv_44]
  */
 (function() {
 "use strict";
@@ -9,6 +8,9 @@
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/sharding/libs/sharded_index_util.js");
+
+// Test intentionally inserts orphans outside of migration.
+TestData.skipCheckOrphans = true;
 
 /*
  * Shards the given collection.

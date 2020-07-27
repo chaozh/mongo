@@ -32,17 +32,18 @@
 #include <boost/log/core/record_view.hpp>
 #include <boost/log/utility/formatting_ostream_fwd.hpp>
 
-namespace mongo {
-namespace logv2 {
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/logv2/constants.h"
+
+namespace mongo::logv2 {
 
 class BSONFormatter {
 public:
-    static bool binary() {
-        return true;
-    };
+    BSONFormatter(const AtomicWord<int32_t>* maxAttributeSizeKB = nullptr) {}
 
+    void operator()(boost::log::record_view const& rec, BSONObjBuilder& builder) const;
     void operator()(boost::log::record_view const& rec, boost::log::formatting_ostream& strm) const;
+    BSONObj operator()(boost::log::record_view const& rec) const;
 };
 
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
@@ -38,7 +36,6 @@
 #include "mongo/db/commands/http_client_gen.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/http_client.h"
 
@@ -77,6 +74,14 @@ bool isLocalhostURI(StringData uri) {
     return hp.isLocalHost();
 }
 
+std::string stringFromDataBuilder(DataBuilder& builder) {
+    const auto sz = builder.size();
+    std::string ret;
+    ret.resize(sz);
+    std::copy_n(builder.release().get(), sz, &ret[0]);
+    return ret;
+}
+
 class CmdHttpClient final : public TypedCommand<CmdHttpClient> {
 public:
     using Request = HttpClientRequest;
@@ -105,15 +110,12 @@ public:
                 client->setTimeout(Seconds(timeoutSecs.get()));
             }
 
-            auto ret = client->get(uri);
-            const auto sz = ret.size();
-
-            std::string output;
-            output.resize(sz);
-            std::copy_n(ret.release().get(), sz, &output[0]);
+            auto ret = client->request(HttpClient::HttpMethod::kGET, uri, {nullptr, 0});
 
             Reply reply;
-            reply.setBody(std::move(output));
+            reply.setCode(ret.code);
+            reply.setHeader(stringFromDataBuilder(ret.header));
+            reply.setBody(stringFromDataBuilder(ret.body));
             return reply;
         }
 

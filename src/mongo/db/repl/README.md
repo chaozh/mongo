@@ -57,54 +57,93 @@ satisfy write concerns.
 
 A secondary keeps its data synchronized with its sync source by fetching oplog entries from its sync
 source. This is done via the
-[`OplogFetcher`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/oplog_fetcher.h).
+[`OplogFetcher`](https://github.com/mongodb/mongo/blob/929cd5af6623bb72f05d3364942e84d053ddea0d/src/mongo/db/repl/oplog_fetcher.h).
 
-The `OplogFetcher` first sends a `find` command to the sync source's oplog, and then follows with a
-series of `getMore`s on the cursor.
+The `OplogFetcher` does not directly apply the operations it retrieves from the sync source.
+Rather, it puts them into a buffer (the **`OplogBuffer`**) and another thread is in charge of
+taking the operations off the buffer and applying them. That buffer uses an in-memory blocking
+queue for steady state replication; there is a similar collection-backed buffer used for initial
+sync.
 
-The `OplogFetcher` makes use of the
-[`Fetcher`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/client/fetcher.h) for this task,
-which is a generic class used for fetching data from a collection on a remote node. A `Fetcher` is
-given a `find` command and then follows that command with `getMore` requests. The `Fetcher` also
-takes in a callback function that is called with the results of every batch.
+#### Oplog Fetcher Lifecycle
+
+The `OplogFetcher` is owned by the
+[`BackgroundSync`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/bgsync.h) thread.
+The `BackgroundSync` thread runs continuously while a node is in `SECONDARY` state.
+`BackgroundSync` sits in a loop, where each iteration it first chooses a sync source with the
+`SyncSourceResolver` and then starts up the `OplogFetcher`.
+
+In steady state, the `OplogFetcher` continuously receives and processes batches of oplog entries
+from its sync source.
+
+The `OplogFetcher` could terminate because the first batch implies that a rollback is required, it
+could receive an error from the sync source, or it could just be shut down by its owner, such as
+when `BackgroundSync` itself is shut down. In addition, after every batch, the `OplogFetcher` runs
+validation checks on the documents in that batch. It then decides if it should continue syncing
+from the current sync source. If validation fails, or if the node decides to stop syncing, the
+`OplogFetcher` will shut down.
+
+When the `OplogFetcher` terminates, `BackgroundSync` restarts sync source selection, exits, or goes
+into ROLLBACK depending on the return status.
+
+#### Oplog Fetcher Implementation Details
 
 Let’s refer to the sync source as node A and the fetching node as node B.
 
+After starting up, the `OplogFetcher` first creates a connection to sync source A. Through this
+connection, it will establish an **exhaust cursor** to fetch oplog entries. This means that after
+the initial `find` and `getMore` are sent, A will keep sending all subsequent batches without
+needing B to run any additional `getMore`s.
+
 The `find` command that B’s `OplogFetcher` first sends to sync source A has a greater than or equal
 predicate on the timestamp of the last oplog entry it has fetched. The original `find` command
-should always return at least 1 document due to the greater than or equal predicate. If it does not,
-that means that the A’s oplog is behind B's and thus A should not be B’s sync source. If it does
+should always return at least 1 document due to the greater than or equal predicate. If it does
+not, that means that A’s oplog is behind B's and thus A should not be B’s sync source. If it does
 return a non-empty batch, but the first document returned does not match the last entry in B’s
-oplog, that means that B's oplog has diverged from A's and it should go into
+oplog, there are two possibilities. If the oldest entry in A's oplog is newer than B's latest
+entry, that means that B is too stale to sync from A. As a result, B blacklists A as a sync source
+candidate. Otherwise, B's oplog has diverged from A's and it should go into
 [**ROLLBACK**](https://docs.mongodb.com/manual/core/replica-set-rollbacks/).
 
 After getting the original `find` response, secondaries check the metadata that accompanies the
 response to see if the sync source is still a good sync source. Secondaries check that the node has
 not rolled back since it was chosen and that it is still ahead of them.
 
-The `OplogFetcher` uses **long-polling**. It specifies `awaitData: true, tailable: true` so that the
-`getMore`s block until their `maxTimeMS` expires waiting for more data instead of returning
-immediately. If there is no data to return at the end of `maxTimeMS`, the `OplogFetcher` receives an
-empty batch and simply issues another `getMore`.
+The `OplogFetcher` specifies `awaitData: true, tailable: true` on the cursor so that subsequent
+batches block until their `maxTimeMS` expires waiting for more data instead of returning
+immediately. If there is no data to return at the end of `maxTimeMS`, the `OplogFetcher` receives
+an empty batch and will wait on the next batch.
 
-If any fetch requests have an error, then the `OplogFetcher` creates a new `Fetcher`. It restarts
-the `Fetcher` with a new `find` command each time it receives an error for a maximum of 3 retries.
-If it expires its retries then the `OplogFetcher` shuts down with an error status.
+If the `OplogFetcher` encounters any errors while trying to connect to the sync source or get a
+batch, it will use `OplogFetcherRestartDecision` to check that it has enough retries left to create
+a new cursor. The connection class will automatically handle reconnecting to the sync source when
+needed. Whenever the `OplogFetcher` successfully receives a batch, it will reset its retries. If it
+errors enough times in a row to exhaust its retries, that might be an indication that there is
+something wrong with the connection or the sync source. In that case, the `OplogFetcher` will shut
+down with an error status.
 
-The `OplogFetcher` is owned by the
-[`BackgroundSync`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/bgsync.h) thread.
-The `BackgroundSync` thread runs continuously while a node is in `SECONDARY` state. `BackgroundSync`
-sits in a loop, where each iteration it first chooses a sync source with the `SyncSourceResolver`
-and then starts up the `OplogFetcher`. When the `OplogFetcher` terminates, `BackgroundSync` restarts
-sync source selection, exits, or goes into ROLLBACK depending on the return status. The
-`OplogFetcher` could terminate because the first batch implies that a rollback is required, it could
-receive an error from the sync source, or it could just be shut down by its owner, such as when
-`BackgroundSync` itself is shut down.
+The `OplogFetcher` may shut down for a variety of other reasons as well. After each successful
+batch, the `OplogFetcher` decides if it should continue syncing from the current sync source. If
+the `OplogFetcher` decides to continue, it will wait for the next batch to arrive and repeat. If
+not, the `OplogFetcher` will terminate, which will lead to `BackgroundSync` choosing a new sync
+source. Reasons for changing sync sources include:
 
-The `OplogFetcher` does not directly apply the operations it retrieves from the sync source. Rather,
-it puts them into a buffer (the **`OplogBuffer`**) and another thread is in charge of taking the
-operations off the buffer and applying them. That buffer uses an in-memory blocking queue for steady
-state replication; there is a similar collection-backed buffer used for initial sync.
+* If the node is no longer in the replica set configuration.
+* If the current sync source is no longer in the replica set configuration.
+* If the user has requested another sync source via the `replSetSyncFrom` command.
+* If chaining is disabled and the node is not currently syncing from the primary.
+* If the sync source is not the primary, does not have its own sync source, and is not ahead of
+  the node. This indicates that the sync source will not receive writes in a timely manner. As a
+  result, continuing to sync from it will likely cause the node to be lagged.
+* If the most recent OpTime of the sync source is more than `maxSyncSourceLagSecs` seconds behind
+  another member's latest oplog entry. This ensures that the sync source is not too far behind
+  other nodes in the set. `maxSyncSourceLagSecs` is a server parameter and has a default value of
+  30 seconds.
+* If the node has discovered another eligible sync source that is significantly closer. A
+  significantly closer node has a ping time that is at least `changeSyncSourceThresholdMillis`
+  lower than our current sync source. This minimizes the number of nodes that have sync sources
+  located far away.`changeSyncSourceThresholdMillis` is a server parameter and has a default value
+  of 5 ms.
 
 ### Sync Source Selection
 
@@ -153,9 +192,9 @@ make sure it actually is able to fetch from the sync source candidate’s oplog.
   then the node blacklists that sync source candidate as well because the candidate is too far
   ahead.
 * During initial sync, rollback, or recovery from unclean shutdown, nodes will set a specific
-  OpTime, **`minValid`**, that they must reach before it is safe to read from the node and before
-  the node can transition into `SECONDARY` state. If the secondary has a `minValid`, then the sync
-  source candidate is checked for that `minValid` entry.
+  OpTime, [**`minValid`**](#replication-timestamp-glossary), that they must reach before it is safe
+  to read from the node and before the node can transition into `SECONDARY` state. If the secondary
+  has a `minValid`, then the sync source candidate is checked for that `minValid` entry.
 * The sync source's **RollbackID** is also fetched to be checked after the first batch is returned
   by the `OplogFetcher`.
 
@@ -166,19 +205,49 @@ Otherwise, the secondary found a sync source! At that point `BackgroundSync` sta
 
 ### Oplog Entry Application
 
-A separate thread, `RSDataSync` is used for pulling oplog entries off of the oplog buffer and
-applying them. `RSDataSync` constructs a `SyncTail` in a loop which is used to actually apply the
-operations. The `SyncTail` instance does some oplog application, and terminates when there is a state
-change where we need to pause oplog application. After it terminates, `RSDataSync` loops back and
-decides if it should make a new `SyncTail` and continue.
+A separate thread, `ReplBatcher`, runs the
+[`OplogBatcher`](https://github.com/mongodb/mongo/blob/r4.3.6/src/mongo/db/repl/oplog_batcher.h) and
+is used for pulling oplog entries off of the oplog buffer and creating the next batch that will be
+applied. These batches are called **oplog applier batches** and are different from **oplog fetcher
+batches**, which are sent by a node's sync source during [oplog fetching](#oplog-fetching). Oplog
+applier batches differ from oplog fetcher batches because they have more restrictions than just size
+limits when creating a new batch. Operations in a batch are applied in parallel when possible, so
+there are certain operation types (like commands) which require being in their own oplog applier
+batch. For example, a dropDatabase operation shouldn't be applied in parallel with other operations,
+so it must be in a batch of size one.
 
-`SyncTail` creates multiple threads that apply buffered oplog entries in parallel. Operations are
-pulled off of the oplog buffer in batches to be applied. Nodes keep track of their “last applied
-OpTime”, which is only moved forward at the end of a batch. Oplog entries within the same batch are
-not necessarily applied in order. Operations on a document must be atomic and ordered, so operations
-on the same document will be put on the same thread to be serialized. Additionally, command
-operations are done serially in batches of size 1. Insert operations are also batched together for
-improved performance.
+The
+[`OplogApplier`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/oplog_applier.h)
+is in charge of applying each batch of oplog entries received from the batcher. It will run in an
+endless loop doing the following:
+
+1. Get the next oplog applier batch from the batcher.
+2. Acquire the [Parallel Batch Writer Mode lock](#parallel-batch-writer-mode).
+3. Set the [`oplogTruncateAfterPoint`](#replication-timestamp-glossary) to the node's last applied
+   optime (before this batch) to aid in [startup recovery](#startup-recovery) if the node shuts down
+   in the middle of writing entries to the oplog.
+4. Write the batch of oplog entries into the oplog.
+5. Clear the `oplogTruncateAfterPoint` and set the [**`minValid`**](#replication-timestamp-glossary)
+   document to be the optime of the last entry in the batch. Until the node applies entries through
+   the optime set in this document, the data will not be consistent with the oplog.
+6. Use multiple threads to apply the batch in parallel. This means that oplog entries within the
+   same batch are not necessarily applied in order. The operations in each batch will be divided
+   among the writer threads. The only restriction for creating the vector of operations that each
+   writer thread will apply serially has to do with the namespace that the operation applies to.
+   Operations on a document must be atomic and ordered, so operations on the same namespace will be
+   put on the same thread to be serialized. When applying operations, each writer thread will try to
+   **group** together insert operations for improved performance and will apply all other operations
+   individually.
+7. Tell the storage engine to flush the journal.
+8. Persist the node's "applied through" optime (the optime of the last oplog entry in this oplog
+   applier batch) to disk. This will update the `minValid` document now that the batch has been
+   applied in its entirety.
+9. Update [**oplog visibility**](../catalog/README.md#oplog-visibility) by notifying the storage
+   engine of the new oplog entries. Since entries in an oplog applier batch are applied in
+   parallel, it is only safe to make these entries visible once all the entries in this batch are
+   applied, otherwise an oplog hole could be made visible.
+10. Finalize the batch by advancing the global timestamp (and the node's last applied optime) to the
+   last optime in the batch.
 
 ## Replication and Topology Coordinators
 
@@ -191,7 +260,10 @@ The external state also manages and owns all of the replication threads.
 
 The `TopologyCoordinator` is in charge of maintaining state about the topology of the cluster. On
 significant changes (anything that affects the response to isMaster), the TopologyCoordinator updates
-its TopologyVersion. The [`isMaster`](https://github.com/mongodb/mongo/blob/r4.3.3/src/mongo/db/repl/replication_info.cpp#L258) command awaits changes in the TopologyVersion before returning.
+its TopologyVersion. The [`isMaster`](https://github.com/mongodb/mongo/blob/r4.3.3/src/mongo/db/repl/replication_info.cpp#L258) command awaits changes in the TopologyVersion before returning. On
+shutdown, if the server is a secondary, it enters quiesce mode: we increment the TopologyVersion and
+start responding to `isMaster` commands with a `ShutdownInProgress` error, so that clients cease
+routing new operations to the node.
 
 The `TopologyCoordinator` is non-blocking and does a large amount of a node's decision making
 surrounding replication. Most replication command requests and responses are filled in here.
@@ -248,12 +320,10 @@ It includes:
 
 1. The upstream node's last committed OpTime
 2. The current term.
-3. The `ReplicaSetConfig` version (this is used to determine if a reconfig has occurred on the
-   upstream node that hasn't been registered by the downstream node yet).
+3. The `ReplicaSetConfig` version and term (this is used to determine if a reconfig has occurred on
+   the upstream node that hasn't been registered by the downstream node yet).
 4. The replica set ID.
-
-If the metadata has a different config version than the downstream node's config version, then the
-metadata is ignored until a reconfig command is received that synchronizes the config versions.
+5. Whether the upstream node is primary.
 
 The node sets its term to the upstream node's term, and if it's a primary (which can only happen on
 heartbeats), it steps down.
@@ -293,21 +363,23 @@ quadratically with the number of nodes and is the reasoning behind the 50 member
 set. The data, `ReplSetHeartbeatArgsV1` that accompanies every heartbeat is:
 
 1. `ReplicaSetConfig` version
-2. The id of the sender in the `ReplSetConfig`
-3. Term
-4. Replica set name
-5. Sender host address
+2. `ReplicaSetConfig` term
+3. The id of the sender in the `ReplSetConfig`
+4. Term
+5. Replica set name
+6. Sender host address
 
 When the remote node receives the heartbeat, it first processes the heartbeat data, and then sends a
 response back. First, the remote node makes sure the heartbeat is compatible with its replica set
-name and its `ReplicaSetConfig` version and otherwise sends an error.
+name. Otherwise it sends an error.
 
 The receiving node's `TopologyCoordinator` updates the last time it received a heartbeat from the
 sending node for liveness checking in its `MemberHeartbeatData` list.
 
-If the sending node's config is higher than the receiving node's, then the receiving node schedules
-a heartbeat to get the config. The receiving node's `ReplicationCoordinator` also updates its
-`SlaveInfo` with the last update from the sending node and marks it as being up.
+If the sending node's config is newer than the receiving node's, then the receiving node schedules a
+heartbeat to get the config. The receiving node's `ReplicationCoordinator` also updates its
+`SlaveInfo` with the last update from the sending node and marks it as being up. See more details on
+config propagation via heartbeats in the [Reconfiguration](#Reconfiguration) section.
 
 It then creates a `ReplSetHeartbeatResponse` object. This includes:
 
@@ -315,11 +387,11 @@ It then creates a `ReplSetHeartbeatResponse` object. This includes:
 2. The receiving node's election time
 3. The receiving node's last applied OpTime
 4. The receiving node's last durable OpTime
-5. The node the receiving node thinks is primary
-6. The term of the receiving node
-7. The state of the receiving node
-8. The receiving node's sync source
-9. The receiving node's `ReplicaSetConfig` version
+5. The term of the receiving node
+6. The state of the receiving node
+7. The receiving node's sync source
+8. The receiving node's `ReplicaSetConfig` version and term
+9. Whether the receiving node is primary
 
 When the sending node receives the response to the heartbeat, it first processes its
 `ReplSetMetadata` like before.
@@ -406,8 +478,7 @@ When a node receives a `replSetUpdatePosition` command, the first thing it does 
 For every node’s OpTime data in the `optimes` array, the receiving node updates its view of the
 replicaset in the replication and topology coordinators. This updates the liveness information of
 every node in the `optimes` list. If the data is about the receiving node, it ignores it. If the
-`ReplSetConfig` versions don’t match, it errors. If the receiving node is a primary and it learns
-that the commit point should be moved forward, it does so.
+receiving node is a primary and it learns that the commit point should be moved forward, it does so.
 
 If something has changed and the receiving node itself has a sync source, it forwards its new
 information to its own sync source.
@@ -540,9 +611,9 @@ replaces the local version with the remote versions.
 
 The node gets the last applied OpTime from the sync source and the Rollback ID to check if a
 rollback has happened during this rollback, in which case it fails rollback and shuts down. The
-last applied OpTime is set as the `minValid` for the node and the node goes into RECOVERING state.
-The node resumes fetching and applying operations like a normal secondary until it hits that
-`minValid`. Only at that point does the node go into SECONDARY state.
+last applied OpTime is set as the [`minValid`](#replication-timestamp-glossary) for the node and the
+node goes into RECOVERING state. The node resumes fetching and applying operations like a normal
+secondary until it hits that `minValid`. Only at that point does the node go into SECONDARY state.
 
 This process is very similar to initial sync and startup after an unclean shutdown in that
 operations are applied on data that may already reflect those operations and operations in the
@@ -900,8 +971,9 @@ which ensures a snapshot with no oplog holes.
 
 Secondaries begin replicating transaction oplog entries once the primary has either prepared or
 committed the transaction. They use the `OplogApplier` to apply these entries, which then uses the
-writer thread pool to schedule operations to apply.
-<!-- TODO SERVER-43969: Link to oplog application section -->
+writer thread pool to schedule operations to apply. See the
+[oplog entry application](#oplog-entry-application) section for more details on how secondary oplog
+application works.
 
 Before secondaries process and apply transaction oplog entries, they will track operations that
 require changes to `config.transactions`. This results in an update to the transactions table entry
@@ -1020,10 +1092,10 @@ error code), so that the caller knows that they can safely retry the entire tran
 
 The **Parallel Batch Writer Mode** lock (also known as the PBWM or the Peanut Butter Lock) is a
 global resource that helps manage the concurrency of running operations while a secondary is
-applying a batch of oplog entries. Since secondary oplog application applies batches in parallel,
-operations will not necessarily be applied in order, so a node will hold the PBWM while it is
-waiting for the entire batch to be applied. For secondaries, in order to read at a consistent state
-without needing the PBWM lock, a node will try to read at the
+[applying a batch of oplog entries](#oplog-entry-application). Since secondary oplog application
+applies batches in parallel, operations will not necessarily be applied in order, so a node will
+hold the PBWM while it is waiting for the entire batch to be applied. For secondaries, in order to
+read at a consistent state without needing the PBWM lock, a node will try to read at the
 [`lastApplied`](#replication-timestamp-glossary) timestamp. Since `lastApplied` is set after a batch
 is completed, it is guaranteed to be at a batch boundary. However, during initial sync there could
 be changes from a background index build that occur after the `lastApplied` timestamp. Since there
@@ -1119,7 +1191,7 @@ updates its own term accordingly. The `ReplicationCoordinator` then asks the `To
 if it should grant a vote. The vote is rejected if:
 
 1. It's from an older term.
-2. The config versions do not match.
+2. The configs do not match (see more detail in [Config Ordering and Elections](#config-ordering-and-elections)).
 3. The replica set name does not match.
 4. The last applied OpTime that comes in the vote request is older than the voter's last applied
    OpTime.
@@ -1208,7 +1280,7 @@ that is okay. If you consider the minimum spanning tree on the cluster where edg
 from nodes to their sync source, then as long as the primary is connected to a majority of nodes, it
 will stay primary.
 * Force reconfig via the `replSetReconfig` command
-* Force reconfig via heartbeat: If we learn of a newer config version through heartbeats, we will
+* Force reconfig via heartbeat: If we learn of a newer config through heartbeats, we will
 schedule a replica set config change.
 
 During unconditional stepdown, we do not check preconditions before attempting to step down. Similar
@@ -1294,8 +1366,8 @@ truncate the oplog on the rollback node.
 During the last few steps of the data modification section, we clear the state of the
 `DropPendingCollectionReaper`, which manages collections that are marked as drop-pending by the Two
 Phase Drop algorithm, and make sure it aligns with what is currently on disk. After doing so, we can
-run through the oplog recovery process, which truncates the oplog after the `common point` (at the
-truncate point) and applies all oplog entries through the end of the sync source's oplog. See the
+run through the oplog recovery process, which truncates the oplog after the `common point` and
+applies all oplog entries through the end of the sync source's oplog. See the
 [Startup Recovery](#startup-recovery) section for more information on truncating the oplog and
 applying oplog entries.
 
@@ -1432,9 +1504,7 @@ following:
 
 As seen here, there can be operations on collections that have since been dropped or indexes could
 conflict with the data being added. As a result, many errors that occur here are ignored and assumed
-to resolve themselves, such as `DuplicateKey` errors (like in the example above). If known
-problematic operations such as `renameCollection` are received, where we cannot assume a drop will
-come and fix them, we abort and retry initial sync.
+to resolve themselves, such as `DuplicateKey` errors (like in the example above).
 
 ## Finishing initial sync
 
@@ -1448,6 +1518,162 @@ After that it will reconstruct all prepared transactions. The node will then cle
 flag and tell the storage engine that the [`initialDataTimestamp`](#replication-timestamp-glossary)
 is the node's last applied OpTime. Finally, the `InitialSyncer` shuts down and the
 `ReplicationCoordinator` starts steady state replication.
+
+## Initial Sync Semantics
+
+Nodes in initial sync do not contribute to write concern acknowledgment. While in a `STARTUP2`
+state, a node will not send any `replSetUpdatePosition` commands to its sync source. It will also
+have the `lastAppliedOpTime` and `lastDurableOpTime` set to null in heartbeat responses. The
+combined effect of this is that the primary of the replica set will not receive updates about the
+initial syncing node's progress, and will thus not be able to count that member towards the
+acknowledgment of writes.
+
+In a similar vein, we prevent new members from voting (or increasing the number of nodes needed
+to commit majority writes) until they have successfully completed initial sync and transitioned
+to `SECONDARY` state. This is done as follows: whenever a new voting node is added to the set, we
+internally rewrite its `MemberConfig` to have a special [`newlyAdded=true`](https://github.com/mongodb/mongo/blob/80f424c02df47469792917673ab7e6dd77b01421/src/mongo/db/repl/member_config.idl#L75-L81)
+field. This field signifies that this node is temporarily non-voting and should thus be excluded
+from all voter checks or counts. Once the replica set primary receives a heartbeat response from
+the member stating that it is either in `SECONDARY`, `RECOVERING`, or `ROLLBACK` state, that primary
+schedules an automatic reconfig to remove the corresponding `newlyAdded` field. Note that we filter
+that field out of `replSetGetStatus` responses, but it is always visible in the config stored on
+disk.
+
+# Reconfiguration
+
+MongoDB replica sets consist of a set of members, where a *member* corresponds to a single
+participant of the replica set, identified by a host name and port. We refer to a *node* as the
+mongod server process that corresponds to a particular replica set member. A replica set
+*configuration* consists of a list of members in a replica set along with some member specific
+settings as well as global settings for the set. We alternately refer to a configuration as a
+*config*, for brevity. Each member of the config has a [member
+id](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/member_id.h), which is a
+unique integer identifier for that member. The schema of a config is defined in the
+[ReplSetConfig](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/repl_set_config.h#L110-L547)
+class, which is serialized as a BSON object and stored durably in the `local.system.replset`
+collection on each replica set node.
+
+## Initiation
+
+When the mongod processes for members of a replica set are first started, they have no configuration
+installed and they do not communicate with each other over the network or replicate any data. To
+initialize the replica set, an initial config must be provided via the `replSetInitiate` command, so
+that nodes know who the other members of the replica set are. Upon receiving this command, which can
+be run on any node of an uninitialized set, a node validates and installs the specified config. It
+then establishes connections to and begins sending heartbeats to the other nodes of the replica set
+contained in the configuration it installed. Configurations are propagated between nodes via
+heartbeats, which is how nodes in the replica set will receive and install the initial config.
+
+## Reconfiguration Behavior
+
+To update the current configuration, a client may execute the `replSetReconfig` command with the
+new, desired config. Reconfigurations [can be run
+](https://github.com/mongodb/mongo/blob/892bce4528b2ec97d9f264b5a982d54da0e4971d/src/mongo/db/repl/repl_set_commands.cpp#L419-L421)in
+*safe* mode or in *force* mode. We alternately refer to reconfigurations as *reconfigs*, for
+brevity. Safe reconfigs, which are the default, can only be run against primary nodes and ensure the
+replication safety guarantee that majority committed writes will not be rolled back. Force reconfigs
+can be run against either a primary or secondary node and their usage may cause the rollback of
+majority committed writes. Although force reconfigs are unsafe, they exist to allow users to salvage
+or repair a replica set where a majority of nodes are no longer operational or reachable.
+
+### Safe Reconfig Protocol
+
+The safe reconfiguration protocol implemented in MongoDB shares certain conceptual similarities with
+the "single server" reconfiguration approach described in Section 4 of the [Raft PhD
+thesis](https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf), but was designed with some
+differences to integrate with the existing, heartbeat-based reconfig protocol more easily.
+
+Note that in a static configuration, the safety of the Raft protocol depends on the fact that any
+two quorums (i.e. majorities) of a replica set have at least one member in common i.e. they satisfy
+the *quorum overlap* property. For any two arbitrary configurations, however, this is not the case.
+So, extra restrictions are placed on how nodes are allowed to move between configurations. First,
+all safe reconfigs enforce a **[single node
+change](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/repl_set_config_checks.cpp#L82-L89)**
+condition, which requires that no more than a single voting node is added or removed in a single
+reconfig. Any number of non voting nodes can be added or removed in a single reconfig. This
+constraint ensures that any adjacent configs satisfy quorum overlap. You can see a justification of
+why this is true in the Raft thesis section referenced above.
+
+Even though the single node change condition ensures quorum overlap between two adjacent configs,
+quorum overlap may not always be ensured between configs on all nodes of the system, so there are
+two additional constraints that must be satisfied before a primary node can install a new
+configuration:
+
+1. **[Config
+Replication](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/replication_coordinator_impl.cpp#L3531-L3534)**:
+The current config, C, must be installed on at least a majority of voting nodes in C.
+2. **[Oplog
+Commitment](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/replication_coordinator_impl.cpp#L3553-L3560)**:
+Any oplog entries that were majority committed in the previous config, C0, must be replicated to at
+least a majority of voting nodes in the current config, C1.
+
+Condition 1 ensures that any configs earlier than C can no longer independently form a quorum to
+elect a node or commit a write. Condition 2 ensures that committed writes in any older configs are
+now committed by the rules of the current configuration. This guarantees that any leaders elected in
+a subsequent configuration will contain these entries in their log upon assuming role as leader.
+When both conditions are satisfied, we say that the current config is *committed*.
+
+We wait for both of these conditions to become true at the
+[beginning](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/repl_set_commands.cpp#L421-L437)
+of the `replSetReconfig` command, before installing the new config. Satisfaction of these conditions
+before transitioning to a new config is fundamental to the safety of the reconfig protocol. After
+satisfying these conditions and installing the new config, we also wait for condition 1 to become
+true of the new config at the
+[end](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/repl_set_commands.cpp#L442-L454)
+of the reconfig command. This waiting ensures that the new config is installed on a majority of
+nodes before reconfig returns success, but it is not strictly necessary for guaranteeing safety. If
+it fails, an error will be returned, but the new config will have already been installed and can
+begin to propagate. On a subsequent reconfig, we will still ensure that both safety conditions are
+satisfied before installing the next config. By waiting for config replication at the end of the
+reconfig command, however, we can make the waiting period shorter at the beginning of the next
+reconfig, in addition to ensuring that the newly installed config will be present on a subsequent
+primary.
+
+Note that force reconfigs bypass all checks of condition 1 and 2, and they do not enforce the single
+node change condition.
+
+### Config Ordering and Elections
+
+As mentioned above, configs are propagated between nodes via heartbeats. To do this properly, nodes
+must have some way of determining if one config is "newer" than another. Each configuration has a
+`term` and `version` field, and configs are totally ordered by the [`(version,
+term)`](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/repl_set_config.h#L50-L55)
+pair, where `term` is compared first, and then `version`, analogous to the rules for optime
+comparison. The `term` of a config is the term of the primary that originally created that config,
+and the `version` is a monotonically increasing number assigned to each config. When executing a
+reconfig, the version of the new config must be greater than the version of the current config.  If
+the `(version, term)` pair of config A is greater than that of config B, then it is considered
+"newer" than config B. If a node hears about a newer config via a heartbeat from another node, it
+will [schedule a
+heartbeat](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/replication_coordinator_impl.cpp#L5019-L5036)
+to fetch the config and
+[install](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/topology_coordinator.cpp#L892-L895)
+it locally.
+
+Note that force reconfigs set the new config's term to an [uninitialized term
+value](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/optime.h#L58-L59). When we
+compare two configs, if either of them has an uninitialized term value, then we only consider config
+versions for comparison. A force reconfig also [increments the
+version](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/replication_coordinator_impl.cpp#L3227-L3232)
+of the current config by a large, random number. This makes it very likely that the force config
+will be "newer" than any other config in the system.
+
+Config ordering also affects voting behavior. If a replica set node is a candidate for election in
+config `(vc, tc)`, then a prospective voter with config `(v, t)` will only cast a vote for the
+candidate if `(vc, tc) = (v, t)`. For correctness, it would be acceptable for a candidate to cast
+its vote whenever `(vc, tc) >= (v, t)`, but the current implementation is more restrictive. For a
+description of the complete voting behavior, see the [Elections](#Elections) section.
+
+### Formal Specification
+
+For more details on the safe reconfig protocol and its behaviors, refer to the [TLA+
+specification](https://github.com/mongodb/mongo/tree/r4.4.0-rc6/src/mongo/db/repl/tla_plus/MongoReplReconfig).
+It defines two main invariants of the protocol,
+[ElectionSafety](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/tla_plus/MongoReplReconfig/MongoReplReconfig.tla#L403-L404)
+and
+[NeverRollbackCommitted](https://github.com/mongodb/mongo/blob/r4.4.0-rc6/src/mongo/db/repl/tla_plus/MongoReplReconfig/MongoReplReconfig.tla#L413-L420),
+which assert, respectively, that no two leaders are elected in the same term and that majority
+committed writes are never rolled back.
 
 # Startup Recovery
 
@@ -1465,27 +1691,45 @@ recovers from a **stable checkpoint**, which is a durable view of the data at a 
 It should be noted that due to journaling, the oplog and many collections in the local database are
 an exception and are up-to-date at startup rather than reflecting the recovery timestamp.
 
-If a node went through an unclean shutdown, then it might have been in the middle of writing a batch
-of oplog entries to its oplog. Since this is done in parallel, it could mean that there are gaps in
-the oplog from entries in the batch that weren't written yet, called **oplog holes**. During startup,
-a node wouldn't be able to tell which oplog entries were successfully written into the oplog. To fix
-this, after getting the recovery timestamp, the node will truncate its oplog to a point that it can
-guarantee didn't have any oplog holes using the `oplogTruncateAfterPoint` document. This document is
-journaled and untimestamped so that it will reflect information more recent than the latest stable
-checkpoint even after a shutdown. During oplog application, before writing a batch of oplog entries
-to the oplog, the node will set the `oplogTruncateAfterPoint` to be the first entry in the batch. If
-the node shuts down before finishing writing the batch, then during startup recovery, the node will
-truncate the oplog to the point before the batch (meaning it will truncate inclusive of the
-`oplogTruncateAfterPoint`). If the node successfully finishes writing the batch to the oplog during
-oplog application, it will reset the `oplogTruncateAfterPoint` since there are no oplog holes and
-the oplog wouldn't need to be truncated if the node restarted.
+If a node went through an unclean shutdown, then it might have been in the middle of applying
+parallel writes. Each write is associated with an oplog entry. Primaries perform writes in parallel,
+and batch application applies oplog entries in parallel. Since these operations are done in
+parallel, they can cause temporary gaps in the oplog from entries that are not yet written, called
+**oplog holes**. A node can crash while there are still **oplog holes** on disk.
+
+During startup, a node will not be able to tell which oplog entries were successfully persisted in
+the oplog and which were uncommitted on disk and disappeared. A primary may be unknowingly missing
+oplog entries that the secondaries already replicated; or a secondary may lose oplog entries that it
+thought it had already replicated. This would make the recently crashed node inconsistent with the
+rest its replica set. To fix this, after getting the recovery timestamp, the node will truncate its
+oplog to a point that it can guarantee does not have any oplog holes using the
+[`oplogTruncateAfterPoint`](#replication-timestamp-glossary) document. This document is journaled
+and untimestamped so that it will reflect information more recent than the latest stable checkpoint
+even after a shutdown.
+
+The `oplogTruncateAfterPoint` can be set in two scenarios. The first is during
+[oplog batch application](#oplog-entry-application). Before writing a batch of oplog entries to the
+oplog, the node will set the `oplogTruncateAfterPoint` to the `lastApplied` timestamp. If the node
+shuts down before it finishes writing the batch, then during startup recovery the node will truncate
+the oplog back to the point saved before the batch application began. If the node successfully
+finishes writing the batch to the oplog, it will reset the `oplogTruncateAfterPoint` to null since
+there are no oplog holes and the oplog will not need to be truncated if the node restarts.
+
+The second scenario for setting the `oplogTruncateAfterPoint` is while primary. A primary allows
+secondaries to replicate one of its oplog entries as soon as there are no oplog holes in-memory
+behind the entry. However, secondaries do not have to wait for the oplog entry to make it to disk
+on the primary nor for there to be no holes behind it on disk on the primary. Therefore, some
+already replicated writes may disappear from the primary if the primary crashes. The primary will
+continually update the `oplogTruncateAfterPoint` in order to track and forward the no oplog holes
+point on disk, in case of an unclean shutdown. Then startup recovery can take care of any oplog
+inconsistency with the rest of the replica set.
 
 After truncating the oplog, the node will see if the recovery timestamp differs from the top of the
 newly truncated oplog. If it does, this means that there are oplog entries that must be applied to
 make the data consistent with the oplog. The node will apply all the operations starting at the
 recovery timestamp through the top of the oplog. The one exception is that it will not apply
 `prepareTransaction` oplog entries. Similar to how a node reconstructs prepared transactions during
-initial sync and rollback, the node will update the transactions table every time it see a
+initial sync and rollback, the node will update the transactions table every time it sees a
 `prepareTransaction` oplog entry. Once the node has finished applying all the oplog entries through
 the top of the oplog, it will [reconstruct](#recovering-prepared-transactions) all transactions
 still in the prepare state.
@@ -1553,12 +1797,12 @@ transaction. For a prepared transaction, we have the following guarantee: `prepa
 
 **`currentCommittedSnapshot`**: An optime maintained in `ReplicationCoordinator` that is used to
 serve majority reads and is always guaranteed to be <= `lastCommittedOpTime`. When `eMRC=true`, this
-is currently set to the stable optime, which is guaranteed to be in a node’s oplog. Since it is
-reset every time we recalculate the stable optime, it will also be up to date.
+is currently [set to the stable optime](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4945). 
+Since it is reset every time we recalculate the stable optime, it will also be up to date.
 
-When `eMRC=false`, this is set to the `lastCommittedOpTime`, so it may not be in the node’s oplog.
-The `stable_timestamp` is not allowed to advance past the `all_durable`. So, this value shouldn’t
-be ahead of `all_durable` unless `eMRC=false`.
+When `eMRC=false`, this [is set](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4952-L4961) 
+to the minimum of the stable optime and the `lastCommittedOpTime`, even though it is not used to 
+serve majority reads in that case.
 
 **`initialDataTimestamp`**: A timestamp used to indicate the timestamp at which history “begins”.
 When a node comes out of initial sync, we inform the storage engine that the `initialDataTimestamp`
@@ -1580,13 +1824,25 @@ we update this optime, we also recalculate the `stable_timestamp`. Note that the
 most recent majority committed oplog entry. For more information about how the `lastCommittedOpTime`
 is updated and propagated, please see [Commit Point Propagation](#commit-point-propagation).
 
-**`lastDurable`**: Optime of the latest oplog entry that has been flushed to the journal. It is
-asynchronously updated by the storage engine as new writes become durable. Default journaling
-frequency is 100ms, so this could lag up to that amount behind lastApplied.
+**`lastDurable`**: Optime of either the latest oplog entry (non-primary) or the latest no oplog
+holes point (primary) that has been flushed to the journal. It is asynchronously updated by the
+storage engine as new writes become durable. Default journaling frequency is 100ms.
+
+**`minValid`**: Optime that indicates the point a node has to apply through for the data to be
+considered consistent. This optime is set on the `minValid` document in
+[`ReplicationConsistencyMarkers`](https://github.com/mongodb/mongo/blob/r4.2.0/src/mongo/db/repl/replication_consistency_markers.h),
+which means that it will be persisted between restarts of a node.
 
 **`oldest_timestamp`**: The earliest timestamp that the storage engine is guaranteed to have history
 for. New transactions can never start a timestamp earlier than this timestamp. Since we advance this
 as we advance the `stable_timestamp`, it will be less than or equal to the `stable_timestamp`.
+
+**`oplogTruncateAfterPoint`**: Tracks the latest no oplog holes point. On primaries, it is updated
+by the storage engine prior to flushing the journal to disk. During
+[oplog batch application](#oplog-entry-application), it is set at the start of the batch and cleared
+at the end of batch application. Startup recovery will use the `oplogTruncateAfterPoint` to truncate
+the oplog back to an oplog point consistent with the rest of the replica set: other nodes may have
+replicated in-memory data that a crashed node no longer has and is unaware that it lacks.
 
 **`prepareTimestamp`**: The timestamp of the ‘prepare’ oplog entry for a prepared transaction. This
 is the earliest timestamp at which it is legal to commit the transaction. This timestamp is provided
@@ -1605,3 +1861,7 @@ which is why we must use the Rollback via Refetch rollback algorithm.
 
 This timestamp is also required to increase monotonically except when `eMRC=false`, where in a
 special case during rollback it is possible for the `stableTimestamp` to move backwards.
+
+The calculation of this value in the replication layer occurs [here](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4824-L4881).
+The replication layer will [skip setting the stable timestamp](https://github.com/mongodb/mongo/blob/00fbc981646d9e6ebc391f45a31f4070d4466753/src/mongo/db/repl/replication_coordinator_impl.cpp#L4907-L4921) if it is earlier than the
+`initialDataTimestamp`, since data earlier than that timestamp may be inconsistent.

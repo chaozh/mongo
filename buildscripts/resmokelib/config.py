@@ -46,10 +46,10 @@ DEFAULT_GENNY_EXECUTABLE = os.path.normpath("genny/build/src/driver/genny")
 # Names below correspond to how they are specified via the command line or in the options YAML file.
 DEFAULTS = {
     "always_use_log_files": False,
-    "archive_file": None,
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
     "base_port": 20000,
+    "backup_on_restart_dir": None,
     "buildlogger_url": "https://logkeeper.mongodb.org",
     "continue_on_failure": False,
     "dbpath_prefix": None,
@@ -62,12 +62,13 @@ DEFAULTS = {
     "include_with_any_tags": None,
     "install_dir": None,
     "jobs": 1,
-    "log_format": None,
+    "logger_file": None,
     "mongo_executable": None,
     "mongod_executable": None,
     "mongod_set_parameters": None,
     "mongos_executable": None,
     "mongos_set_parameters": None,
+    "mrlog": None,
     "no_journal": False,
     "num_clients_per_fixture": 1,
     "perf_report_file": None,
@@ -76,6 +77,7 @@ DEFAULTS = {
     "repeat_tests_max": None,
     "repeat_tests_min": None,
     "repeat_tests_secs": None,
+    "replay_file": None,
     "report_failure_status": "fail",
     "report_file": None,
     "seed": int(time.time() * 256),  # Taken from random.py code in Python 2.7.
@@ -90,12 +92,18 @@ DEFAULTS = {
     "majority_read_concern": None,  # Default is set on the commandline.
     "storage_engine": None,
     "storage_engine_cache_size_gb": None,
+    "suite_files": "with_server",
     "tag_file": None,
+    "test_files": [],
     "transport_layer": None,
+    "user_friendly_output": None,
     "mixed_bin_versions": None,
     "linear_chain": None,
     "num_replset_nodes": None,
     "num_shards": None,
+
+    # Internal testing options.
+    "internal_params": [],
 
     # Evergreen options.
     "build_id": None,
@@ -122,7 +130,10 @@ DEFAULTS = {
     "benchmark_repetitions": None,
 
     # Config Dir
-    "config_dir": "buildscripts/resmokeconfig"
+    "config_dir": "buildscripts/resmokeconfig",
+
+    # UndoDB options
+    "undo_recorder_path": None
 }
 
 _SuiteOptions = collections.namedtuple("_SuiteOptions", [
@@ -223,9 +234,6 @@ SuiteOptions.ALL_INHERITED = SuiteOptions(  # type: ignore
 # Log to files located in the db path and don't clean dbpaths after tests.
 ALWAYS_USE_LOG_FILES = False
 
-# The name of the archive JSON file used to associate S3 archives to an Evergreen task.
-ARCHIVE_FILE = None
-
 # The limit size of all archive files for an Evergreen task.
 ARCHIVE_LIMIT_MB = None
 
@@ -302,8 +310,15 @@ GENNY_EXECUTABLE = None
 # jstest portion of the suite(s).
 INCLUDE_WITH_ANY_TAGS = None
 
+# Params that can be set to change internal resmoke behavior. Used to test resmoke and should
+# not be set by the user.
+INTERNAL_PARAMS = []
+
 # If set, then resmoke.py starts the specified number of Job instances to run tests.
 JOBS = None
+
+# Yaml file that specified logging configuration.
+LOGGER_FILE = None
 
 # Where to find the MONGO*_EXECUTABLE binaries
 INSTALL_DIR = None
@@ -316,10 +331,6 @@ MONGOD_EXECUTABLE = None
 
 # The --setParameter options passed to mongod.
 MONGOD_SET_PARAMETERS = None
-
-# If set, the log format to use by all mongod's and mongo shells started by resmoke.py
-# Supported values are the same as what is supported in mongod/mongo shell: default, text, json
-LOG_FORMAT = None
 
 # The path to the mongos executable used by resmoke.py.
 MONGOS_EXECUTABLE = None
@@ -418,8 +429,14 @@ STORAGE_ENGINE = None
 # storage engine cache size.
 STORAGE_ENGINE_CACHE_SIZE = None
 
+# Yaml suites that specify how tests should be executed.
+SUITE_FILES = None
+
 # The tag file to use that associates tests with tags.
 TAG_FILE = None
+
+# The test files to execute.
+TEST_FILES = None
 
 # If set, then mongod/mongos's started by resmoke.py will use the specified transport layer.
 TRANSPORT_LAYER = None
@@ -442,9 +459,15 @@ BENCHMARK_LIST_TESTS = None
 BENCHMARK_MIN_TIME = None
 BENCHMARK_REPETITIONS = None
 
+# UndoDB options
+UNDO_RECORDER_PATH = None
+
 ##
 # Internally used configuration options that aren't exposed to the user
 ##
+
+# The name of the archive JSON file used to associate S3 archives to an Evergreen task.
+ARCHIVE_FILE = "archive.json"
 
 # S3 Bucket to upload archive files.
 ARCHIVE_BUCKET = "mongodatafiles"
@@ -471,3 +494,6 @@ EXTERNAL_SUITE_SELECTORS = (DEFAULT_BENCHMARK_TEST_LIST, DEFAULT_UNIT_TEST_LIST,
 CONFIG_DIR = None
 NAMED_SUITES = None
 LOGGER_DIR = None
+
+# Generated logging config for the current invocation.
+LOGGING_CONFIG: dict = {}

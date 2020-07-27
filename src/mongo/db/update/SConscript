@@ -21,7 +21,7 @@ env.Library(
 )
 
 env.Library(
-    target='update',
+    target='update_nodes',
     source=[
         'addtoset_node.cpp',
         'arithmetic_node.cpp',
@@ -31,8 +31,6 @@ env.Library(
         'current_date_node.cpp',
         'modifier_node.cpp',
         'modifier_table.cpp',
-        'object_replace_executor.cpp',
-        'pipeline_executor.cpp',
         'pop_node.cpp',
         'pull_node.cpp',
         'pullall_node.cpp',
@@ -47,10 +45,24 @@ env.Library(
         'update_object_node.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/logical_clock',
-        '$BUILD_DIR/mongo/db/pipeline/pipeline',
         '$BUILD_DIR/mongo/db/update_index_data',
+        '$BUILD_DIR/mongo/db/vector_clock_mutable',
         'update_common',
+    ],
+)
+
+env.Library(
+    target='update',
+    source=[
+        'document_diff_applier.cpp',
+        'document_diff_calculator.cpp',
+        'document_diff_serialization.cpp',
+        'object_replace_executor.cpp',
+        'pipeline_executor.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/pipeline/pipeline',
+        'update_nodes'
     ],
 )
 
@@ -63,7 +75,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
-        '$BUILD_DIR/mongo/db/query/query_planner',
+        '$BUILD_DIR/mongo/db/query/canonical_query',
         '$BUILD_DIR/mongo/db/server_options_core',
         'update',
     ],
@@ -77,6 +89,10 @@ env.CppUnitTest(
         'bit_node_test.cpp',
         'compare_node_test.cpp',
         'current_date_node_test.cpp',
+        'document_diff_calculator_test.cpp',
+        'document_diff_serialization_test.cpp',
+        'document_diff_applier_test.cpp',
+        'document_diff_test.cpp',
         'field_checker_test.cpp',
         'log_builder_test.cpp',
         'modifier_table_test.cpp',
@@ -100,12 +116,12 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson_test_utils',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value_test_util',
-        '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
         '$BUILD_DIR/mongo/db/query/query_planner',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/vector_clock_trivial',
         'update',
         'update_common',
         'update_driver',

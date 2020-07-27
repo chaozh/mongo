@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -13,10 +13,8 @@
  *     Check if the inserted key/value pair is valid.
  */
 static int
-__random_insert_valid(
-  WT_CURSOR_BTREE *cbt, WT_INSERT_HEAD *ins_head, WT_INSERT *ins, WT_UPDATE **updp, bool *validp)
+__random_insert_valid(WT_CURSOR_BTREE *cbt, WT_INSERT_HEAD *ins_head, WT_INSERT *ins, bool *validp)
 {
-    *updp = NULL;
     *validp = false;
 
     __cursor_pos_clear(cbt);
@@ -24,8 +22,10 @@ __random_insert_valid(
     cbt->ins_head = ins_head;
     cbt->ins = ins;
     cbt->compare = 0;
+    cbt->tmp->data = WT_INSERT_KEY(ins);
+    cbt->tmp->size = WT_INSERT_KEY_SIZE(ins);
 
-    return (__wt_cursor_valid(cbt, updp, validp));
+    return (__wt_cursor_valid(cbt, cbt->tmp, WT_RECNO_OOB, validp));
 }
 
 /*
@@ -33,16 +33,15 @@ __random_insert_valid(
  *     Check if the slot key/value pair is valid.
  */
 static int
-__random_slot_valid(WT_CURSOR_BTREE *cbt, uint32_t slot, WT_UPDATE **updp, bool *validp)
+__random_slot_valid(WT_CURSOR_BTREE *cbt, uint32_t slot, bool *validp)
 {
-    *updp = NULL;
     *validp = false;
 
     __cursor_pos_clear(cbt);
     cbt->slot = slot;
     cbt->compare = 0;
 
-    return (__wt_cursor_valid(cbt, updp, validp));
+    return (__wt_cursor_valid(cbt, cbt->tmp, WT_RECNO_OOB, validp));
 }
 
 /* Magic constant: 5000 entries in a skip list is enough to forcibly evict. */
@@ -62,7 +61,7 @@ __random_skip_entries(WT_CURSOR_BTREE *cbt, WT_INSERT_HEAD *ins_head)
     uint32_t entries;
     int level;
 
-    session = (WT_SESSION_IMPL *)cbt->iface.session;
+    session = CUR2S(cbt);
     entries = 0; /* [-Wconditional-uninitialized] */
 
     if (ins_head == NULL)
@@ -104,18 +103,16 @@ __random_skip_entries(WT_CURSOR_BTREE *cbt, WT_INSERT_HEAD *ins_head)
  *     Return a random key/value from a skip list.
  */
 static int
-__random_leaf_skip(
-  WT_CURSOR_BTREE *cbt, WT_INSERT_HEAD *ins_head, uint32_t entries, WT_UPDATE **updp, bool *validp)
+__random_leaf_skip(WT_CURSOR_BTREE *cbt, WT_INSERT_HEAD *ins_head, uint32_t entries, bool *validp)
 {
     WT_INSERT *ins, *saved_ins;
     WT_SESSION_IMPL *session;
     uint32_t i;
     int retry;
 
-    *updp = NULL;
     *validp = false;
 
-    session = (WT_SESSION_IMPL *)cbt->iface.session;
+    session = CUR2S(cbt);
 
     /* This is a relatively expensive test, try a few times then quit. */
     for (retry = 0; retry < WT_RANDOM_SKIP_RETRY; ++retry) {
@@ -134,7 +131,7 @@ __random_leaf_skip(
 
         /* Try and return our selected record. */
         if (ins != NULL) {
-            WT_RET(__random_insert_valid(cbt, ins_head, ins, updp, validp));
+            WT_RET(__random_insert_valid(cbt, ins_head, ins, validp));
             if (*validp)
                 return (0);
         }
@@ -146,7 +143,7 @@ __random_leaf_skip(
             ins = saved_ins;
         }
         for (; --i > 0 && ins != NULL; ins = WT_SKIP_NEXT(ins)) {
-            WT_RET(__random_insert_valid(cbt, ins_head, ins, updp, validp));
+            WT_RET(__random_insert_valid(cbt, ins_head, ins, validp));
             if (*validp)
                 return (0);
         }
@@ -164,24 +161,23 @@ __random_leaf_skip(
  *     Look for a large insert list from which we can select a random item.
  */
 static int
-__random_leaf_insert(WT_CURSOR_BTREE *cbt, WT_UPDATE **updp, bool *validp)
+__random_leaf_insert(WT_CURSOR_BTREE *cbt, bool *validp)
 {
     WT_INSERT_HEAD *ins_head;
     WT_PAGE *page;
     WT_SESSION_IMPL *session;
     uint32_t entries, slot, start;
 
-    *updp = NULL;
     *validp = false;
 
     page = cbt->ref->page;
-    session = (WT_SESSION_IMPL *)cbt->iface.session;
+    session = CUR2S(cbt);
 
     /* Check for a large insert list with no items, that's common when tables are newly created. */
     ins_head = WT_ROW_INSERT_SMALLEST(page);
     entries = __random_skip_entries(cbt, ins_head);
     if (entries >= WT_RANDOM_SKIP_INSERT_SMALLEST_ENOUGH) {
-        WT_RET(__random_leaf_skip(cbt, ins_head, entries, updp, validp));
+        WT_RET(__random_leaf_skip(cbt, ins_head, entries, validp));
         if (*validp)
             return (0);
     }
@@ -197,7 +193,7 @@ __random_leaf_insert(WT_CURSOR_BTREE *cbt, WT_UPDATE **updp, bool *validp)
             ins_head = WT_ROW_INSERT(page, &page->pg_row[slot]);
             entries = __random_skip_entries(cbt, ins_head);
             if (entries >= WT_RANDOM_SKIP_INSERT_ENOUGH) {
-                WT_RET(__random_leaf_skip(cbt, ins_head, entries, updp, validp));
+                WT_RET(__random_leaf_skip(cbt, ins_head, entries, validp));
                 if (*validp)
                     return (0);
             }
@@ -206,7 +202,7 @@ __random_leaf_insert(WT_CURSOR_BTREE *cbt, WT_UPDATE **updp, bool *validp)
             ins_head = WT_ROW_INSERT(page, &page->pg_row[slot]);
             entries = __random_skip_entries(cbt, ins_head);
             if (entries >= WT_RANDOM_SKIP_INSERT_ENOUGH) {
-                WT_RET(__random_leaf_skip(cbt, ins_head, entries, updp, validp));
+                WT_RET(__random_leaf_skip(cbt, ins_head, entries, validp));
                 if (*validp)
                     return (0);
             }
@@ -217,7 +213,7 @@ __random_leaf_insert(WT_CURSOR_BTREE *cbt, WT_UPDATE **updp, bool *validp)
     ins_head = WT_ROW_INSERT_SMALLEST(page);
     entries = __random_skip_entries(cbt, ins_head);
     if (entries >= WT_RANDOM_SKIP_INSERT_ENOUGH) {
-        WT_RET(__random_leaf_skip(cbt, ins_head, entries, updp, validp));
+        WT_RET(__random_leaf_skip(cbt, ins_head, entries, validp));
         if (*validp)
             return (0);
     }
@@ -232,29 +228,26 @@ __random_leaf_insert(WT_CURSOR_BTREE *cbt, WT_UPDATE **updp, bool *validp)
  *     Return a random key/value from a page's on-disk entries.
  */
 static int
-__random_leaf_disk(WT_CURSOR_BTREE *cbt, WT_UPDATE **updp, bool *validp)
+__random_leaf_disk(WT_CURSOR_BTREE *cbt, bool *validp)
 {
     WT_PAGE *page;
     WT_SESSION_IMPL *session;
     uint32_t entries, slot;
     int retry;
 
-    *updp = NULL;
     *validp = false;
 
     page = cbt->ref->page;
-    session = (WT_SESSION_IMPL *)cbt->iface.session;
+    session = CUR2S(cbt);
     entries = cbt->ref->page->entries;
 
     /* This is a relatively cheap test, so try several times. */
     for (retry = 0; retry < WT_RANDOM_DISK_RETRY; ++retry) {
         slot = __wt_random(&session->rnd) % entries;
-        WT_RET(__random_slot_valid(cbt, slot, updp, validp));
-        if (!*validp)
-            continue;
-
-        /* The row-store search function builds the key, so we have to as well. */
-        return (__wt_row_leaf_key(session, page, page->pg_row + slot, cbt->tmp, false));
+        WT_RET(__wt_row_leaf_key(session, page, page->pg_row + slot, cbt->tmp, false));
+        WT_RET(__random_slot_valid(cbt, slot, validp));
+        if (*validp)
+            break;
     }
     return (0);
 }
@@ -274,12 +267,11 @@ __random_leaf(WT_CURSOR_BTREE *cbt)
     WT_CURSOR *cursor;
     WT_DECL_RET;
     WT_SESSION_IMPL *session;
-    WT_UPDATE *upd;
     uint32_t i;
     bool next, valid;
 
-    cursor = (WT_CURSOR *)cbt;
-    session = (WT_SESSION_IMPL *)cbt->iface.session;
+    cursor = &cbt->iface;
+    session = CUR2S(cbt);
 
     /*
      * If the page has a sufficiently large number of disk-based entries, randomly select from them.
@@ -287,24 +279,24 @@ __random_leaf(WT_CURSOR_BTREE *cbt)
      * a reasonable chunk of the name space.
      */
     if (cbt->ref->page->entries > WT_RANDOM_DISK_ENOUGH) {
-        WT_RET(__random_leaf_disk(cbt, &upd, &valid));
+        WT_RET(__random_leaf_disk(cbt, &valid));
         if (valid)
-            return (__cursor_kv_return(cbt, upd));
+            return (__cursor_kv_return(cbt, cbt->upd_value));
     }
 
     /* Look for any large insert list and select from it. */
-    WT_RET(__random_leaf_insert(cbt, &upd, &valid));
+    WT_RET(__random_leaf_insert(cbt, &valid));
     if (valid)
-        return (__cursor_kv_return(cbt, upd));
+        return (__cursor_kv_return(cbt, cbt->upd_value));
 
     /*
      * Try again if there are at least a few hundred disk-based entries: this may be a normal leaf
      * page with big items.
      */
     if (cbt->ref->page->entries > WT_RANDOM_DISK_ENOUGH / 2) {
-        WT_RET(__random_leaf_disk(cbt, &upd, &valid));
+        WT_RET(__random_leaf_disk(cbt, &valid));
         if (valid)
-            return (__cursor_kv_return(cbt, upd));
+            return (__cursor_kv_return(cbt, cbt->upd_value));
     }
 
     /*
@@ -395,10 +387,10 @@ restart:
     /* Search the internal pages of the tree. */
     current = &btree->root;
     for (;;) {
-        page = current->page;
-        if (!WT_PAGE_IS_INTERNAL(page))
+        if (F_ISSET(current, WT_REF_FLAG_LEAF))
             break;
 
+        page = current->page;
         WT_INTL_INDEX_GET(session, page, pindex);
         entries = pindex->entries;
 
@@ -420,15 +412,13 @@ restart:
         descent = NULL;
         for (i = 0; i < entries; ++i) {
             descent = pindex->index[__wt_random(&session->rnd) % entries];
-            if (descent->state == WT_REF_DISK || descent->state == WT_REF_LIMBO ||
-              descent->state == WT_REF_LOOKASIDE || descent->state == WT_REF_MEM)
+            if (descent->state == WT_REF_DISK || descent->state == WT_REF_MEM)
                 break;
         }
         if (i == entries)
             for (i = 0; i < entries; ++i) {
                 descent = pindex->index[i];
-                if (descent->state == WT_REF_DISK || descent->state == WT_REF_LIMBO ||
-                  descent->state == WT_REF_LOOKASIDE || descent->state == WT_REF_MEM)
+                if (descent->state == WT_REF_DISK || descent->state == WT_REF_MEM)
                     break;
             }
         if (i == entries || descent == NULL) {
@@ -484,9 +474,9 @@ __wt_btcur_next_random(WT_CURSOR_BTREE *cbt)
     uint64_t n, skip;
     uint32_t read_flags;
 
-    btree = cbt->btree;
+    btree = CUR2BT(cbt);
     cursor = &cbt->iface;
-    session = (WT_SESSION_IMPL *)cbt->iface.session;
+    session = CUR2S(cbt);
 
     read_flags = WT_READ_RESTART_OK;
     if (F_ISSET(cbt, WT_CBT_READ_ONCE))
@@ -528,7 +518,7 @@ __wt_btcur_next_random(WT_CURSOR_BTREE *cbt)
          * items we didn't find any valid pages. We can't return WT_NOTFOUND to the application
          * unless a tree is really empty, fallback to skipping through tree pages.
          */
-        WT_ERR_NOTFOUND_OK(ret);
+        WT_ERR_NOTFOUND_OK(ret, false);
     }
 
     /*

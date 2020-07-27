@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/exec/projection.h"
 
@@ -42,7 +42,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -117,12 +117,12 @@ auto rehydrateIndexKey(const BSONObj& keyPattern, const BSONObj& dehydratedKey) 
 }
 }  // namespace
 
-ProjectionStage::ProjectionStage(boost::intrusive_ptr<ExpressionContext> expCtx,
+ProjectionStage::ProjectionStage(ExpressionContext* expCtx,
                                  const BSONObj& projObj,
                                  WorkingSet* ws,
                                  std::unique_ptr<PlanStage> child,
                                  const char* stageType)
-    : PlanStage{expCtx->opCtx, std::move(child), stageType},
+    : PlanStage{expCtx, std::move(child), stageType},
       _projObj{expCtx->explain ? boost::make_optional(projObj.getOwned()) : boost::none},
       _ws{*ws} {}
 
@@ -139,18 +139,7 @@ PlanStage::StageState ProjectionStage::doWork(WorkingSetID* out) {
     if (PlanStage::ADVANCED == status) {
         WorkingSetMember* member = _ws.get(id);
         // Punt to our specific projection impl.
-        Status projStatus = transform(member);
-        if (!projStatus.isOK()) {
-            warning() << "Couldn't execute projection, status = " << redact(projStatus);
-            *out = WorkingSetCommon::allocateStatusMember(&_ws, projStatus);
-            return PlanStage::FAILURE;
-        }
-
-        *out = id;
-    } else if (PlanStage::FAILURE == status) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
+        transform(member);
         *out = id;
     } else if (PlanStage::NEED_YIELD == status) {
         *out = id;
@@ -176,13 +165,13 @@ ProjectionStageDefault::ProjectionStageDefault(boost::intrusive_ptr<ExpressionCo
                                                const projection_ast::Projection* projection,
                                                WorkingSet* ws,
                                                std::unique_ptr<PlanStage> child)
-    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
+    : ProjectionStage{expCtx.get(), projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
       _requestedMetadata{projection->metadataDeps()},
       _projectType{projection->type()},
       _executor{projection_executor::buildProjectionExecutor(
           expCtx, projection, {}, projection_executor::kDefaultBuilderParams)} {}
 
-Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
+void ProjectionStageDefault::transform(WorkingSetMember* member) const {
     Document input;
 
     // Most metadata should have already been stored within the WSM when we project out a document.
@@ -224,11 +213,9 @@ Status ProjectionStageDefault::transform(WorkingSetMember* member) const {
     // constructed from the input one backed by BSON which is owned by the storage system, so we
     // need to  make sure we transition an owned document.
     transitionMemberToOwnedObj(projected.getOwned(), member);
-
-    return Status::OK();
 }
 
-ProjectionStageCovered::ProjectionStageCovered(boost::intrusive_ptr<ExpressionContext> expCtx,
+ProjectionStageCovered::ProjectionStageCovered(ExpressionContext* expCtx,
                                                const BSONObj& projObj,
                                                const projection_ast::Projection* projection,
                                                WorkingSet* ws,
@@ -263,7 +250,7 @@ ProjectionStageCovered::ProjectionStageCovered(boost::intrusive_ptr<ExpressionCo
     }
 }
 
-Status ProjectionStageCovered::transform(WorkingSetMember* member) const {
+void ProjectionStageCovered::transform(WorkingSetMember* member) const {
     BSONObjBuilder bob;
 
     // We're pulling data out of the key.
@@ -282,10 +269,9 @@ Status ProjectionStageCovered::transform(WorkingSetMember* member) const {
         ++keyIndex;
     }
     transitionMemberToOwnedObj(bob.obj(), member);
-    return Status::OK();
 }
 
-ProjectionStageSimple::ProjectionStageSimple(boost::intrusive_ptr<ExpressionContext> expCtx,
+ProjectionStageSimple::ProjectionStageSimple(ExpressionContext* expCtx,
                                              const BSONObj& projObj,
                                              const projection_ast::Projection* projection,
                                              WorkingSet* ws,
@@ -296,7 +282,7 @@ ProjectionStageSimple::ProjectionStageSimple(boost::intrusive_ptr<ExpressionCont
                        projection->getRequiredFields().end()};
 }
 
-Status ProjectionStageSimple::transform(WorkingSetMember* member) const {
+void ProjectionStageSimple::transform(WorkingSetMember* member) const {
     BSONObjBuilder bob;
     // SIMPLE_DOC implies that we expect an object so it's kind of redundant.
     // If we got here because of SIMPLE_DOC the planner shouldn't have messed up.
@@ -318,7 +304,6 @@ Status ProjectionStageSimple::transform(WorkingSetMember* member) const {
     }
 
     transitionMemberToOwnedObj(bob.obj(), member);
-    return Status::OK();
 }
 
 }  // namespace mongo

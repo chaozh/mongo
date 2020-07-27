@@ -3,7 +3,6 @@
  * starting the rollback process. Only applies to Recoverable Rollback via WiredTiger checkpoints.
  *
  * @tags: [
- *     requires_fcv_44,
  *     requires_wiredtiger,
  *     requires_journaling,
  *     requires_majority_read_concern,
@@ -47,7 +46,20 @@ function CommonOps(node) {
     IndexBuildTest.waitForIndexBuildToStart(testDB, collName, "x_1");
 }
 
-const rollbackTest = new RollbackTest();
+const replTest = new ReplSetTest({
+    name: jsTestName(),
+    nodes: 3,
+    useBridge: true,
+});
+replTest.startSet();
+let config = replTest.getReplSetConfig();
+config.members[2].priority = 0;
+config.settings = {
+    chainingAllowed: false
+};
+replTest.initiateWithHighElectionTimeout(config);
+
+const rollbackTest = new RollbackTest(jsTestName(), replTest);
 const originalPrimary = rollbackTest.getPrimary();
 const testDB = originalPrimary.getDB(dbName);
 CommonOps(originalPrimary);
@@ -60,12 +72,14 @@ assert.commandWorked(rollbackNode.getDB(dbName)["rollbackColl"].insert({x: 1}));
 rollbackTest.transitionToSyncSourceOperationsBeforeRollback();
 rollbackTest.transitionToSyncSourceOperationsDuringRollback();
 
-IndexBuildTest.resumeIndexBuilds(originalPrimary);
-
 // Make sure that rollback is hung waiting for the background index operation to complete.
 jsTestLog("Waiting for rollback to block on the background index build completion.");
 let msg1 = "Waiting for all background operations to complete before starting rollback";
 checkLog.contains(rollbackNode, msg1);
+
+jsTestLog("Resuming index builds on the original primary.");
+reconnect(originalPrimary);
+IndexBuildTest.resumeIndexBuilds(originalPrimary);
 
 // Make sure the background index build completed before rollback started.
 checkLog.contains(rollbackNode,

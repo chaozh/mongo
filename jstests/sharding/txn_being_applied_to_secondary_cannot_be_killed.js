@@ -21,8 +21,9 @@ const ns = dbName + "." + collName;
 TestData.transactionLifetimeLimitSeconds = 10;
 
 const rsOpts = {
-    nodes: 3,
-    settings: {chainingAllowed: false}
+    // Make secondaries unelectable.
+    nodes: [{}, {rsConfig: {priority: 0}}, {rsConfig: {priority: 0}}],
+    settings: {chainingAllowed: false, electionTimeoutMillis: ReplSetTest.kForeverMillis}
 };
 let st = new ShardingTest({mongos: 2, shards: {rs0: rsOpts, rs1: rsOpts, rs2: rsOpts}});
 
@@ -74,9 +75,8 @@ assert.commandWorked(session.commitTransaction_forTesting());
 jsTest.log("Verify that the transaction was committed on all shards.");
 // Use assert.soon(), because although coordinateCommitTransaction currently blocks
 // until the commit process is fully complete, it will eventually be changed to only
-// block until the decision is *written*, at which point the test can pass the
-// operationTime returned by coordinateCommitTransaction as 'afterClusterTime' in the
-// read to ensure the read sees the transaction's writes (TODO SERVER-37165).
+// block until the decision is *written*, so the documents may not be visible
+// immediately.
 assert.soon(function() {
     return 3 === st.s.getDB(dbName).getCollection(collName).find().itcount();
 });

@@ -43,7 +43,9 @@
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
 #include "mongo/db/service_entry_point_mongod.h"
+#include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/assert_util.h"
@@ -82,16 +84,18 @@ ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine, RepairAct
     initializeStorageEngine(serviceContext,
                             StorageEngineInitFlags::kAllowNoLockFile |
                                 StorageEngineInitFlags::kSkipMetadataFile);
+    StorageControl::startStorageControls(serviceContext);
 
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
     IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
+    CollectionShardingStateFactory::set(
+        getServiceContext(),
+        std::make_unique<CollectionShardingStateFactoryShard>(getServiceContext()));
 }
 
 ServiceContextMongoDTest::~ServiceContextMongoDTest() {
-    IndexBuildsCoordinator::get(getServiceContext())->shutdown();
-
     {
         auto opCtx = getClient()->makeOperationContext();
         Lock::GlobalLock glk(opCtx.get(), MODE_X);
@@ -104,6 +108,23 @@ ServiceContextMongoDTest::~ServiceContextMongoDTest() {
     std::swap(storageGlobalParams.engine, _stashedStorageParams.engine);
     std::swap(storageGlobalParams.engineSetByUser, _stashedStorageParams.engineSetByUser);
     std::swap(storageGlobalParams.repair, _stashedStorageParams.repair);
+}
+
+void ServiceContextMongoDTest::tearDown() {
+    {
+        // Some tests set the current OperationContext but do not release it until destruction.
+        ServiceContext::UniqueOperationContext uniqueOpCtx;
+        auto opCtx = getClient()->getOperationContext();
+        if (!opCtx) {
+            uniqueOpCtx = getClient()->makeOperationContext();
+            opCtx = uniqueOpCtx.get();
+        }
+        IndexBuildsCoordinator::get(opCtx)->shutdown(opCtx);
+    }
+
+    CollectionShardingStateFactory::clear(getServiceContext());
+
+    ServiceContextTest::tearDown();
 }
 
 }  // namespace mongo

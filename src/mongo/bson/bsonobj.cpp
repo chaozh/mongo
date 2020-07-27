@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/db/jsobj.h"
 
@@ -38,9 +38,9 @@
 #include "mongo/bson/generator_extended_relaxed_2_0_0.h"
 #include "mongo/bson/generator_legacy_strict.h"
 #include "mongo/db/json.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/allocator.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -111,23 +111,18 @@ BSONObj BSONObj::copy() const {
     // those assumptions, and preserving any currently observed behavior does not form an argument
     // against the later application of such optimizations.
     int size = objsize();
-    if (!isOwned() && (size < kMinBSONLength || size > BufferMaxSize)) {
-        // Only for unowned objects, the size is validated in the constructor, so it is an error for
-        // the size to ever be invalid. This means that the unowned memory we are reading has
-        // changed, and we must exit immediately to avoid further undefined behavior.
-        severe() << "BSONObj::copy() - size " << size
-                 << " of unowned BSONObj is invalid and differs from previously validated size.";
-        fassertFailed(31322);
-    }
+    _validateUnownedSize(size);
     auto storage = SharedBuffer::allocate(size);
 
     // If the call to objsize() changes between this call and the previous one, this indicates that
     // that the memory we are reading has changed, and we must exit immediately to avoid further
     // undefined behavior.
     if (int sizeAfter = objsize(); sizeAfter != size) {
-        severe() << "BSONObj::copy() - size " << sizeAfter
-                 << " differs from previously observed size " << size;
-        fassertFailed(31323);
+        LOGV2_FATAL(
+            31323,
+            "BSONObj::copy() - size {sizeAfter} differs from previously observed size {size}",
+            "sizeAfter"_attr = sizeAfter,
+            "size"_attr = size);
     }
     memcpy(storage.get(), objdata(), size);
     return BSONObj(std::move(storage));
@@ -143,80 +138,134 @@ BSONObj BSONObj::getOwned(const BSONObj& obj) {
     return obj.getOwned();
 }
 
+BSONObj BSONObj::redact() const {
+    _validateUnownedSize(objsize());
+
+    // Helper to get an "internal function" to be able to do recursion
+    struct redactor {
+        void operator()(BSONObjBuilder& builder, const BSONObj& obj) {
+            for (BSONElement e : obj) {
+                if (e.type() == Object || e.type() == Array) {
+                    BSONObjBuilder subBuilder = builder.subobjStart(e.fieldNameStringData());
+                    operator()(subBuilder, e.Obj());
+                    subBuilder.done();
+                } else {
+                    builder.append(e.fieldNameStringData(), "###"_sd);
+                }
+            }
+        }
+    };
+
+    BSONObjBuilder builder;
+    redactor()(builder, *this);
+    return builder.obj();
+}
+
+void BSONObj::_validateUnownedSize(int size) const {
+    // Only for unowned objects, the size is validated in the constructor, so it is an error for
+    // the size to ever be invalid. This means that the unowned memory we are reading has
+    // changed, and we must exit immediately to avoid further undefined behavior.
+    if (!isOwned() && (size < kMinBSONLength || size > BufferMaxSize)) {
+        LOGV2_FATAL(31322,
+                    "BSONObj::_validateUnownedSize() - size {size} of unowned BSONObj is invalid "
+                    "and differs from previously validated size.",
+                    "size"_attr = size);
+    }
+}
+
 template <typename Generator>
-void BSONObj::_jsonStringGenerator(const Generator& g,
-                                   int pretty,
-                                   bool isArray,
-                                   fmt::memory_buffer& buffer) const {
+BSONObj BSONObj::_jsonStringGenerator(const Generator& g,
+                                      int pretty,
+                                      bool isArray,
+                                      fmt::memory_buffer& buffer,
+                                      size_t writeLimit) const {
     if (isEmpty()) {
-        fmt::format_to(buffer, "{}", isArray ? "[]" : "{}");
-        return;
+        const auto empty = isArray ? "[]"_sd : "{}"_sd;
+        buffer.append(empty.rawData(), empty.rawData() + empty.size());
+        return BSONObj();
     }
     buffer.push_back(isArray ? '[' : '{');
 
     BSONObjIterator i(*this);
     BSONElement e = i.next();
-    if (!e.eoo())
+    BSONObj truncation;
+    if (!e.eoo()) {
+        bool writeSeparator = false;
         while (1) {
-            e.jsonStringGenerator(g, !isArray, pretty, buffer);
+            truncation = e.jsonStringGenerator(
+                g, writeSeparator, !isArray, pretty ? (pretty + 1) : 0, buffer, writeLimit);
             e = i.next();
-            if (e.eoo()) {
+            if (!truncation.isEmpty() || e.eoo()) {
                 g.writePadding(buffer);
                 break;
             }
-            buffer.push_back(',');
-            if (pretty) {
-                fmt::format_to(buffer, "{: <{}}", '\n', pretty * 2);
-            }
+            writeSeparator = true;
         }
+    }
 
+    if (pretty)
+        fmt::format_to(buffer, "\n{:<{}}", "", (pretty - 1) * 4);
     buffer.push_back(isArray ? ']' : '}');
+    return truncation;
 }
 
-void BSONObj::jsonStringGenerator(ExtendedCanonicalV200Generator const& generator,
-                                  int pretty,
-                                  bool isArray,
-                                  fmt::memory_buffer& buffer) const {
-    _jsonStringGenerator(generator, pretty, isArray, buffer);
+BSONObj BSONObj::jsonStringGenerator(ExtendedCanonicalV200Generator const& generator,
+                                     int pretty,
+                                     bool isArray,
+                                     fmt::memory_buffer& buffer,
+                                     size_t writeLimit) const {
+    return _jsonStringGenerator(generator, pretty, isArray, buffer, writeLimit);
 }
-void BSONObj::jsonStringGenerator(ExtendedRelaxedV200Generator const& generator,
-                                  int pretty,
-                                  bool isArray,
-                                  fmt::memory_buffer& buffer) const {
-    _jsonStringGenerator(generator, pretty, isArray, buffer);
+BSONObj BSONObj::jsonStringGenerator(ExtendedRelaxedV200Generator const& generator,
+                                     int pretty,
+                                     bool isArray,
+                                     fmt::memory_buffer& buffer,
+                                     size_t writeLimit) const {
+    return _jsonStringGenerator(generator, pretty, isArray, buffer, writeLimit);
 }
-void BSONObj::jsonStringGenerator(LegacyStrictGenerator const& generator,
-                                  int pretty,
-                                  bool isArray,
-                                  fmt::memory_buffer& buffer) const {
-    _jsonStringGenerator(generator, pretty, isArray, buffer);
+BSONObj BSONObj::jsonStringGenerator(LegacyStrictGenerator const& generator,
+                                     int pretty,
+                                     bool isArray,
+                                     fmt::memory_buffer& buffer,
+                                     size_t writeLimit) const {
+    return _jsonStringGenerator(generator, pretty, isArray, buffer, writeLimit);
 }
 
-std::string BSONObj::jsonString(JsonStringFormat format, int pretty, bool isArray) const {
+std::string BSONObj::jsonString(JsonStringFormat format,
+                                int pretty,
+                                bool isArray,
+                                size_t writeLimit,
+                                BSONObj* outTruncationResult) const {
     fmt::memory_buffer buffer;
-    jsonStringBuffer(format, pretty, isArray, buffer);
+    BSONObj truncation = jsonStringBuffer(format, pretty, isArray, buffer);
+    if (outTruncationResult) {
+        *outTruncationResult = truncation;
+    }
     return fmt::to_string(buffer);
 }
 
-void BSONObj::jsonStringBuffer(JsonStringFormat format,
-                               int pretty,
-                               bool isArray,
-                               fmt::memory_buffer& buffer) const {
-    auto withGenerator = [&](auto&& gen) { jsonStringGenerator(gen, pretty, isArray, buffer); };
+BSONObj BSONObj::jsonStringBuffer(JsonStringFormat format,
+                                  int pretty,
+                                  bool isArray,
+                                  fmt::memory_buffer& buffer,
+                                  size_t writeLimit) const {
+    auto withGenerator = [&](auto&& gen) {
+        return jsonStringGenerator(gen, pretty, isArray, buffer, writeLimit);
+    };
 
     if (format == ExtendedCanonicalV2_0_0) {
-        withGenerator(ExtendedCanonicalV200Generator());
+        return withGenerator(ExtendedCanonicalV200Generator());
     } else if (format == ExtendedRelaxedV2_0_0) {
-        withGenerator(ExtendedRelaxedV200Generator());
+        return withGenerator(ExtendedRelaxedV200Generator(dateFormatIsLocalTimezone()));
     } else if (format == LegacyStrict) {
-        withGenerator(LegacyStrictGenerator());
+        return withGenerator(LegacyStrictGenerator());
     } else {
         MONGO_UNREACHABLE;
     }
 }
 
-bool BSONObj::valid(BSONVersion version) const {
-    return validateBSON(objdata(), objsize(), version).isOK();
+bool BSONObj::valid() const {
+    return validateBSON(objdata(), objsize()).isOK();
 }
 
 int BSONObj::woCompare(const BSONObj& r,
@@ -294,8 +343,7 @@ bool BSONObj::isFieldNamePrefixOf(const BSONObj& otherObj) const {
     return !a.more();
 }
 
-BSONObj BSONObj::extractFieldsUnDotted(const BSONObj& pattern) const {
-    BSONObjBuilder b;
+void BSONObj::extractFieldsUndotted(BSONObjBuilder* b, const BSONObj& pattern) const {
     BSONObjIterator i(pattern);
     while (i.moreWithEOO()) {
         BSONElement e = i.next();
@@ -303,13 +351,17 @@ BSONObj BSONObj::extractFieldsUnDotted(const BSONObj& pattern) const {
             break;
         BSONElement x = getField(e.fieldName());
         if (!x.eoo())
-            b.appendAs(x, "");
+            b->appendAs(x, "");
     }
+}
+
+BSONObj BSONObj::extractFieldsUndotted(const BSONObj& pattern) const {
+    BSONObjBuilder b;
+    extractFieldsUndotted(&b, pattern);
     return b.obj();
 }
 
-BSONObj BSONObj::filterFieldsUndotted(const BSONObj& filter, bool inFilter) const {
-    BSONObjBuilder b;
+void BSONObj::filterFieldsUndotted(BSONObjBuilder* b, const BSONObj& filter, bool inFilter) const {
     BSONObjIterator i(*this);
     while (i.moreWithEOO()) {
         BSONElement e = i.next();
@@ -317,8 +369,13 @@ BSONObj BSONObj::filterFieldsUndotted(const BSONObj& filter, bool inFilter) cons
             break;
         BSONElement x = filter.getField(e.fieldName());
         if ((x.eoo() && !inFilter) || (!x.eoo() && inFilter))
-            b.append(e);
+            b->append(e);
     }
+}
+
+BSONObj BSONObj::filterFieldsUndotted(const BSONObj& filter, bool inFilter) const {
+    BSONObjBuilder b;
+    filterFieldsUndotted(&b, filter, inFilter);
     return b.obj();
 }
 
@@ -344,42 +401,6 @@ BSONElement BSONObj::getFieldUsingIndexNames(StringData fieldName, const BSONObj
         --j;
     }
     return BSONElement();
-}
-
-/* note: addFields always adds _id even if not specified
-   returns n added not counting _id unless requested.
-*/
-int BSONObj::addFields(BSONObj& from, std::set<std::string>& fields) {
-    verify(isEmpty() && !isOwned()); /* partial implementation for now... */
-
-    BSONObjBuilder b;
-
-    int N = fields.size();
-    int n = 0;
-    BSONObjIterator i(from);
-    bool gotId = false;
-    while (i.moreWithEOO()) {
-        BSONElement e = i.next();
-        const char* fname = e.fieldName();
-        if (fields.count(fname)) {
-            b.append(e);
-            ++n;
-            gotId = gotId || strcmp(fname, "_id") == 0;
-            if (n == N && gotId)
-                break;
-        } else if (strcmp(fname, "_id") == 0) {
-            b.append(e);
-            gotId = true;
-            if (n == N && gotId)
-                break;
-        }
-    }
-
-    if (n) {
-        *this = b.obj();
-    }
-
-    return n;
 }
 
 bool BSONObj::couldBeArray() const {
@@ -526,18 +547,6 @@ Status BSONObj::storageValidEmbedded() const {
     return Status::OK();
 }
 
-void BSONObj::dump() const {
-    LogstreamBuilder builder = log();
-    builder << std::hex;
-    const char* p = objdata();
-    for (int i = 0; i < objsize(); i++) {
-        builder << i << '\t' << (0xff & ((unsigned)*p));
-        if (*p >= 'A' && *p <= 'z')
-            builder << '\t' << *p;
-        p++;
-    }
-}
-
 void BSONObj::getFields(unsigned n, const char** fieldNames, BSONElement* fields) const {
     BSONObjIterator i(*this);
     while (i.more()) {
@@ -610,6 +619,29 @@ BSONObj BSONObj::addField(const BSONElement& field) const {
     return b.obj();
 }
 
+BSONObj BSONObj::addFields(const BSONObj& from,
+                           const boost::optional<std::set<std::string>>& fields) const {
+    BSONObjBuilder bob;
+    for (auto&& originalField : *this) {
+        auto commonField = from[originalField.fieldNameStringData()];
+        // If there is a common field, add the value from 'from' object.
+        if (commonField && (!fields || fields->count(originalField.fieldName()))) {
+            bob.append(commonField);
+        } else {
+            bob.append(originalField);
+        }
+    }
+
+    for (auto&& fromField : from) {
+        // Ignore the common fields as they are already added earlier.
+        if (!hasField(fromField.fieldNameStringData()) &&
+            (!fields || fields->count(fromField.fieldName()))) {
+            bob.append(fromField);
+        }
+    }
+    return bob.obj();
+}
+
 BSONObj BSONObj::removeField(StringData name) const {
     BSONObjBuilder b;
     BSONObjIterator i(*this);
@@ -620,6 +652,17 @@ BSONObj BSONObj::removeField(StringData name) const {
             b.append(e);
     }
     return b.obj();
+}
+
+BSONObj BSONObj::removeFields(const std::set<std::string>& fields) const {
+    BSONObjBuilder bob;
+    for (auto&& field : *this) {
+        if (fields.count(field.fieldName())) {
+            continue;
+        }
+        bob.append(field);
+    }
+    return bob.obj();
 }
 
 std::string BSONObj::hexDump() const {

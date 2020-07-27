@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
-
 #include <vector>
 
 #include "mongo/base/init.h"
@@ -39,7 +37,6 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/s/request_types/wait_for_fail_point_gen.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 

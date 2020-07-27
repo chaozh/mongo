@@ -150,6 +150,10 @@ structs:
                               matching documents and 1 deletes a single document."
                 type: multi_delete_bool
                 cpp_name: multi
+            hint:
+                description: "Specifies the hint to use for the operation."
+                type: indexHint 
+                default: mongo::BSONObj()
             collation:
                 description: "Specifies the collation to use for the operation."
                 type: object
@@ -180,6 +184,11 @@ commands:
                 description: "An array of one or more update statements to perform."
                 type: array<UpdateOpEntry>
                 supports_doc_sequence: true
+            let:
+                description: "A set of user-specified constants used by pipeline-style update
+                              operations and $expr."
+                type: object
+                optional: true
             runtimeConstants:
                 description: "A collection of values that do not change once computed. These are
                               used by pipeline-style update operations."
@@ -197,3 +206,12 @@ commands:
                 description: "An array of one or more delete statements to perform."
                 type: array<DeleteOpEntry>
                 supports_doc_sequence: true
+            let:
+                description: "A set of user-specified constants used by $expr."
+                type: object
+                optional: true
+            runtimeConstants:
+                description: "A collection of values that do not change once computed. These are 
+                              used by $expr."
+                type: RuntimeConstants
+                optional: true

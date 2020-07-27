@@ -1,7 +1,6 @@
-/*
+/**
  * Make sure that $gt and $lt queries return the same results regardless of whether there is a
  * multikey index.
- * @tags: [requires_fcv_44]
  */
 
 (function() {
@@ -41,6 +40,7 @@ collList.forEach(function(collObj) {
         {val: [MaxKey]},
         {val: [MaxKey, 3]},
         {val: [3, MaxKey]},
+        {val: []},
     ]));
 });
 
@@ -48,7 +48,7 @@ const queryList = [
     [2, 2], [0, 3],   [3, 0],      [1, 3],      [3, 1],       [1, 5],   [5, 1],      [1],
     [3],    [5],      {"test": 2}, {"test": 6}, [true, true], [true],   true,        1,
     3,      5,        null,        [null],      [],           [MinKey], [MinKey, 2], [MinKey, 4],
-    MinKey, [MaxKey], [MaxKey, 2], [MaxKey, 4], MaxKey,
+    MinKey, [MaxKey], [MaxKey, 2], [MaxKey, 4], MaxKey,       [],
 ];
 
 let failedLT = [];

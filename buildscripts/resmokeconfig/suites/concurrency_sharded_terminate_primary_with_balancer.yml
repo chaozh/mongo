@@ -106,7 +106,6 @@ selector:
   - jstests/concurrency/fsm_workloads/cleanupOrphanedWhileMigrating.js
   - jstests/concurrency/fsm_workloads/sharded_base_partitioned.js
   - jstests/concurrency/fsm_workloads/sharded_mergeChunks_partitioned.js
-  - jstests/concurrency/fsm_workloads/sharded_moveChunk_drop_shard_key_index.js
   - jstests/concurrency/fsm_workloads/sharded_moveChunk_partitioned.js
   - jstests/concurrency/fsm_workloads/sharded_splitChunk_partitioned.js
 
@@ -117,6 +116,7 @@ selector:
 
   # Uses getmores.
   - jstests/concurrency/fsm_workloads/agg_base.js
+  - jstests/concurrency/fsm_workloads/agg_unionWith_interrupt_cleanup.js
   - jstests/concurrency/fsm_workloads/create_capped_collection.js
   - jstests/concurrency/fsm_workloads/create_capped_collection_maxdocs.js
   - jstests/concurrency/fsm_workloads/create_index_background.js
@@ -171,11 +171,6 @@ selector:
   # much value in running it.
   - jstests/concurrency/fsm_workloads/drop_collection.js
 
-  # TODO (SERVER-35534) Unblacklist this workload from the concurrency stepdown suites. It fails
-  # with PooledConnectionsDropped when setFCV is run concurrently with movePrimary, which seems like
-  # it's due to a race condition in the NetworkInterfaceTL.
-  - jstests/concurrency/fsm_workloads/database_versioning.js
-
   # serverStatus does not include transaction metrics on mongos.
   - jstests/concurrency/fsm_workloads/multi_statement_transaction_atomicity_isolation_metrics_test.js
 
@@ -216,6 +211,7 @@ executor:
     terminate: true
   - class: CheckReplDBHash
   - class: ValidateCollections
+  - class: CheckOrphansDeleted
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture
@@ -239,6 +235,7 @@ executor:
       set_parameters:
         enableTestCommands: 1
         enableElectionHandoff: 0
+        roleGraphInvalidationIsFatal: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

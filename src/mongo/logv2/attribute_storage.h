@@ -37,9 +37,9 @@
 
 #include <boost/container/small_vector.hpp>
 #include <functional>
+#include <string_view>
 
-namespace mongo {
-namespace logv2 {
+namespace mongo::logv2 {
 
 class TypeErasedAttributeStorage;
 
@@ -146,14 +146,29 @@ template <class T, class = void>
 struct HasToString : std::false_type {};
 
 template <class T>
-struct HasToString<T, std::void_t<decltype(std::declval<T>().toString())>> : std::true_type {};
+struct HasToString<T, std::void_t<decltype(std::declval<T>().toString())>>
+    : std::is_same<std::remove_cv_t<decltype(std::declval<T>().toString())>, std::string> {};
+
+template <class T, class = void>
+struct HasToStringReturnStringData : std::false_type {};
+
+template <class T>
+struct HasToStringReturnStringData<T, std::void_t<decltype(std::declval<T>().toString())>>
+    : std::is_convertible<decltype(std::declval<T>().toString()), StringData> {};
 
 template <class T, class = void>
 struct HasNonMemberToString : std::false_type {};
 
 template <class T>
 struct HasNonMemberToString<T, std::void_t<decltype(toString(std::declval<T>()))>>
-    : std::true_type {};
+    : std::is_same<decltype(toString(std::declval<T>())), std::string> {};
+
+template <class T, class = void>
+struct HasNonMemberToStringReturnStringData : std::false_type {};
+
+template <class T>
+struct HasNonMemberToStringReturnStringData<T, std::void_t<decltype(toString(std::declval<T>()))>>
+    : std::is_convertible<decltype(toString(std::declval<T>())), StringData> {};
 
 template <class T, class = void>
 struct HasNonMemberToBSON : std::false_type {};
@@ -190,11 +205,15 @@ inline double mapValue(float value) {
 inline double mapValue(double value) {
     return value;
 }
+
 inline StringData mapValue(StringData value) {
     return value;
 }
 inline StringData mapValue(std::string const& value) {
     return value;
+}
+inline StringData mapValue(std::string_view value) {
+    return StringData(value.data(), value.size());
 }
 inline StringData mapValue(char* value) {
     return value;
@@ -202,11 +221,12 @@ inline StringData mapValue(char* value) {
 inline StringData mapValue(const char* value) {
     return value;
 }
-inline const BSONObj* mapValue(BSONObj const& value) {
-    return &value;
+
+inline const BSONObj mapValue(BSONObj const& value) {
+    return value;
 }
-inline const BSONArray* mapValue(BSONArray const& value) {
-    return &value;
+inline const BSONArray mapValue(BSONArray const& value) {
+    return value;
 }
 inline CustomAttributeValue mapValue(BSONElement const& val) {
     CustomAttributeValue custom;
@@ -236,6 +256,13 @@ auto mapValue(T val) {
         CustomAttributeValue custom;
         custom.toString = [val]() { return toString(val); };
         return custom;
+    } else if constexpr (HasNonMemberToStringReturnStringData<T>::value) {
+        CustomAttributeValue custom;
+        custom.stringSerialize = [val](fmt::memory_buffer& buffer) {
+            StringData sd = toString(val);
+            buffer.append(sd.begin(), sd.end());
+        };
+        return custom;
     } else {
         return mapValue(static_cast<std::underlying_type_t<T>>(val));
     }
@@ -263,9 +290,14 @@ template <
                          !IsDuration<T>::value && !IsContainer<T>::value,
                      int> = 0>
 CustomAttributeValue mapValue(const T& val) {
-    static_assert(HasToString<T>::value || HasStringSerialize<T>::value ||
-                      HasNonMemberToString<T>::value,
-                  "custom type needs toString() or serialize(fmt::memory_buffer&) implementation");
+    static_assert(HasToString<T>::value || HasToStringReturnStringData<T>::value ||
+                      HasStringSerialize<T>::value || HasNonMemberToString<T>::value ||
+                      HasNonMemberToStringReturnStringData<T>::value ||
+                      HasBSONBuilderAppend<T>::value || HasBSONSerialize<T>::value ||
+                      HasToBSON<T>::value || HasToBSONArray<T>::value ||
+                      HasNonMemberToBSON<T>::value,
+                  "custom type needs toBSON(), toBSONArray(), serialize(BSONObjBuilder*), "
+                  "toString() or serialize(fmt::memory_buffer&) implementation");
 
     CustomAttributeValue custom;
     if constexpr (HasBSONBuilderAppend<T>::value) {
@@ -273,6 +305,7 @@ CustomAttributeValue mapValue(const T& val) {
             builder.append(fieldName, val);
         };
     }
+
     if constexpr (HasBSONSerialize<T>::value) {
         custom.BSONSerialize = [&val](BSONObjBuilder& builder) { val.serialize(&builder); };
     } else if constexpr (HasToBSON<T>::value) {
@@ -286,12 +319,23 @@ CustomAttributeValue mapValue(const T& val) {
             builder.appendElements(toBSON(val));
         };
     }
+
     if constexpr (HasStringSerialize<T>::value) {
         custom.stringSerialize = [&val](fmt::memory_buffer& buffer) { val.serialize(buffer); };
     } else if constexpr (HasToString<T>::value) {
         custom.toString = [&val]() { return val.toString(); };
+    } else if constexpr (HasToStringReturnStringData<T>::value) {
+        custom.stringSerialize = [&val](fmt::memory_buffer& buffer) {
+            StringData sd = val.toString();
+            buffer.append(sd.begin(), sd.end());
+        };
     } else if constexpr (HasNonMemberToString<T>::value) {
         custom.toString = [&val]() { return toString(val); };
+    } else if constexpr (HasNonMemberToStringReturnStringData<T>::value) {
+        custom.stringSerialize = [&val](fmt::memory_buffer& buffer) {
+            StringData sd = toString(val);
+            buffer.append(sd.begin(), sd.end());
+        };
     }
 
     return custom;
@@ -308,7 +352,8 @@ public:
         for (auto it = _begin; it != _end; ++it) {
             const auto& item = *it;
             auto append = [&builder](auto&& val) {
-                if constexpr (std::is_same_v<decltype(val), CustomAttributeValue&&>) {
+                using V = decltype(val);
+                if constexpr (std::is_same_v<V, CustomAttributeValue&&>) {
                     if (val.BSONAppend) {
                         BSONObjBuilder objBuilder;
                         val.BSONAppend(objBuilder, ""_sd);
@@ -326,8 +371,10 @@ public:
                     } else {
                         builder.append(val.toString());
                     }
-                } else if constexpr (IsDuration<std::decay_t<decltype(val)>>::value) {
+                } else if constexpr (IsDuration<std::decay_t<V>>::value) {
                     builder.append(val.toBSON());
+                } else if constexpr (std::is_same_v<std::decay_t<V>, unsigned int>) {
+                    builder.append(static_cast<long long>(val));
                 } else {
                     builder.append(val);
                 }
@@ -365,6 +412,10 @@ public:
 
                 } else if constexpr (IsDuration<std::decay_t<decltype(val)>>::value) {
                     fmt::format_to(buffer, "{}", val.toString());
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(val)>, BSONObj>) {
+                    val.jsonStringBuffer(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, false, buffer);
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(val)>, BSONArray>) {
+                    val.jsonStringBuffer(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true, buffer);
                 } else {
                     fmt::format_to(buffer, "{}", val);
                 }
@@ -404,7 +455,8 @@ public:
         for (auto it = _begin; it != _end; ++it) {
             const auto& item = *it;
             auto append = [builder](StringData key, auto&& val) {
-                if constexpr (std::is_same_v<decltype(val), CustomAttributeValue&&>) {
+                using V = decltype(val);
+                if constexpr (std::is_same_v<V, CustomAttributeValue&&>) {
                     if (val.BSONAppend) {
                         val.BSONAppend(*builder, key);
                     } else if (val.BSONSerialize) {
@@ -420,8 +472,10 @@ public:
                     } else {
                         builder->append(key, val.toString());
                     }
-                } else if constexpr (IsDuration<std::decay_t<decltype(val)>>::value) {
+                } else if constexpr (IsDuration<std::decay_t<V>>::value) {
                     builder->append(key, val.toBSON());
+                } else if constexpr (std::is_same_v<std::decay_t<V>, unsigned int>) {
+                    builder->append(key, static_cast<long long>(val));
                 } else {
                     builder->append(key, val);
                 }
@@ -458,6 +512,12 @@ public:
                     }
                 } else if constexpr (IsDuration<std::decay_t<decltype(val)>>::value) {
                     fmt::format_to(buffer, "{}: {}", key, val.toString());
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(val)>, BSONObj>) {
+                    fmt::format_to(buffer, "{}: ", key);
+                    val.jsonStringBuffer(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, false, buffer);
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(val)>, BSONArray>) {
+                    fmt::format_to(buffer, "{}: ", key);
+                    val.jsonStringBuffer(JsonStringFormat::ExtendedRelaxedV2_0_0, 0, true, buffer);
                 } else {
                     fmt::format_to(buffer, "{}: {}", key, val);
                 }
@@ -518,8 +578,8 @@ public:
                   Minutes,
                   Hours,
                   Days,
-                  const BSONObj*,
-                  const BSONArray*,
+                  BSONObj,
+                  BSONArray,
                   CustomAttributeValue>
         value;
 };
@@ -553,29 +613,55 @@ AttributeStorage<Args...> makeAttributeStorage(const Args&... args) {
 class DynamicAttributes {
 public:
     // Do not allow rvalue references and temporary objects to avoid lifetime problem issues
-    template <typename T,
-              std::enable_if_t<std::is_arithmetic_v<T> || std::is_pointer_v<T> || std::is_enum_v<T>,
+    template <size_t N,
+              typename T,
+              std::enable_if_t<std::is_arithmetic_v<T> || std::is_pointer_v<T> ||
+                                   std::is_enum_v<T> || detail::IsDuration<T>::value,
                                int> = 0>
-    void add(StringData name, T value) {
-        _attributes.emplace_back(name, value);
+    void add(const char (&name)[N], T value) {
+        _attributes.emplace_back(StringData(name, N - 1), value);
     }
 
-    template <typename T, std::enable_if_t<std::is_class_v<T>, int> = 0>
-    void add(StringData name, const T& value) {
-        _attributes.emplace_back(name, value);
+    template <size_t N>
+    void add(const char (&name)[N], BSONObj value) {
+        BSONObj owned = value.getOwned();
+        _attributes.emplace_back(StringData(name, N - 1), owned);
     }
 
-    template <typename T, std::enable_if_t<std::is_class_v<T>, int> = 0>
-    void add(StringData name, T&& value) = delete;
+    template <size_t N>
+    void add(const char (&name)[N], BSONArray value) {
+        BSONArray owned = static_cast<BSONArray>(value.getOwned());
+        _attributes.emplace_back(StringData(name, N - 1), owned);
+    }
 
-    void add(StringData name, StringData value) {
-        _attributes.emplace_back(name, value);
+    template <size_t N,
+              typename T,
+              std::enable_if_t<std::is_class_v<T> && !detail::IsDuration<T>::value, int> = 0>
+    void add(const char (&name)[N], const T& value) {
+        _attributes.emplace_back(StringData(name, N - 1), value);
+    }
+
+    template <size_t N,
+              typename T,
+              std::enable_if_t<std::is_class_v<T> && !detail::IsDuration<T>::value, int> = 0>
+    void add(const char (&name)[N], T&& value) = delete;
+
+    template <size_t N>
+    void add(const char (&name)[N], StringData value) {
+        _attributes.emplace_back(StringData(name, N - 1), value);
+    }
+
+    // Deep copies the string instead of taking it by reference
+    template <size_t N>
+    void addDeepCopy(const char (&name)[N], std::string value) {
+        _copiedStrings.push_front(std::move(value));
+        add(name, StringData(_copiedStrings.front()));
     }
 
     // Does not have the protections of add() above. Be careful about lifetime of value!
-    template <typename T>
-    void addUnsafe(StringData name, const T& value) {
-        _attributes.emplace_back(name, value);
+    template <size_t N, typename T>
+    void addUnsafe(const char (&name)[N], const T& value) {
+        _attributes.emplace_back(StringData(name, N - 1), value);
     }
 
 private:
@@ -584,11 +670,16 @@ private:
     friend class mongo::logv2::TypeErasedAttributeStorage;
 
     boost::container::small_vector<detail::NamedAttribute, constants::kNumStaticAttrs> _attributes;
+
+    // Linked list of deep copies to std::string that we can take address-of.
+    std::forward_list<std::string> _copiedStrings;
 };
 
 // Wrapper around internal pointer of AttributeStorage so it does not need any template parameters
 class TypeErasedAttributeStorage {
 public:
+    using const_iterator = const detail::NamedAttribute*;
+
     TypeErasedAttributeStorage() : _size(0) {}
 
     template <typename... Args>
@@ -604,6 +695,13 @@ public:
 
     std::size_t size() const {
         return _size;
+    }
+
+    const_iterator begin() const {
+        return _data;
+    }
+    const_iterator end() const {
+        return _data + _size;
     }
 
     // Applies a function to every stored named attribute in order they are captured
@@ -645,5 +743,4 @@ auto mapLog(It begin, It end) {
     return detail::AssociativeContainerLogger(begin, end);
 }
 
-}  // namespace logv2
-}  // namespace mongo
+}  // namespace mongo::logv2

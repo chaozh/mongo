@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -57,7 +57,7 @@
 #include "mongo/db/query/view_response_formatter.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/views/resolved_view.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -76,6 +76,10 @@ public:
         return AllowedOnSecondary::kOptIn;
     }
 
+    bool maintenanceOk() const override {
+        return false;
+    }
+
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
@@ -87,6 +91,14 @@ public:
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const override {
         return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
+    }
+
+    bool supportsReadMirroring(const BSONObj&) const override {
+        return true;
     }
 
     ReadWriteType getReadWriteType() const override {
@@ -161,7 +173,7 @@ public:
         Collection* const collection = ctx->getCollection();
 
         auto executor = uassertStatusOK(
-            getExecutorDistinct(opCtx, collection, QueryPlannerParams::DEFAULT, &parsedDistinct));
+            getExecutorDistinct(collection, QueryPlannerParams::DEFAULT, &parsedDistinct));
 
         auto bodyBuilder = result->getBodyBuilder();
         Explain::explainStages(executor.get(), collection, verbosity, BSONObj(), &bodyBuilder);
@@ -181,14 +193,19 @@ public:
                     AutoGetCollection::ViewMode::kViewsPermitted);
         const auto& nss = ctx->getNss();
 
-        // Distinct doesn't filter orphan documents so it is not allowed to run on sharded
-        // collections in multi-document transactions.
-        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+        if (!ctx->getView()) {
+            // Distinct doesn't filter orphan documents so it is not allowed to run on sharded
+            // collections in multi-document transactions.
+            uassert(
+                ErrorCodes::OperationNotSupportedInTransaction,
                 "Cannot run 'distinct' on a sharded collection in a multi-document transaction. "
                 "Please see http://dochub.mongodb.org/core/transaction-distinct for a recommended "
                 "alternative.",
                 !opCtx->inMultiDocumentTransaction() ||
-                    !CollectionShardingState::get(opCtx, nss)->getCurrentMetadata()->isSharded());
+                    !CollectionShardingState::get(opCtx, nss)
+                         ->getCollectionDescription(opCtx)
+                         .isSharded());
+        }
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
         auto defaultCollation =
@@ -217,13 +234,12 @@ public:
         Collection* const collection = ctx->getCollection();
 
         auto executor =
-            getExecutorDistinct(opCtx, collection, QueryPlannerParams::DEFAULT, &parsedDistinct);
+            getExecutorDistinct(collection, QueryPlannerParams::DEFAULT, &parsedDistinct);
         uassertStatusOK(executor.getStatus());
 
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            CurOp::get(opCtx)->setPlanSummary_inlock(
-                Explain::getPlanSummary(executor.getValue().get()));
+            CurOp::get(opCtx)->setPlanSummary_inlock(executor.getValue()->getPlanSummary());
         }
 
         const auto key = cmdObj[ParsedDistinct::kKeyField].valuestrsafe();
@@ -232,64 +248,61 @@ public:
         BSONElementSet values(executor.getValue()->getCanonicalQuery()->getCollator());
 
         const int kMaxResponseSize = BSONObjMaxUserSize - 4096;
-        size_t listApproxBytes = 0;
-        BSONObj obj;
-        PlanExecutor::ExecState state;
-        while (PlanExecutor::ADVANCED == (state = executor.getValue()->getNext(&obj, nullptr))) {
-            // Distinct expands arrays.
-            //
-            // If our query is covered, each value of the key should be in the index key and
-            // available to us without this.  If a collection scan is providing the data, we may
-            // have to expand an array.
-            BSONElementSet elts;
-            dps::extractAllElementsAlongPath(obj, key, elts);
 
-            for (BSONElementSet::iterator it = elts.begin(); it != elts.end(); ++it) {
-                BSONElement elt = *it;
-                if (values.count(elt)) {
-                    continue;
+        try {
+            size_t listApproxBytes = 0;
+            BSONObj obj;
+            while (PlanExecutor::ADVANCED == executor.getValue()->getNext(&obj, nullptr)) {
+                // Distinct expands arrays.
+                //
+                // If our query is covered, each value of the key should be in the index key and
+                // available to us without this.  If a collection scan is providing the data, we may
+                // have to expand an array.
+                BSONElementSet elts;
+                dps::extractAllElementsAlongPath(obj, key, elts);
+
+                for (BSONElementSet::iterator it = elts.begin(); it != elts.end(); ++it) {
+                    BSONElement elt = *it;
+                    if (values.count(elt)) {
+                        continue;
+                    }
+
+                    // This is an approximate size check which safeguards against use of unbounded
+                    // memory by the distinct command. We perform a more precise check at the end of
+                    // this method to confirm that the response size is less than 16MB.
+                    listApproxBytes += elt.size();
+                    uassert(
+                        17217, "distinct too big, 16mb cap", listApproxBytes < kMaxResponseSize);
+
+                    auto distinctObj = elt.wrap();
+                    values.insert(distinctObj.firstElement());
+                    distinctValueHolder.push_back(std::move(distinctObj));
                 }
-
-                // This is an approximate size check which safeguards against use of unbounded
-                // memory by the distinct command. We perform a more precise check at the end of
-                // this method to confirm that the response size is less than 16MB.
-                listApproxBytes += elt.size();
-                uassert(17217, "distinct too big, 16mb cap", listApproxBytes < kMaxResponseSize);
-
-                auto distinctObj = elt.wrap();
-                values.insert(distinctObj.firstElement());
-                distinctValueHolder.push_back(std::move(distinctObj));
             }
+        } catch (DBException& exception) {
+            LOGV2_WARNING(23797,
+                          "Plan executor error during distinct command: {error}, "
+                          "stats: {stats}",
+                          "Plan executor error during distinct command",
+                          "error"_attr = exception.toStatus(),
+                          "stats"_attr = redact(executor.getValue()->getStats()));
+
+            exception.addContext("Executor error during distinct command");
+            throw;
         }
-
-        // Return an error if execution fails for any reason.
-        if (PlanExecutor::FAILURE == state) {
-            // We should always have a valid status member object at this point.
-            auto status = WorkingSetCommon::getMemberObjectStatus(obj);
-            invariant(!status.isOK());
-            warning() << "Plan executor error during distinct command: "
-                      << redact(PlanExecutor::statestr(state)) << ", status: " << status
-                      << ", stats: "
-                      << redact(Explain::getWinningPlanStats(executor.getValue().get()));
-
-            uassertStatusOK(status.withContext("Executor error during distinct command"));
-        }
-
 
         auto curOp = CurOp::get(opCtx);
 
         // Get summary information about the plan.
         PlanSummaryStats stats;
-        Explain::getSummaryStats(*executor.getValue(), &stats);
+        executor.getValue()->getSummaryStats(&stats);
         if (collection) {
-            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, stats);
+            CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, stats);
         }
         curOp->debug().setPlanSummaryMetrics(stats);
 
         if (curOp->shouldDBProfile()) {
-            BSONObjBuilder execStatsBob;
-            Explain::getWinningPlanStats(executor.getValue().get(), &execStatsBob);
-            curOp->debug().execStats = execStatsBob.obj();
+            curOp->debug().execStats = executor.getValue()->getStats();
         }
 
         BSONArrayBuilder valueListBuilder(result.subarrayStart("values"));
@@ -298,9 +311,30 @@ public:
         }
         valueListBuilder.doneFast();
 
+        if (!opCtx->inMultiDocumentTransaction() &&
+            repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()) {
+            result.append("atClusterTime"_sd,
+                          repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()->asTimestamp());
+        }
+
         uassert(31299, "distinct too big, 16mb cap", result.len() < kMaxResponseSize);
         return true;
     }
+
+    void appendMirrorableRequest(BSONObjBuilder* bob, const BSONObj& cmdObj) const override {
+        static const auto kMirrorableKeys = [] {
+            BSONObjBuilder keyBob;
+            keyBob.append("distinct", 1);
+            keyBob.append("key", 1);
+            keyBob.append("query", 1);
+            keyBob.append("collation", 1);
+            return keyBob.obj();
+        }();
+
+        // Filter the keys that can be mirrored
+        cmdObj.filterFieldsUndotted(bob, kMirrorableKeys, true);
+    }
+
 
 } distinctCmd;
 

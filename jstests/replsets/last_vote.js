@@ -8,7 +8,9 @@
 // other node. It then restarts the first node as a replicaset and manually runs
 // replSetRequestVotes commands against it and checks that its response is correct.
 //
-// @tags: [requires_persistence]
+// @tags: [
+//   requires_persistence,
+// ]
 
 (function() {
 "use strict";
@@ -122,7 +124,7 @@ var response = assert.commandWorked(node0.adminCommand({
     term: term - 1,
     candidateIndex: 1,
     configVersion: conf.version,
-    lastCommittedOp: getLatestOp(node0)
+    lastAppliedOpTime: getLatestOp(node0)
 }));
 assert.eq(
     response.term, term, "replSetRequestVotes response had the wrong term: " + tojson(response));
@@ -140,7 +142,7 @@ response = assert.commandWorked(node0.adminCommand({
     term: term,
     candidateIndex: 1,
     configVersion: conf.version,
-    lastCommittedOp: getLatestOp(node0)
+    lastAppliedOpTime: getLatestOp(node0)
 }));
 assert.eq(
     response.term, term, "replSetRequestVotes response had the wrong term: " + tojson(response));
@@ -159,7 +161,7 @@ response = assert.commandWorked(node0.adminCommand({
     term: term,
     candidateIndex: 1,
     configVersion: conf.version,
-    lastCommittedOp: getLatestOp(node0)
+    lastAppliedOpTime: getLatestOp(node0)
 }));
 assert.eq(
     response.term, term, "replSetRequestVotes response had the wrong term: " + tojson(response));
@@ -176,7 +178,7 @@ response = assert.commandWorked(node0.adminCommand({
     term: term + 1,
     candidateIndex: 1,
     configVersion: conf.version,
-    lastCommittedOp: getLatestOp(node0)
+    lastAppliedOpTime: getLatestOp(node0)
 }));
 assert.eq(response.term,
           term + 1,
@@ -197,7 +199,7 @@ response = assert.commandWorked(node0.adminCommand({
     term: term + 2,
     candidateIndex: 1,
     configVersion: conf.version,
-    lastCommittedOp: getLatestOp(node0)
+    lastAppliedOpTime: getLatestOp(node0)
 }));
 assert.eq(response.term,
           term + 2,

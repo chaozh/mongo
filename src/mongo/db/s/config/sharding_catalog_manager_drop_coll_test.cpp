@@ -27,12 +27,13 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -41,7 +42,6 @@
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/config_server_test_fixture.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {

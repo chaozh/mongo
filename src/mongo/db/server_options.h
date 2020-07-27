@@ -63,8 +63,6 @@ struct ServerGlobalParams {
 
     int listenBacklog = 0;  // --listenBacklog, real default is SOMAXCONN
 
-    bool indexBuildRetry = true;  // --noIndexBuildRetry
-
     AtomicWord<bool> quiet{false};  // --quiet
 
     ClusterRole clusterRole = ClusterRole::None;  // --configsvr/--shardsvr
@@ -84,9 +82,6 @@ struct ServerGlobalParams {
     std::string socket = "/tmp";  // UNIX domain socket directory
     std::string transportLayer;   // --transportLayer (must be either "asio" or "legacy")
 
-    // --serviceExecutor ("adaptive", "synchronous")
-    std::string serviceExecutor;
-
     size_t maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
     std::vector<stdx::variant<CIDR, std::string>> maxConnsOverride;
     int reservedAdminThreads = 0;
@@ -98,15 +93,15 @@ struct ServerGlobalParams {
     std::string timeZoneInfoPath;  // Path to time zone info directory, or empty if none.
 
     std::string logpath;  // Path to log file, if logging to a file; otherwise, empty.
-    logv2::LogFormat logFormat = logv2::LogFormat::kDefault;  // Log format to output to
+    logv2::LogTimestampFormat logTimestampFormat = logv2::LogTimestampFormat::kISO8601Local;
+
     bool logAppend = false;         // True if logging to a file in append mode.
     bool logRenameOnRotate = true;  // True if logging should rename log files on rotate
     bool logWithSyslog = false;     // True if logging to syslog; must not be set if logpath is set.
     int syslogFacility;             // Facility used when appending messages to the syslog.
 
 #ifndef _WIN32
-    ProcessId parentProc;  // --fork pid of initial process
-    ProcessId leaderProc;  // --fork pid of leader process
+    int forkReadyFd = -1;  // for `--fork`. Write to it and close it when daemon service is up.
 #endif
 
     /**
@@ -156,6 +151,9 @@ struct ServerGlobalParams {
     // queryableBackupMode.
     BSONObj overrideShardIdentity;
 
+    // True if the current binary version is an LTS Version.
+    static constexpr bool kIsLTSBinaryVersion = false;
+
     struct FeatureCompatibility {
         /**
          * The combination of the fields (version, targetVersion) in the featureCompatiiblityVersion
@@ -167,48 +165,64 @@ struct ServerGlobalParams {
          *
          * The legal enum (and featureCompatibilityVersion document) states are:
          *
-         * kFullyDowngradedTo42
-         * (4.2, Unset): Only 4.2 features are available, and new and existing storage
-         *               engine entries use the 4.2 format
-         *
-         * kUpgradingTo44
-         * (4.2, 4.4): Only 4.2 features are available, but new storage engine entries
-         *             use the 4.4 format, and existing entries may have either the
-         *             4.2 or 4.4 format
-         *
-         * kFullyUpgradedTo44
-         * (4.4, Unset): 4.4 features are available, and new and existing storage
+         * kFullyDowngradedTo44
+         * (4.4, Unset): Only 4.4 features are available, and new and existing storage
          *               engine entries use the 4.4 format
          *
-         * kDowngradingTo42
-         * (4.2, 4.2): Only 4.2 features are available and new storage engine
-         *             entries use the 4.2 format, but existing entries may have
-         *             either the 4.2 or 4.4 format
+         * kUpgradingFrom44To451
+         * (4.4, 4.5.1): Only 4.4 features are available, but new storage engine entries
+         *             use the 4.5.1 format, and existing entries may have either the
+         *             4.4 or 4.5.1 format
          *
-         * kUnsetDefault42Behavior
+         * kVersion451
+         * (4.5.1, Unset): 4.5.1 features are available, and new and existing storage
+         *               engine entries use the 4.5.1 format
+         *
+         * kDowngradingFrom451To44
+         * (4.4, 4.4): Only 4.4 features are available and new storage engine
+         *             entries use the 4.4 format, but existing entries may have
+         *             either the 4.4 or 4.5.1 format
+         *
+         * kUnsetDefault44Behavior
          * (Unset, Unset): This is the case on startup before the fCV document is
          *                 loaded into memory. isVersionInitialized() will return
          *                 false, and getVersion() will return the default
-         *                 (kFullyDowngradedTo42).
+         *                 (kFullyDowngradedTo44).
          *
          */
         enum class Version {
             // The order of these enums matter, higher upgrades having higher values, so that
             // features can be active or inactive if the version is higher than some minimum or
             // lower than some maximum, respectively.
-            kUnsetDefault42Behavior = 0,
-            kFullyDowngradedTo42 = 1,
-            kDowngradingTo42 = 2,
-            kUpgradingTo44 = 3,
-            kFullyUpgradedTo44 = 4,
+            kUnsetDefault44Behavior = 0,
+            kFullyDowngradedTo44 = 1,
+            kDowngradingFrom451To44 = 2,
+            kUpgradingFrom44To451 = 3,
+            kVersion451 = 4,
         };
+
+        // These constants should only be used for generic FCV references. Generic references are
+        // FCV references that are expected to exist across LTS binary versions.
+        static constexpr Version kLatest = Version::kVersion451;
+        static constexpr Version kLastContinuous = Version::kFullyDowngradedTo44;
+        static constexpr Version kLastLTS = Version::kFullyDowngradedTo44;
+
+        // These constants should only be used for generic FCV references. Generic references are
+        // FCV references that are expected to exist across LTS binary versions.
+        // NOTE: DO NOT USE THEM FOR REGULAR FCV CHECKS.
+        static constexpr Version kUpgradingFromLastLTSToLatest = Version::kUpgradingFrom44To451;
+        static constexpr Version kUpgradingFromLastContinuousToLatest =
+            Version::kUpgradingFrom44To451;
+        static constexpr Version kDowngradingFromLatestToLastLTS = Version::kDowngradingFrom451To44;
+        static constexpr Version kDowngradingFromLatestToLastContinuous =
+            Version::kDowngradingFrom451To44;
 
         /**
          * On startup, the featureCompatibilityVersion may not have been explicitly set yet. This
          * exposes the actual state of the featureCompatibilityVersion if it is uninitialized.
          */
         const bool isVersionInitialized() const {
-            return _version.load() != Version::kUnsetDefault42Behavior;
+            return _version.load() != Version::kUnsetDefault44Behavior;
         }
 
         /**
@@ -221,19 +235,55 @@ struct ServerGlobalParams {
         }
 
         void reset() {
-            _version.store(Version::kUnsetDefault42Behavior);
+            _version.store(Version::kUnsetDefault44Behavior);
         }
 
         void setVersion(Version version) {
             return _version.store(version);
         }
 
-        bool isVersion(Version version) {
-            return _version.load() == version;
+        bool isLessThanOrEqualTo(Version version, Version* versionReturn = nullptr) {
+            Version currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion <= version;
+        }
+
+        bool isGreaterThanOrEqualTo(Version version, Version* versionReturn = nullptr) {
+            Version currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion >= version;
+        }
+
+        bool isLessThan(Version version, Version* versionReturn = nullptr) {
+            Version currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion < version;
+        }
+
+        bool isGreaterThan(Version version, Version* versionReturn = nullptr) {
+            Version currentVersion = getVersion();
+            if (versionReturn != nullptr) {
+                *versionReturn = currentVersion;
+            }
+            return currentVersion > version;
+        }
+
+        // This function is to be used for generic FCV references only, and not for FCV-gating.
+        bool isUpgradingOrDowngrading(boost::optional<Version> version = boost::none) {
+            if (version == boost::none) {
+                version = getVersion();
+            }
+            return version != kLatest && version != kLastContinuous && version != kLastLTS;
         }
 
     private:
-        AtomicWord<Version> _version{Version::kUnsetDefault42Behavior};
+        AtomicWord<Version> _version{Version::kUnsetDefault44Behavior};
 
     } featureCompatibility;
 

@@ -34,11 +34,12 @@
 namespace mongo {
 
 RequiresIndexStage::RequiresIndexStage(const char* stageType,
-                                       OperationContext* opCtx,
+                                       ExpressionContext* expCtx,
+                                       const Collection* collection,
                                        const IndexDescriptor* indexDescriptor,
                                        WorkingSet* workingSet)
-    : RequiresCollectionStage(stageType, opCtx, indexDescriptor->getCollection()),
-      _weakIndexCatalogEntry(collection()->getIndexCatalog()->getEntryShared(indexDescriptor)) {
+    : RequiresCollectionStage(stageType, expCtx, collection),
+      _weakIndexCatalogEntry(indexDescriptor->getEntry()->shared_from_this()) {
     auto indexCatalogEntry = _weakIndexCatalogEntry.lock();
     _indexDescriptor = indexCatalogEntry->descriptor();
     _indexAccessMethod = indexCatalogEntry->accessMethod();

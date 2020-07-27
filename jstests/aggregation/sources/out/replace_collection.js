@@ -3,30 +3,30 @@
  *
  * This test assumes that collections are not implicitly sharded, since $out is prohibited if the
  * output collection is sharded.
- * @tags: [assumes_unsharded_collection]
  */
 (function() {
 "use strict";
 
-load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
-load("jstests/libs/fixture_helpers.js");      // For FixtureHelpers.isMongos.
+load("jstests/aggregation/extras/merge_helpers.js");  // For dropWithoutImplicitRecreate.
+load("jstests/aggregation/extras/utils.js");          // For assertErrorCode.
+load("jstests/libs/fixture_helpers.js");              // For FixtureHelpers.isMongos.
 
 const coll = db.source;
+const targetCollName = "target";
 coll.drop();
 
-const targetColl = db.target;
-targetColl.drop();
-
-const pipeline = [{$out: targetColl.getName()}];
+dropWithoutImplicitRecreate(targetCollName);
+const pipeline = [{$out: targetCollName}];
 
 //
 // Test $out with a non-existent output collection.
 //
 assert.commandWorked(coll.insert({_id: 0}));
 coll.aggregate(pipeline);
+const targetColl = db.target;
 assert.eq(1, targetColl.find().itcount());
 
-// Test $internalOutToDifferentDB with a non-existent database. This is only expected to work in a
+// Test $out with a non-existent database. This is only expected to work in a
 // non-sharded environment.
 const destDB = db.getSiblingDB("outDifferentDB");
 destDB.dropDatabase();
@@ -34,16 +34,11 @@ if (FixtureHelpers.isMongos(db)) {
     assert.commandFailedWithCode(db.runCommand({
         aggregate: coll.getName(),
         cursor: {},
-        pipeline: [{
-            $internalOutToDifferentDB:
-                {db: destDB.getName(), coll: destDB.outDifferentColl.getName()}
-        }]
+        pipeline: [{$out: {db: destDB.getName(), coll: 'outDifferentColl'}}]
     }),
                                  ErrorCodes.NamespaceNotFound);
 } else {
-    coll.aggregate({
-        $internalOutToDifferentDB: {db: destDB.getName(), coll: destDB.outDifferentColl.getName()}
-    });
+    coll.aggregate({$out: {db: destDB.getName(), coll: destDB.outDifferentColl.getName()}});
     assert.eq(1, destDB.outDifferentColl.find().itcount());
 }
 
@@ -56,7 +51,7 @@ assert.eq(1, targetColl.find().itcount());
 //
 // Test that $out will preserve the indexes and options of the output collection.
 //
-targetColl.drop();
+dropWithoutImplicitRecreate(targetCollName);
 assert.commandWorked(db.createCollection(targetColl.getName(), {validator: {a: {$gt: 0}}}));
 assert.commandWorked(targetColl.createIndex({a: 1}));
 
@@ -76,7 +71,7 @@ assert.eq({a: {$gt: 0}}, listColl.cursor.firstBatch[0].options["validator"]);
 //
 coll.drop();
 assert.commandWorked(coll.insert([{_id: 0, a: 0}, {_id: 1, a: 0}]));
-targetColl.drop();
+dropWithoutImplicitRecreate(targetCollName);
 assert.commandWorked(targetColl.createIndex({a: 1}, {unique: true}));
 
 assertErrorCode(coll, pipeline, ErrorCodes.DuplicateKey);

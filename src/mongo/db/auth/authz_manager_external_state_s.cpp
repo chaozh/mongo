@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authz_manager_external_state_s.h"
@@ -115,9 +113,10 @@ Status AuthzManagerExternalStateMongos::getStoredAuthorizationVersion(OperationC
 }
 
 Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opCtx,
-                                                           const UserName& userName,
+                                                           const UserRequest& user,
                                                            BSONObj* result) {
-    if (!shouldUseRolesFromConnection(opCtx, userName)) {
+    const UserName& userName = user.name;
+    if (!user.roles) {
         BSONObj usersInfoCmd =
             BSON("usersInfo" << BSON_ARRAY(BSON(AuthorizationManager::USER_NAME_FIELD_NAME
                                                 << userName.getUser()
@@ -151,8 +150,7 @@ Status AuthzManagerExternalStateMongos::getUserDescription(OperationContext* opC
         // Obtain privilege information from the config servers for all roles acquired from the X509
         // certificate.
         BSONArrayBuilder userRolesBuilder;
-        auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
-        for (const RoleName& role : sslPeerInfo.roles) {
+        for (const RoleName& role : *user.roles) {
             userRolesBuilder.append(BSON(
                 AuthorizationManager::ROLE_NAME_FIELD_NAME
                 << role.getRole() << AuthorizationManager::ROLE_DB_FIELD_NAME << role.getDB()));

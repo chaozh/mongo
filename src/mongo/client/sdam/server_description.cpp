@@ -28,7 +28,7 @@
  */
 
 #include "mongo/client/sdam/server_description.h"
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
@@ -38,8 +38,8 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/oid.h"
 #include "mongo/client/sdam/sdam_datatypes.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/log.h"
 
 
 namespace mongo::sdam {
@@ -54,15 +54,14 @@ std::set<ServerType> kDataServerTypes{
 ServerDescription::ServerDescription(ClockSource* clockSource,
                                      const IsMasterOutcome& isMasterOutcome,
                                      boost::optional<IsMasterRTT> lastRtt,
-                                     boost::optional<TopologyVersion> topologyVersion,
-                                     boost::optional<int> poolResetCounter)
+                                     boost::optional<TopologyVersion> topologyVersion)
     : ServerDescription(isMasterOutcome.getServer()) {
     if (isMasterOutcome.isSuccess()) {
         const auto response = *isMasterOutcome.getResponse();
 
         // type must be parsed before RTT is calculated.
         parseTypeFromIsMaster(response);
-        calculateRtt(*isMasterOutcome.getRtt(), lastRtt);
+        calculateRtt(isMasterOutcome.getRtt(), lastRtt);
 
         _lastUpdateTime = clockSource->now();
         _minWireVersion = response["minWireVersion"].numberInt();
@@ -73,7 +72,6 @@ ServerDescription::ServerDescription(ClockSource* clockSource,
         saveHosts(response);
         saveTags(response.getObjectField("tags"));
         saveElectionId(response.getField("electionId"));
-        saveStreamable(response.getField("streamable"));
 
         auto lsTimeoutField = response.getField("logicalSessionTimeoutMinutes");
         if (lsTimeoutField.type() == BSONType::NumberInt) {
@@ -92,37 +90,30 @@ ServerDescription::ServerDescription(ClockSource* clockSource,
 
         auto primaryField = response.getField("primary");
         if (primaryField.type() == BSONType::String) {
-            _primary = response.getStringField("primary");
-        }
-
-        if (poolResetCounter) {
-            _poolResetCounter = poolResetCounter.get();
+            _primary = HostAndPort(response.getStringField("primary"));
         }
     } else {
         _error = isMasterOutcome.getErrorMsg();
         _topologyVersion = topologyVersion;
-        if (poolResetCounter) {
-            _poolResetCounter = poolResetCounter.get();
-        }
     }
 }
 
 void ServerDescription::storeHostListIfPresent(const std::string key,
                                                const BSONObj response,
-                                               std::set<ServerAddress>& destination) {
+                                               std::set<HostAndPort>& destination) {
     if (response.hasField(key)) {
         auto hostsBsonArray = response[key].Array();
         std::transform(hostsBsonArray.begin(),
                        hostsBsonArray.end(),
                        std::inserter(destination, destination.begin()),
-                       [](const BSONElement e) { return boost::to_lower_copy(e.String()); });
+                       [](const BSONElement e) { return HostAndPort(e.String()); });
     }
 }
 
 void ServerDescription::saveHosts(const BSONObj response) {
     if (response.hasField("me")) {
         auto me = response.getField("me");
-        _me = boost::to_lower_copy(me.str());
+        _me = HostAndPort(me.str());
     }
 
     storeHostListIfPresent("hosts", response, _hosts);
@@ -137,22 +128,21 @@ void ServerDescription::saveTags(BSONObj tagsObj) {
     }
 }
 
+void ServerDescription::appendBsonTags(BSONObjBuilder& builder) const {
+    for (const auto& pair : _tags) {
+        const auto& key = pair.first;
+        const auto& value = pair.second;
+        builder.append(key, value);
+    }
+}
+
 void ServerDescription::saveElectionId(BSONElement electionId) {
     if (electionId.type() == jstOID) {
         _electionId = electionId.OID();
     }
 }
 
-void ServerDescription::saveStreamable(BSONElement streamableField) {
-    if (_type == ServerType::kUnknown) {
-        _streamable = false;
-        return;
-    }
-
-    _streamable = streamableField && streamableField.Bool();
-}
-
-void ServerDescription::calculateRtt(const IsMasterRTT currentRtt,
+void ServerDescription::calculateRtt(const boost::optional<IsMasterRTT> currentRtt,
                                      const boost::optional<IsMasterRTT> lastRtt) {
     if (getType() == ServerType::kUnknown) {
         // if a server's type is Unknown, it's RTT is null
@@ -161,12 +151,28 @@ void ServerDescription::calculateRtt(const IsMasterRTT currentRtt,
         return;
     }
 
-    if (lastRtt) {
-        // new_rtt = alpha * x + (1 - alpha) * old_rtt
-        _rtt = IsMasterRTT(static_cast<IsMasterRTT::rep>(kRttAlpha * currentRtt.count() +
-                                                         (1 - kRttAlpha) * lastRtt.get().count()));
-    } else {
+    if (currentRtt == boost::none) {
+        // An onServerHeartbeatSucceededEvent occured. Note: This should not be reached by an
+        // onServerHeartbeatFailedEvent. Upon the failed event, the type is set to
+        // ServerType::Unknown.
+
+        // The ServerType is no longer ServerType::Unknown, but the ServerPingMonitor has not
+        // updated the RTT yet. Set the _rtt to max() until the ServerPingMonitor provides the
+        // accurate RTT measurement.
+        if (lastRtt == boost::none) {
+            _rtt = IsMasterRTT::max();
+            return;
+        }
+
+        // Do not update the RTT upon an onServerHeartbeatSucceededEvent.
+        _rtt = lastRtt;
+    } else if (lastRtt == boost::none || lastRtt == IsMasterRTT::max()) {
+        // The lastRtt either does not exist or is not accurate. Discard it and use the currentRtt.
         _rtt = currentRtt;
+    } else {
+        // new_rtt = alpha * x + (1 - alpha) * old_rtt
+        _rtt = IsMasterRTT(static_cast<IsMasterRTT::rep>(kRttAlpha * currentRtt.get().count() +
+                                                         (1 - kRttAlpha) * lastRtt.get().count()));
     }
 }
 
@@ -206,13 +212,16 @@ void ServerDescription::parseTypeFromIsMaster(const BSONObj isMaster) {
     } else if (isMaster.getBoolField("isreplicaset")) {
         t = ServerType::kRSGhost;
     } else {
-        error() << "unknown server type from successful ismaster reply: " << isMaster.toString();
+        LOGV2_ERROR(23931,
+                    "Unknown server type from successful isMaster reply: {isMaster}",
+                    "Unknown server type from successful isMaster reply",
+                    "isMaster"_attr = isMaster.toString());
         t = ServerType::kUnknown;
     }
     _type = t;
 }
 
-const ServerAddress& ServerDescription::getAddress() const {
+const HostAndPort& ServerDescription::getAddress() const {
     return _address;
 }
 
@@ -236,19 +245,19 @@ ServerType ServerDescription::getType() const {
     return _type;
 }
 
-const boost::optional<ServerAddress>& ServerDescription::getMe() const {
+const boost::optional<HostAndPort>& ServerDescription::getMe() const {
     return _me;
 }
 
-const std::set<ServerAddress>& ServerDescription::getHosts() const {
+const std::set<HostAndPort>& ServerDescription::getHosts() const {
     return _hosts;
 }
 
-const std::set<ServerAddress>& ServerDescription::getPassives() const {
+const std::set<HostAndPort>& ServerDescription::getPassives() const {
     return _passives;
 }
 
-const std::set<ServerAddress>& ServerDescription::getArbiters() const {
+const std::set<HostAndPort>& ServerDescription::getArbiters() const {
     return _arbiters;
 }
 
@@ -268,7 +277,7 @@ const boost::optional<mongo::OID>& ServerDescription::getElectionId() const {
     return _electionId;
 }
 
-const boost::optional<ServerAddress>& ServerDescription::getPrimary() const {
+const boost::optional<HostAndPort>& ServerDescription::getPrimary() const {
     return _primary;
 }
 
@@ -284,15 +293,16 @@ const boost::optional<TopologyVersion>& ServerDescription::getTopologyVersion() 
     return _topologyVersion;
 }
 
-int ServerDescription::getPoolResetCounter() {
-    return _poolResetCounter;
-}
-
-bool ServerDescription::isStreamable() const {
-    return _streamable;
-}
-
 bool ServerDescription::isEquivalent(const ServerDescription& other) const {
+    if (_topologyVersion && other._topologyVersion &&
+        ((_topologyVersion->getProcessId() != other._topologyVersion->getProcessId()) ||
+         (_topologyVersion->getCounter() != other._topologyVersion->getCounter()))) {
+        return false;
+    } else if ((!_topologyVersion && other._topologyVersion) ||
+               (_topologyVersion && !other._topologyVersion)) {
+        return false;
+    }
+
     auto otherValues = std::tie(other._type,
                                 other._minWireVersion,
                                 other._maxWireVersion,
@@ -305,10 +315,7 @@ bool ServerDescription::isEquivalent(const ServerDescription& other) const {
                                 other._setVersion,
                                 other._electionId,
                                 other._primary,
-                                other._logicalSessionTimeoutMinutes,
-                                other._topologyVersion,
-                                other._streamable,
-                                other._poolResetCounter);
+                                other._logicalSessionTimeoutMinutes);
     auto thisValues = std::tie(_type,
                                _minWireVersion,
                                _maxWireVersion,
@@ -321,10 +328,7 @@ bool ServerDescription::isEquivalent(const ServerDescription& other) const {
                                _setVersion,
                                _electionId,
                                _primary,
-                               _logicalSessionTimeoutMinutes,
-                               _topologyVersion,
-                               _streamable,
-                               _poolResetCounter);
+                               _logicalSessionTimeoutMinutes);
     return thisValues == otherValues;
 }
 
@@ -335,7 +339,7 @@ bool ServerDescription::isDataBearingServer() const {
 // output server description to bson. This is primarily used for debugging.
 BSONObj ServerDescription::toBson() const {
     BSONObjBuilder bson;
-    bson.append("address", _address);
+    bson.append("address", _address.toString());
 
     if (_topologyVersion) {
         bson.append("topologyVersion", _topologyVersion->toBSON());
@@ -360,12 +364,9 @@ BSONObj ServerDescription::toBson() const {
 
     bson.append("minWireVersion", _minWireVersion);
     bson.append("maxWireVersion", _maxWireVersion);
-    bson.append("streamable", _streamable);
-    bson.append("poolResetCounter", _poolResetCounter);
-
 
     if (_me) {
-        bson.append("me", *_me);
+        bson.append("me", (*_me).toString());
     }
     if (_setName) {
         bson.append("setName", *_setName);
@@ -377,7 +378,7 @@ BSONObj ServerDescription::toBson() const {
         bson.append("electionId", *_electionId);
     }
     if (_primary) {
-        bson.append("primary", *_primary);
+        bson.append("primary", (*_primary).toString());
     }
     if (_lastUpdateTime) {
         bson.append("lastUpdateTime", *_lastUpdateTime);
@@ -386,9 +387,28 @@ BSONObj ServerDescription::toBson() const {
         bson.append("logicalSessionTimeoutMinutes", *_logicalSessionTimeoutMinutes);
     }
 
-    bson.append("hosts", _hosts);
-    bson.append("arbiters", _arbiters);
-    bson.append("passives", _passives);
+    BSONArrayBuilder hostsBuilder;
+    for (const auto& host : _hosts) {
+        hostsBuilder.append(host.toString());
+    }
+    bson.append("hosts", hostsBuilder.obj());
+
+    BSONArrayBuilder arbitersBuilder;
+    for (const auto& arbiter : _arbiters) {
+        arbitersBuilder.append(arbiter.toString());
+    }
+    bson.append("arbiters", arbitersBuilder.obj());
+
+    BSONArrayBuilder passivesBuilder;
+    for (const auto& passive : _passives) {
+        passivesBuilder.append(passive.toString());
+    }
+    bson.append("passives", passivesBuilder.obj());
+
+    if (getTags().size()) {
+        BSONObjBuilder tagsBuilder(bson.subobjStart("tags"));
+        appendBsonTags(tagsBuilder);
+    }
 
     return bson.obj();
 }
@@ -403,6 +423,23 @@ int ServerDescription::getMaxWireVersion() const {
 
 std::string ServerDescription::toString() const {
     return toBson().toString();
+}
+
+ServerDescriptionPtr ServerDescription::cloneWithRTT(IsMasterRTT rtt) {
+    auto newServerDescription = std::make_shared<ServerDescription>(*this);
+    auto lastRtt = newServerDescription->getRtt();
+    newServerDescription->calculateRtt(rtt, lastRtt);
+    return newServerDescription;
+}
+
+const boost::optional<TopologyDescriptionPtr> ServerDescription::getTopologyDescription() {
+    if (_topologyDescription) {
+        const auto result = _topologyDescription->lock();
+        invariant(result);
+        return boost::optional<TopologyDescriptionPtr>(result);
+    } else {
+        return boost::none;
+    }
 }
 
 

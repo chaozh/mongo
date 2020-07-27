@@ -48,7 +48,6 @@ namespace mongo {
  */
 class DocumentSourceLookUp final : public DocumentSource {
 public:
-    static constexpr size_t kMaxSubPipelineDepth = 20;
     static constexpr StringData kStageName = "$lookup"_sd;
 
     struct LetVariable {
@@ -65,8 +64,11 @@ public:
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
 
-        LiteParsed(NamespaceString foreignNss, boost::optional<LiteParsedPipeline> pipeline)
-            : LiteParsedDocumentSourceNestedPipelines(std::move(foreignNss), std::move(pipeline)) {}
+        LiteParsed(std::string parseTimeName,
+                   NamespaceString foreignNss,
+                   boost::optional<LiteParsedPipeline> pipeline)
+            : LiteParsedDocumentSourceNestedPipelines(
+                  std::move(parseTimeName), std::move(foreignNss), std::move(pipeline)) {}
 
         /**
          * Lookup from a sharded collection may not be allowed.
@@ -240,13 +242,6 @@ private:
 
     GetNextResult unwindResult();
 
-    /**
-     * Copies 'vars' and 'vps' to the Variables and VariablesParseState objects in 'expCtx'. These
-     * copies provide access to 'let' defined variables in sub-pipeline execution.
-     */
-    static void copyVariablesToExpCtx(const Variables& vars,
-                                      const VariablesParseState& vps,
-                                      ExpressionContext* expCtx);
     /**
      * Resolves let defined variables against 'localDoc' and stores the results in 'variables'.
      */

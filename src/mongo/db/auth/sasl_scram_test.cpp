@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -47,9 +47,9 @@
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/auth/sasl_scram_server_conversation.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/log.h"
 #include "mongo/util/password_digest.h"
 
 namespace mongo {
@@ -170,7 +170,7 @@ protected:
     const SCRAMStepsResult goalState =
         SCRAMStepsResult(SaslTestState(SaslTestState::kClient, 4), Status::OK());
 
-    ServiceContext::UniqueServiceContext serviceContext;
+    ServiceContext* serviceContext;
     ServiceContext::UniqueClient client;
     ServiceContext::UniqueOperationContext opCtx;
 
@@ -182,7 +182,9 @@ protected:
     std::unique_ptr<NativeSaslClientSession> saslClientSession;
 
     void setUp() final {
-        serviceContext = ServiceContext::make();
+        auto serviceContextHolder = ServiceContext::make();
+        serviceContext = serviceContextHolder.get();
+        setGlobalServiceContext(std::move(serviceContextHolder));
         client = serviceContext->makeClient("test");
         opCtx = serviceContext->makeOperationContext(client.get());
 
@@ -190,13 +192,12 @@ protected:
             std::make_unique<AuthzManagerExternalStateMock>();
         authzManagerExternalState = uniqueAuthzManagerExternalStateMock.get();
         auto newManager = std::make_unique<AuthorizationManagerImpl>(
-            std::move(uniqueAuthzManagerExternalStateMock),
-            AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
+            serviceContext, std::move(uniqueAuthzManagerExternalStateMock));
         authzSession = std::make_unique<AuthorizationSessionImpl>(
             std::make_unique<AuthzSessionExternalStateMock>(newManager.get()),
             AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
         authzManager = newManager.get();
-        AuthorizationManager::set(serviceContext.get(), std::move(newManager));
+        AuthorizationManager::set(serviceContext, std::move(newManager));
 
         saslClientSession = std::make_unique<NativeSaslClientSession>();
         saslClientSession->setParameter(NativeSaslClientSession::parameterMechanism,
@@ -211,7 +212,8 @@ protected:
     void tearDown() final {
         opCtx.reset();
         client.reset();
-        serviceContext.reset();
+        setGlobalServiceContext(nullptr);
+        serviceContext = nullptr;
 
         saslClientSession.reset();
         saslServerSession.reset();
@@ -270,12 +272,12 @@ protected:
 
 public:
     void run() {
-        log() << "SCRAM-SHA-1 variant";
+        LOGV2(20252, "SCRAM-SHA-1 variant");
         saslServerSession = std::make_unique<SaslSCRAMSHA1ServerMechanism>("test");
         _digestPassword = true;
         Test::run();
 
-        log() << "SCRAM-SHA-256 variant";
+        LOGV2(20253, "SCRAM-SHA-256 variant");
         saslServerSession = std::make_unique<SaslSCRAMSHA256ServerMechanism>("test");
         _digestPassword = false;
         Test::run();

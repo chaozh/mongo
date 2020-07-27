@@ -27,15 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
 #include <climits>
 
 #include "mongo/db/repl/member_data.h"
-#include "mongo/db/repl/rslog.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace repl {
@@ -69,8 +68,11 @@ bool MemberData::setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse) 
     }
     // Log if the state changes
     if (_lastResponse.getState() != hbResponse.getState()) {
-        log() << "Member " << _hostAndPort.toString() << " is now in state "
-              << hbResponse.getState().toString() << rsLog;
+        LOGV2(21215,
+              "Member {hostAndPort} is now in state {newState}",
+              "Member is in new state",
+              "hostAndPort"_attr = _hostAndPort.toString(),
+              "newState"_attr = hbResponse.getState().toString());
     }
 
     bool opTimeAdvanced =
@@ -80,8 +82,14 @@ bool MemberData::setUpValues(Date_t now, ReplSetHeartbeatResponse&& hbResponse) 
         : OpTimeAndWallTime();
     opTimeAdvanced =
         advanceLastDurableOpTimeAndWallTime(durableOpTimeAndWallTime, now) || opTimeAdvanced;
+
+    bool configChanged = (getConfigVersionAndTerm() < hbResponse.getConfigVersionAndTerm());
+    _configTerm = hbResponse.getConfigTerm();
+    _configVersion = hbResponse.getConfigVersion();
+
     _lastResponse = std::move(hbResponse);
-    return opTimeAdvanced;
+
+    return (opTimeAdvanced || configChanged);
 }
 
 void MemberData::setDownValues(Date_t now, const std::string& heartbeatMessage) {
@@ -93,8 +101,11 @@ void MemberData::setDownValues(Date_t now, const std::string& heartbeatMessage) 
     _lastHeartbeatMessage = heartbeatMessage;
 
     if (_lastResponse.getState() != MemberState::RS_DOWN) {
-        log() << "Member " << _hostAndPort.toString() << " is now in state RS_DOWN - "
-              << redact(heartbeatMessage) << rsLog;
+        LOGV2(21216,
+              "Member {hostAndPort} is now in state RS_DOWN - {heartbeatMessage}",
+              "Member is now in state RS_DOWN",
+              "hostAndPort"_attr = _hostAndPort.toString(),
+              "heartbeatMessage"_attr = redact(heartbeatMessage));
     }
 
     _lastResponse = ReplSetHeartbeatResponse();
@@ -116,8 +127,10 @@ void MemberData::setAuthIssue(Date_t now) {
     _lastHeartbeatMessage.clear();
 
     if (_lastResponse.getState() != MemberState::RS_UNKNOWN) {
-        log() << "Member " << _hostAndPort.toString()
-              << " is now in state RS_UNKNOWN due to authentication issue." << rsLog;
+        LOGV2(21217,
+              "Member {hostAndPort} is now in state RS_UNKNOWN due to authentication issue.",
+              "Member is now in state RS_UNKNOWN due to authentication issue",
+              "hostAndPort"_attr = _hostAndPort.toString());
     }
 
     _lastResponse = ReplSetHeartbeatResponse();
@@ -139,16 +152,9 @@ void MemberData::setLastDurableOpTimeAndWallTime(OpTimeAndWallTime opTime, Date_
     invariant(opTime.opTime.isNull() || opTime.wallTime > Date_t());
     _lastUpdate = now;
     _lastUpdateStale = false;
-    if (_lastAppliedOpTime < opTime.opTime) {
-        // TODO(russotto): We think this should never happen, rollback or no rollback.  Make this an
-        // invariant and see what happens.
-        log() << "Durable progress (" << opTime.opTime << ") is ahead of the applied progress ("
-              << _lastAppliedOpTime
-              << ". This is likely due to a "
-                 "rollback."
-              << " memberid: " << _memberId << _hostAndPort.toString()
-              << " previous durable progress: " << _lastDurableOpTime;
-    } else {
+    // Since _lastDurableOpTime is set asynchronously from _lastAppliedOpTime, it is possible that
+    // 'opTime' is ahead of _lastAppliedOpTime.
+    if (_lastAppliedOpTime >= opTime.opTime) {
         _lastDurableOpTime = opTime.opTime;
         _lastDurableWallTime = opTime.wallTime;
     }

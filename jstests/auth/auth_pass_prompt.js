@@ -14,7 +14,7 @@ if (!_isWindows()) {
         "'var database = db.getMongo().getDB(" + database + "); database.auth(" + user + ");'";
 
     const binshell = '/bin/sh';
-    const mongo = './mongo';
+    const mongo = 'mongo';
     const host = conn.host;
     const port = conn.port;
     const ret = runProgram(
@@ -22,7 +22,7 @@ if (!_isWindows()) {
 
     const output = rawMongoProgramOutput();
     assert.eq(output.includes("Enter password:"), true, output);
-    assert.eq(output.includes("Successfully authenticated"), true, output);
+    assert.eq(output.includes("Successful authentication"), true, output);
 
     MongoRunner.stopMongod(conn);
 }

@@ -36,6 +36,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -185,6 +186,12 @@ public:
     void setOperationKey(OperationKey opKey);
 
     /**
+     * Removes the operation UUID associated with this operation.
+     * DO NOT call this function outside `~OperationContext()` and `killAndDelistOperation()`.
+     */
+    void releaseOperationKey();
+
+    /**
      * Returns the session ID associated with this operation, if there is one.
      */
     const boost::optional<LogicalSessionId>& getLogicalSessionId() const {
@@ -259,6 +266,20 @@ public:
      */
     bool writesAreReplicated() const {
         return _writesAreReplicated;
+    }
+
+    /**
+     * Returns true if operations' durations should be added to serverStatus latency metrics.
+     */
+    bool shouldIncrementLatencyStats() const {
+        return _shouldIncrementLatencyStats;
+    }
+
+    /**
+     * Sets the shouldIncrementLatencyStats flag.
+     */
+    void setShouldIncrementLatencyStats(bool shouldIncrementLatencyStats) {
+        _shouldIncrementLatencyStats = shouldIncrementLatencyStats;
     }
 
     void markKillOnClientDisconnect();
@@ -387,6 +408,19 @@ public:
     }
 
     /**
+     * Clears metadata associated with a multi-document transaction.
+     */
+    void resetMultiDocumentTransactionState() {
+        invariant(_inMultiDocumentTransaction);
+        invariant(!_writeUnitOfWork);
+        invariant(_ruState == WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        _inMultiDocumentTransaction = false;
+        _isStartingMultiDocumentTransaction = false;
+        _lsid = boost::none;
+        _txnNumber = boost::none;
+    }
+
+    /**
      * Returns whether this operation is starting a multi-document transaction.
      */
     bool isStartingMultiDocumentTransaction() const {
@@ -422,6 +456,15 @@ public:
     bool isExhaust() const {
         return _exhaust;
     }
+
+    void storeMaxTimeMS(Microseconds maxTime) {
+        _storedMaxTime = maxTime;
+    }
+
+    /**
+     * Restore deadline to match the value stored in _storedMaxTime.
+     */
+    void restoreMaxTimeMS();
 
 private:
     StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
@@ -540,16 +583,20 @@ private:
     bool _isExecutingShutdown = false;
 
     // Max operation time requested by the user or by the cursor in the case of a getMore with no
-    // user-specified maxTime. This is tracked with microsecond granularity for the purpose of
+    // user-specified maxTimeMS. This is tracked with microsecond granularity for the purpose of
     // assigning unused execution time back to a cursor at the end of an operation, only. The
     // _deadline and the service context's fast clock are the only values consulted for determining
     // if the operation's timelimit has been exceeded.
     Microseconds _maxTime = Microseconds::max();
 
+    // The value of the maxTimeMS requested by user in the case it was overwritten.
+    boost::optional<Microseconds> _storedMaxTime;
+
     // Timer counting the elapsed time since the construction of this OperationContext.
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
+    bool _shouldIncrementLatencyStats = true;
     bool _shouldParticipateInFlowControl = true;
     bool _inMultiDocumentTransaction = false;
     bool _isStartingMultiDocumentTransaction = false;
@@ -561,6 +608,12 @@ private:
     // Whether this operation is an exhaust command.
     bool _exhaust = false;
 };
+
+// Gets a TimeZoneDatabase pointer from the ServiceContext.
+inline const TimeZoneDatabase* getTimeZoneDatabase(OperationContext* opCtx) {
+    return opCtx && opCtx->getServiceContext() ? TimeZoneDatabase::get(opCtx->getServiceContext())
+                                               : nullptr;
+}
 
 namespace repl {
 /**

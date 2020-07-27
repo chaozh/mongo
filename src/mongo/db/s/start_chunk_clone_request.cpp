@@ -76,15 +76,6 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
                                    std::move(sessionIdStatus.getValue()),
                                    std::move(secondaryThrottleStatus.getValue()));
 
-    // TODO (SERVER-44787): Remove this existence check after 4.4 is released and the
-    // disableResumableRangeDeleter option is removed.
-    if (obj.getField("uuid")) {
-        request._migrationId = UUID::parse(obj);
-        request._lsid = LogicalSessionId::parse(IDLParserErrorContext("StartChunkCloneRequest"),
-                                                obj[kLsid].Obj());
-        request._txnNumber = obj.getField(kTxnNumber).Long();
-    }
-
     {
         std::string fromShardConnectionString;
         Status status =
@@ -161,6 +152,11 @@ StatusWith<StartChunkCloneRequest> StartChunkCloneRequest::createFromCommand(Nam
         }
     }
 
+    request._migrationId = UUID::parse(obj);
+    request._lsid =
+        LogicalSessionId::parse(IDLParserErrorContext("StartChunkCloneRequest"), obj[kLsid].Obj());
+    request._txnNumber = obj.getField(kTxnNumber).Long();
+
     return request;
 }
 
@@ -183,36 +179,11 @@ void StartChunkCloneRequest::appendAsCommand(
     invariant(fromShardConnectionString.isValid());
 
     builder->append(kRecvChunkStart, nss.ns());
+
     migrationId.appendToBuilder(builder, kMigrationId);
     builder->append(kLsid, lsid.toBSON());
     builder->append(kTxnNumber, txnNumber);
-    sessionId.append(builder);
-    builder->append(kFromShardConnectionString, fromShardConnectionString.toString());
-    builder->append(kFromShardId, fromShardId.toString());
-    builder->append(kToShardId, toShardId.toString());
-    builder->append(kChunkMinKey, chunkMinKey);
-    builder->append(kChunkMaxKey, chunkMaxKey);
-    builder->append(kShardKeyPattern, shardKeyPattern);
-    secondaryThrottle.append(builder);
-}
 
-// TODO (SERVER-44787): Remove this overload after 4.4 is released.
-void StartChunkCloneRequest::appendAsCommand(
-    BSONObjBuilder* builder,
-    const NamespaceString& nss,
-    const MigrationSessionId& sessionId,
-    const ConnectionString& fromShardConnectionString,
-    const ShardId& fromShardId,
-    const ShardId& toShardId,
-    const BSONObj& chunkMinKey,
-    const BSONObj& chunkMaxKey,
-    const BSONObj& shardKeyPattern,
-    const MigrationSecondaryThrottleOptions& secondaryThrottle) {
-    invariant(builder->asTempObj().isEmpty());
-    invariant(nss.isValid());
-    invariant(fromShardConnectionString.isValid());
-
-    builder->append(kRecvChunkStart, nss.ns());
     sessionId.append(builder);
     builder->append(kFromShardConnectionString, fromShardConnectionString.toString());
     builder->append(kFromShardId, fromShardId.toString());

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -54,8 +54,8 @@
 #include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_participant.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -107,25 +107,17 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                                           false,  // needsMerge
                                           queryRequest.allowDiskUse(),
                                           false,  // bypassDocumentValidation
+                                          false,  // isMapReduceCommand
                                           queryRequest.nss(),
                                           queryRequest.getRuntimeConstants(),
                                           std::move(collator),
                                           nullptr,  // mongoProcessInterface
                                           StringMap<ExpressionContext::ResolvedNamespace>{},
-                                          boost::none  // uuid
+                                          boost::none,                             // uuid
+                                          queryRequest.getLetParameters(),         // let
+                                          CurOp::get(opCtx)->dbProfileLevel() > 0  // mayDbProfile
         );
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
-    // TODO (SERVER-43361): We will not need to set 'sortKeyFormat' after branching for 4.5.
-    auto assumeInternalClient = !opCtx->getClient()->session() ||
-        (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
-    if (assumeInternalClient) {
-        expCtx->sortKeyFormat =
-            queryRequest.use44SortKeys() ? SortKeyFormat::k44SortKey : SortKeyFormat::k42SortKey;
-    } else {
-        // The client is not a mongoS, so we will not need to use an older sort key format to
-        // support it. Use default value for the ExpressionContext's 'sortKeyFormat' member
-        // variable, which is the newest format.
-    }
     return expCtx;
 }
 
@@ -178,10 +170,16 @@ public:
         return false;
     }
 
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
+    }
+
     class Invocation final : public CommandInvocation {
     public:
         Invocation(const FindCmd* definition, const OpMsgRequest& request, StringData dbName)
-            : CommandInvocation(definition), _request(request), _dbName(dbName) {}
+            : CommandInvocation(definition), _request(request), _dbName(dbName) {
+            invariant(_request.body.isOwned());
+        }
 
     private:
         bool supportsWriteConcern() const override {
@@ -190,6 +188,10 @@ public:
 
         ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const final {
             return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+        }
+
+        bool supportsReadMirroring() const override {
+            return true;
         }
 
         bool canIgnorePrepareConflicts() const override {
@@ -304,8 +306,6 @@ public:
             CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
             // Although it is a command, a find command gets counted as a query.
             globalOpCounters.gotQuery();
-            ServerReadConcernMetrics::get(opCtx)->recordReadConcern(
-                repl::ReadConcernArgs::get(opCtx));
 
             // Parse the command BSON to a QueryRequest. Pass in the parsedNss in case _request.body
             // does not have a UUID.
@@ -331,86 +331,23 @@ public:
                     "The 'readOnce' option is not supported within a transaction.",
                     !txnParticipant || !opCtx->inMultiDocumentTransaction() || !qr->isReadOnce());
 
-            uassert(ErrorCodes::InvalidOptions,
-                    "The '$_internalReadAtClusterTime' option is only supported when testing"
-                    " commands are enabled",
-                    !qr->getReadAtClusterTime() || getTestCommandsEnabled());
-
-            uassert(
-                ErrorCodes::OperationNotSupportedInTransaction,
-                "The '$_internalReadAtClusterTime' option is not supported within a transaction.",
-                !txnParticipant || !opCtx->inMultiDocumentTransaction() ||
-                    !qr->getReadAtClusterTime());
-
-            uassert(ErrorCodes::InvalidOptions,
-                    "The '$_internalReadAtClusterTime' option is only supported when replication is"
-                    " enabled",
-                    !qr->getReadAtClusterTime() || replCoord->isReplEnabled());
-
-            auto* storageEngine = opCtx->getServiceContext()->getStorageEngine();
-            uassert(ErrorCodes::InvalidOptions,
-                    "The '$_internalReadAtClusterTime' option is only supported by storage engines"
-                    " that support document-level concurrency",
-                    !qr->getReadAtClusterTime() || storageEngine->supportsDocLocking());
-
             // Validate term before acquiring locks, if provided.
-            if (auto term = qr->getReplicationTerm()) {
+            auto term = qr->getReplicationTerm();
+            if (term) {
                 // Note: updateTerm returns ok if term stayed the same.
                 uassertStatusOK(replCoord->updateTerm(opCtx, *term));
             }
 
-            // We call RecoveryUnit::setTimestampReadSource() before acquiring a lock on the
-            // collection via AutoGetCollectionForRead in order to ensure the comparison to the
-            // collection's minimum visible snapshot is accurate.
-            if (auto targetClusterTime = qr->getReadAtClusterTime()) {
-                uassert(ErrorCodes::InvalidOptions,
-                        str::stream() << "$_internalReadAtClusterTime value must not be a null"
-                                         " timestamp.",
-                        !targetClusterTime->isNull());
-
-                // We aren't holding the global lock in intent mode, so it is possible after
-                // comparing 'targetClusterTime' to 'lastAppliedOpTime' for the last applied opTime
-                // to go backwards or for the term to change due to replication rollback. This isn't
-                // an actual concern because the testing infrastructure won't use the
-                // $_internalReadAtClusterTime option in any test suite where rollback is expected
-                // to occur.
-                auto lastAppliedOpTime = replCoord->getMyLastAppliedOpTime();
-
-                uassert(ErrorCodes::InvalidOptions,
-                        str::stream() << "$_internalReadAtClusterTime value must not be greater"
-                                         " than the last applied opTime. Requested clusterTime: "
-                                      << targetClusterTime->toString()
-                                      << "; last applied opTime: " << lastAppliedOpTime.toString(),
-                        lastAppliedOpTime.getTimestamp() >= targetClusterTime);
-
-                // We aren't holding the global lock in intent mode, so it is possible for the
-                // global storage engine to have been destructed already as a result of the server
-                // shutting down. This isn't an actual concern because the testing infrastructure
-                // won't use the $_internalReadAtClusterTime option in any test suite where clean
-                // shutdown is expected to occur concurrently with tests running.
-                auto allDurableTime = storageEngine->getAllDurableTimestamp();
-                invariant(!allDurableTime.isNull());
-
-                uassert(ErrorCodes::InvalidOptions,
-                        str::stream() << "$_internalReadAtClusterTime value must not be greater"
-                                         " than the all_durable timestamp. Requested"
-                                         " clusterTime: "
-                                      << targetClusterTime->toString()
-                                      << "; all_durable timestamp: " << allDurableTime.toString(),
-                        allDurableTime >= targetClusterTime);
-
-                // The $_internalReadAtClusterTime option causes any storage-layer cursors created
-                // during plan execution to read from a consistent snapshot of data at the supplied
-                // clusterTime, even across yields.
-                opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
-                                                              targetClusterTime);
-
-                // The $_internalReadAtClusterTime option also causes any storage-layer cursors
-                // created during plan execution to block on prepared transactions. Since the find
-                // command ignores prepare conflicts by default, change the behavior.
-                opCtx->recoveryUnit()->setPrepareConflictBehavior(
-                    PrepareConflictBehavior::kEnforce);
+            // The presence of a term in the request indicates that this is an internal replication
+            // oplog read request.
+            if (term && parsedNss == NamespaceString::kRsOplogNamespace) {
+                // We do not want to take tickets for internal (replication) oplog reads. Stalling
+                // on ticket acquisition can cause complicated deadlocks. Primaries may depend on
+                // data reaching secondaries in order to proceed; and secondaries may get stalled
+                // replicating because of an inability to acquire a read ticket.
+                opCtx->lockState()->skipAcquireTicket();
             }
+
 
             // Acquire locks. If the query is on a view, we release our locks and convert the query
             // request into an aggregation command.
@@ -481,7 +418,7 @@ public:
 
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
-                CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+                CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
             }
 
             if (!collection) {
@@ -502,46 +439,48 @@ public:
             // Stream query results, adding them to a BSONArray as we go.
             CursorResponseBuilder::Options options;
             options.isInitialResponse = true;
+            if (!opCtx->inMultiDocumentTransaction()) {
+                options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+            }
             CursorResponseBuilder firstBatch(result, options);
-            Document doc;
+            BSONObj obj;
             PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
             std::uint64_t numResults = 0;
-            while (!FindCommon::enoughForFirstBatch(originalQR, numResults) &&
-                   PlanExecutor::ADVANCED == (state = exec->getNext(&doc, nullptr))) {
-                // If we can't fit this result inside the current batch, then we stash it for later.
-                BSONObj obj = doc.toBson();
-                if (!FindCommon::haveSpaceForNext(obj, numResults, firstBatch.bytesUsed())) {
-                    exec->enqueue(obj);
-                    break;
+
+            try {
+                while (!FindCommon::enoughForFirstBatch(originalQR, numResults) &&
+                       PlanExecutor::ADVANCED == (state = exec->getNext(&obj, nullptr))) {
+                    // If we can't fit this result inside the current batch, then we stash it for
+                    // later.
+                    if (!FindCommon::haveSpaceForNext(obj, numResults, firstBatch.bytesUsed())) {
+                        exec->enqueue(obj);
+                        break;
+                    }
+
+                    // If this executor produces a postBatchResumeToken, add it to the response.
+                    firstBatch.setPostBatchResumeToken(exec->getPostBatchResumeToken());
+
+                    // Add result to output buffer.
+                    firstBatch.append(obj);
+                    numResults++;
                 }
-
-                // If this executor produces a postBatchResumeToken, add it to the response.
-                firstBatch.setPostBatchResumeToken(exec->getPostBatchResumeToken());
-
-                // Add result to output buffer.
-                firstBatch.append(obj);
-                numResults++;
-            }
-
-            // Throw an assertion if query execution fails for any reason.
-            if (PlanExecutor::FAILURE == state) {
+            } catch (DBException& exception) {
                 firstBatch.abandon();
 
-                // We should always have a valid status member object at this point.
-                auto status = WorkingSetCommon::getMemberObjectStatus(doc);
-                invariant(!status.isOK());
-                warning() << "Plan executor error during find command: "
-                          << PlanExecutor::statestr(state) << ", status: " << status
-                          << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
+                LOGV2_WARNING(23798,
+                              "Plan executor error during find command: {error}, "
+                              "stats: {stats}",
+                              "Plan executor error during find command",
+                              "error"_attr = exception.toStatus(),
+                              "stats"_attr = redact(exec->getStats()));
 
-                uassertStatusOK(status.withContext("Executor error during find command"));
+                exception.addContext("Executor error during find command");
+                throw;
             }
 
             // Set up the cursor for getMore.
             CursorId cursorId = 0;
             if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
-                // Create a ClientCursor containing this plan executor and register it with the
-                // cursor manager.
                 ClientCursorPin pinnedCursor = CursorManager::get(opCtx)->registerCursor(
                     opCtx,
                     {std::move(exec),
@@ -550,9 +489,7 @@ public:
                      opCtx->getWriteConcern(),
                      repl::ReadConcernArgs::get(opCtx),
                      _request.body,
-                     ClientCursorParams::LockPolicy::kLockExternally,
-                     {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)},
-                     expCtx->needsMerge});
+                     {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::find)}});
                 cursorId = pinnedCursor.getCursor()->cursorid();
 
                 invariant(!exec);
@@ -582,8 +519,31 @@ public:
             firstBatch.done(cursorId, nss.ns());
         }
 
+        void appendMirrorableRequest(BSONObjBuilder* bob) const override {
+            // Filter the keys that can be mirrored
+            static const auto kMirrorableKeys = [] {
+                BSONObjBuilder keyBob;
+                keyBob.append("find", 1);
+                keyBob.append("filter", 1);
+                keyBob.append("skip", 1);
+                keyBob.append("limit", 1);
+                keyBob.append("sort", 1);
+                keyBob.append("hint", 1);
+                keyBob.append("collation", 1);
+                keyBob.append("min", 1);
+                keyBob.append("max", 1);
+                return keyBob.obj();
+            }();
+
+            _request.body.filterFieldsUndotted(bob, kMirrorableKeys, true);
+
+            // Tell the find to only return a single batch
+            bob->append("batchSize", 1);
+            bob->append("singleBatch", true);
+        }
+
     private:
-        const OpMsgRequest& _request;
+        const OpMsgRequest _request;
         const StringData _dbName;
     };
 

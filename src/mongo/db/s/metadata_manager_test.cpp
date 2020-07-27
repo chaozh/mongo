@@ -30,7 +30,6 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
-#include <memory>
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog_raii.h"
@@ -38,6 +37,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/metadata_manager.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
@@ -45,7 +45,6 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -73,20 +72,20 @@ protected:
     /**
      * Returns an instance of CollectionMetadata which has no chunks owned by 'thisShard'.
      */
-    static CollectionMetadata makeEmptyMetadata() {
+    static CollectionMetadata makeEmptyMetadata(
+        const KeyPattern& shardKeyPattern = kShardKeyPattern,
+        const ChunkRange& range = ChunkRange{BSON(kPattern << MINKEY), BSON(kPattern << MAXKEY)},
+        UUID uuid = UUID::gen()) {
         const OID epoch = OID::gen();
 
         auto rt = RoutingTableHistory::makeNew(
             kNss,
-            UUID::gen(),
-            kShardKeyPattern,
+            uuid,
+            shardKeyPattern,
             nullptr,
             false,
             epoch,
-            {ChunkType{kNss,
-                       ChunkRange{BSON(kPattern << MINKEY), BSON(kPattern << MAXKEY)},
-                       ChunkVersion(1, 0, epoch),
-                       kOtherShard}});
+            {ChunkType{kNss, range, ChunkVersion(1, 0, epoch), kOtherShard}});
 
         std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, boost::none);
 
@@ -101,13 +100,13 @@ protected:
      * It will fassert if the chunk bounds are incorrect or overlap an existing chunk or if the
      * chunk version is lower than the maximum one.
      */
-    static CollectionMetadata cloneMetadataPlusChunk(const ScopedCollectionMetadata& metadata,
+    static CollectionMetadata cloneMetadataPlusChunk(const CollectionMetadata& collMetadata,
                                                      const ChunkRange& range) {
         const BSONObj& minKey = range.getMin();
         const BSONObj& maxKey = range.getMax();
-        ASSERT(!rangeMapOverlaps(metadata->getChunks(), minKey, maxKey));
+        ASSERT(!rangeMapOverlaps(collMetadata.getChunks(), minKey, maxKey));
 
-        auto cm = metadata->getChunkManager();
+        auto cm = collMetadata.getChunkManager();
 
         const auto chunkToSplit = cm->findIntersectingChunkWithSimpleCollation(minKey);
         ASSERT_BSONOBJ_GTE(minKey, chunkToSplit.getMin());
@@ -135,13 +134,13 @@ protected:
         return CollectionMetadata(std::make_shared<ChunkManager>(rt, boost::none), kThisShard);
     }
 
-    static CollectionMetadata cloneMetadataMinusChunk(const ScopedCollectionMetadata& metadata,
+    static CollectionMetadata cloneMetadataMinusChunk(const CollectionMetadata& metadata,
                                                       const ChunkRange& range) {
         const BSONObj& minKey = range.getMin();
         const BSONObj& maxKey = range.getMax();
-        ASSERT(rangeMapOverlaps(metadata->getChunks(), minKey, maxKey));
+        ASSERT(rangeMapOverlaps(metadata.getChunks(), minKey, maxKey));
 
-        auto cm = metadata->getChunkManager();
+        auto cm = metadata.getChunkManager();
 
         const auto chunkToMoveOut = cm->findIntersectingChunkWithSimpleCollation(minKey);
         ASSERT_BSONOBJ_EQ(minKey, chunkToMoveOut.getMin());
@@ -159,33 +158,13 @@ protected:
     std::shared_ptr<MetadataManager> _manager;
 };
 
-TEST_F(MetadataManagerTest, CleanUpForMigrateIn) {
-    _manager->setFilteringMetadata(makeEmptyMetadata());
-
-    // Sanity checks
-    ASSERT(_manager->getActiveMetadata(boost::none)->isSharded());
-    ASSERT_EQ(0UL, _manager->getActiveMetadata(boost::none)->getChunks().size());
-
-    ChunkRange range1(BSON("key" << 0), BSON("key" << 10));
-    ChunkRange range2(BSON("key" << 10), BSON("key" << 20));
-
-    auto notif1 = _manager->beginReceive(range1);
-    ASSERT(!notif1.isReady());
-
-    auto notif2 = _manager->beginReceive(range2);
-    ASSERT(!notif2.isReady());
-
-    ASSERT_EQ(2UL, _manager->numberOfRangesToClean());
-    ASSERT_EQ(0UL, _manager->numberOfRangesToCleanStillInUse());
-}
-
 TEST_F(MetadataManagerTest, TrackOrphanedDataCleanupBlocksOnScheduledRangeDeletions) {
     ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
 
     // Enable fail point to suspendRangeDeletion.
     globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::alwaysOn);
 
-    auto notifn1 = _manager->cleanUpRange(cr1, false /*delayBeforeDeleting*/);
+    auto notifn1 = _manager->cleanUpRange(cr1, boost::none, false /*delayBeforeDeleting*/);
     ASSERT_FALSE(notifn1.isReady());
     ASSERT_EQ(_manager->numberOfRangesToClean(), 1UL);
 
@@ -199,20 +178,20 @@ TEST_F(MetadataManagerTest, TrackOrphanedDataCleanupBlocksOnScheduledRangeDeleti
 TEST_F(MetadataManagerTest, CleanupNotificationsAreSignaledWhenMetadataManagerIsDestroyed) {
     const ChunkRange rangeToClean(BSON("key" << 20), BSON("key" << 30));
 
-    _manager->setFilteringMetadata(cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none),
-                                                          {BSON("key" << 0), BSON("key" << 20)}));
+    _manager->setFilteringMetadata(cloneMetadataPlusChunk(
+        _manager->getActiveMetadata(boost::none)->get(), {BSON("key" << 0), BSON("key" << 20)}));
 
     _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none), rangeToClean));
+        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), rangeToClean));
 
     // Optional so that it can be reset.
-    boost::optional<ScopedCollectionMetadata> cursorOnMovedMetadata{
+    boost::optional<ScopedCollectionDescription> cursorOnMovedMetadata{
         _manager->getActiveMetadata(boost::none)};
 
     _manager->setFilteringMetadata(
-        cloneMetadataMinusChunk(_manager->getActiveMetadata(boost::none), rangeToClean));
+        cloneMetadataMinusChunk(_manager->getActiveMetadata(boost::none)->get(), rangeToClean));
 
-    auto notif = _manager->cleanUpRange(rangeToClean, false /*delayBeforeDeleting*/);
+    auto notif = _manager->cleanUpRange(rangeToClean, boost::none, false /*delayBeforeDeleting*/);
     ASSERT(!notif.isReady());
 
     auto optNotif = _manager->trackOrphanedDataCleanup(rangeToClean);
@@ -225,8 +204,8 @@ TEST_F(MetadataManagerTest, CleanupNotificationsAreSignaledWhenMetadataManagerIs
     ASSERT(!notif.isReady());
     ASSERT(!optNotif->isReady());
 
-    // Destroys the ScopedCollectionMetadata object and causes the destructor of MetadataManager to
-    // run, which should trigger all deletion notifications.
+    // Destroys the ScopedCollectionDescription object and causes the destructor of MetadataManager
+    // to run, which should trigger all deletion notifications.
     cursorOnMovedMetadata.reset();
 
     // Advance time to simulate orphanCleanupDelaySecs passing.
@@ -243,8 +222,8 @@ TEST_F(MetadataManagerTest, RefreshAfterSuccessfulMigrationSinglePending) {
     ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
 
     _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none), cr1));
-    ASSERT_EQ(_manager->getActiveMetadata(boost::none)->getChunks().size(), 1UL);
+        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr1));
+    ASSERT_EQ(_manager->getActiveMetadata(boost::none)->get().getChunks().size(), 1UL);
 }
 
 TEST_F(MetadataManagerTest, RefreshAfterSuccessfulMigrationMultiplePending) {
@@ -253,15 +232,15 @@ TEST_F(MetadataManagerTest, RefreshAfterSuccessfulMigrationMultiplePending) {
 
     {
         _manager->setFilteringMetadata(
-            cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none), cr1));
+            cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr1));
         ASSERT_EQ(_manager->numberOfRangesToClean(), 0UL);
-        ASSERT_EQ(_manager->getActiveMetadata(boost::none)->getChunks().size(), 1UL);
+        ASSERT_EQ(_manager->getActiveMetadata(boost::none)->get().getChunks().size(), 1UL);
     }
 
     {
         _manager->setFilteringMetadata(
-            cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none), cr2));
-        ASSERT_EQ(_manager->getActiveMetadata(boost::none)->getChunks().size(), 2UL);
+            cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr2));
+        ASSERT_EQ(_manager->getActiveMetadata(boost::none)->get().getChunks().size(), 2UL);
     }
 }
 
@@ -269,9 +248,9 @@ TEST_F(MetadataManagerTest, RefreshAfterNotYetCompletedMigrationMultiplePending)
     ChunkRange cr1(BSON("key" << 0), BSON("key" << 10));
     ChunkRange cr2(BSON("key" << 30), BSON("key" << 40));
 
-    _manager->setFilteringMetadata(cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none),
-                                                          {BSON("key" << 50), BSON("key" << 60)}));
-    ASSERT_EQ(_manager->getActiveMetadata(boost::none)->getChunks().size(), 1UL);
+    _manager->setFilteringMetadata(cloneMetadataPlusChunk(
+        _manager->getActiveMetadata(boost::none)->get(), {BSON("key" << 50), BSON("key" << 60)}));
+    ASSERT_EQ(_manager->getActiveMetadata(boost::none)->get().getChunks().size(), 1UL);
 }
 
 TEST_F(MetadataManagerTest, BeginReceiveWithOverlappingRange) {
@@ -279,9 +258,9 @@ TEST_F(MetadataManagerTest, BeginReceiveWithOverlappingRange) {
     ChunkRange cr2(BSON("key" << 30), BSON("key" << 40));
 
     _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none), cr1));
+        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr1));
     _manager->setFilteringMetadata(
-        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none), cr2));
+        cloneMetadataPlusChunk(_manager->getActiveMetadata(boost::none)->get(), cr2));
 
     ChunkRange crOverlap(BSON("key" << 5), BSON("key" << 35));
 }
@@ -295,7 +274,7 @@ TEST_F(MetadataManagerTest, RangesToCleanMembership) {
     // Enable fail point to suspendRangeDeletion.
     globalFailPointRegistry().find("suspendRangeDeletion")->setMode(FailPoint::alwaysOn);
 
-    auto notifn = _manager->cleanUpRange(cr, false /*delayBeforeDeleting*/);
+    auto notifn = _manager->cleanUpRange(cr, boost::none, false /*delayBeforeDeleting*/);
     ASSERT(!notifn.isReady());
     ASSERT_EQ(1UL, _manager->numberOfRangesToClean());
 
@@ -308,13 +287,13 @@ TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectsLastSnapshotInList) 
 
     auto scm1 = _manager->getActiveMetadata(boost::none);
     {
-        _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm1, cr1));
+        _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm1->get(), cr1));
         ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 1UL);
         ASSERT_EQ(_manager->numberOfRangesToClean(), 0UL);
 
         auto scm2 = _manager->getActiveMetadata(boost::none);
-        ASSERT_EQ(scm2->getChunks().size(), 1UL);
-        _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2, cr2));
+        ASSERT_EQ(scm2->get().getChunks().size(), 1UL);
+        _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2->get(), cr2));
         ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 2UL);
         ASSERT_EQ(_manager->numberOfEmptyMetadataSnapshots(), 0);
     }
@@ -323,7 +302,9 @@ TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectsLastSnapshotInList) 
     // is now out of scope, but that in scm1 should remain
     ASSERT_EQ(_manager->numberOfEmptyMetadataSnapshots(), 1);
     ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 2UL);
-    ASSERT_EQ(_manager->getActiveMetadata(boost::none)->getChunks().size(), 2UL);
+
+    auto scm = _manager->getActiveMetadata(boost::none);
+    ASSERT_EQ(scm->get().getChunks().size(), 2UL);
 }
 
 TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectSnapshotInMiddleOfList) {
@@ -333,18 +314,18 @@ TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectSnapshotInMiddleOfLis
     ChunkRange cr4(BSON("key" << 90), BSON("key" << 100));
 
     auto scm = _manager->getActiveMetadata(boost::none);
-    _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm, cr1));
+    _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm->get(), cr1));
     ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 1UL);
     ASSERT_EQ(_manager->numberOfRangesToClean(), 0UL);
 
     auto scm2 = _manager->getActiveMetadata(boost::none);
-    ASSERT_EQ(scm2->getChunks().size(), 1UL);
-    _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2, cr2));
+    ASSERT_EQ(scm2->get().getChunks().size(), 1UL);
+    _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2->get(), cr2));
 
     {
         auto scm3 = _manager->getActiveMetadata(boost::none);
-        ASSERT_EQ(scm3->getChunks().size(), 2UL);
-        _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm3, cr3));
+        ASSERT_EQ(scm3->get().getChunks().size(), 2UL);
+        _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm3->get(), cr3));
         ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 3UL);
         ASSERT_EQ(_manager->numberOfEmptyMetadataSnapshots(), 0);
 
@@ -359,8 +340,8 @@ TEST_F(MetadataManagerTest, ClearUnneededChunkManagerObjectSnapshotInMiddleOfLis
          * ]
          */
         scm2 = _manager->getActiveMetadata(boost::none);
-        ASSERT_EQ(scm2->getChunks().size(), 3UL);
-        _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2, cr4));
+        ASSERT_EQ(scm2->get().getChunks().size(), 3UL);
+        _manager->setFilteringMetadata(cloneMetadataPlusChunk(scm2->get(), cr4));
         ASSERT_EQ(_manager->numberOfMetadataSnapshots(), 4UL);
         ASSERT_EQ(_manager->numberOfEmptyMetadataSnapshots(), 1);
     }

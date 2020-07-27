@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/db/server_options_helpers.h"
 
@@ -47,14 +47,13 @@
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/idl/server_parameter.h"
-#include "mongo/logger/log_component.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/logv2/log_component.h"
+#include "mongo/logv2/log_component_settings.h"
+#include "mongo/logv2/log_manager.h"
 #include "mongo/transport/message_compressor_registry.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
-#include "mongo/util/log_global_settings.h"
-#include "mongo/util/map_util.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_options.h"
@@ -264,10 +263,6 @@ Status storeBaseOptions(const moe::Environment& params) {
         return ret;
     }
 
-    if (params.count("logv2")) {
-        logV2Set(true);
-    }
-
     if (params.count("systemLog.verbosity")) {
         int verbosity = params["systemLog.verbosity"].as<int>();
         if (verbosity < 0) {
@@ -275,13 +270,14 @@ Status storeBaseOptions(const moe::Environment& params) {
             return Status(ErrorCodes::BadValue,
                           "systemLog.verbosity YAML Config cannot be negative");
         }
-        setMinimumLoggedSeverity(logger::LogSeverity::Debug(verbosity));
+        logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+            mongo::logv2::LogComponent::kDefault, logv2::LogSeverity::Debug(verbosity));
     }
 
     // log component hierarchy verbosity levels
-    for (int i = 0; i < int(logger::LogComponent::kNumLogComponents); ++i) {
-        logger::LogComponent component = static_cast<logger::LogComponent::Value>(i);
-        if (component == logger::LogComponent::kDefault) {
+    for (int i = 0; i < int(logv2::LogComponent::kNumLogComponents); ++i) {
+        logv2::LogComponent component = static_cast<logv2::LogComponent::Value>(i);
+        if (component == logv2::LogComponent::kDefault) {
             continue;
         }
         const string dottedName = "systemLog.component." + component.getDottedName() + ".verbosity";
@@ -289,9 +285,11 @@ Status storeBaseOptions(const moe::Environment& params) {
             int verbosity = params[dottedName].as<int>();
             // Clear existing log level if log level is negative.
             if (verbosity < 0) {
-                clearMinimumLoggedSeverity(component);
+                logv2::LogManager::global().getGlobalSettings().clearMinimumLoggedSeverity(
+                    component);
             } else {
-                setMinimumLoggedSeverity(component, logger::LogSeverity::Debug(verbosity));
+                logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+                    component, logv2::LogSeverity::Debug(verbosity));
             }
         }
     }
@@ -312,15 +310,17 @@ Status storeBaseOptions(const moe::Environment& params) {
     if (params.count("systemLog.timeStampFormat")) {
         using logger::MessageEventDetailsEncoder;
         std::string formatterName = params["systemLog.timeStampFormat"].as<string>();
-        if (formatterName == "ctime") {
-            MessageEventDetailsEncoder::setDateFormatter(outputDateAsCtime);
-        } else if (formatterName == "iso8601-utc") {
+        if (formatterName == "iso8601-utc") {
             MessageEventDetailsEncoder::setDateFormatter(outputDateAsISOStringUTC);
+            serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601UTC;
+            setDateFormatIsLocalTimezone(false);
         } else if (formatterName == "iso8601-local") {
             MessageEventDetailsEncoder::setDateFormatter(outputDateAsISOStringLocal);
+            serverGlobalParams.logTimestampFormat = logv2::LogTimestampFormat::kISO8601Local;
+            setDateFormatIsLocalTimezone(true);
         } else {
             StringBuilder sb;
-            sb << "Value of logTimestampFormat must be one of ctime, iso8601-utc "
+            sb << "Value of logTimestampFormat must be one of iso8601-utc "
                << "or iso8601-local; not \"" << formatterName << "\".";
             return Status(ErrorCodes::BadValue, sb.str());
         }
@@ -380,24 +380,6 @@ Status storeBaseOptions(const moe::Environment& params) {
     }
 #endif  // _WIN32
 
-    if (params.count("systemLog.logFormat")) {
-        std::string formatStr = params["systemLog.logFormat"].as<string>();
-        if (!logV2Enabled() && formatStr != "default")
-            return Status(ErrorCodes::BadValue,
-                          "Can only use systemLog.logFormat if logv2 is enabled.");
-        if (formatStr == "default") {
-            serverGlobalParams.logFormat = logv2::LogFormat::kDefault;
-        } else if (formatStr == "text") {
-            serverGlobalParams.logFormat = logv2::LogFormat::kText;
-        } else if (formatStr == "json") {
-            serverGlobalParams.logFormat = logv2::LogFormat::kJson;
-        } else {
-            return Status(ErrorCodes::BadValue,
-                          "Unsupported value for logFormat: " + formatStr +
-                              ". Valid values are: default, text or json");
-        }
-    }
-
     if (params.count("systemLog.logAppend") && params["systemLog.logAppend"].as<bool>() == true) {
         serverGlobalParams.logAppend = true;
     }
@@ -437,10 +419,9 @@ Status storeBaseOptions(const moe::Environment& params) {
         for (std::map<std::string, std::string>::iterator parametersIt = parameters.begin();
              parametersIt != parameters.end();
              parametersIt++) {
-            ServerParameter* parameter =
-                mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
-                                   parametersIt->first,
-                                   static_cast<ServerParameter*>(nullptr));
+            const auto& serverParams = ServerParameterSet::getGlobal()->getMap();
+            auto iter = serverParams.find(parametersIt->first);
+            ServerParameter* parameter = (iter == serverParams.end()) ? nullptr : iter->second;
             if (nullptr == parameter) {
                 StringBuilder sb;
                 sb << "Illegal --setParameter parameter: \"" << parametersIt->first << "\"";

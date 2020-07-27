@@ -19,6 +19,7 @@ env.Library(
 env.Library(
     target='expressions',
     source=[
+        'doc_validation_error.cpp',
         'expression.cpp',
         'expression_algo.cpp',
         'expression_array.cpp',
@@ -67,7 +68,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/geo/geoparser',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
         '$BUILD_DIR/mongo/db/query/query_knobs',
-        '$BUILD_DIR/mongo/db/pipeline/expression',
+        '$BUILD_DIR/mongo/db/pipeline/expression_context',
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/util/regex_util',
         '$BUILD_DIR/third_party/shim_pcrecpp',
@@ -96,6 +97,7 @@ env.Library(
 env.CppUnitTest(
     target='db_matcher_test',
     source=[
+        'doc_validation_error_test.cpp',
         'expression_algo_test.cpp',
         'expression_always_boolean_test.cpp',
         'expression_array_test.cpp',

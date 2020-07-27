@@ -1,4 +1,5 @@
 load("jstests/libs/parallelTester.js");
+load("jstests/libs/logv2_helpers.js");
 
 /**
  * Implements a kill session test helper
@@ -132,7 +133,7 @@ var _kill_sessions_api_module = (function() {
                 }
 
                 return false;
-            }, "never started sleep", 30000, 1);
+            }, "never started sleep with 'secs' " + id, 30000, 1);
         });
 
         return new HangingOpHandle(thread, lsid);
@@ -248,11 +249,21 @@ var _kill_sessions_api_module = (function() {
     CursorHandle.prototype.assertCursorKillLogMessages = function(hostsToCheck) {
         for (let hostToCheck of hostsToCheck) {
             if (hostToCheck.host in this._cursors) {
-                assert(checkLog.checkContainsOnce(
-                           hostToCheck,
-                           'killing cursor: ' + this._cursors[hostToCheck.host].exactValueString +
-                               ' as part of killing session(s)'),
-                       "cursor kill was not logged by " + hostToCheck.host);
+                if (isJsonLog(hostToCheck)) {
+                    assert(checkLog.checkContainsOnceJsonStringMatch(
+                               hostToCheck,
+                               20528,
+                               'cursorId',
+                               this._cursors[hostToCheck.host].exactValueString),
+                           "cursor kill was not logged by " + hostToCheck.host);
+                } else {
+                    assert(
+                        checkLog.checkContainsOnce(
+                            hostToCheck,
+                            'killing cursor: ' + this._cursors[hostToCheck.host].exactValueString +
+                                ' as part of killing session(s)'),
+                        "cursor kill was not logged by " + hostToCheck.host);
+                }
             }
         }
     };
@@ -279,6 +290,8 @@ var _kill_sessions_api_module = (function() {
             "$readPreference": {
                 mode: "primaryPreferred",
             },
+            readConcern: {},
+            writeConcern: {w: 1},
         };
 
         var cursors = {};

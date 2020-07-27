@@ -62,3 +62,25 @@ server_parameters:
         cpp_varname: gTakeUnstableCheckpointOnShutdown
         set_at: startup
         default: false
+    operationMemoryPoolBlockInitialSizeKB:
+        description: 'Initial block size in KB for the per operation temporary object memory pool'
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: gOperationMemoryPoolBlockInitialSizeKB
+        default: 1
+        validator:
+            gte: 1
+    operationMemoryPoolBlockMaxSizeKB:
+        description: 'Maximum block size in KB for the per operation temporary object memory pool'
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<int32_t>
+        cpp_varname: gOperationMemoryPoolBlockMaxSizeKB
+        default: 2048
+        validator:
+            gte: 1
+    disableLockFreeReads:
+        description: "Disables the lock-free reads feature."
+        set_at: [ startup ]
+        cpp_varname: 'storageGlobalParams.disableLockFreeReads'
+        default: true
+

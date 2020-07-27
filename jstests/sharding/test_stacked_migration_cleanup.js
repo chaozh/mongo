@@ -3,6 +3,8 @@
 (function() {
 'use strict';
 
+const clusterInFCV44 = jsTestOptions().mongosBinVersion != 'last-lts';
+
 // start up a new sharded cluster
 var st = new ShardingTest({shards: 2, mongos: 1});
 
@@ -45,6 +47,16 @@ for (var i = 0; i < numChunks; i++) {
         mongos.adminCommand({moveChunk: coll + "", find: {_id: i}, to: st.shard1.shardName}));
 }
 
+// Shards don't persist range deletion state in FCV < 4.4.
+if (clusterInFCV44) {
+    jsTest.log("Verifying that the donor still has the range deletion task docs...");
+
+    // Range deletions are queued async of migrate thread.
+    let rangeDelDocs =
+        st.shard0.getDB("config").getCollection("rangeDeletions").find({nss: coll + ""}).toArray();
+    assert.eq(numChunks, rangeDelDocs.length, `rangeDelDocs: ${tojson(rangeDelDocs.length)}`);
+}
+
 jsTest.log("Dropping and re-creating collection...");
 
 coll.drop();
@@ -55,9 +67,20 @@ for (var i = 0; i < numChunks; i++) {
 }
 assert.commandWorked(bulk.execute());
 
-sleep(10 * 1000);
+jsTest.log("Allowing the range deletion tasks to be processed by closing the cursor...");
+cursor.close();
 
-jsTest.log("Checking that documents were not cleaned up...");
+// Shards don't persist range deletion state in FCV < 4.4.
+if (clusterInFCV44) {
+    assert.soon(() => {
+        return 0 ===
+            st.shard0.getDB("config").getCollection("rangeDeletions").count({nss: coll + ""});
+    });
+} else {
+    sleep(10 * 1000);
+}
+
+jsTest.log("Checking that the new collection's documents were not cleaned up...");
 
 for (var i = 0; i < numChunks; i++) {
     assert.neq(null, coll.findOne({_id: i}));

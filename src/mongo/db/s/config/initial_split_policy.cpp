@@ -27,20 +27,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/config/initial_split_policy.h"
 
-#include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -205,7 +203,7 @@ InitialSplitPolicy::ShardCollectionConfig InitialSplitPolicy::generateShardColle
 std::unique_ptr<InitialSplitPolicy> InitialSplitPolicy::calculateOptimizationStrategy(
     OperationContext* opCtx,
     const ShardKeyPattern& shardKeyPattern,
-    const ShardsvrShardCollection& request,
+    const ShardsvrShardCollectionRequest& request,
     const std::vector<TagsType>& tags,
     size_t numShards,
     bool collectionIsEmpty) {
@@ -253,45 +251,6 @@ std::unique_ptr<InitialSplitPolicy> InitialSplitPolicy::calculateOptimizationStr
         return std::make_unique<SingleChunkOnPrimarySplitPolicy>();
     }
     return std::make_unique<UnoptimizedSplitPolicy>();
-}
-
-boost::optional<CollectionType> InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    const ShardsvrShardCollection& request,
-    repl::ReadConcernLevel readConcernLevel) {
-    auto const catalogClient = Grid::get(opCtx)->catalogClient();
-
-    auto collStatus = catalogClient->getCollection(opCtx, nss, readConcernLevel);
-    if (collStatus == ErrorCodes::NamespaceNotFound) {
-        // Not currently sharded.
-        return boost::none;
-    }
-
-    uassertStatusOK(collStatus);
-    auto existingOptions = collStatus.getValue().value;
-
-    CollectionType requestedOptions;
-    requestedOptions.setNs(nss);
-    requestedOptions.setKeyPattern(KeyPattern(request.getKey()));
-    requestedOptions.setDefaultCollation(*request.getCollation());
-    requestedOptions.setUnique(request.getUnique());
-
-    // Set the distributionMode to "sharded" because this CollectionType represents the requested
-    // target state for the collection after shardCollection. The requested CollectionType will be
-    // compared with the existing CollectionType below, and if the existing CollectionType either
-    // does not have a distributionMode (FCV 4.2) or has distributionMode "sharded" (FCV 4.4), the
-    // collection will be considered to already be in its target state.
-    requestedOptions.setDistributionMode(CollectionType::DistributionMode::kSharded);
-
-    // If the collection is already sharded, fail if the deduced options in this request do not
-    // match the options the collection was originally sharded with.
-    uassert(ErrorCodes::AlreadyInitialized,
-            str::stream() << "sharding already enabled for collection " << nss.ns()
-                          << " with options " << existingOptions.toString(),
-            requestedOptions.hasSameOptions(existingOptions));
-
-    return existingOptions;
 }
 
 InitialSplitPolicy::ShardCollectionConfig SingleChunkOnPrimarySplitPolicy::createFirstChunks(

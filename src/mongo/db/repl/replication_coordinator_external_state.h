@@ -77,7 +77,7 @@ public:
      *
      * NOTE: Only starts threads if they are not already started,
      */
-    virtual void startThreads(const ReplSettings& settings) = 0;
+    virtual void startThreads() = 0;
 
     /**
      * Returns true if an incomplete initial sync is detected.
@@ -164,10 +164,12 @@ public:
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx) = 0;
 
     /**
-     * Stores the replica set config document in local storage, or returns an error.
+     * Stores the replica set config document in local storage and writes a no-op in the oplog, or
+     * returns an error.
      */
-    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config) = 0;
-
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx,
+                                            const BSONObj& config,
+                                            bool writeOplog) = 0;
 
     /**
      * Creates the collection for "lastVote" documents and initializes it, or returns an error.
@@ -220,17 +222,10 @@ public:
     virtual void closeConnections() = 0;
 
     /**
-     * Resets any active sharding metadata on this server and stops any sharding-related threads
-     * (such as the balancer). It is called after stepDown to ensure that if the node becomes
-     * primary again in the future it will recover its state from a clean slate.
+     * Called after this node has stepped down. This includes stepDowns caused by rollback or node
+     * removal, so this function must also be able to handle those situations.
      */
-    virtual void shardingOnStepDownHook() = 0;
-
-    /**
-     * Clears oplog visibility state. All of the oplog is safely visible because there are no oplog
-     * writes during stepdown.
-     */
-    virtual void clearOplogVisibilityStateForStepDown() = 0;
+    virtual void onStepDownHook() = 0;
 
     /**
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.
@@ -265,11 +260,11 @@ public:
     virtual void updateCommittedSnapshot(const OpTime& newCommitPoint) = 0;
 
     /**
-     * Updates the local snapshot to a consistent point for secondary reads.
+     * Updates the lastApplied snapshot to a consistent point for secondary reads.
      *
-     * It is illegal to call with a optime that does not name an existing snapshot.
+     * It is illegal to call with a non-existent optime.
      */
-    virtual void updateLocalSnapshot(const OpTime& optime) = 0;
+    virtual void updateLastAppliedSnapshot(const OpTime& optime) = 0;
 
     /**
      * Returns whether or not the SnapshotThread is active.

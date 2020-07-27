@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/db/s/migration_coordinator_document_gen.h"
 #include "mongo/s/catalog/type_chunk.h"
 
@@ -44,13 +44,15 @@ class MigrationCoordinator {
 public:
     enum class Decision { kAborted, kCommitted };
 
-    MigrationCoordinator(UUID migrationId,
+    MigrationCoordinator(MigrationSessionId sessionId,
                          ShardId donorShard,
                          ShardId recipientShard,
                          NamespaceString collectionNamespace,
                          UUID collectionUuid,
                          ChunkRange range,
-                         ChunkVersion preMigrationChunkVersion);
+                         ChunkVersion preMigrationChunkVersion,
+                         bool waitForDelete);
+    MigrationCoordinator(const MigrationCoordinatorDocument& doc);
     MigrationCoordinator(const MigrationCoordinator&) = delete;
     MigrationCoordinator& operator=(const MigrationCoordinator&) = delete;
     MigrationCoordinator(MigrationCoordinator&&) = delete;
@@ -58,16 +60,20 @@ public:
 
     ~MigrationCoordinator();
 
+    const UUID& getMigrationId() const;
+    const LogicalSessionId& getLsid() const;
+    TxnNumber getTxnNumber() const;
+
     /**
      * Initializes persistent state required to ensure that orphaned ranges are properly handled,
      * even after failover, by doing the following:
      *
-     * 1) Inserts a document into the local config.migrationCoordinators with the recipientId and
-     * waits for majority writeConcern. 2) Inserts a document into the local config.rangeDeletions
-     * with the collectionUUID, range to delete, and "pending: true" and waits for majority
-     * writeConcern.
+     * 1) Inserts a document into the local config.migrationCoordinators with the lsid and
+     * recipientId and waits for majority writeConcern. 2) Inserts a document into the local
+     * config.rangeDeletions with the collectionUUID, range to delete, and "pending: true" and waits
+     * for majority writeConcern.
      */
-    void startMigration(OperationContext* opCtx, bool waitForDelete);
+    void startMigration(OperationContext* opCtx);
 
     /**
      * Saves the decision.
@@ -79,8 +85,11 @@ public:
     /**
      * If a decision has been set, makes the decision durable, then communicates the decision by
      * updating the local (donor's) and remote (recipient's) config.rangeDeletions entries.
+     *
+     * If the decision was to commit, returns a future that is set when range deletion for
+     * the donated range completes.
      */
-    void completeMigration(OperationContext* opCtx);
+    boost::optional<SemiFuture<void>> completeMigration(OperationContext* opCtx);
 
     /**
      * Deletes the persistent state for this migration from config.migrationCoordinators.
@@ -90,9 +99,10 @@ public:
 private:
     /**
      * Deletes the range deletion task from the recipient node and marks the range deletion task on
-     * the donor as ready to be processed.
+     * the donor as ready to be processed. Returns a future that is set when range deletion for
+     * the donated range completes.
      */
-    void _commitMigrationOnDonorAndRecipient(OperationContext* opCtx);
+    SemiFuture<void> _commitMigrationOnDonorAndRecipient(OperationContext* opCtx);
 
     /**
      * Deletes the range deletion task from the donor node and marks the range deletion task on the
@@ -103,12 +113,8 @@ private:
     // The decision of the migration commit against the config server.
     boost::optional<Decision> _decision;
 
-    /**
-     * Returns a string that uniquely identifies the migration.
-     */
-    std::string _logPrefix() const;
-
     MigrationCoordinatorDocument _migrationInfo;
+    bool _waitForDelete = false;
 };
 
 }  // namespace migrationutil

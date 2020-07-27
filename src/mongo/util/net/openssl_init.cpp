@@ -27,20 +27,24 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
 #include "mongo/config.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/scopeguard.h"
 
-#include <boost/optional.hpp>
+#include <memory>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <stack>
+#include <vector>
 
 namespace mongo {
 namespace {
@@ -63,36 +67,26 @@ namespace {
 class SSLThreadInfo {
 public:
     static unsigned long getID() {
-        struct CallErrRemoveState {
-            explicit CallErrRemoveState(ThreadIDManager& manager, unsigned long id)
-                : _manager(manager), id(id) {}
-
-            ~CallErrRemoveState() {
-                ERR_remove_state(0);
-                _manager.releaseID(id);
-            };
-
-            ThreadIDManager& _manager;
-            unsigned long id;
+        /** A handle for the threadID resource. */
+        struct ManagedId {
+            ~ManagedId() {
+                idManager().releaseID(id);
+            }
+            const unsigned long id = idManager().reserveID();
         };
 
-        // NOTE: This logic is fully intentional. Because ERR_remove_state (called within
-        // the destructor of the kRemoveStateFromThread object) re-enters this function,
-        // we must have a two phase protection, otherwise we would access a thread local
-        // during its destruction.
-        static thread_local boost::optional<CallErrRemoveState> threadLocalState;
-        if (!threadLocalState) {
-            threadLocalState.emplace(_idManager, _idManager.reserveID());
-        }
+        // The `guard` callback will cause an invocation of `getID`, so it must be destroyed first.
+        static thread_local ManagedId managedId;
+        static thread_local auto guard = makeGuard([] { ERR_remove_state(0); });
 
-        return threadLocalState->id;
+        return managedId.id;
     }
 
     static void lockingCallback(int mode, int type, const char* file, int line) {
         if (mode & CRYPTO_LOCK) {
-            _mutex[type]->lock();
+            mutexes()[type]->lock();
         } else {
-            _mutex[type]->unlock();
+            mutexes()[type]->unlock();
         }
     }
 
@@ -100,8 +94,8 @@ public:
         CRYPTO_set_id_callback(&SSLThreadInfo::getID);
         CRYPTO_set_locking_callback(&SSLThreadInfo::lockingCallback);
 
-        while ((int)_mutex.size() < CRYPTO_num_locks()) {
-            _mutex.emplace_back(std::make_unique<stdx::recursive_mutex>());
+        while ((int)mutexes().size() < CRYPTO_num_locks()) {
+            mutexes().emplace_back(std::make_unique<stdx::recursive_mutex>());
         }
     }
 
@@ -111,7 +105,12 @@ private:
     // Note: see SERVER-8734 for why we are using a recursive mutex here.
     // Once the deadlock fix in OpenSSL is incorporated into most distros of
     // Linux, this can be changed back to a nonrecursive mutex.
-    static std::vector<std::unique_ptr<stdx::recursive_mutex>> _mutex;
+    static std::vector<std::unique_ptr<stdx::recursive_mutex>>& mutexes() {
+        // Keep the static as a pointer to avoid it ever to be destroyed. It is referenced in the
+        // CallErrRemoveState thread local above.
+        static auto m = new std::vector<std::unique_ptr<stdx::recursive_mutex>>();
+        return *m;
+    }
 
     class ThreadIDManager {
     public:
@@ -138,23 +137,27 @@ private:
         std::stack<unsigned long, std::vector<unsigned long>>
             _idLast;  // Stores old thread IDs, for reuse.
     };
-    static ThreadIDManager _idManager;
+
+    static ThreadIDManager& idManager() {
+        static auto& m = *new ThreadIDManager();
+        return m;
+    }
 };
-std::vector<std::unique_ptr<stdx::recursive_mutex>> SSLThreadInfo::_mutex;
-SSLThreadInfo::ThreadIDManager SSLThreadInfo::_idManager;
 
 void setupFIPS() {
 // Turn on FIPS mode if requested, OPENSSL_FIPS must be defined by the OpenSSL headers
 #if defined(MONGO_CONFIG_HAVE_FIPS_MODE_SET)
     int status = FIPS_mode_set(1);
     if (!status) {
-        severe() << "can't activate FIPS mode: "
-                 << SSLManagerInterface::getSSLErrorMessage(ERR_get_error());
+        LOGV2_FATAL(23173,
+                    "can't activate FIPS mode: {error}",
+                    "Can't activate FIPS mode",
+                    "error"_attr = SSLManagerInterface::getSSLErrorMessage(ERR_get_error()));
         fassertFailedNoTrace(16703);
     }
-    log() << "FIPS 140-2 mode activated";
+    LOGV2(23172, "FIPS 140-2 mode activated");
 #else
-    severe() << "this version of mongodb was not compiled with FIPS support";
+    LOGV2_FATAL(23174, "this version of mongodb was not compiled with FIPS support");
     fassertFailedNoTrace(17089);
 #endif
 }

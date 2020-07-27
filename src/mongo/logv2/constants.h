@@ -29,6 +29,9 @@
 
 #pragma once
 
+#include "mongo/base/string_data.h"
+#include "mongo/logv2/log_truncation.h"
+
 namespace mongo::logv2::constants {
 
 // Used in data structures to indicate number of attributes to store without having to allocate
@@ -43,9 +46,16 @@ constexpr StringData kContextFieldName = "ctx"_sd;
 constexpr StringData kIdFieldName = "id"_sd;
 constexpr StringData kMessageFieldName = "msg"_sd;
 constexpr StringData kAttributesFieldName = "attr"_sd;
+constexpr StringData kTruncatedFieldName = "truncated"_sd;
+constexpr StringData kTruncatedSizeFieldName = "size"_sd;
 constexpr StringData kTagsFieldName = "tags"_sd;
 
 // String to be used when logging empty boost::optional with the text formatter
 constexpr StringData kNullOptionalString = "(nothing)"_sd;
+
+constexpr LogTruncation kDefaultTruncation = LogTruncation::Enabled;
+constexpr int32_t kDefaultMaxAttributeOutputSizeKB = 10;
+
+constexpr int32_t kUserAssertWithLogID = -1;
 
 }  // namespace mongo::logv2::constants

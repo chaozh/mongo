@@ -91,6 +91,12 @@ function CollectionValidator() {
             conn.setSlaveOk();
             jsTest.authenticate(conn);
 
+            // Skip validating collections for arbiters.
+            if (conn.getDB('admin').isMaster('admin').arbiterOnly === true) {
+                print('Skipping collection validation on arbiter ' + host);
+                return {ok: 1};
+            }
+
             const requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVersion;
             if (requiredFCV) {
                 // Make sure this node has the desired FCV as it may take time for the updates to
@@ -116,32 +122,10 @@ function CollectionValidator() {
         }
     };
 
-    this.validateNodes = function(hostList, setFCVHost) {
+    this.validateNodes = function(hostList) {
         // We run the scoped threads in a try/finally block in case any thread throws an exception,
         // in which case we want to still join all the threads.
         let threads = [];
-        let adminDB;
-        let originalFCV;
-
-        const requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVersion;
-        if (requiredFCV) {
-            let conn = new Mongo(setFCVHost);
-            adminDB = conn.getDB('admin');
-            originalFCV = adminDB.system.version.findOne({_id: 'featureCompatibilityVersion'});
-
-            if (originalFCV.targetVersion) {
-                // If a previous FCV upgrade or downgrade was interrupted, then we run the
-                // setFeatureCompatibilityVersion command to complete it before attempting to set
-                // the feature compatibility version to 'requiredFCV'.
-                assert.commandWorked(adminDB.runCommand(
-                    {setFeatureCompatibilityVersion: originalFCV.targetVersion}));
-                checkFCV(adminDB, originalFCV.targetVersion);
-            }
-
-            // Now that we are certain that an upgrade or downgrade of the FCV is not in progress,
-            // ensure the 'requiredFCV' is set.
-            assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: requiredFCV}));
-        }
 
         try {
             hostList.forEach(host => {
@@ -160,11 +144,6 @@ function CollectionValidator() {
             returnData.forEach(res => {
                 assert.commandWorked(res, 'Collection validation failed');
             });
-        }
-
-        if (originalFCV && originalFCV.version !== requiredFCV) {
-            assert.commandWorked(
-                adminDB.runCommand({setFeatureCompatibilityVersion: originalFCV.version}));
         }
     };
 }

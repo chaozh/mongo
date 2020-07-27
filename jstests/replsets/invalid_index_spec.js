@@ -7,6 +7,7 @@
 "use strict";
 
 load("jstests/replsets/rslib.js");
+load("jstests/libs/logv2_helpers.js");
 
 const testName = "invalid_index_spec";
 const replTest = new ReplSetTest({nodes: 2});
@@ -48,16 +49,22 @@ replTest.stop(secondary, undefined, {allowedExitCode: exitCode});
 
 // During the transition from the old code path in IndexBuilder to IndexBuildsCoordinator, we
 // will accept the fatal assertion code from either component.
-const msgIndexBuilder = "Fatal Assertion 50769";
+const msgIndexBuilder = "Fatal assertion 50769";
 const msgIndexBuildsCoordinator = "Fatal assertion 34437";
 const msgIndexErrorType = "InvalidIndexSpecificationOption";
 const msgIndexError = "The field 'invalidOption2'";
 
-assert((rawMongoProgramOutput().match(msgIndexBuilder) ||
-        rawMongoProgramOutput().match(msgIndexBuildsCoordinator)) &&
-           (rawMongoProgramOutput().match(msgIndexErrorType) &&
-            rawMongoProgramOutput().match(msgIndexError)),
-       "Replication should have aborted on invalid index specification");
-
+if (isJsonLogNoConn()) {
+    assert(
+        rawMongoProgramOutput().search(
+            /Fatal assertion.*(50769|34437).*InvalidIndexSpecificationOption.*The field 'invalidOption2'/),
+        "Replication should have aborted on invalid index specification");
+} else {
+    assert((rawMongoProgramOutput().match(msgIndexBuilder) ||
+            rawMongoProgramOutput().match(msgIndexBuildsCoordinator)) &&
+               (rawMongoProgramOutput().match(msgIndexErrorType) &&
+                rawMongoProgramOutput().match(msgIndexError)),
+           "Replication should have aborted on invalid index specification");
+}
 replTest.stopSet();
 })();

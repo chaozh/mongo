@@ -55,35 +55,13 @@ class RecoveryUnit;
  * using a CursorManager. See cursor_manager.h for more details.
  */
 struct ClientCursorParams {
-    // Describes whether callers should acquire locks when using a ClientCursor. Not all cursors
-    // have the same locking behavior. In particular, find cursors require the caller to lock the
-    // collection in MODE_IS before calling methods on the underlying plan executor. Aggregate
-    // cursors, on the other hand, may access multiple collections and acquire their own locks on
-    // any involved collections while producing query results. Therefore, the caller need not
-    // explicitly acquire any locks when using a ClientCursor which houses execution machinery for
-    // an aggregate.
-    //
-    // The policy is consulted on getMore in order to determine locking behavior, since during
-    // getMore we otherwise could not easily know what flavor of cursor we're using.
-    enum class LockPolicy {
-        // The caller is responsible for locking the collection over which this ClientCursor
-        // executes.
-        kLockExternally,
-
-        // The caller need not hold no locks; this ClientCursor's plan executor acquires any
-        // necessary locks itself.
-        kLocksInternally,
-    };
-
     ClientCursorParams(std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor,
                        NamespaceString nss,
                        UserNameIterator authenticatedUsersIter,
                        WriteConcernOptions writeConcernOptions,
                        repl::ReadConcernArgs readConcernArgs,
                        BSONObj originatingCommandObj,
-                       LockPolicy lockPolicy,
-                       PrivilegeVector originatingPrivileges,
-                       bool needsMerge)
+                       PrivilegeVector originatingPrivileges)
         : exec(std::move(planExecutor)),
           nss(std::move(nss)),
           writeConcernOptions(std::move(writeConcernOptions)),
@@ -92,9 +70,7 @@ struct ClientCursorParams {
                            ? exec->getCanonicalQuery()->getQueryRequest().getOptions()
                            : 0),
           originatingCommandObj(originatingCommandObj.getOwned()),
-          lockPolicy(lockPolicy),
-          originatingPrivileges(std::move(originatingPrivileges)),
-          needsMerge(needsMerge) {
+          originatingPrivileges(std::move(originatingPrivileges)) {
         while (authenticatedUsersIter.more()) {
             authenticatedUsers.emplace_back(authenticatedUsersIter.next());
         }
@@ -121,9 +97,7 @@ struct ClientCursorParams {
     const repl::ReadConcernArgs readConcernArgs;
     int queryOptions = 0;
     BSONObj originatingCommandObj;
-    const LockPolicy lockPolicy;
     PrivilegeVector originatingPrivileges;
-    const bool needsMerge;
 };
 
 /**
@@ -173,10 +147,6 @@ public:
 
     WriteConcernOptions getWriteConcernOptions() const {
         return _writeConcernOptions;
-    }
-
-    bool needsMerge() const {
-        return _needsMerge;
     }
 
     /**
@@ -272,10 +242,6 @@ public:
         return StringData(_planSummary);
     }
 
-    ClientCursorParams::LockPolicy lockPolicy() const {
-        return _lockPolicy;
-    }
-
     /**
      * Returns a generic cursor containing diagnostics about this cursor.
      * The caller must either have this cursor pinned or hold a mutex from the cursor manager.
@@ -316,14 +282,12 @@ public:
         _lastKnownCommittedOpTime = std::move(lastCommittedOpTime);
     }
 
-    /**
-     * Returns the server-wide the count of living cursors. Such a cursor is called an "open
-     * cursor".
-     */
-    static long long totalOpen();
-
     friend std::size_t partitionOf(const ClientCursor* cursor) {
         return cursor->cursorid();
+    }
+
+    boost::optional<OperationKey> getOperationKey() const {
+        return _opKey;
     }
 
 private:
@@ -416,15 +380,6 @@ private:
     // See the QueryOptions enum in dbclientinterface.h.
     const int _queryOptions = 0;
 
-    const ClientCursorParams::LockPolicy _lockPolicy;
-
-    // The value of a flag specified on the originating command which indicates whether the result
-    // of this cursor will be consumed by a merging node (mongos or a mongod selected to perform a
-    // merge). Note that this flag is only set for aggregate() commands, and not for find()
-    // commands. It is therefore possible that 'needsMerge' is false when in fact there will be a
-    // merge performed.
-    const bool _needsMerge;
-
     // Unused maxTime budget for this cursor.
     Microseconds _leftoverMaxTimeMicros = Microseconds::max();
 
@@ -457,6 +412,9 @@ private:
     // Commit point at the time the last batch was returned. This is only used by internal exhaust
     // oplog fetching. Also see lastKnownCommittedOpTime in GetMoreRequest.
     boost::optional<repl::OpTime> _lastKnownCommittedOpTime;
+
+    // The client OperationKey associated with this cursor.
+    boost::optional<OperationKey> _opKey;
 };
 
 /**

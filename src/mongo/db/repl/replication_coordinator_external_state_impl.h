@@ -66,7 +66,7 @@ public:
         StorageInterface* storageInterface,
         ReplicationProcess* replicationProcess);
     virtual ~ReplicationCoordinatorExternalStateImpl();
-    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startThreads() override;
     virtual void startSteadyStateReplication(OperationContext* opCtx,
                                              ReplicationCoordinator* replCoord) override;
     virtual void stopDataReplication(OperationContext* opCtx) override;
@@ -86,7 +86,9 @@ public:
     virtual bool isSelf(const HostAndPort& host, ServiceContext* service);
     Status createLocalLastVoteCollection(OperationContext* opCtx) final;
     virtual StatusWith<BSONObj> loadLocalConfigDocument(OperationContext* opCtx);
-    virtual Status storeLocalConfigDocument(OperationContext* opCtx, const BSONObj& config);
+    virtual Status storeLocalConfigDocument(OperationContext* opCtx,
+                                            const BSONObj& config,
+                                            bool writeOplog);
     virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx);
     virtual Status storeLocalLastVoteDocument(OperationContext* opCtx, const LastVote& lastVote);
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime);
@@ -95,15 +97,14 @@ public:
     virtual StatusWith<OpTimeAndWallTime> loadLastOpTimeAndWallTime(OperationContext* opCtx);
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual void closeConnections();
-    virtual void shardingOnStepDownHook();
-    virtual void clearOplogVisibilityStateForStepDown() override;
+    virtual void onStepDownHook();
     virtual void signalApplierToChooseNewSyncSource();
     virtual void stopProducer();
     virtual void startProducerIfStopped();
     virtual bool tooStale();
     void dropAllSnapshots() final;
     void updateCommittedSnapshot(const OpTime& newCommitPoint) final;
-    void updateLocalSnapshot(const OpTime& optime) final;
+    void updateLastAppliedSnapshot(const OpTime& optime) final;
     virtual bool snapshotsEnabled() const;
     virtual void notifyOplogMetadataWaiters(const OpTime& committedOpTime);
     boost::optional<OpTime> getEarliestDropPendingOpTime() const final;
@@ -114,7 +115,7 @@ public:
     virtual std::size_t getOplogFetcherInitialSyncMaxFetcherRestarts() const override;
 
     // Methods from JournalListener.
-    virtual JournalListener::Token getToken();
+    virtual JournalListener::Token getToken(OperationContext* opCtx);
     virtual void onDurable(const JournalListener::Token& token);
 
     virtual void setupNoopWriter(Seconds waitTime);
@@ -142,6 +143,27 @@ private:
      * for "opCtx".
      */
     void _dropAllTempCollections(OperationContext* opCtx);
+
+    /**
+     * Resets any active sharding metadata on this server and stops any sharding-related threads
+     * (such as the balancer). It is called after stepDown to ensure that if the node becomes
+     * primary again in the future it will recover its state from a clean slate.
+     */
+    void _shardingOnStepDownHook();
+
+    /**
+     * Stops asynchronous updates to and then clears the oplogTruncateAfterPoint.
+     *
+     * Safe to call when there are no oplog writes, and therefore no oplog holes that must be
+     * tracked by the oplogTruncateAfterPoint.
+     *
+     * Only primaries update the truncate point asynchronously; other replication states update the
+     * truncate point manually as necessary. This function should be called whenever replication
+     * leaves state PRIMARY: stepdown; and shutdown while in state PRIMARY. Otherwise, we might
+     * leave a stale oplogTruncateAfterPoint set and cause unnecessary oplog truncation during
+     * startup if the server gets restarted.
+     */
+    void _stopAsyncUpdatesOfAndClearOplogTruncateAfterPoint();
 
     ServiceContext* _service;
 

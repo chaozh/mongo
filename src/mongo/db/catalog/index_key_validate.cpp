@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -50,8 +50,8 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/represent_as.h"
 #include "mongo/util/str.h"
 
@@ -83,6 +83,7 @@ static std::set<StringData> allowedFieldNames = {
     IndexDescriptor::kDropDuplicatesFieldName,
     IndexDescriptor::kExpireAfterSecondsFieldName,
     IndexDescriptor::kGeoHaystackBucketSize,
+    IndexDescriptor::kHiddenFieldName,
     IndexDescriptor::kIndexNameFieldName,
     IndexDescriptor::kIndexVersionFieldName,
     IndexDescriptor::kKeyPatternFieldName,
@@ -243,8 +244,11 @@ BSONObj removeUnknownFields(const BSONObj& indexSpec) {
         if (allowedFieldNames.count(fieldName)) {
             builder.append(indexSpecElem);
         } else {
-            warning() << "Removing field '" << redact(fieldName)
-                      << "' from index spec: " << redact(indexSpec);
+            LOGV2_WARNING(23878,
+                          "Removing field '{fieldName}' from index spec: {indexSpec}",
+                          "Removing unknown field from index spec",
+                          "fieldName"_attr = redact(fieldName),
+                          "indexSpec"_attr = redact(indexSpec));
         }
     }
     return builder.obj();
@@ -305,19 +309,6 @@ StatusWith<BSONObj> validateIndexSpec(
                 }
             }
 
-            // Allow compound hashed index only if FCV is 4.4.
-            const auto isFeatureDisabled =
-                (featureCompatibility.isVersionInitialized() &&
-                 featureCompatibility.getVersion() <
-                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44);
-            if (isFeatureDisabled && (indexSpecElem.embeddedObject().nFields() > 1) &&
-                (IndexNames::findPluginName(indexSpecElem.embeddedObject()) ==
-                 IndexNames::HASHED)) {
-                return {ErrorCodes::Error(16763),
-                        "Compound hashed indexes can only be created with FCV 4.4 and with test "
-                        "commands enabled "};
-            }
-
             hasKeyPatternField = true;
         } else if (IndexDescriptor::kIndexNameFieldName == indexSpecElemFieldName) {
             if (indexSpecElem.type() != BSONType::String) {
@@ -328,6 +319,14 @@ StatusWith<BSONObj> validateIndexSpec(
             }
 
             hasIndexNameField = true;
+        } else if (IndexDescriptor::kHiddenFieldName == indexSpecElemFieldName) {
+            if (indexSpecElem.type() != BSONType::Bool) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream()
+                            << "The field '" << IndexDescriptor::kIndexNameFieldName
+                            << "' must be a bool, but got " << typeName(indexSpecElem.type())};
+            }
+
         } else if (IndexDescriptor::kNamespaceFieldName == indexSpecElemFieldName) {
             hasNamespaceField = true;
         } else if (IndexDescriptor::kIndexVersionFieldName == indexSpecElemFieldName) {
@@ -383,10 +382,12 @@ StatusWith<BSONObj> validateIndexSpec(
             // specified or may inherit the default collation from the collection. It's legal to
             // parse with the wrong collation, since the collation can be set on a MatchExpression
             // after the fact. Here, we don't bother checking the collation after the fact, since
-            // this invocation of the parser is just for validity checking.
+            // this invocation of the parser is just for validity checking. It's also legal to parse
+            // with an empty namespace string, because we are only doing validity checking and not
+            // resolving the expression against a given namespace.
             auto simpleCollator = nullptr;
             boost::intrusive_ptr<ExpressionContext> expCtx(
-                new ExpressionContext(opCtx, simpleCollator));
+                new ExpressionContext(opCtx, simpleCollator, NamespaceString()));
 
             // Special match expression features (e.g. $jsonSchema, $expr, ...) are not allowed in a
             // partialFilterExpression on index creation.
@@ -505,6 +506,10 @@ Status validateIdIndexSpec(const BSONObj& indexSpec) {
                 str::stream() << "The field '" << IndexDescriptor::kKeyPatternFieldName
                               << "' for an _id index must be {_id: 1}, but got "
                               << keyPatternElem.Obj()};
+    }
+
+    if (!indexSpec[IndexDescriptor::kHiddenFieldName].eoo()) {
+        return Status(ErrorCodes::BadValue, "can't hide _id index");
     }
 
     return Status::OK();

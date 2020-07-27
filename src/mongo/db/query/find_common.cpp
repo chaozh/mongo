@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +38,8 @@
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_request.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -52,6 +52,8 @@ MONGO_FAIL_POINT_DEFINE(waitAfterPinningCursorBeforeGetMoreBatch);
 MONGO_FAIL_POINT_DEFINE(waitWithPinnedCursorDuringGetMoreBatch);
 
 MONGO_FAIL_POINT_DEFINE(waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch);
+
+MONGO_FAIL_POINT_DEFINE(failGetMoreAfterCursorCheckout);
 
 const OperationContext::Decoration<AwaitDataState> awaitDataState =
     OperationContext::declareDecoration<AwaitDataState>();
@@ -79,8 +81,10 @@ bool FindCommon::haveSpaceForNext(const BSONObj& nextDoc, long long numDocs, int
 void FindCommon::waitInFindBeforeMakingBatch(OperationContext* opCtx, const CanonicalQuery& cq) {
     auto whileWaitingFunc = [&, hasLogged = false]() mutable {
         if (!std::exchange(hasLogged, true)) {
-            log() << "Waiting in find before making batch for query - "
-                  << redact(cq.toStringShort());
+            LOGV2(20908,
+                  "Waiting in find before making batch for query - {query}",
+                  "Waiting in find before making batch for query",
+                  "query"_attr = redact(cq.toStringShort()));
         }
     };
 

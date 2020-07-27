@@ -40,7 +40,7 @@ class Status;
 /**
  * The 'CommitQuorumOptions' has the same range of settings as the 'w' field from
  * 'WriteConcernOptions'. It can be set to an integer starting from 0 and up, or to a string. The
- * string option can either be 'majority' or a replica set tag.
+ * string option can be 'majority', 'votingMembers' or a replica set tag.
  *
  * The principal idea behind 'CommitQuorumOptions' is to figure out when an index build should be
  * committed on the replica set based on the number of commit ready members.
@@ -49,8 +49,12 @@ class CommitQuorumOptions {
 public:
     static const StringData kCommitQuorumField;  // = "commitQuorum"
     static const char kMajority[];               // = "majority"
+    static const char kVotingMembers[];          // = "votingMembers"
 
-    static const BSONObj Majority;  // = {"commitQuorum": "majority"}
+    static const int kUninitializedNumNodes = -1;
+    static const int kDisabled = 0;
+    static const BSONObj Majority;       // = {"commitQuorum": "majority"}
+    static const BSONObj VotingMembers;  // = {"commitQuorum": "votingMembers"}
 
     CommitQuorumOptions() {
         reset();
@@ -70,21 +74,29 @@ public:
     static CommitQuorumOptions deserializerForIDL(const BSONElement& commitQuorumElement);
 
     void reset() {
-        numNodes = 0;
+        numNodes = kUninitializedNumNodes;
         mode = "";
+    }
+
+    bool isInitialized() const {
+        return !(mode.empty() && numNodes == kUninitializedNumNodes);
+    }
+
+    inline bool operator==(const CommitQuorumOptions& rhs) const {
+        return (numNodes == rhs.numNodes && mode == rhs.mode) ? true : false;
     }
 
     // Returns the BSON representation of this object.
     BSONObj toBSON() const;
 
     // Appends the BSON representation of this object.
-    void append(StringData fieldName, BSONObjBuilder* builder) const;
+    void appendToBuilder(StringData fieldName, BSONObjBuilder* builder) const;
 
     // The 'commitQuorum' parameter to define the required quorum for the index builds to commit.
     // The 'mode' represents the string format and takes precedence over the number format
     // 'numNodes'.
-    int numNodes;
-    std::string mode;
+    int numNodes = kUninitializedNumNodes;
+    std::string mode = "";
 };
 
 }  // namespace mongo

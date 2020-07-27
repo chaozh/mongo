@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -51,10 +51,10 @@
 #include "mongo/base/data_type_validated.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -85,8 +85,10 @@ std::unique_ptr<StorageEngineMetadata> StorageEngineMetadata::forPath(const std:
         metadata.reset(new StorageEngineMetadata(dbpath));
         Status status = metadata->read();
         if (!status.isOK()) {
-            error() << "Unable to read the storage engine metadata file: " << status;
-            fassertFailedNoTrace(28661);
+            LOGV2_FATAL_NOTRACE(28661,
+                                "Unable to read the storage engine metadata file: {error}",
+                                "Unable to read the storage engine metadata file",
+                                "error"_attr = status);
         }
     }
     return metadata;
@@ -219,14 +221,17 @@ void flushMyDirectory(const boost::filesystem::path& file) {
     // so make a warning. need a better solution longer term.
     // massert(13652, str::stream() << "Couldn't find parent dir for file: " << file.string(),);
     if (!file.has_branch_path()) {
-        log() << "warning flushMyDirectory couldn't find parent dir for file: " << file.string();
+        LOGV2(22283,
+              "warning flushMyDirectory couldn't find parent dir for file: {file}",
+              "flushMyDirectory couldn't find parent dir for file",
+              "file"_attr = file.generic_string());
         return;
     }
 
 
     boost::filesystem::path dir = file.branch_path();  // parent_path in new boosts
 
-    LOG(1) << "flushing directory " << dir.string();
+    LOGV2_DEBUG(22284, 1, "flushing directory {dir_string}", "dir_string"_attr = dir.string());
 
     int fd = ::open(dir.string().c_str(), O_RDONLY);  // DO NOT THROW OR ASSERT BEFORE CLOSING
     massert(13650,
@@ -237,12 +242,12 @@ void flushMyDirectory(const boost::filesystem::path& file) {
         int e = errno;
         if (e == EINVAL) {  // indicates filesystem does not support synchronization
             if (!_warnedAboutFilesystem) {
-                log() << "\tWARNING: This file system is not supported. For further information"
-                      << " see:" << startupWarningsLog;
-                log() << "\t\t\thttp://dochub.mongodb.org/core/unsupported-filesystems"
-                      << startupWarningsLog;
-                log() << "\t\tPlease notify MongoDB, Inc. if an unlisted filesystem generated "
-                      << "this warning." << startupWarningsLog;
+                LOGV2_OPTIONS(
+                    22285,
+                    {logv2::LogTag::kStartupWarnings},
+                    "This file system is not supported. For further information see: "
+                    "http://dochub.mongodb.org/core/unsupported-filesystems Please notify MongoDB, "
+                    "Inc. if an unlisted filesystem generated this warning");
                 _warnedAboutFilesystem = true;
             }
         } else {

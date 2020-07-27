@@ -31,16 +31,16 @@
 
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/metadata_manager.h"
-#include "mongo/db/s/persistent_task_store.h"
+#include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/range_deletion_util.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
-#include "mongo/db/s/wait_for_majority_service.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/unittest/death_test.h"
-#include "mongo/unittest/unittest.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
@@ -79,6 +79,8 @@ public:
     void tearDown() override {
         DBDirectClient client(operationContext());
         client.dropCollection(kNss.ns());
+
+        migrationutil::getMigrationUtilExecutor()->waitForIdle();
 
         WaitForMajorityService::get(getServiceContext()).shutDown();
         ShardServerTestFixture::tearDown();
@@ -133,6 +135,7 @@ TEST_F(RangeDeleterTest,
     const int numDocsToRemovePerBatch = 10;
     auto queriesComplete = SemiFuture<void>::makeReady();
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
 
@@ -143,6 +146,7 @@ TEST_F(RangeDeleterTest,
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               boost::none,
                                numDocsToRemovePerBatch,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -160,6 +164,7 @@ TEST_F(RangeDeleterTest,
     auto queriesComplete = SemiFuture<void>::makeReady();
 
     // Insert documents in range.
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     for (auto i = 0; i < numDocsToInsert; ++i) {
         dbclient.insert(kNss.toString(), BSON(kShardKey << i));
@@ -172,6 +177,7 @@ TEST_F(RangeDeleterTest,
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               boost::none,
                                numDocsToRemovePerBatch,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -185,6 +191,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeInsertsDocumentToNotifySecondarie
     const int numDocsToRemovePerBatch = 10;
     auto queriesComplete = SemiFuture<void>::makeReady();
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
 
@@ -195,6 +202,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeInsertsDocumentToNotifySecondarie
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               boost::none,
                                numDocsToRemovePerBatch,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -216,6 +224,7 @@ TEST_F(
     auto queriesComplete = SemiFuture<void>::makeReady();
 
     // Insert documents in range.
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     for (auto i = 0; i < numDocsToInsert; ++i) {
         dbclient.insert(kNss.toString(), BSON(kShardKey << i));
@@ -228,6 +237,7 @@ TEST_F(
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               boost::none,
                                numDocsToRemovePerBatch,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -247,6 +257,7 @@ TEST_F(RangeDeleterTest,
 
     auto queriesComplete = SemiFuture<void>::makeReady();
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     // All documents below the range.
     for (auto i = minKey - numDocsToInsert; i < minKey; ++i) {
@@ -260,6 +271,7 @@ TEST_F(RangeDeleterTest,
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               boost::none,
                                1 /* numDocsToRemovePerBatch */,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -278,6 +290,7 @@ TEST_F(RangeDeleterTest,
 
     auto queriesComplete = SemiFuture<void>::makeReady();
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     // All documents greater than or equal to the range.
     for (auto i = maxKey; i < maxKey + numDocsToInsert; ++i) {
@@ -291,6 +304,7 @@ TEST_F(RangeDeleterTest,
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               boost::none,
                                1 /* numDocsToRemovePerBatch */,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -304,6 +318,7 @@ TEST_F(RangeDeleterTest,
        RemoveDocumentsInRangeDoesNotRemoveDocumentsForCollectionWithSameNamespaceAndDifferentUUID) {
     const auto numDocsToInsert = 3;
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     for (auto i = 0; i < numDocsToInsert; ++i) {
         dbclient.insert(kNss.toString(), BSON(kShardKey << i));
@@ -318,6 +333,7 @@ TEST_F(RangeDeleterTest,
                                UUID::gen(),
                                kShardKeyPattern,
                                ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10)),
+                               boost::none,
                                10 /* numDocsToRemovePerBatch*/,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -338,6 +354,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeThrowsErrorWhenCollectionDoesNotE
                                UUID::gen(),
                                kShardKeyPattern,
                                ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10)),
+                               boost::none,
                                10 /* numDocsToRemovePerBatch*/,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -348,11 +365,78 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeThrowsErrorWhenCollectionDoesNotE
                        ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist);
 }
 
-
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingSingleBatch) {
-
+TEST_F(RangeDeleterTest, RemoveDocumentsInRangeLeavesDocumentsWhenTaskDocumentDoesNotExist) {
     auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
         repl::ReplicationCoordinator::get(getServiceContext()));
+
+    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
+
+    setFilteringMetadataWithUUID(uuid());
+    DBDirectClient dbclient(operationContext());
+    dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
+
+    // We intentionally skip inserting a range deletion task document to simulate it already having
+    // been deleted.
+
+    // We should wait for replication after attempting to delete the document in the range even when
+    // the task document doesn't exist.
+    const auto expectedNumTimesWaitedForReplication = 1;
+    int numTimesWaitedForReplication = 0;
+
+    // Override special handler for waiting for replication to count the number of times we wait for
+    // replication.
+    replCoord->setAwaitReplicationReturnValueFunction(
+        [&](OperationContext* opCtx, const repl::OpTime& opTime) {
+            ++numTimesWaitedForReplication;
+            return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
+        });
+
+    auto queriesComplete = SemiFuture<void>::makeReady();
+    auto cleanupComplete =
+        removeDocumentsInRange(executor(),
+                               std::move(queriesComplete),
+                               kNss,
+                               uuid(),
+                               kShardKeyPattern,
+                               range,
+                               UUID::gen(),
+                               10 /*numDocsToRemovePerBatch*/,
+                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
+                               Milliseconds(0) /* delayBetweenBatches */);
+
+    cleanupComplete.get();
+
+    // Document should not have been deleted.
+    ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 1);
+    ASSERT_EQ(numTimesWaitedForReplication, expectedNumTimesWaitedForReplication);
+}
+
+TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingSingleBatch) {
+    auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
+        repl::ReplicationCoordinator::get(getServiceContext()));
+
+    const auto numDocsToInsert = 3;
+    const auto numDocsToRemovePerBatch = 10;
+    const auto numBatches = ceil((double)numDocsToInsert / numDocsToRemovePerBatch);
+    ASSERT_EQ(numBatches, 1);
+    // We should wait twice: Once after deleting documents in the range, and once after deleting the
+    // range deletion task.
+    const auto expectedNumTimesWaitedForReplication = 2;
+
+    setFilteringMetadataWithUUID(uuid());
+    DBDirectClient dbclient(operationContext());
+    for (auto i = 0; i < numDocsToInsert; ++i) {
+        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
+    }
+
+    // Insert range deletion task for this collection and range.
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
+    RangeDeletionTask t(
+        UUID::gen(), kNss, uuid(), ShardId("donor"), range, CleanWhenEnum::kDelayed);
+    store.add(operationContext(), t);
+    // Document should be in the store.
+    ASSERT_EQUALS(countDocsInConfigRangeDeletions(store, operationContext()), 1);
 
     int numTimesWaitedForReplication = 0;
     // Override special handler for waiting for replication to count the number of times we wait for
@@ -363,17 +447,6 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingS
             return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
         });
 
-    const auto numDocsToInsert = 3;
-    const auto numDocsToRemovePerBatch = 10;
-    const auto numBatches = ceil((double)numDocsToInsert / numDocsToRemovePerBatch);
-    const auto expectedNumTimesWaitedForReplication =
-        numBatches + 1 /* for deleting range deletion task */;
-
-    DBDirectClient dbclient(operationContext());
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
     auto queriesComplete = SemiFuture<void>::makeReady();
     auto cleanupComplete =
         removeDocumentsInRange(executor(),
@@ -381,7 +454,8 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingS
                                kNss,
                                uuid(),
                                kShardKeyPattern,
-                               ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10)),
+                               range,
+                               t.getId(),
                                numDocsToRemovePerBatch,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -392,9 +466,33 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingS
     ASSERT_EQ(numTimesWaitedForReplication, expectedNumTimesWaitedForReplication);
 }
 
-TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingEveryBatch) {
+TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationOnlyOnceAfterSeveralBatches) {
     auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
         repl::ReplicationCoordinator::get(getServiceContext()));
+
+    const auto numDocsToInsert = 3;
+    const auto numDocsToRemovePerBatch = 1;
+    const auto numBatches = ceil((double)numDocsToInsert / numDocsToRemovePerBatch);
+    ASSERT_GTE(numBatches, 1);
+
+    // We should wait twice: Once after deleting documents in the range, and once after deleting the
+    // range deletion task.
+    const auto expectedNumTimesWaitedForReplication = 2;
+
+    setFilteringMetadataWithUUID(uuid());
+    DBDirectClient dbclient(operationContext());
+    for (auto i = 0; i < numDocsToInsert; ++i) {
+        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
+    }
+
+    // Insert range deletion task for this collection and range.
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
+    RangeDeletionTask t(
+        UUID::gen(), kNss, uuid(), ShardId("donor"), range, CleanWhenEnum::kDelayed);
+    store.add(operationContext(), t);
+    // Document should be in the store.
+    ASSERT_EQUALS(countDocsInConfigRangeDeletions(store, operationContext()), 1);
 
     int numTimesWaitedForReplication = 0;
 
@@ -405,17 +503,6 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingE
             return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
         });
 
-    const auto numDocsToInsert = 3;
-    const auto numDocsToRemovePerBatch = 1;
-    const auto numBatches = ceil((double)numDocsToInsert / numDocsToRemovePerBatch);
-    const auto expectedNumTimesWaitedForReplication =
-        numBatches + 1 /* for deleting range deletion task */;
-
-    DBDirectClient dbclient(operationContext());
-    for (auto i = 0; i < numDocsToInsert; ++i) {
-        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
-    }
-
     auto queriesComplete = SemiFuture<void>::makeReady();
     auto cleanupComplete =
         removeDocumentsInRange(executor(),
@@ -423,7 +510,8 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingE
                                kNss,
                                uuid(),
                                kShardKeyPattern,
-                               ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10)),
+                               range,
+                               t.getId(),
                                numDocsToRemovePerBatch,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -432,6 +520,58 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeWaitsForReplicationAfterDeletingE
 
     ASSERT_EQUALS(dbclient.count(kNss, BSONObj()), 0);
     ASSERT_EQ(numTimesWaitedForReplication, expectedNumTimesWaitedForReplication);
+}
+
+TEST_F(RangeDeleterTest, RemoveDocumentsInRangeDoesNotWaitForReplicationIfErrorDuringDeletion) {
+    auto replCoord = checked_cast<repl::ReplicationCoordinatorMock*>(
+        repl::ReplicationCoordinator::get(getServiceContext()));
+
+    const auto numDocsToInsert = 3;
+    const auto numDocsToRemovePerBatch = 10;
+
+    setFilteringMetadataWithUUID(uuid());
+    DBDirectClient dbclient(operationContext());
+    for (auto i = 0; i < numDocsToInsert; ++i) {
+        dbclient.insert(kNss.toString(), BSON(kShardKey << i));
+    }
+
+    // Insert range deletion task for this collection and range.
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
+    const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
+    RangeDeletionTask t(
+        UUID::gen(), kNss, uuid(), ShardId("donor"), range, CleanWhenEnum::kDelayed);
+    store.add(operationContext(), t);
+    // Document should be in the store.
+    ASSERT_EQUALS(countDocsInConfigRangeDeletions(store, operationContext()), 1);
+
+    int numTimesWaitedForReplication = 0;
+    // Override special handler for waiting for replication to count the number of times we wait for
+    // replication.
+    replCoord->setAwaitReplicationReturnValueFunction(
+        [&](OperationContext* opCtx, const repl::OpTime& opTime) {
+            ++numTimesWaitedForReplication;
+            return repl::ReplicationCoordinator::StatusAndDuration(Status::OK(), Milliseconds(0));
+        });
+
+    // Pretend we stepped down.
+    replCoord->setCanAcceptNonLocalWrites(false);
+    std::ignore = replCoord->setFollowerMode(repl::MemberState::RS_SECONDARY);
+
+    auto queriesComplete = SemiFuture<void>::makeReady();
+    auto cleanupComplete =
+        removeDocumentsInRange(executor(),
+                               std::move(queriesComplete),
+                               kNss,
+                               uuid(),
+                               kShardKeyPattern,
+                               range,
+                               t.getId(),
+                               numDocsToRemovePerBatch,
+                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
+                               Milliseconds(0) /* delayBetweenBatches */);
+
+    ASSERT_THROWS_CODE(cleanupComplete.get(), DBException, ErrorCodes::PrimarySteppedDown);
+    ASSERT_EQ(numTimesWaitedForReplication, 0);
 }
 
 TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRetriesOnWriteConflictException) {
@@ -443,13 +583,12 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRetriesOnWriteConflictException) 
     const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
     auto queriesComplete = SemiFuture<void>::makeReady();
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
 
     // Insert range deletion task for this collection and range.
-    setFilteringMetadataWithUUID(uuid());
-    PersistentTaskStore<RangeDeletionTask> store(operationContext(),
-                                                 NamespaceString::kRangeDeletionNamespace);
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
     RangeDeletionTask t(
         UUID::gen(), kNss, uuid(), ShardId("donor"), range, CleanWhenEnum::kDelayed);
     store.add(operationContext(), t);
@@ -463,6 +602,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRetriesOnWriteConflictException) 
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               t.getId(),
                                10 /*numDocsToRemovePerBatch*/,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -481,13 +621,12 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRetriesOnUnexpectedError) {
     const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
     auto queriesComplete = SemiFuture<void>::makeReady();
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
 
     // Insert range deletion task for this collection and range.
-    setFilteringMetadataWithUUID(uuid());
-    PersistentTaskStore<RangeDeletionTask> store(operationContext(),
-                                                 NamespaceString::kRangeDeletionNamespace);
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
     RangeDeletionTask t(
         UUID::gen(), kNss, uuid(), ShardId("donor"), range, CleanWhenEnum::kDelayed);
     store.add(operationContext(), t);
@@ -501,6 +640,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRetriesOnUnexpectedError) {
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               t.getId(),
                                10 /*numDocsToRemovePerBatch*/,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -520,6 +660,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRespectsDelayInBetweenBatches) {
     auto queriesComplete = SemiFuture<void>::makeReady();
 
     // Insert documents in range.
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     for (auto i = 0; i < numDocsToInsert; ++i) {
         dbclient.insert(kNss.toString(), BSON(kShardKey << i));
@@ -532,6 +673,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRespectsDelayInBetweenBatches) {
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               boost::none,
                                numDocsToRemovePerBatch,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
                                delayBetweenBatches);
@@ -562,6 +704,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRespectsOrphanCleanupDelay) {
     auto queriesComplete = SemiFuture<void>::makeReady();
 
     // Insert documents in range.
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     for (auto i = 0; i < numDocsToInsert; ++i) {
         dbclient.insert(kNss.toString(), BSON(kShardKey << i));
@@ -573,6 +716,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRespectsOrphanCleanupDelay) {
                                                   uuid(),
                                                   kShardKeyPattern,
                                                   range,
+                                                  boost::none,
                                                   numDocsToRemovePerBatch,
                                                   orphanCleanupDelay,
                                                   Milliseconds(0) /* delayBetweenBatches */);
@@ -598,14 +742,12 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRemovesRangeDeletionTaskOnSuccess
     const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
     auto queriesComplete = SemiFuture<void>::makeReady();
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
 
     // Insert range deletion task for this collection and range.
-    setFilteringMetadataWithUUID(uuid());
-    PersistentTaskStore<RangeDeletionTask> store(operationContext(),
-                                                 NamespaceString::kRangeDeletionNamespace);
-
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
 
     RangeDeletionTask t(
         UUID::gen(), kNss, uuid(), ShardId("donor"), range, CleanWhenEnum::kDelayed);
@@ -620,6 +762,7 @@ TEST_F(RangeDeleterTest, RemoveDocumentsInRangeRemovesRangeDeletionTaskOnSuccess
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               t.getId(),
                                10 /*numDocsToRemovePerBatch*/,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -636,13 +779,12 @@ TEST_F(RangeDeleterTest,
 
     auto fakeUuid = UUID::gen();
 
+    setFilteringMetadataWithUUID(fakeUuid);
     DBDirectClient dbclient(operationContext());
     dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
 
     // Insert range deletion task for this collection and range.
-    setFilteringMetadataWithUUID(fakeUuid);
-    PersistentTaskStore<RangeDeletionTask> store(operationContext(),
-                                                 NamespaceString::kRangeDeletionNamespace);
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
 
     RangeDeletionTask t(
         UUID::gen(), kNss, fakeUuid, ShardId("donor"), range, CleanWhenEnum::kDelayed);
@@ -657,6 +799,7 @@ TEST_F(RangeDeleterTest,
                                fakeUuid,
                                kShardKeyPattern,
                                range,
+                               t.getId(),
                                10 /*numDocsToRemovePerBatch*/,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -674,13 +817,12 @@ TEST_F(RangeDeleterTest,
     const ChunkRange range(BSON(kShardKey << 0), BSON(kShardKey << 10));
     auto queriesComplete = SemiFuture<void>::makeReady();
 
+    setFilteringMetadataWithUUID(uuid());
     DBDirectClient dbclient(operationContext());
     dbclient.insert(kNss.toString(), BSON(kShardKey << 5));
 
     // Insert range deletion task for this collection and range.
-    setFilteringMetadataWithUUID(uuid());
-    PersistentTaskStore<RangeDeletionTask> store(operationContext(),
-                                                 NamespaceString::kRangeDeletionNamespace);
+    PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
 
     RangeDeletionTask t(
         UUID::gen(), kNss, uuid(), ShardId("donor"), range, CleanWhenEnum::kDelayed);
@@ -701,6 +843,7 @@ TEST_F(RangeDeleterTest,
                                uuid(),
                                kShardKeyPattern,
                                range,
+                               t.getId(),
                                10 /*numDocsToRemovePerBatch*/,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -728,6 +871,7 @@ DEATH_TEST_F(RangeDeleterTest, RemoveDocumentsInRangeCrashesIfInputFutureHasErro
                                uuid(),
                                kShardKeyPattern,
                                ChunkRange(BSON(kShardKey << 0), BSON(kShardKey << 10)),
+                               boost::none,
                                10 /* numDocsToRemovePerBatch */,
                                Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete */,
                                Milliseconds(0) /* delayBetweenBatches */);
@@ -735,6 +879,35 @@ DEATH_TEST_F(RangeDeleterTest, RemoveDocumentsInRangeCrashesIfInputFutureHasErro
 
     // Should cause an invariant failure.
     queriesCompletePf.promise.setError(Status(ErrorCodes::InternalError, "Some unexpected error"));
+    cleanupComplete.get();
+}
+
+TEST_F(RangeDeleterTest, RemoveDocumentsInRangeDoesNotCrashWhenShardKeyIndexDoesNotExist) {
+    auto queriesComplete = SemiFuture<void>::makeReady();
+    const std::string kNoShardKeyIndexMsg("Unable to find shard key index for");
+    auto logCountBefore = countTextFormatLogLinesContaining(kNoShardKeyIndexMsg);
+
+    auto cleanupComplete =
+        removeDocumentsInRange(executor(),
+                               std::move(queriesComplete),
+                               kNss,
+                               uuid(),
+                               BSON("x" << 1) /* shard key pattern */,
+                               ChunkRange(BSON("x" << 0), BSON("x" << 10)),
+                               boost::none,
+                               10 /* numDocsToRemovePerBatch*/,
+                               Seconds(0) /* delayForActiveQueriesOnSecondariesToComplete*/,
+                               Milliseconds(0) /* delayBetweenBatches */);
+
+    // Range deleter will keep on retrying when it encounters non-stepdown errors. Make it run
+    // a few iterations and then create the index to make it exit the retry loop.
+    while (countTextFormatLogLinesContaining(kNoShardKeyIndexMsg) < logCountBefore) {
+        sleepmicros(100);
+    }
+
+    DBDirectClient client(operationContext());
+    client.createIndex(kNss.ns(), BSON("x" << 1));
+
     cleanupComplete.get();
 }
 

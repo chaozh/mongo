@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/redaction.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -155,7 +155,7 @@ const int MutableOplogEntry::kOplogVersion = 2;
 
 // Static
 ReplOperation MutableOplogEntry::makeInsertOperation(const NamespaceString& nss,
-                                                     boost::optional<UUID> uuid,
+                                                     UUID uuid,
                                                      const BSONObj& docToInsert) {
     ReplOperation op;
     op.setOpType(OpTypeEnum::kInsert);
@@ -191,7 +191,7 @@ BSONObj MutableOplogEntry::makeCreateCollCmdObj(const NamespaceString& collectio
 }
 
 ReplOperation MutableOplogEntry::makeUpdateOperation(const NamespaceString nss,
-                                                     boost::optional<UUID> uuid,
+                                                     UUID uuid,
                                                      const BSONObj& update,
                                                      const BSONObj& criteria) {
     ReplOperation op;
@@ -233,7 +233,7 @@ ReplOperation MutableOplogEntry::makeCreateIndexesCommand(const NamespaceString 
 }
 
 ReplOperation MutableOplogEntry::makeDeleteOperation(const NamespaceString& nss,
-                                                     boost::optional<UUID> uuid,
+                                                     UUID uuid,
                                                      const BSONObj& docToDelete) {
     ReplOperation op;
     op.setOpType(OpTypeEnum::kDelete);
@@ -353,16 +353,44 @@ bool OplogEntry::shouldPrepare() const {
         getObject()[ApplyOpsCommandInfoBase::kPrepareFieldName].booleanSafe();
 }
 
-bool OplogEntry::isTransactionWithCommand() const {
+bool OplogEntry::isSingleOplogEntryTransaction() const {
+    if (getCommandType() != CommandType::kApplyOps || !getTxnNumber() || !getSessionId() ||
+        getObject()[ApplyOpsCommandInfoBase::kPartialTxnFieldName].booleanSafe()) {
+        return false;
+    }
+    auto prevOptimeOpt = getPrevWriteOpTimeInTransaction();
+    if (!prevOptimeOpt) {
+        // If there is no prevWriteOptime, then this oplog entry is not a part of a transaction.
+        return false;
+    }
+    return prevOptimeOpt->isNull();
+}
+
+bool OplogEntry::isEndOfLargeTransaction() const {
+    if (getCommandType() != CommandType::kApplyOps) {
+        // If the oplog entry is neither commit nor abort, then it must be an applyOps. Otherwise,
+        // it cannot be a termainal oplog entry of a large transaction.
+        return false;
+    }
+    auto prevOptimeOpt = getPrevWriteOpTimeInTransaction();
+    if (!prevOptimeOpt) {
+        // If the oplog entry is neither commit nor abort, then it must be an applyOps. Otherwise,
+        // it cannot be a terminal oplog entry of a large transaction.
+        return false;
+    }
+    // There should be a previous oplog entry in a multiple oplog entry transaction if this is
+    // supposed to be the last one. The first oplog entry in a large transaction will have a null
+    // ts.
+    return !prevOptimeOpt->isNull() && !isPartialTransaction();
+}
+
+bool OplogEntry::isSingleOplogEntryTransactionWithCommand() const {
+    if (!isSingleOplogEntryTransaction()) {
+        return false;
+    }
+    // Since we know that this oplog entry at this point is part of a transaction, we can safely
+    // assume that it has an applyOps field.
     auto applyOps = getObject().getField("applyOps");
-    if (applyOps.eoo()) {
-        return false;
-    }
-    if (!getTxnNumber() || !getSessionId()) {
-        // Only transactions can produce applyOps oplog entries with transaction numbers and
-        // session IDs.
-        return false;
-    }
     // Iterating through the entire applyOps array is not optimal for performance. A potential
     // optimization, if necessary, could be to ensure the primary always constructs applyOps oplog
     // entries with commands at the beginning.

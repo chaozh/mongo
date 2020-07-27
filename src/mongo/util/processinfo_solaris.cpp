@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include <boost/filesystem.hpp>
 #include <boost/none.hpp>
@@ -45,8 +45,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include "mongo/logv2/log.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
@@ -139,7 +139,9 @@ void ProcessInfo::getExtraInfo(BSONObjBuilder& info) {
 void ProcessInfo::SystemInfo::collectSystemInfo() {
     struct utsname unameData;
     if (uname(&unameData) == -1) {
-        log() << "Unable to collect detailed system information: " << strerror(errno);
+        LOGV2(23356,
+              "Unable to collect detailed system information: {strerror_errno}",
+              "strerror_errno"_attr = strerror(errno));
     }
 
     char buf_64[32];
@@ -148,7 +150,9 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
         sysinfo(SI_ARCHITECTURE_NATIVE, buf_native, sizeof(buf_native)) != -1) {
         addrSize = str::equals(buf_64, buf_native) ? 64 : 32;
     } else {
-        log() << "Unable to determine system architecture: " << strerror(errno);
+        LOGV2(23357,
+              "Unable to determine system architecture: {strerror_errno}",
+              "strerror_errno"_attr = strerror(errno));
     }
 
     osType = unameData.sysname;
@@ -177,12 +181,16 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
             Status minorStatus = NumberParser{}(versionComponents[1], &minorInt);
 
             if (!majorStatus.isOK() || !minorStatus.isOK()) {
-                warning() << "Could not parse OS version numbers from uname: " << osVersion;
+                LOGV2_WARNING(23360,
+                              "Could not parse OS version numbers from uname: {osVersion}",
+                              "osVersion"_attr = osVersion);
             } else if ((majorInt == 11 && minorInt >= 2) || majorInt > 11) {
                 preferMsyncOverFSync = true;
             }
         } else {
-            warning() << "Could not parse OS version string from uname: " << osVersion;
+            LOGV2_WARNING(23361,
+                          "Could not parse OS version string from uname: {osVersion}",
+                          "osVersion"_attr = osVersion);
         }
     }
 
@@ -198,7 +206,9 @@ bool ProcessInfo::checkNumaEnabled() {
     lgrp_cookie_t cookie = lgrp_init(LGRP_VIEW_OS);
 
     if (cookie == LGRP_COOKIE_NONE) {
-        warning() << "lgrp_init failed: " << errnoWithDescription();
+        LOGV2_WARNING(23362,
+                      "lgrp_init failed: {errnoWithDescription}",
+                      "errnoWithDescription"_attr = errnoWithDescription());
         return false;
     }
 
@@ -207,7 +217,9 @@ bool ProcessInfo::checkNumaEnabled() {
     int groups = lgrp_nlgrps(cookie);
 
     if (groups == -1) {
-        warning() << "lgrp_nlgrps failed: " << errnoWithDescription();
+        LOGV2_WARNING(23363,
+                      "lgrp_nlgrps failed: {errnoWithDescription}",
+                      "errnoWithDescription"_attr = errnoWithDescription());
         return false;
     }
 
@@ -223,7 +235,9 @@ bool ProcessInfo::blockInMemory(const void* start) {
     char x = 0;
     if (mincore(
             static_cast<char*>(const_cast<void*>(alignToStartOfPage(start))), getPageSize(), &x)) {
-        log() << "mincore failed: " << errnoWithDescription();
+        LOGV2(23358,
+              "mincore failed: {errnoWithDescription}",
+              "errnoWithDescription"_attr = errnoWithDescription());
         return 1;
     }
     return x & 0x1;
@@ -234,7 +248,9 @@ bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<
     if (mincore(static_cast<char*>(const_cast<void*>(alignToStartOfPage(start))),
                 numPages * getPageSize(),
                 &out->front())) {
-        log() << "mincore failed: " << errnoWithDescription();
+        LOGV2(23359,
+              "mincore failed: {errnoWithDescription}",
+              "errnoWithDescription"_attr = errnoWithDescription());
         return false;
     }
     for (size_t i = 0; i < numPages; ++i) {

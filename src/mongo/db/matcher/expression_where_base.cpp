@@ -36,7 +36,7 @@
 namespace mongo {
 
 WhereMatchExpressionBase::WhereMatchExpressionBase(WhereParams params)
-    : MatchExpression(WHERE), _code(std::move(params.code)), _scope(std::move(params.scope)) {}
+    : MatchExpression(WHERE), _code(std::move(params.code)) {}
 
 void WhereMatchExpressionBase::debugString(StringBuilder& debug, int indentationLevel) const {
     _debugAddSpace(debug, indentationLevel);
@@ -44,13 +44,10 @@ void WhereMatchExpressionBase::debugString(StringBuilder& debug, int indentation
 
     _debugAddSpace(debug, indentationLevel + 1);
     debug << "code: " << getCode() << "\n";
-
-    _debugAddSpace(debug, indentationLevel + 1);
-    debug << "scope: " << getScope() << "\n";
 }
 
 void WhereMatchExpressionBase::serialize(BSONObjBuilder* out, bool includePath) const {
-    out->appendCodeWScope("$where", getCode(), getScope());
+    out->appendCode("$where", getCode());
 }
 
 bool WhereMatchExpressionBase::equivalent(const MatchExpression* other) const {
@@ -58,8 +55,7 @@ bool WhereMatchExpressionBase::equivalent(const MatchExpression* other) const {
         return false;
     }
     const WhereMatchExpressionBase* realOther = static_cast<const WhereMatchExpressionBase*>(other);
-    return getCode() == realOther->getCode() &&
-        SimpleBSONObjComparator::kInstance.evaluate(getScope() == realOther->getScope());
+    return getCode() == realOther->getCode();
 }
 
 }  // namespace mongo

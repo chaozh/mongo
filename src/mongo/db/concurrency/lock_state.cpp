@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -35,17 +35,19 @@
 
 #include <vector>
 
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/concurrency/flow_control_ticketholder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/flow_control.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/new.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -191,19 +193,33 @@ bool LockerImpl::isRSTLLocked() const {
 }
 
 void LockerImpl::dump() const {
-    StringBuilder ss;
-    ss << "Locker id " << _id << " status: ";
+    struct Entry {
+        ResourceId key;
+        LockRequest::Status status;
+        LockMode mode;
 
-    _lock.lock();
-    LockRequestsMap::ConstIterator it = _requests.begin();
-    while (!it.finished()) {
-        ss << it.key().toString() << " " << lockRequestStatusName(it->status) << " in "
-           << modeName(it->mode) << "; ";
-        it.next();
+        BSONObj toBSON() const {
+            BSONObjBuilder b;
+            b.append("key", key.toString());
+            b.append("status", lockRequestStatusName(status));
+            b.append("mode", modeName(mode));
+            return b.obj();
+        }
+        std::string toString() const {
+            return tojson(toBSON());
+        }
+    };
+    std::vector<Entry> entries;
+    {
+        auto lg = stdx::lock_guard(_lock);
+        for (auto it = _requests.begin(); !it.finished(); it.next())
+            entries.push_back({it.key(), it->status, it->mode});
     }
-    _lock.unlock();
-
-    log() << ss.str();
+    LOGV2(20523,
+          "Locker id {id} status: {requests}",
+          "Locker status",
+          "id"_attr = _id,
+          "requests"_attr = entries);
 }
 
 
@@ -337,6 +353,12 @@ bool LockerImpl::_acquireTicket(OperationContext* opCtx, LockMode mode, Date_t d
         // If the ticket wait is interrupted, restore the state of the client.
         auto restoreStateOnErrorGuard = makeGuard([&] { _clientState.store(kInactive); });
 
+        // Acquiring a ticket is a potentially blocking operation. This must not be called after a
+        // transaction timestamp has been set, indicating this transaction has created an oplog
+        // hole.
+        if (opCtx)
+            invariant(!opCtx->recoveryUnit()->isTimestamped());
+
         OperationContext* interruptible = _uninterruptibleLocksRequested ? nullptr : opCtx;
         if (deadline == Date_t::max()) {
             holder->waitForTicket(interruptible);
@@ -368,21 +390,13 @@ void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadl
         _modeForTicket = mode;
     }
 
-    LockMode actualLockMode = mode;
-    if (opCtx) {
-        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-        if (storageEngine && !storageEngine->supportsDBLocking()) {
-            actualLockMode = isSharedLockMode(mode) ? MODE_S : MODE_X;
-        }
-    }
-
-    const LockResult result = _lockBegin(opCtx, resourceIdGlobal, actualLockMode);
+    const LockResult result = _lockBegin(opCtx, resourceIdGlobal, mode);
     // Fast, uncontended path
     if (result == LOCK_OK)
         return;
 
     invariant(result == LOCK_WAITING);
-    _lockComplete(opCtx, resourceIdGlobal, actualLockMode, deadline);
+    _lockComplete(opCtx, resourceIdGlobal, mode, deadline);
 }
 
 bool LockerImpl::unlockGlobal() {
@@ -659,17 +673,7 @@ void LockerImpl::setGlobalLockTakenInMode(LockMode mode) {
 ResourceId LockerImpl::getWaitingResource() const {
     scoped_spinlock scopedLock(_lock);
 
-    LockRequestsMap::ConstIterator it = _requests.begin();
-    while (!it.finished()) {
-        if (it->status == LockRequest::STATUS_WAITING ||
-            it->status == LockRequest::STATUS_CONVERTING) {
-            return it.key();
-        }
-
-        it.next();
-    }
-
-    return ResourceId();
+    return _waitingResource;
 }
 
 void LockerImpl::getLockerInfo(LockerInfo* lockerInfo,
@@ -866,6 +870,7 @@ LockResult LockerImpl::_lockBegin(OperationContext* opCtx, ResourceId resId, Loc
     if (result == LOCK_WAITING) {
         globalStats.recordWait(_id, resId, mode);
         _stats.recordWait(resId, mode);
+        _setWaitingResource(resId);
     } else if (result == LOCK_OK && opCtx && _uninterruptibleLocksRequested == 0) {
         // Lock acquisitions are not allowed to succeed when opCtx is marked as interrupted, unless
         // the caller requested an uninterruptible lock.
@@ -891,6 +896,7 @@ void LockerImpl::_lockComplete(OperationContext* opCtx,
         LockRequestsMap::Iterator it = _requests.find(resId);
         invariant(it);
         _unlockImpl(&it);
+        _setWaitingResource(ResourceId());
     });
 
     // This failpoint is used to time out non-intent locks if they cannot be granted immediately
@@ -974,6 +980,7 @@ void LockerImpl::_lockComplete(OperationContext* opCtx,
 
     invariant(result == LOCK_OK);
     unlockOnErrorGuard.dismiss();
+    _setWaitingResource(ResourceId());
 }
 
 void LockerImpl::getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) {
@@ -986,6 +993,10 @@ void LockerImpl::getFlowControlTicket(OperationContext* opCtx, LockMode lockMode
         // tracking whether other resources need to be released.
         _clientState.store(kQueuedWriter);
         auto restoreState = makeGuard([&] { _clientState.store(kInactive); });
+        // Acquiring a ticket is a potentially blocking operation. This must not be called after a
+        // transaction timestamp has been set, indicating this transaction has created an oplog
+        // hole.
+        invariant(!opCtx->recoveryUnit()->isTimestamped());
         ticketholder->getTicket(opCtx, &_flowControlStats);
     }
 }
@@ -1045,6 +1056,12 @@ bool LockerImpl::isGlobalLockedRecursively() {
     return !globalLockRequest.finished() && globalLockRequest->recursiveCount > 1;
 }
 
+void LockerImpl::_setWaitingResource(ResourceId resId) {
+    scoped_spinlock scopedLock(_lock);
+
+    _waitingResource = resId;
+}
+
 //
 // Auto classes
 //
@@ -1062,7 +1079,7 @@ public:
     }
 
     void taskDoWork() {
-        LOG(2) << "cleaning up unused lock buckets of the global lock manager";
+        LOGV2_DEBUG(20524, 2, "cleaning up unused lock buckets of the global lock manager");
         getGlobalLockManager()->cleanupUnusedLocks();
     }
 } unusedLockCleaner;

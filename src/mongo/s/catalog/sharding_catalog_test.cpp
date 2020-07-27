@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,6 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -57,7 +56,6 @@
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/future.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -72,7 +70,12 @@ using rpc::ReplSetMetadata;
 using std::vector;
 using unittest::assertGet;
 
-using ShardingCatalogClientTest = ShardingTestFixture;
+class ShardingCatalogClientTest : public ShardingTestFixture {
+protected:
+    DistLockManagerMock* distLock() const {
+        return dynamic_cast<DistLockManagerMock*>(ShardingTestFixture::distLock());
+    }
+};
 
 const int kMaxCommandRetry = 3;
 const NamespaceString kNamespace("TestDB", "TestColl");
@@ -122,9 +125,10 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
                                      {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
                                      newOpTime,
                                      100,
+                                     0,
                                      OID(),
-                                     30,
-                                     -1);
+                                     -1,
+                                     true);
             BSONObjBuilder builder;
             metadata.writeToMetadata(&builder).transitional_ignore();
 
@@ -195,9 +199,10 @@ TEST_F(ShardingCatalogClientTest, GetDatabaseExisting) {
                                  {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
                                  newOpTime,
                                  100,
+                                 0,
                                  OID(),
-                                 30,
-                                 -1);
+                                 -1,
+                                 true);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder).transitional_ignore();
 
@@ -422,9 +427,10 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
                                      {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
                                      newOpTime,
                                      100,
+                                     0,
                                      OID(),
-                                     30,
-                                     -1);
+                                     -1,
+                                     true);
             BSONObjBuilder builder;
             metadata.writeToMetadata(&builder).transitional_ignore();
 
@@ -578,16 +584,14 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandSuccess) {
 
     auto future = launchAsync([this] {
         BSONObjBuilder responseBuilder;
-        bool ok = catalogClient()->runUserManagementWriteCommand(operationContext(),
-                                                                 "dropUser",
-                                                                 "test",
-                                                                 BSON("dropUser"
-                                                                      << "test"),
-                                                                 &responseBuilder);
-        ASSERT_FALSE(ok);
-
-        Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
-        ASSERT_EQUALS(ErrorCodes::UserNotFound, commandStatus);
+        auto status = catalogClient()->runUserManagementWriteCommand(operationContext(),
+                                                                     "dropUser",
+                                                                     "test",
+                                                                     BSON("dropUser"
+                                                                          << "test"),
+                                                                     &responseBuilder);
+        ASSERT_NOT_OK(status);
+        ASSERT_EQUALS(ErrorCodes::UserNotFound, status);
     });
 
     onCommand([](const RemoteCommandRequest& request) {
@@ -619,7 +623,7 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandInvalidWriteConce
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     BSONObjBuilder responseBuilder;
-    bool ok =
+    auto status =
         catalogClient()->runUserManagementWriteCommand(operationContext(),
                                                        "dropUser",
                                                        "test",
@@ -627,11 +631,9 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandInvalidWriteConce
                                                             << "test"
                                                             << "writeConcern" << BSON("w" << 2)),
                                                        &responseBuilder);
-    ASSERT_FALSE(ok);
-
-    Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
-    ASSERT_EQUALS(ErrorCodes::InvalidOptions, commandStatus);
-    ASSERT_STRING_CONTAINS(commandStatus.reason(), "Invalid replication write concern");
+    ASSERT_NOT_OK(status);
+    ASSERT_EQUALS(ErrorCodes::InvalidOptions, status);
+    ASSERT_STRING_CONTAINS(status.reason(), "Invalid replication write concern");
 }
 
 TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandRewriteWriteConcern) {
@@ -648,7 +650,7 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandRewriteWriteConce
     auto future =
         launchAsync([this] {
             BSONObjBuilder responseBuilder;
-            bool ok =
+            auto status =
                 catalogClient()->runUserManagementWriteCommand(
                     operationContext(),
                     "dropUser",
@@ -657,10 +659,8 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandRewriteWriteConce
                          << "test"
                          << "writeConcern" << BSON("w" << 1 << "wtimeout" << 30)),
                     &responseBuilder);
-            ASSERT_FALSE(ok);
-
-            Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
-            ASSERT_EQUALS(ErrorCodes::UserNotFound, commandStatus);
+            ASSERT_NOT_OK(status);
+            ASSERT_EQUALS(ErrorCodes::UserNotFound, status);
         });
 
     onCommand([](const RemoteCommandRequest& request) {
@@ -692,16 +692,14 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotMaster) {
 
     auto future = launchAsync([this] {
         BSONObjBuilder responseBuilder;
-        bool ok = catalogClient()->runUserManagementWriteCommand(operationContext(),
-                                                                 "dropUser",
-                                                                 "test",
-                                                                 BSON("dropUser"
-                                                                      << "test"),
-                                                                 &responseBuilder);
-        ASSERT_FALSE(ok);
-
-        Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
-        ASSERT_EQUALS(ErrorCodes::NotMaster, commandStatus);
+        auto status = catalogClient()->runUserManagementWriteCommand(operationContext(),
+                                                                     "dropUser",
+                                                                     "test",
+                                                                     BSON("dropUser"
+                                                                          << "test"),
+                                                                     &responseBuilder);
+        ASSERT_NOT_OK(status);
+        ASSERT_EQUALS(ErrorCodes::NotMaster, status);
     });
 
     for (int i = 0; i < 3; ++i) {
@@ -725,16 +723,13 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotMasterRetrySuc
 
     auto future = launchAsync([this] {
         BSONObjBuilder responseBuilder;
-        bool ok = catalogClient()->runUserManagementWriteCommand(operationContext(),
-                                                                 "dropUser",
-                                                                 "test",
-                                                                 BSON("dropUser"
-                                                                      << "test"),
-                                                                 &responseBuilder);
-        ASSERT_TRUE(ok);
-
-        Status commandStatus = getStatusFromCommandResult(responseBuilder.obj());
-        ASSERT_OK(commandStatus);
+        auto status = catalogClient()->runUserManagementWriteCommand(operationContext(),
+                                                                     "dropUser",
+                                                                     "test",
+                                                                     BSON("dropUser"
+                                                                          << "test"),
+                                                                     &responseBuilder);
+        ASSERT_OK(status);
     });
 
     onCommand([&](const RemoteCommandRequest& request) {
@@ -823,9 +818,10 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
                                  {newOpTime, Date_t() + Seconds(newOpTime.getSecs())},
                                  newOpTime,
                                  100,
+                                 0,
                                  OID(),
-                                 30,
-                                 -1);
+                                 -1,
+                                 true);
         BSONObjBuilder builder;
         metadata.writeToMetadata(&builder).transitional_ignore();
 

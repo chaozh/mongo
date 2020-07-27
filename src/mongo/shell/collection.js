@@ -60,6 +60,11 @@ DBCollection.prototype.help = function() {
     print("\tdb." + shortName + ".drop() drop the collection");
     print("\tdb." + shortName + ".dropIndex(index) - e.g. db." + shortName +
           ".dropIndex( \"indexName\" ) or db." + shortName + ".dropIndex( { \"indexKey\" : 1 } )");
+    print("\tdb." + shortName + ".hideIndex(index) - e.g. db." + shortName +
+          ".hideIndex( \"indexName\" ) or db." + shortName + ".hideIndex( { \"indexKey\" : 1 } )");
+    print("\tdb." + shortName + ".unhideIndex(index) - e.g. db." + shortName +
+          ".unhideIndex( \"indexName\" ) or db." + shortName +
+          ".unhideIndex( { \"indexKey\" : 1 } )");
     print("\tdb." + shortName + ".dropIndexes()");
     print("\tdb." + shortName +
           ".ensureIndex(keypattern[,options]) - DEPRECATED, use createIndex() instead");
@@ -269,6 +274,8 @@ DBCollection.prototype.insert = function(obj, options) {
     if (!obj)
         throw Error("no object passed to insert!");
 
+    options = typeof (options) === 'undefined' ? {} : options;
+
     var flags = 0;
 
     var wc = undefined;
@@ -294,7 +301,7 @@ DBCollection.prototype.insert = function(obj, options) {
     var ordered = ((flags & 1) == 0);
 
     if (!wc)
-        wc = this.getWriteConcern();
+        wc = this._createWriteConcern(options);
 
     var result = undefined;
     var startTime =
@@ -874,6 +881,35 @@ DBCollection.prototype.dropIndex = function(index) {
     return res;
 };
 
+/**
+ * Hide an index from the query planner.
+ */
+DBCollection.prototype._hiddenIndex = function(index, hidden) {
+    assert(index, "please specify index to hide");
+
+    // Need an extra check for array because 'Array' is an 'object', but not every 'object' is an
+    // 'Array'.
+    var indexField = {};
+    if (typeof index == "string") {
+        indexField = {name: index, hidden: hidden};
+    } else if (typeof index == "object") {
+        indexField = {keyPattern: index, hidden: hidden};
+    } else {
+        throw new Error("Index must be either the index name or the index specification document");
+    }
+    var cmd = {"collMod": this._shortName, index: indexField};
+    var res = this._db.runCommand(cmd);
+    return res;
+};
+
+DBCollection.prototype.hideIndex = function(index) {
+    return this._hiddenIndex(index, true);
+};
+
+DBCollection.prototype.unhideIndex = function(index) {
+    return this._hiddenIndex(index, false);
+};
+
 DBCollection.prototype.getCollection = function(subName) {
     return this._db.getCollection(this._shortName + "." + subName);
 };
@@ -1072,85 +1108,94 @@ DBCollection.autocomplete = function(obj) {
     return ret;
 };
 
-// Sharding additions
+/**
+ * Return true if the collection has been sharded.
+ *
+ * @method
+ * @return {boolean}
+ */
+DBCollection.prototype._isSharded = function() {
+    return !!this._db.getSiblingDB("config").collections.countDocuments(
+        {_id: this._fullName, dropped: false});
+};
 
-/*
-Usage :
-
-mongo <mongos>
-> load('path-to-file/shardingAdditions.js')
-Loading custom sharding extensions...
-true
-
-> var collection = db.getMongo().getCollection("foo.bar")
-> collection.getShardDistribution() // prints statistics related to the collection's data
-distribution
-
-> collection.getSplitKeysForChunks() // generates split points for all chunks in the collection,
-based on the
-                                     // default maxChunkSize or alternately a specified chunk size
-> collection.getSplitKeysForChunks( 10 ) // Mb
-
-> var splitter = collection.getSplitKeysForChunks() // by default, the chunks are not split, the
-keys are just
-                                                    // found.  A splitter function is returned which
-will actually
-                                                    // do the splits.
-
-> splitter() // ! Actually executes the splits on the cluster !
-
-*/
-
+/**
+ * Prints statistics related to the collection's data distribution
+ */
 DBCollection.prototype.getShardDistribution = function() {
-    var stats = this.stats();
+    var config = this.getDB().getSiblingDB("config");
 
-    if (!stats.sharded) {
+    if (!this._isSharded()) {
         print("Collection " + this + " is not sharded.");
         return;
     }
 
-    var config = this.getDB().getSiblingDB("config");
+    var collStats = this.aggregate({"$collStats": {storageStats: {}}});
 
-    var numChunks = 0;
+    var totals = {numChunks: 0, size: 0, count: 0};
+    var conciseShardsStats = [];
 
-    for (var shard in stats.shards) {
-        var shardDoc = config.shards.findOne({_id: shard});
+    collStats.forEach(function(extShardStats) {
+        // Extract and store only the relevant subset of the stats for this shard
+        const shardStats = {
+            shardId: extShardStats.shard,
+            host: config.shards.findOne({_id: extShardStats.shard}).host,
+            size: extShardStats.storageStats.size,
+            count: extShardStats.storageStats.count,
+            numChunks:
+                config.chunks.countDocuments({ns: extShardStats.ns, shard: extShardStats.shard}),
+            avgObjSize: extShardStats.storageStats.avgObjSize
+        };
 
-        print("\nShard " + shard + " at " + shardDoc.host);
+        print("\nShard " + shardStats.shardId + " at " + shardStats.host);
 
-        var shardStats = stats.shards[shard];
-
-        var chunks = config.chunks.find({ns: stats.ns, shard: shard}).toArray();
-
-        numChunks += chunks.length;
-
-        var estChunkData = (chunks.length == 0) ? 0 : shardStats.size / chunks.length;
-        var estChunkCount = (chunks.length == 0) ? 0 : Math.floor(shardStats.count / chunks.length);
-
+        var estChunkData =
+            (shardStats.numChunks == 0) ? 0 : (shardStats.size / shardStats.numChunks);
+        var estChunkCount =
+            (shardStats.numChunks == 0) ? 0 : Math.floor(shardStats.count / shardStats.numChunks);
         print(" data : " + sh._dataFormat(shardStats.size) + " docs : " + shardStats.count +
-              " chunks : " + chunks.length);
+              " chunks : " + shardStats.numChunks);
         print(" estimated data per chunk : " + sh._dataFormat(estChunkData));
         print(" estimated docs per chunk : " + estChunkCount);
-    }
+
+        totals.size += shardStats.size;
+        totals.count += shardStats.count;
+        totals.numChunks += shardStats.numChunks;
+
+        conciseShardsStats.push(shardStats);
+    });
 
     print("\nTotals");
-    print(" data : " + sh._dataFormat(stats.size) + " docs : " + stats.count +
-          " chunks : " + numChunks);
-    for (var shard in stats.shards) {
-        var shardStats = stats.shards[shard];
-
+    print(" data : " + sh._dataFormat(totals.size) + " docs : " + totals.count +
+          " chunks : " + totals.numChunks);
+    for (const shardStats of conciseShardsStats) {
         var estDataPercent =
-            (stats.size == 0) ? 0 : (Math.floor(shardStats.size / stats.size * 10000) / 100);
+            (totals.size == 0) ? 0 : (Math.floor(shardStats.size / totals.size * 10000) / 100);
         var estDocPercent =
-            (stats.count == 0) ? 0 : (Math.floor(shardStats.count / stats.count * 10000) / 100);
+            (totals.count == 0) ? 0 : (Math.floor(shardStats.count / totals.count * 10000) / 100);
 
-        print(" Shard " + shard + " contains " + estDataPercent + "% data, " + estDocPercent +
-              "% docs in cluster, " +
-              "avg obj size on shard : " + sh._dataFormat(stats.shards[shard].avgObjSize));
+        print(" Shard " + shardStats.shardId + " contains " + estDataPercent + "% data, " +
+              estDocPercent + "% docs in cluster, " +
+              "avg obj size on shard : " + sh._dataFormat(shardStats.avgObjSize));
     }
 
     print("\n");
 };
+
+/*
+
+Generates split points for all chunks in the collection, based on the default maxChunkSize
+> collection.getSplitKeysForChunks()
+
+or alternately a specified chunk size in Mb.
+> collection.getSplitKeysForChunks( 10 )
+
+By default, the chunks are not split, the keys are just found. A splitter function is returned which
+will actually do the splits.
+> var splitter = collection.getSplitKeysForChunks()
+> splitter()
+
+*/
 
 DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
     var stats = this.stats();

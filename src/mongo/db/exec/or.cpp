@@ -44,8 +44,11 @@ using std::vector;
 // static
 const char* OrStage::kStageType = "OR";
 
-OrStage::OrStage(OperationContext* opCtx, WorkingSet* ws, bool dedup, const MatchExpression* filter)
-    : PlanStage(kStageType, opCtx), _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup) {}
+OrStage::OrStage(ExpressionContext* expCtx,
+                 WorkingSet* ws,
+                 bool dedup,
+                 const MatchExpression* filter)
+    : PlanStage(kStageType, expCtx), _ws(ws), _filter(filter), _currentChild(0), _dedup(dedup) {}
 
 void OrStage::addChild(std::unique_ptr<PlanStage> child) {
     _children.emplace_back(std::move(child));
@@ -107,12 +110,6 @@ PlanStage::StageState OrStage::doWork(WorkingSetID* out) {
         } else {
             return PlanStage::NEED_TIME;
         }
-    } else if (PlanStage::FAILURE == childStatus) {
-        // The stage which produces a failure is responsible for allocating a working set member
-        // with error details.
-        invariant(WorkingSet::INVALID_ID != id);
-        *out = id;
-        return childStatus;
     } else if (PlanStage::NEED_YIELD == childStatus) {
         *out = id;
     }

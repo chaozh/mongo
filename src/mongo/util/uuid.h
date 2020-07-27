@@ -39,6 +39,7 @@
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/logv2/log_attr.h"
 
 namespace mongo {
 
@@ -46,6 +47,7 @@ namespace repl {
 class CollectionInfo;
 class OplogEntryBase;
 class DurableReplOperation;
+class InitialSyncIdDocument;
 }  // namespace repl
 
 namespace idl {
@@ -63,7 +65,6 @@ class UUID {
 
     // Make the IDL generated parser a friend
     friend class ConfigsvrShardCollectionResponse;
-    friend class ConfigsvrCommitShardCollection;
     friend class ShardsvrShardCollectionResponse;
     friend class ShardsvrRenameCollection;
     friend class DatabaseVersion;
@@ -83,9 +84,16 @@ class UUID {
     friend class repl::CollectionInfo;
     friend class repl::OplogEntryBase;
     friend class repl::DurableReplOperation;
+    friend class repl::InitialSyncIdDocument;
+    friend class ResumeIndexInfo;
     friend class ResumeTokenInternal;
     friend class ShardCollectionTypeBase;
+    friend class TenantMigrationDonorDocument;
+    friend class TenantMigrationRecipientDocument;
     friend class VoteCommitIndexBuild;
+    friend class DonorStartMigration;
+    friend class DonorWaitForMigrationToCommit;
+    friend class DonorForgetMigration;
 
 public:
     /**
@@ -200,6 +208,10 @@ public:
             return hash;
         }
     };
+
+    friend auto logAttrs(const UUID& uuid) {
+        return "uuid"_attr = uuid;
+    }
 
 private:
     UUID(const UUIDStorage& uuid) : _uuid(uuid) {}

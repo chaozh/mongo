@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/config.h"
 #include "mongo/platform/basic.h"
@@ -212,6 +212,45 @@ TEST(AssertUtils, UassertTypedExtraInfoWorks) {
     }
 }
 
+TEST(AssertUtils, UassertIncrementsUserAssertionCounter) {
+    auto userAssertions = assertionCount.user.load();
+    auto asserted = false;
+    try {
+        Status status = {ErrorCodes::BadValue, "Test"};
+        uassertStatusOK(status);
+    } catch (const DBException&) {
+        asserted = true;
+    }
+    ASSERT(asserted);
+    ASSERT_EQ(userAssertions + 1, assertionCount.user.load());
+}
+
+TEST(AssertUtils, InternalAssertWithStatus) {
+    auto userAssertions = assertionCount.user.load();
+    try {
+        Status status = {ErrorCodes::BadValue, "Test"};
+        internalAssert(status);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), ErrorCodes::BadValue);
+        ASSERT_EQ(ex.reason(), "Test");
+    }
+    ASSERT_EQ(userAssertions, assertionCount.user.load());
+}
+
+TEST(AssertUtils, InternalAssertWithExpression) {
+    auto userAssertions = assertionCount.user.load();
+    try {
+        internalAssert(48922, "Test", false);
+    } catch (const DBException& ex) {
+        ASSERT_EQ(ex.code(), 48922);
+        ASSERT_EQ(ex.reason(), "Test");
+    }
+
+    internalAssert(48922, "Another test", true);
+
+    ASSERT_EQ(userAssertions, assertionCount.user.load());
+}
+
 TEST(AssertUtils, MassertTypedExtraInfoWorks) {
     try {
         msgasserted(ErrorExtraInfoExample(123), "");
@@ -229,32 +268,6 @@ TEST(AssertUtils, MassertTypedExtraInfoWorks) {
         ASSERT_EQ(ex.extraInfo<ErrorExtraInfoExample>()->data, 123);
         ASSERT_EQ(ex->data, 123);
     }
-}
-
-// uassert and its friends
-DEATH_TEST(UassertionTerminationTest, uassert, "Terminating with uassert") {
-    uassert(40204, "Terminating with uassert", false);
-}
-
-DEATH_TEST(UassertionTerminationTest, uasserted, "Terminating with uasserted") {
-    uasserted(40205, "Terminating with uasserted");
-}
-
-DEATH_TEST(UassertionTerminationTest, uassertStatusOK, "Terminating with uassertStatusOK") {
-    uassertStatusOK(Status(ErrorCodes::InternalError, "Terminating with uassertStatusOK"));
-}
-
-DEATH_TEST(UassertionTerminationTest, uassertStatusOKOverload, "Terminating with uassertStatusOK") {
-    uassertStatusOK(
-        StatusWith<std::string>(ErrorCodes::InternalError, "Terminating with uassertStatusOK"));
-}
-
-DEATH_TEST(UassertionTerminationTest,
-           uassertStatusOKWithContext,
-           "Terminating with uassertStatusOKWithContext") {
-    uassertStatusOKWithContext(
-        Status(ErrorCodes::InternalError, "Terminating with uassertStatusOKWithContext"),
-        "Terminating with uassertStatusOKWithContext");
 }
 
 // fassert and its friends
@@ -304,22 +317,8 @@ DEATH_TEST(FassertionTerminationTest,
         40213, {ErrorCodes::InternalError, "Terminating with fassertFailedWithStatusNoTrace"});
 }
 
-// massert and its friends
-DEATH_TEST(MassertionTerminationTest, massert, "Terminating with massert") {
-    massert(40214, "Terminating with massert", false);
-}
-
-
-DEATH_TEST(MassertionTerminationTest, massertStatusOK, "Terminating with massertStatusOK") {
-    massertStatusOK(Status(ErrorCodes::InternalError, "Terminating with massertStatusOK"));
-}
-
-DEATH_TEST(MassertionTerminationTest, msgasserted, "Terminating with msgasserted") {
-    msgasserted(40215, "Terminating with msgasserted");
-}
-
 // invariant and its friends
-DEATH_TEST(InvariantTerminationTest, invariant, "Invariant failure false " __FILE__) {
+DEATH_TEST_REGEX(InvariantTerminationTest, invariant, "Invariant failure.*false.*" __FILE__) {
     invariant(false);
 }
 
@@ -408,7 +407,7 @@ DEATH_TEST(InvariantTerminationTest,
 
 #if defined(MONGO_CONFIG_DEBUG_BUILD)
 // dassert and its friends
-DEATH_TEST(DassertTerminationTest, invariant, "Invariant failure false " __FILE__) {
+DEATH_TEST_REGEX(DassertTerminationTest, invariant, "Invariant failure.*false.*" __FILE__) {
     dassert(false);
 }
 

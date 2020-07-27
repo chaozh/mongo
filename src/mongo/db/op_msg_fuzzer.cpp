@@ -41,6 +41,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/service_entry_point_mongod.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/platform/basic.h"
 #include "mongo/transport/service_entry_point_impl.h"
 #include "mongo/transport/session.h"
@@ -77,8 +78,7 @@ extern "C" int LLVMFuzzerTestOneInput(const char* Data, size_t Size) {
         localExternalState = std::make_unique<mongo::AuthzManagerExternalStateMock>();
         externalState = localExternalState.get();
         localAuthzManager = std::make_unique<mongo::AuthorizationManagerImpl>(
-            std::move(localExternalState),
-            mongo::AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
+            serviceContext, std::move(localExternalState));
 
         authzManager = localAuthzManager.get();
         externalState->setAuthorizationManager(authzManager);
@@ -99,8 +99,8 @@ extern "C" int LLVMFuzzerTestOneInput(const char* Data, size_t Size) {
     mongo::ServiceContext::UniqueOperationContext opCtx =
         serviceContext->makeOperationContext(client.get());
     auto logicalClock = std::make_unique<mongo::LogicalClock>(serviceContext);
-    logicalClock->setClusterTimeFromTrustedSource(kInMemoryLogicalTime);
     mongo::LogicalClock::set(serviceContext, std::move(logicalClock));
+    VectorClockMutable::get(getServiceContext())->tickClusterTimeTo(kInMemoryLogicalTime);
 
     int new_size = Size + sizeof(int);
     auto sb = mongo::SharedBuffer::allocate(new_size);

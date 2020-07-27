@@ -90,9 +90,11 @@ class OpObserverMock : public OpObserverNoop {
 public:
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) override {
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) override {
         ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-        OpObserverNoop::onTransactionPrepare(opCtx, reservedSlots, statements);
+        OpObserverNoop::onTransactionPrepare(
+            opCtx, reservedSlots, statements, numberOfPreImagesToWrite);
 
         uassert(ErrorCodes::OperationFailed,
                 "onTransactionPrepare() failed",
@@ -105,10 +107,11 @@ public:
     bool transactionPrepared = false;
     std::function<void()> onTransactionPrepareFn = [this]() { transactionPrepared = true; };
 
-    void onUnpreparedTransactionCommit(
-        OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) override {
+    void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) override {
         ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-        OpObserverNoop::onUnpreparedTransactionCommit(opCtx, statements);
+        OpObserverNoop::onUnpreparedTransactionCommit(opCtx, statements, numberOfPreImagesToWrite);
 
         uassert(ErrorCodes::OperationFailed,
                 "onUnpreparedTransactionCommit() failed",
@@ -376,6 +379,42 @@ TEST_F(TransactionParticipantRetryableWritesTest, StartingOldTxnShouldAssert) {
     ASSERT(txnParticipant.getLastWriteOpTime().isNull());
 }
 
+TEST_F(TransactionParticipantRetryableWritesTest,
+       OlderRetryableWriteFailsOnSessionWithNewerRetryableWrite) {
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant.refreshFromStorageIfNeeded(opCtx());
+    const TxnNumber txnNum = 22;
+    const auto& sessionId = *opCtx()->getLogicalSessionId();
+
+    StringBuilder sb;
+    sb << "Retryable write with txnNumber 21 is prohibited on session " << sessionId
+       << " because a newer retryable write with txnNumber 22 has already started on this session.";
+    txnParticipant.beginOrContinue(opCtx(), txnNum, boost::none, boost::none);
+    ASSERT_THROWS_WHAT(
+        txnParticipant.beginOrContinue(opCtx(), txnNum - 1, boost::none, boost::none),
+        AssertionException,
+        sb.str());
+    ASSERT(txnParticipant.getLastWriteOpTime().isNull());
+}
+
+TEST_F(TransactionParticipantRetryableWritesTest,
+       OldTransactionFailsOnSessionWithNewerRetryableWrite) {
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant.refreshFromStorageIfNeeded(opCtx());
+    const TxnNumber txnNum = 22;
+    auto autocommit = false;
+    const auto& sessionId = *opCtx()->getLogicalSessionId();
+
+    StringBuilder sb;
+    sb << "Cannot start transaction 21 on session " << sessionId
+       << " because a newer retryable write with txnNumber 22 has already started on this session.";
+    txnParticipant.beginOrContinue(opCtx(), txnNum, boost::none, boost::none);
+    ASSERT_THROWS_WHAT(txnParticipant.beginOrContinue(opCtx(), txnNum - 1, autocommit, boost::none),
+                       AssertionException,
+                       sb.str());
+    ASSERT(txnParticipant.getLastWriteOpTime().isNull());
+}
+
 TEST_F(TransactionParticipantRetryableWritesTest, SessionTransactionsCollectionNotDefaultCreated) {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.refreshFromStorageIfNeeded(opCtx());
@@ -435,17 +474,18 @@ TEST_F(TransactionParticipantRetryableWritesTest, CheckStatementExecuted) {
     ASSERT(txnParticipant.checkStatementExecutedNoOplogEntryFetch(2000));
 }
 
-DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
-             CheckStatementExecutedForInvalidatedTransactionInvariants,
-             "Invariant failure p().isValid") {
+DEATH_TEST_REGEX_F(TransactionParticipantRetryableWritesTest,
+                   CheckStatementExecutedForInvalidatedTransactionInvariants,
+                   R"#(Invariant failure.*p\(\).isValid)#") {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.invalidate(opCtx());
     txnParticipant.checkStatementExecuted(opCtx(), 0);
 }
 
-DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
-             WriteOpCompletedOnPrimaryForOldTransactionInvariants,
-             "Invariant failure sessionTxnRecord.getTxnNum() == o().activeTxnNumber") {
+DEATH_TEST_REGEX_F(
+    TransactionParticipantRetryableWritesTest,
+    WriteOpCompletedOnPrimaryForOldTransactionInvariants,
+    R"#(Invariant failure.*sessionTxnRecord.getTxnNum\(\) == o\(\).activeTxnNumber)#") {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.refreshFromStorageIfNeeded(opCtx());
 
@@ -483,9 +523,10 @@ DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
     }
 }
 
-DEATH_TEST_F(TransactionParticipantRetryableWritesTest,
-             WriteOpCompletedOnPrimaryForInvalidatedTransactionInvariants,
-             "Invariant failure sessionTxnRecord.getTxnNum() == o().activeTxnNumber") {
+DEATH_TEST_REGEX_F(
+    TransactionParticipantRetryableWritesTest,
+    WriteOpCompletedOnPrimaryForInvalidatedTransactionInvariants,
+    R"#(Invariant failure.*sessionTxnRecord.getTxnNum\(\) == o\(\).activeTxnNumber)#") {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant.refreshFromStorageIfNeeded(opCtx());
 

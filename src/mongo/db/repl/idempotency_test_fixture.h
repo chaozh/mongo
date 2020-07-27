@@ -84,12 +84,21 @@ struct CollectionState {
 bool operator==(const CollectionState& lhs, const CollectionState& rhs);
 bool operator!=(const CollectionState& lhs, const CollectionState& rhs);
 std::ostream& operator<<(std::ostream& stream, const CollectionState& state);
-StringBuilderImpl<SharedBufferAllocator>& operator<<(StringBuilderImpl<SharedBufferAllocator>& sb,
-                                                     const CollectionState& state);
+StringBuilder& operator<<(StringBuilder& sb, const CollectionState& state);
 
 class IdempotencyTest : public OplogApplierImplTest {
 public:
-    IdempotencyTest() : OplogApplierImplTest("wiredTiger"){};
+    IdempotencyTest() : OplogApplierImplTest("wiredTiger") {
+        globalFailPointRegistry()
+            .find("doUntimestampedWritesForIdempotencyTests")
+            ->setMode(FailPoint::alwaysOn);
+    }
+
+    ~IdempotencyTest() {
+        globalFailPointRegistry()
+            .find("doUntimestampedWritesForIdempotencyTests")
+            ->setMode(FailPoint::off);
+    }
 
 protected:
     enum class SequenceType : int { kEntireSequence, kAnyPrefix, kAnySuffix, kAnyPrefixOrSuffix };
@@ -155,58 +164,5 @@ protected:
     NamespaceString nss{"test.foo"};
 };
 
-OplogEntry makeCreateCollectionOplogEntry(OpTime opTime,
-                                          const NamespaceString& nss = NamespaceString("test.t"),
-                                          const BSONObj& options = BSONObj());
-
-OplogEntry makeInsertDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToInsert);
-
-OplogEntry makeDeleteDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToDelete);
-
-OplogEntry makeUpdateDocumentOplogEntry(OpTime opTime,
-                                        const NamespaceString& nss,
-                                        const BSONObj& documentToUpdate,
-                                        const BSONObj& updatedDocument);
-
-OplogEntry makeCreateIndexOplogEntry(OpTime opTime,
-                                     const NamespaceString& nss,
-                                     const std::string& indexName,
-                                     const BSONObj& keyPattern,
-                                     const UUID& uuid);
-
-OplogEntry makeCommandOplogEntry(OpTime opTime,
-                                 const NamespaceString& nss,
-                                 const BSONObj& command,
-                                 boost::optional<UUID> uuid = boost::none);
-
-OplogEntry makeCommandOplogEntryWithSessionInfoAndStmtId(
-    OpTime opTime,
-    const NamespaceString& nss,
-    const BSONObj& command,
-    LogicalSessionId lsid,
-    TxnNumber txnNum,
-    StmtId stmtId,
-    boost::optional<OpTime> prevOpTime = boost::none);
-
-OplogEntry makeInsertDocumentOplogEntryWithSessionInfo(OpTime opTime,
-                                                       const NamespaceString& nss,
-                                                       const BSONObj& documentToInsert,
-                                                       OperationSessionInfo info);
-
-OplogEntry makeInsertDocumentOplogEntryWithSessionInfoAndStmtId(
-    OpTime opTime,
-    const NamespaceString& nss,
-    boost::optional<UUID> uuid,
-    const BSONObj& documentToInsert,
-    LogicalSessionId lsid,
-    TxnNumber txnNum,
-    StmtId stmtId,
-    boost::optional<OpTime> prevOpTime = boost::none);
-
-BSONObj makeInsertApplyOpsEntry(const NamespaceString& nss, const UUID& uuid, const BSONObj& doc);
 }  // namespace repl
 }  // namespace mongo

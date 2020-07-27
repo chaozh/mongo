@@ -142,6 +142,12 @@ public:
     virtual void join() = 0;
 
     /**
+     * Returns a future that becomes ready when shutdown() has been called and all outstanding
+     * callbacks have finished running.
+     */
+    virtual SharedSemiFuture<void> joinAsync() = 0;
+
+    /**
      * Writes diagnostic information into "b".
      */
     virtual void appendDiagnosticBSON(BSONObjBuilder* b) const = 0;
@@ -265,6 +271,33 @@ public:
         const RemoteCommandRequestOnAny& request,
         const RemoteCommandOnAnyCallbackFn& cb,
         const BatonHandle& baton = nullptr) = 0;
+
+    /**
+     * Schedules "cb" to be run by the executor on each reply recevied from executing the exhaust
+     * remote command described by "request".
+     *
+     * Returns a handle for waiting on or canceling the callback, or
+     * ErrorCodes::ShutdownInProgress.
+     *
+     * May be called by client threads or callbacks running in the executor.
+     *
+     * Contract: Implementations should guarantee that callback should be called *after* doing any
+     * processing related to the callback.
+     */
+    virtual StatusWith<CallbackHandle> scheduleExhaustRemoteCommand(
+        const RemoteCommandRequest& request,
+        const RemoteCommandCallbackFn& cb,
+        const BatonHandle& baton = nullptr);
+
+    virtual StatusWith<CallbackHandle> scheduleExhaustRemoteCommandOnAny(
+        const RemoteCommandRequestOnAny& request,
+        const RemoteCommandOnAnyCallbackFn& cb,
+        const BatonHandle& baton = nullptr) = 0;
+
+    /**
+     * Returns true if there are any tasks scheduled on the executor.
+     */
+    virtual bool hasTasks() = 0;
 
     /**
      * If the callback referenced by "cbHandle" hasn't already executed, marks it as

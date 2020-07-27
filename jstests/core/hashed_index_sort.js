@@ -2,7 +2,12 @@
  * Test to verify the behaviour of compound hashed indexes when 'sort' operation is used along with
  * the 'find' command. The test verifies compound hashed index with hashed prefix and non-hashed
  * prefix.
- * @tags: [assumes_unsharded_collection, requires_fcv_44]
+ * @tags: [
+ *  assumes_unsharded_collection,
+ *  # Sort optimizations added in 4.6 can generate a different plan in the presence of equality
+ *  # predicates.
+ *  requires_fcv_46
+ * ]
  */
 (function() {
 "use strict";
@@ -56,7 +61,7 @@ function validateFindCmdOutputAndPlan(
 assert.commandWorked(coll.createIndex({a: "hashed", b: -1, c: 1}));
 
 // Verify that an exact match predicate on hashed field (prefix) and sort with an immediate range
-// field can use 'SORT_MERGE'.
+// field can be answered by the index.
 validateFindCmdOutputAndPlan({
     filter: {a: 1},
     project: {b: 1, c: 1, _id: 0},
@@ -68,7 +73,8 @@ validateFindCmdOutputAndPlan({
         {b: 3, c: 4},
         {b: 4, c: 5},
     ],
-    expectedStages: ["IXSCAN", "FETCH", "SORT_MERGE"]
+    expectedStages: ["IXSCAN", "FETCH"],
+    stagesNotExpected: ["SORT_MERGE", "SORT"]
 });
 
 // Verify that a list of exact match predicates on hashed field (prefix) and sort with an immediate
@@ -106,7 +112,7 @@ assert.commandWorked(coll.createIndex({a: 1, b: -1, c: "hashed", d: 1}));
 
 // Verify that an exact match predicate on range field (prefix) and sort with an immediate range
 // field doesn't require any additional sort stages. The entire operation can be answered by the
-// index.
+// index, if all the projection and filter fields are part of the index.
 validateFindCmdOutputAndPlan({
     filter: {a: 1},
     project: {_id: 0, a: 1, b: 1},
@@ -120,6 +126,44 @@ validateFindCmdOutputAndPlan({
     ],
     expectedStages: ["IXSCAN"],
     stagesNotExpected: ["SORT_MERGE", "SORT", "FETCH"]
+});
+
+// Verify that an exact match predicate on range field (prefix) and sort with an immediate range
+// field doesn't require any additional sort stages. An additional FETCH stage will be required if
+// the filter/projection includes a hashed field.
+validateFindCmdOutputAndPlan({
+    filter: {a: 1, c: 2},
+    project: {_id: 0, a: 1, b: 1},
+    sort: {b: 1, d: -1},
+    expectedOutput: [{a: 1, b: 1}],
+    expectedStages: ["IXSCAN", "FETCH"],
+    stagesNotExpected: ["SORT_MERGE", "SORT"]
+});
+
+// Verify that the sort can use index when there is no filter and the sort order is a non-hashed
+// prefix of the index pattern.
+validateFindCmdOutputAndPlan({
+    filter: {},
+    project: {_id: 0, a: 1, b: 1},
+    sort: {a: 1, b: -1},
+    expectedOutput: [
+        {a: 0, b: 4}, {a: 0, b: 3}, {a: 0, b: 2}, {a: 0, b: 1}, {a: 0, b: 0},
+        {a: 1, b: 4}, {a: 1, b: 3}, {a: 1, b: 2}, {a: 1, b: 1}, {a: 1, b: 0},
+        {a: 2, b: 4}, {a: 2, b: 3}, {a: 2, b: 2}, {a: 2, b: 1}, {a: 2, b: 0},
+        {a: 3, b: 4}, {a: 3, b: 3}, {a: 3, b: 2}, {a: 3, b: 1}, {a: 3, b: 0},
+        {a: 4, b: 4}, {a: 4, b: 3}, {a: 4, b: 2}, {a: 4, b: 1}, {a: 4, b: 0},
+    ],
+    expectedStages: ["IXSCAN"],
+    stagesNotExpected: ["SORT_MERGE", "SORT", "FETCH"]
+});
+
+// Verify that the sort cannot use index when there is no filter and the sort order uses a hashed
+// field from the index.
+validateFindCmdOutputAndPlan({
+    filter: {},
+    project: {_id: 0, a: 1, b: 1},
+    sort: {a: 1, b: -1, c: 1},
+    expectedStages: ["SORT", "COLLSCAN"],
 });
 
 // Verify that a list of exact match predicates on range field (prefix) and sort with an immediate

@@ -217,8 +217,12 @@ public:
         return createScope();
     }
 
-    virtual Scope* newScopeForCurrentThread() {
-        return createScopeForCurrentThread();
+    virtual Scope* newScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) {
+        return createScopeForCurrentThread(jsHeapLimitMB);
+    }
+
+    Scope* newScopeForCurrentThread() {
+        return newScopeForCurrentThread(boost::none);
     }
 
     virtual void runTest() = 0;
@@ -255,12 +259,12 @@ public:
     void setScopeInitCallback(void (*func)(Scope&)) {
         _scopeInitCallback = func;
     }
-    static void setConnectCallback(void (*func)(DBClientBase&)) {
+    static void setConnectCallback(void (*func)(DBClientBase&, StringData)) {
         _connectCallback = func;
     }
-    static void runConnectCallback(DBClientBase& c) {
+    static void runConnectCallback(DBClientBase& c, StringData uri) {
         if (_connectCallback)
-            _connectCallback(c);
+            _connectCallback(c, uri);
     }
 
     // engine implementation may either respond to interrupt events or
@@ -273,11 +277,11 @@ public:
 
 protected:
     virtual Scope* createScope() = 0;
-    virtual Scope* createScopeForCurrentThread() = 0;
+    virtual Scope* createScopeForCurrentThread(boost::optional<int> jsHeapLimitMB) = 0;
     void (*_scopeInitCallback)(Scope&);
 
 private:
-    static void (*_connectCallback)(DBClientBase&);
+    static void (*_connectCallback)(DBClientBase&, StringData);
 };
 
 void installGlobalUtils(Scope& scope);

@@ -1208,6 +1208,13 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
                 object_value = self._gen_field_deserializer_expression(bson_element, field)
                 if field.chained_struct_field:
+                    if field.optional:
+                        # We must invoke the boost::optional constructor when setting optional view
+                        # types
+                        cpp_type_info = cpp_types.get_cpp_type(field)
+                        object_value = '%s(%s)' % (cpp_type_info.get_getter_setter_type(),
+                                                   object_value)
+
                     # No need for explicit validation as setter will throw for us.
                     self._writer.write_line(
                         '%s.%s(%s);' % (_get_field_member_name(field.chained_struct_field),
@@ -1477,7 +1484,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
             param_type += '&'
 
         method_template = {
-            'class_name': common.title_case(struct.name),
+            'class_name': common.title_case(struct.cpp_name),
             'method_name': _get_field_member_validator_name(field),
             'param_type': param_type,
             'optional_param': optional_params[0],

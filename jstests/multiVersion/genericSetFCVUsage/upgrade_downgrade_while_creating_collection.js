@@ -19,7 +19,7 @@ rst.initiate(replSetConfig);
 const primary = rst.getPrimary();
 const primaryDB = primary.getDB("test");
 
-for (let versions of [{from: lastStableFCV, to: latestFCV}, {from: latestFCV, to: lastStableFCV}]) {
+for (let versions of [{from: lastLTSFCV, to: latestFCV}, {from: latestFCV, to: lastLTSFCV}]) {
     jsTestLog("Changing FeatureCompatibilityVersion from " + versions.from + " to " + versions.to +
               " while creating a collection");
     assert.commandWorked(primaryDB.adminCommand({setFeatureCompatibilityVersion: versions.from}));
@@ -37,7 +37,8 @@ for (let versions of [{from: lastStableFCV, to: latestFCV}, {from: latestFCV, to
         }, primary.port);
 
         assert.soon(function() {
-            return rawMongoProgramOutput().match("createCollection: test.mycoll");
+            return rawMongoProgramOutput().match(
+                /\"id\":20320.*test.mycoll/);  // Create Collection log
         });
 
         awaitUpgradeFCV = startParallelShell(

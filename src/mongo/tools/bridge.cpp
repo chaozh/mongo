@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kBridge
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kBridge
 
 #include "mongo/platform/basic.h"
 
@@ -40,6 +40,7 @@
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
@@ -55,7 +56,6 @@
 #include "mongo/transport/transport_layer_asio.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/signal_handlers.h"
 #include "mongo/util/str.h"
@@ -93,7 +93,7 @@ public:
             return status.getStatus();
         }
 
-        log() << "Processing bridge command: " << cmdName;
+        LOGV2(22916, "Processing bridge command", "cmdName"_attr = cmdName, "cmdObj"_attr = cmdObj);
 
         BridgeCommand* command = status.getValue();
         return command->run(cmdObj, &_settingsMutex, &_settings);
@@ -194,6 +194,35 @@ public:
         return _prng.nextCanonicalDouble();
     }
 
+    void setInExhaust(bool inExhaust) {
+        _inExhaust = inExhaust;
+    }
+
+    bool inExhaust() const {
+        return _inExhaust;
+    }
+
+    // Handle response for request with kExhaustSupported flag or response from the exhaust stream.
+    // This sets up the internal states for the ProxiedConnection and returns whether there is
+    // "moreToCome" from the exhaust stream.
+    bool handleExhaustResponse(Message& response) {
+        // Only support OP_MSG exhaust cursors.
+        invariant(response.operation() == dbMsg);
+        uassert(4622300,
+                "Response ID did not match the sent message ID.",
+                !_lastExhaustRequestId ||
+                    response.header().getResponseToMsgId() == _lastExhaustRequestId);
+        if (response.operation() == dbCompressed) {
+            MessageCompressorManager compressorManager;
+            response = uassertStatusOK(compressorManager.decompressMessage(response));
+        }
+        _inExhaust = OpMsg::isFlagSet(response, OpMsg::kMoreToCome);
+        if (_inExhaust) {
+            _lastExhaustRequestId = response.header().getId();
+        }
+        return _inExhaust;
+    }
+
     static ProxiedConnection& get(const transport::SessionHandle& session);
 
 private:
@@ -204,6 +233,8 @@ private:
     PseudoRandom _prng;
     boost::optional<HostAndPort> _host;
     bool _seenFirstMessage = false;
+    bool _inExhaust = false;
+    int _lastExhaustRequestId = 0;
 };
 
 const transport::Session::Decoration<ProxiedConnection> ProxiedConnection::_get =
@@ -221,21 +252,31 @@ public:
 };
 
 DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const Message& request) {
-    uassert(51754,
-            "Mongobridge does not support exhaust",
-            !OpMsg::isFlagSet(request, OpMsg::kExhaustSupported));
-
     if (request.operation() == dbQuery) {
         DbMessage d(request);
         QueryMessage q(d);
         if (q.queryOptions & QueryOption_Exhaust) {
-            uasserted(51755, "Mongobridge does not support exhaust");
+            uasserted(51755, "Mongobridge does not support OP_QUERY exhaust");
         }
     }
 
     const auto& source = opCtx->getClient()->session();
     auto& dest = ProxiedConnection::get(source);
     auto brCtx = BridgeContext::get();
+
+    // If the bridge decides to return something else other than a response from an active exhaust
+    // stream, make sure we close the exhaust stream properly.
+    auto earlyExhaustExitGuard = makeGuard([&] {
+        if (dest.inExhaust()) {
+            LOGV2(4622301, "mongobridge shutting down exhaust stream", "remote"_attr = dest);
+            dest.setInExhaust(false);
+            // Active exhaust stream should have a session.
+            invariant(dest.getSession());
+            // Close the connection to the dest server to end the exhaust stream.
+            dest->end();
+            dest.setSession(nullptr);
+        }
+    });
 
     if (!dest.getSession()) {
         dest.setSession([]() -> transport::SessionHandle {
@@ -249,7 +290,11 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
                     tl->connect(destAddr, transport::kGlobalSSLMode, connectExpiration - now);
                 auto status = sws.getStatus();
                 if (!status.isOK()) {
-                    warning() << "Unable to establish connection to " << destAddr << ": " << status;
+                    LOGV2_WARNING(22924,
+                                  "Unable to establish connection to {remoteAddress}: {error}",
+                                  "Unable to establish connection",
+                                  "remoteAddress"_attr = destAddr,
+                                  "error"_attr = status);
                     now = getGlobalServiceContext()->getFastClockSource()->now();
                 } else {
                     return std::move(sws.getValue());
@@ -277,8 +322,14 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
 
         dest.extractHostInfo(*cmdRequest);
 
-        LOG(1) << "Received \"" << cmdRequest->getCommandName() << "\" command with arguments "
-               << cmdRequest->body << " from " << dest;
+        LOGV2_DEBUG(22917,
+                    1,
+                    "Received \"{commandName}\" command with arguments "
+                    "{arguments} from {remote}",
+                    "Received command",
+                    "commandName"_attr = cmdRequest->getCommandName(),
+                    "arguments"_attr = cmdRequest->body,
+                    "remote"_attr = dest);
     }
 
     // Handle a message intended to configure the mongobridge and return a response.
@@ -304,8 +355,11 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
     switch (hostSettings.state) {
         // Close the connection to 'dest'.
         case HostSettings::State::kHangUp:
-            log() << "Rejecting connection from " << dest << ", end connection "
-                  << source->remote().toString();
+            LOGV2(22918,
+                  "Rejecting connection from {remote}, end connection {source}",
+                  "Rejecting connection",
+                  "remote"_attr = dest,
+                  "source"_attr = source->remote().toString());
             source->end();
             return {Message()};
         // Forward the message to 'dest' with probability '1 - hostSettings.loss'.
@@ -313,12 +367,19 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
             if (dest.nextCanonicalDouble() < hostSettings.loss) {
                 std::string hostName = dest.toString();
                 if (cmdRequest) {
-                    log() << "Discarding \"" << cmdRequest->getCommandName()
-                          << "\" command with arguments " << cmdRequest->body << " from "
-                          << hostName;
+                    LOGV2(22919,
+                          "Discarding \"{commandName}\" command with arguments "
+                          "{arguments} from {hostName}",
+                          "Discarding command from host",
+                          "commandName"_attr = cmdRequest->getCommandName(),
+                          "arguments"_attr = cmdRequest->body,
+                          "hostName"_attr = hostName);
                 } else {
-                    log() << "Discarding " << networkOpToString(request.operation()) << " from "
-                          << hostName;
+                    LOGV2(22920,
+                          "Discarding {operation} from {hostName}",
+                          "Discarding operation from host",
+                          "operation"_attr = networkOpToString(request.operation()),
+                          "hostName"_attr = hostName);
                 }
                 return {Message()};
             }
@@ -329,19 +390,30 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
             break;
     }
 
-    uassertStatusOK(dest->sinkMessage(request));
+    // If we get another type of request (e.g. exhaust cleanup killCursor request from the service
+    // state machine), unset the exhaust mode.
+    if (dest.inExhaust() &&
+        (request.operation() != dbMsg || !OpMsg::isFlagSet(request, OpMsg::kExhaustSupported))) {
+        dest.setInExhaust(false);
+    }
+
+    // Skip sending request in exhaust mode.
+    if (!dest.inExhaust()) {
+        uassertStatusOK(dest->sinkMessage(request));
+    }
 
     // Send the message we received from 'source' to 'dest'. 'dest' returns a response for
     // OP_QUERY, OP_GET_MORE, and OP_MSG messages that we respond with.
     if (!isFireAndForgetCommand &&
         (request.operation() == dbQuery || request.operation() == dbGetMore ||
          request.operation() == dbMsg)) {
-        // TODO dbMsg moreToCome
-        // Forward the message to 'dest' and receive its reply in 'response'.
         auto response = uassertStatusOK(dest->sourceMessage());
-        uassert(50765,
-                "Response ID did not match the sent message ID.",
-                response.header().getResponseToMsgId() == request.header().getId());
+
+        if (!dest.inExhaust()) {
+            uassert(50765,
+                    "Response ID did not match the sent message ID.",
+                    response.header().getResponseToMsgId() == request.header().getId());
+        }
 
         // Reload the message handling settings for 'host' in case they were changed
         // while waiting for a response from 'dest'.
@@ -351,21 +423,37 @@ DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const
         // reply with. If the message handling settings were since changed to close
         // connections from 'host', then do so now.
         if (hostSettings.state == HostSettings::State::kHangUp) {
-            log() << "Closing connection from " << dest << ", end connection " << source->remote();
+            LOGV2(22921,
+                  "Closing connection from {remote}, end connection {source}",
+                  "Closing connection",
+                  "remote"_attr = dest,
+                  "source"_attr = source->remote());
             source->end();
             return {Message()};
+        }
+
+        // Only support OP_MSG exhaust cursors.
+        bool isExhaust = false;
+        if (request.operation() == dbMsg && OpMsg::isFlagSet(request, OpMsg::kExhaustSupported)) {
+            isExhaust = dest.handleExhaustResponse(response);
+            earlyExhaustExitGuard.dismiss();
         }
 
         // The original checksum won't be valid once the network layer replaces requestId. Remove it
         // because the network layer re-checksums the response.
         OpMsg::removeChecksum(&response);
-        return {std::move(response)};
+
+        // Return a DbResponse with shouldRunAgainForExhaust being set to isExhaust to indicate
+        // whether this should be run again to receive more responses from the exhaust stream.
+        // We do not need to set 'nextInvocation' in the DbResponse because mongobridge
+        // only receives responses but ignores the next request if it is in exhaust mode.
+        return {std::move(response), isExhaust};
     } else {
         return {Message()};
     }
 }
 
-int bridgeMain(int argc, char** argv, char** envp) {
+int bridgeMain(int argc, char** argv) {
 
     registerShutdownTask([&] {
         // NOTE: This function may be called at any time. It must not
@@ -384,7 +472,7 @@ int bridgeMain(int argc, char** argv, char** envp) {
     });
 
     setupSignalHandlers();
-    runGlobalInitializersOrDie(argc, argv, envp);
+    runGlobalInitializersOrDie(std::vector<std::string>(argv, argv + argc));
     startSignalProcessingThread(LogFileStatus::kNoLogFileToRotate);
 
     setGlobalServiceContext(ServiceContext::make());
@@ -403,12 +491,12 @@ int bridgeMain(int argc, char** argv, char** envp) {
         opts, serviceContext->getServiceEntryPoint()));
     auto tl = serviceContext->getTransportLayer();
     if (!tl->setup().isOK()) {
-        log() << "Error setting up transport layer";
+        LOGV2(22922, "Error setting up transport layer");
         return EXIT_NET_ERROR;
     }
 
     if (!tl->start().isOK()) {
-        log() << "Error starting transport layer";
+        LOGV2(22923, "Error starting transport layer");
         return EXIT_NET_ERROR;
     }
 
@@ -424,14 +512,11 @@ int bridgeMain(int argc, char** argv, char** envp) {
 // WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
 // and makes them available through the argv() and envp() members.  This enables bridgeMain()
 // to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    mongo::WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = mongo::bridgeMain(argc, wcl.argv(), wcl.envp());
-    mongo::quickExit(exitCode);
+int wmain(int argc, wchar_t* argvW[]) {
+    mongo::quickExit(mongo::bridgeMain(argc, mongo::WindowsCommandLine(argc, argvW).argv()));
 }
 #else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = mongo::bridgeMain(argc, argv, envp);
-    mongo::quickExit(exitCode);
+int main(int argc, char* argv[]) {
+    mongo::quickExit(mongo::bridgeMain(argc, argv));
 }
 #endif

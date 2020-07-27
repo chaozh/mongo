@@ -6,28 +6,29 @@
 //
 // This test involves using fsync to lock the secondaries, so cannot be run on
 // storage engines which do not support the command.
-// @tags: [requires_fsync]
-//
+// @tags: [
+//    requires_fsync
+// ]
 
 (function() {
 'use strict';
 
-// The mongod secondaries are set to priority 0 and votes 0 to prevent the primaries
-// from stepping down during migrations on slow evergreen builders.
+// The mongod secondaries are set to priority 0 to prevent the primaries from stepping down during
+// migrations on slow evergreen builders.
 var s = new ShardingTest({
     shards: 2,
     other: {
         chunkSize: 1,
         rs0: {
             nodes: [
-                {rsConfig: {votes: 1}},
-                {rsConfig: {priority: 0, votes: 0}},
+                {},
+                {rsConfig: {priority: 0}},
             ],
         },
         rs1: {
             nodes: [
-                {rsConfig: {votes: 1}},
-                {rsConfig: {priority: 0, votes: 0}},
+                {},
+                {rsConfig: {priority: 0}},
             ],
         }
     }

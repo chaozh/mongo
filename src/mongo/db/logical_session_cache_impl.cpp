@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -36,11 +36,13 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/logv2/log_severity_suppressor.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/duration.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -123,22 +125,43 @@ size_t LogicalSessionCacheImpl::size() {
 void LogicalSessionCacheImpl::_periodicRefresh(Client* client) {
     try {
         _refresh(client);
-    } catch (...) {
-        log() << "Failed to refresh session cache: " << exceptionToStatus()
-              << ", will try again at the next refresh interval";
+    } catch (const DBException& ex) {
+        LOGV2(
+            20710,
+            "Failed to refresh session cache: {error}, will try again at the next refresh interval",
+            "Failed to refresh session cache, will try again at the next refresh interval",
+            "error"_attr = redact(ex));
     }
 }
 
 void LogicalSessionCacheImpl::_periodicReap(Client* client) {
     auto res = _reap(client);
     if (!res.isOK()) {
-        log() << "Failed to reap transaction table: " << res;
+        LOGV2(20711,
+              "Failed to reap transaction table: {error}",
+              "Failed to reap transaction table",
+              "error"_attr = redact(res));
     }
 
     return;
 }
 
 Status LogicalSessionCacheImpl::_reap(Client* client) {
+    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
+    auto* const opCtx = [&] {
+        if (client->getOperationContext()) {
+            return client->getOperationContext();
+        }
+
+        uniqueCtx.emplace(client->makeOperationContext());
+        return uniqueCtx->get();
+    }();
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord && replCoord->isReplEnabled() && replCoord->getMemberState().arbiter()) {
+        return Status::OK();
+    }
+
     // Take the lock to update some stats.
     {
         stdx::lock_guard<Latch> lk(_mutex);
@@ -152,16 +175,6 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
         _stats.setTransactionReaperJobCount(_stats.getTransactionReaperJobCount() + 1);
     }
 
-    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
-    auto* const opCtx = [&] {
-        if (client->getOperationContext()) {
-            return client->getOperationContext();
-        }
-
-        uniqueCtx.emplace(client->makeOperationContext());
-        return uniqueCtx->get();
-    }();
-
     int numReaped = 0;
 
     try {
@@ -169,14 +182,18 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
         try {
             _sessionsColl->checkSessionsCollectionExists(opCtx);
         } catch (const DBException& ex) {
-            StringData notSetUpWarning =
-                "Sessions collection is not set up; "
-                "waiting until next sessions reap interval";
             if (ex.code() != ErrorCodes::NamespaceNotFound ||
                 ex.code() != ErrorCodes::NamespaceNotSharded) {
-                log() << notSetUpWarning << ": " << ex.reason();
+                LOGV2(
+                    20712,
+                    "Sessions collection is not set up: {error}; waiting until next sessions reap "
+                    "interval",
+                    "Sessions collection is not set up; waiting until next sessions reap interval",
+                    "error"_attr = redact(ex));
             } else {
-                log() << notSetUpWarning;
+                LOGV2(20713,
+                      "Sessions collection is not set up because the namespace is either not found"
+                      "or not sharded; waiting until next sessions reap interval");
             }
             return Status::OK();
         }
@@ -205,6 +222,22 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
 }
 
 void LogicalSessionCacheImpl::_refresh(Client* client) {
+    // get or make an opCtx
+    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
+    auto* const opCtx = [&client, &uniqueCtx] {
+        if (client->getOperationContext()) {
+            return client->getOperationContext();
+        }
+
+        uniqueCtx.emplace(client->makeOperationContext());
+        return uniqueCtx->get();
+    }();
+
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord && replCoord->isReplEnabled() && replCoord->getMemberState().arbiter()) {
+        return;
+    }
+
     // Stats for serverStatus:
     {
         stdx::lock_guard<Latch> lk(_mutex);
@@ -227,24 +260,16 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
         _stats.setLastSessionsCollectionJobDurationMillis(millis.count());
     });
 
-    // get or make an opCtx
-    boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
-    auto* const opCtx = [&client, &uniqueCtx] {
-        if (client->getOperationContext()) {
-            return client->getOperationContext();
-        }
-
-        uniqueCtx.emplace(client->makeOperationContext());
-        return uniqueCtx->get();
-    }();
-
     ON_BLOCK_EXIT([&opCtx] { clearShardingOperationFailedStatus(opCtx); });
 
     try {
         _sessionsColl->setupSessionsCollection(opCtx);
     } catch (const DBException& ex) {
-        log() << "Failed to refresh session cache, will try again at the next refresh interval"
-              << causedBy(redact(ex));
+        LOGV2(
+            20714,
+            "Failed to refresh session cache, will try again at the next refresh interval {error}",
+            "Failed to refresh session cache, will try again at the next refresh interval",
+            "error"_attr = redact(ex));
         return;
     }
 
@@ -372,9 +397,18 @@ Status LogicalSessionCacheImpl::_addToCacheIfNotFull(WithLock, LogicalSessionRec
                              << "Unable to add session ID " << record.getId()
                              << " into the cache because the number of active sessions is too "
                                 "high"};
-        auto severity =
-            MONGO_GET_LIMITED_SEVERITY(ErrorCodes::TooManyLogicalSessions, Seconds{1}, 0, 2);
-        LOG(severity) << status.toString();
+        // Returns Info() unless it was called in the past second.
+        // In that case it will return the quieter Debug(2) */
+        static auto& bumpedSeverity = *new logv2::SeveritySuppressor{
+            Seconds{1}, logv2::LogSeverity::Info(), logv2::LogSeverity::Debug(2)};
+        LOGV2_DEBUG(20715,
+                    bumpedSeverity().toInt(),
+                    "Unable to add session {sessionId} into the cache, too many active sessions: "
+                    "{sessionCount}, maximum: {maxSessions}",
+                    "Unable to add session into the cache, too many active sessions",
+                    "sessionId"_attr = record.getId(),
+                    "sessionCount"_attr = _activeSessions.size(),
+                    "maxSessions"_attr = maxSessions);
         return status;
     }
 

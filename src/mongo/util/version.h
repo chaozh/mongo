@@ -31,10 +31,10 @@
 #define UTIL_VERSION_HEADER
 
 #include <string>
-#include <tuple>
 #include <vector>
 
 #include "mongo/base/string_data.h"
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
@@ -46,12 +46,21 @@ class BSONObjBuilder;
  * able to access version information.
  */
 class VersionInfoInterface {
+public:
+    struct BuildInfoField {
+        StringData key;
+        StringData value;
+        bool inBuildInfo;  // included in buildInfo BSON
+        bool inVersion;    // included in --version output
+    };
+
+    enum class NotEnabledAction {
+        kAbortProcess,
+        kFallback,
+    };
+
     VersionInfoInterface(const VersionInfoInterface&) = delete;
     VersionInfoInterface& operator=(const VersionInfoInterface&) = delete;
-
-public:
-    using BuildInfoTuple = std::tuple<StringData, StringData, bool, bool>;
-
     virtual ~VersionInfoInterface() = default;
 
     /**
@@ -59,11 +68,6 @@ public:
      * below. Ownership of the object is not transferred.
      */
     static void enable(const VersionInfoInterface* handler);
-
-    enum class NotEnabledAction {
-        kAbortProcess,
-        kFallback,
-    };
 
     /**
      * Obtain the currently configured instance of the VersionInfoInterface. By default, if this
@@ -126,9 +130,9 @@ public:
     virtual StringData targetMinOS() const noexcept = 0;
 
     /**
-     * Returns a vector of tuples describing build information (e.g. LINKFLAGS, compiler, etc.).
+     * Returns build information (e.g. LINKFLAGS, compiler, etc.).
      */
-    virtual std::vector<BuildInfoTuple> buildInfo() const = 0;
+    virtual std::vector<BuildInfoField> buildInfo() const = 0;
 
     /**
      * Returns the version of OpenSSL in use, if any, adorned with the provided prefix and suffix.
@@ -136,18 +140,15 @@ public:
     std::string openSSLVersion(StringData prefix = "", StringData suffix = "") const;
 
     /**
-     * Returns true if the running version has the same major and minor version as the provided
-     * string. Note that the minor version is checked, despite the name of this function.
-     */
-    bool isSameMajorVersion(const char* otherVersion) const noexcept;
-
-    /**
      * Uses the provided text to make a pretty representation of the version.
      */
     std::string makeVersionString(StringData binaryName) const;
 
     /**
-     * Appends the information associated with 'buildInfo', above, to the given builder.
+     * Appends several fields of build information to the `result`. One of them is
+     * "buildEnvironment", mapped to a subobject containing most of the information associated
+     * with 'buildInfo', above, but with the elements for which inBuildInfo == false
+     * removed.
      */
     void appendBuildInfo(BSONObjBuilder* result) const;
 
@@ -157,9 +158,12 @@ public:
     void logTargetMinOS() const;
 
     /**
-     * Logs the result of 'buildInfo', above.
+     * Logs similar info to `appendBuildInfo`, suitable for the --version flag or for a
+     * startup log message (trimmed for user-friendliness). The `buildInfo` data appear
+     * in a subobject mapped to the "environment" key, but with the elements for which
+     * inVersion == false removed. Puts to `os` if nonnull, else to LOGV2.
      */
-    void logBuildInfo() const;
+    void logBuildInfo(std::ostream* os) const;
 
 protected:
     constexpr VersionInfoInterface() = default;

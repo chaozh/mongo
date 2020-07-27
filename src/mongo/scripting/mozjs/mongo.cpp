@@ -190,7 +190,8 @@ void setHiddenMongo(JSContext* cx,
 
         ObjectWrapper from(cx, args.thisv());
         ObjectWrapper to(cx, newMongo);
-        for (const auto& k : {InternedString::slaveOk, InternedString::defaultDB}) {
+        for (const auto& k :
+             {InternedString::slaveOk, InternedString::defaultDB, InternedString::authenticated}) {
             JS::RootedValue tmpValue(cx);
             from.getValue(k, &tmpValue);
             to.setValue(k, tmpValue);
@@ -833,7 +834,7 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
         uasserted(ErrorCodes::InternalError, errmsg);
     }
 
-    ScriptEngine::runConnectCallback(*conn);
+    ScriptEngine::runConnectCallback(*conn, host);
 
     JS::RootedObject thisv(cx);
     scope->getProto<MongoExternalInfo>().newObject(&thisv);
@@ -923,7 +924,7 @@ void MongoExternalInfo::Functions::_forgetReplSet::call(JSContext* cx, JS::CallA
     }
 
     std::string rsName = ValueWriter(cx, args.get(0)).toString();
-    globalRSMonitorManager.removeMonitor(rsName);
+    ReplicaSetMonitorManager::get()->removeMonitor(rsName);
 
     args.rval().setUndefined();
 }

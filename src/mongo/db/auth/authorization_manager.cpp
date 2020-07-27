@@ -50,7 +50,6 @@ constexpr StringData AuthorizationManager::V1_USER_SOURCE_FIELD_NAME;
 
 const NamespaceString AuthorizationManager::adminCommandNamespace("admin.$cmd");
 const NamespaceString AuthorizationManager::rolesCollectionNamespace("admin.system.roles");
-const NamespaceString AuthorizationManager::usersAltCollectionNamespace("admin.system.new_users");
 const NamespaceString AuthorizationManager::usersBackupCollectionNamespace(
     "admin.system.backup_users");
 const NamespaceString AuthorizationManager::usersCollectionNamespace("admin.system.users");
@@ -71,9 +70,9 @@ const int AuthorizationManager::schemaVersion26Upgrade;
 const int AuthorizationManager::schemaVersion26Final;
 const int AuthorizationManager::schemaVersion28SCRAM;
 
-std::unique_ptr<AuthorizationManager> AuthorizationManager::create() {
+std::unique_ptr<AuthorizationManager> AuthorizationManager::create(ServiceContext* serviceContext) {
     static auto w = MONGO_WEAK_FUNCTION_DEFINITION(AuthorizationManager::create);
-    return w();
+    return w(serviceContext);
 }
 
 }  // namespace mongo

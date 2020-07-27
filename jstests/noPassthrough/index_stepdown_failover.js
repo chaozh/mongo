@@ -21,12 +21,6 @@ const primary = rst.getPrimary();
 const testDB = primary.getDB('test');
 const coll = testDB.getCollection('test');
 
-if (!IndexBuildTest.supportsTwoPhaseIndexBuild(primary)) {
-    jsTestLog('Two phase index builds not enabled, skipping test.');
-    rst.stopSet();
-    return;
-}
-
 assert.commandWorked(coll.insert({a: 1}));
 
 // Start index build on primary, but prevent it from finishing.
@@ -38,7 +32,12 @@ const secondary = rst.getSecondary();
 const secondaryDB = secondary.getDB(testDB.getName());
 const secondaryColl = secondaryDB.getCollection(coll.getName());
 IndexBuildTest.waitForIndexBuildToStart(secondaryDB);
-IndexBuildTest.assertIndexes(secondaryColl, 2, ["_id_"], ["a_1"], {includeBuildUUIDs: true});
+const indexMap =
+    IndexBuildTest.assertIndexes(secondaryColl, 2, ["_id_"], ["a_1"], {includeBuildUUIDs: true});
+const indexBuildUUID = indexMap['a_1'].buildUUID;
+
+// Index build should be present in the config.system.indexBuilds collection.
+assert(primary.getCollection('config.system.indexBuilds').findOne({_id: indexBuildUUID}));
 
 const newPrimary = rst.getSecondary();
 const newPrimaryDB = secondaryDB;
@@ -50,14 +49,13 @@ const newPrimaryColl = secondaryColl;
 assert.commandWorked(primary.adminCommand({replSetStepDown: 60, force: true}));
 const exitCode = createIdx({checkExitSuccess: false});
 assert.neq(0, exitCode, 'expected shell to exit abnormally due to index build being terminated');
-checkLog.contains(primary, 'Index build interrupted: ');
+checkLog.containsJson(primary, 20441);
 
 // Unblock the index build on the old primary during the collection scanning phase.
 // This index build will not complete because it has to wait for a commitIndexBuild oplog
 // entry.
 IndexBuildTest.resumeIndexBuilds(primary);
-checkLog.contains(primary,
-                  'Index build waiting for commit or abort before completing final phase: ');
+checkLog.containsJson(primary, 3856203);
 
 // Step up the new primary.
 rst.stepUp(newPrimary);
@@ -70,6 +68,9 @@ IndexBuildTest.assertIndexes(coll, 2, ['_id_', 'a_1']);
 // Check that index was created on the new primary.
 IndexBuildTest.waitForIndexBuildToStop(newPrimaryDB);
 IndexBuildTest.assertIndexes(newPrimaryColl, 2, ['_id_', 'a_1']);
+
+// Index build should be removed from the config.system.indexBuilds collection.
+assert.isnull(newPrimary.getCollection('config.system.indexBuilds').findOne({_id: indexBuildUUID}));
 
 rst.stopSet();
 })();

@@ -49,6 +49,10 @@ public:
         int64_t records;      // Approximate number of records in a chunk of the oplog.
         int64_t bytes;        // Approximate size of records in a chunk of the oplog.
         RecordId lastRecord;  // RecordId of the last record in a chunk of the oplog.
+        Date_t wallTime;      // Walltime of when this chunk of the oplog was created.
+
+        Stone(int64_t records, int64_t bytes, RecordId lastRecord, Date_t wallTime)
+            : records(records), bytes(bytes), lastRecord(lastRecord), wallTime(wallTime) {}
     };
 
     OplogStones(OperationContext* opCtx, WiredTigerRecordStore* rs);
@@ -57,32 +61,27 @@ public:
 
     void kill();
 
-    bool hasExcessStones_inlock() const {
-        int64_t total_bytes = 0;
-        for (std::deque<OplogStones::Stone>::const_iterator it = _stones.begin();
-             it != _stones.end();
-             ++it) {
-            total_bytes += it->bytes;
-        }
-        return total_bytes > _rs->cappedMaxSize();
-    }
+    bool hasExcessStones_inlock() const;
 
     void awaitHasExcessStonesOrDead();
 
     void getOplogStonesStats(BSONObjBuilder& builder) const {
         builder.append("totalTimeProcessingMicros", _totalTimeProcessing.load());
         builder.append("processingMethod", _processBySampling.load() ? "sampling" : "scanning");
+        if (auto oplogMinRetentionHours = storageGlobalParams.oplogMinRetentionHours.load()) {
+            builder.append("oplogMinRetentionHours", oplogMinRetentionHours);
+        }
     }
 
     boost::optional<OplogStones::Stone> peekOldestStoneIfNeeded() const;
 
     void popOldestStone();
 
-    void createNewStoneIfNeeded(RecordId lastRecord);
+    void createNewStoneIfNeeded(OperationContext* opCtx, RecordId lastRecord, Date_t wallTime);
 
     void updateCurrentStoneAfterInsertOnCommit(OperationContext* opCtx,
                                                int64_t bytesInserted,
-                                               RecordId highestInserted,
+                                               const Record& highestInsertedRecord,
                                                int64_t countInserted);
 
     void clearStonesOnCommit(OperationContext* opCtx);

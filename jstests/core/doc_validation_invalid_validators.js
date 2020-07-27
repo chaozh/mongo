@@ -1,6 +1,9 @@
 // Cannot implicitly shard accessed collections because of collection existing when none
 // expected.
-// @tags: [assumes_no_implicit_collection_creation_after_drop, requires_non_retryable_commands]
+// @tags: [
+//   assumes_no_implicit_collection_creation_after_drop,
+//   requires_non_retryable_commands,
+// ]
 
 // Verify invalid validator statements won't work and that we
 // can't create validated collections on restricted databases.
@@ -42,6 +45,19 @@ assert.commandWorked(db.createCollection(collName, {validator: {a: {$exists: tru
 assert.commandFailed(db.runCommand({"collMod": collName, "validator": {$text: {$search: "bob"}}}));
 assert.commandFailed(
     db.runCommand({"collMod": collName, "validator": {$where: "this.a == this.b"}}));
+assert.commandFailedWithCode(db.runCommand({
+    "collMod": collName,
+    "validator": {
+        $expr:
+            {$function: {body: 'function(age) { return age >= 21; }', args: ['$age'], lang: 'js'}}
+    }
+}),
+                             4660800);
+assert.commandFailedWithCode(db.runCommand({
+    "collMod": collName,
+    "validator": {$expr: {$_internalJsEmit: {eval: 'function() {}', this: {}}}}
+}),
+                             4660801);
 assert.commandFailed(db.runCommand({"collMod": collName, "validator": {$near: {place: "holder"}}}));
 assert.commandFailed(
     db.runCommand({"collMod": collName, "validator": {$geoNear: {place: "holder"}}}));

@@ -87,6 +87,11 @@ public:
                            SetupOptions options = {});
 
     /**
+     * Unregisters the builder associated with the given buildUUID from the _builders map.
+     */
+    void unregisterIndexBuild(const UUID& buildUUID);
+
+    /**
      * Runs the scanning/insertion phase of the index build..
      */
     Status startBuildingIndex(OperationContext* opCtx,
@@ -138,12 +143,13 @@ public:
                             OnCommitFn onCommitFn);
 
     /**
-     * Signals the index build to be aborted and returns without waiting for completion.
-     *
-     * Returns true if a build existed to be signaled, as opposed to having already finished and
-     * been cleared away, or not having yet started..
+     * Deletes the index entry from the durable catalog.
      */
-    bool abortIndexBuild(const UUID& buildUUID, const std::string& reason);
+    using OnCleanUpFn = MultiIndexBlock::OnCleanUpFn;
+    bool abortIndexBuild(OperationContext* opCtx,
+                         Collection* collection,
+                         const UUID& buildUUID,
+                         OnCleanUpFn onCleanUpFn);
 
     /**
      * Signals the index build to be aborted without being cleaned up and returns without waiting
@@ -152,22 +158,23 @@ public:
      * Returns true if a build existed to be signaled, as opposed to having already finished and
      * been cleared away, or not having yet started..
      */
-    bool abortIndexBuildWithoutCleanup(OperationContext* opCtx,
-                                       const UUID& buildUUID,
-                                       const std::string& reason);
+    bool abortIndexBuildWithoutCleanupForRollback(OperationContext* opCtx,
+                                                  Collection* collection,
+                                                  const UUID& buildUUID,
+                                                  const std::string& reason);
 
     /**
-     * Cleans up the index build state and unregisters it from the manager.
+     * The same as abortIndexBuildWithoutCleanupForRollback above, but additionally writes the
+     * current state of the index build to disk if the specified index build is a two-phase hybrid
+     * index build and resumable index builds are supported.
      */
-    using OnCleanUpFn = MultiIndexBlock::OnCleanUpFn;
-    void tearDownIndexBuild(OperationContext* opCtx,
-                            Collection* collection,
-                            const UUID& buildUUID,
-                            OnCleanUpFn onCleanUpFn);
+    bool abortIndexBuildWithoutCleanupForShutdown(OperationContext* opCtx,
+                                                  Collection* collection,
+                                                  const UUID& buildUUID);
 
     /**
      * Returns true if the index build supports background writes while building an index. This is
-     * true for the kHybrid and kBackground methods.
+     * true for the kHybrid method.
      */
     bool isBackgroundBuilding(const UUID& buildUUID);
 
@@ -183,21 +190,24 @@ private:
     void _registerIndexBuild(UUID buildUUID);
 
     /**
-     * Unregisters the builder associcated with the given buildUUID from the _builders map.
+     * Returns a pointer to the builder. Returns a bad status if the builder does not exist.
      */
-    void _unregisterIndexBuild(const UUID& buildUUID);
-
-    /**
-     * Returns a shared pointer to the builder. Invariants if the builder does not exist.
-     */
-    std::shared_ptr<MultiIndexBlock> _getBuilder(const UUID& buildUUID);
+    StatusWith<MultiIndexBlock*> _getBuilder(const UUID& buildUUID);
 
     // Protects the map data structures below.
     mutable Mutex _mutex = MONGO_MAKE_LATCH("IndexBuildsManager::_mutex");
 
     // Map of index builders by build UUID. Allows access to the builders so that actions can be
     // taken on and information passed to and from index builds.
-    std::map<UUID, std::shared_ptr<MultiIndexBlock>> _builders;
+    std::map<UUID, std::unique_ptr<MultiIndexBlock>> _builders;
+
+    /**
+     * Deletes records containing duplicate keys and inserts them into a local lost and found
+     * collection titled "local.system.lost_and_found.<original collection UUID>".
+     */
+    StatusWith<long long> _moveDocsToLostAndFound(OperationContext* opCtx,
+                                                  NamespaceString ns,
+                                                  std::set<RecordId>* dupRecords);
 };
 
 }  // namespace mongo

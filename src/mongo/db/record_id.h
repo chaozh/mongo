@@ -38,7 +38,6 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/logger/logstream_builder.h"
 #include "mongo/util/bufreader.h"
 
 namespace mongo {
@@ -202,8 +201,4 @@ inline std::ostream& operator<<(std::ostream& stream, const boost::optional<Reco
     return stream << "RecordId(" << (id ? id.get().repr() : 0) << ')';
 }
 
-inline logger::LogstreamBuilder& operator<<(logger::LogstreamBuilder& stream, const RecordId& id) {
-    stream.stream() << id;
-    return stream;
-}
 }  // namespace mongo

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -37,33 +37,10 @@
 #include <iostream>
 #include <psapi.h>
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/processinfo.h"
 
 namespace mongo {
-
-// dynamically link to psapi.dll (in case this version of Windows
-// does not support what we need)
-struct PsApiInit {
-    bool supported;
-    typedef BOOL(WINAPI* pQueryWorkingSetEx)(HANDLE hProcess, PVOID pv, DWORD cb);
-    pQueryWorkingSetEx QueryWSEx;
-
-    PsApiInit() {
-        HINSTANCE psapiLib = LoadLibrary(TEXT("psapi.dll"));
-        if (psapiLib) {
-            QueryWSEx =
-                reinterpret_cast<pQueryWorkingSetEx>(GetProcAddress(psapiLib, "QueryWorkingSetEx"));
-            if (QueryWSEx) {
-                supported = true;
-                return;
-            }
-        }
-        supported = false;
-    }
-};
-
-static PsApiInit* psapiGlobal = NULL;
 
 int _wconvertmtos(SIZE_T s) {
     return (int)(s / (1024 * 1024));
@@ -95,7 +72,9 @@ int ProcessInfo::getVirtualMemorySize() {
     BOOL status = GlobalMemoryStatusEx(&mse);
     if (!status) {
         DWORD gle = GetLastError();
-        error() << "GlobalMemoryStatusEx failed with " << errnoWithDescription(gle);
+        LOGV2_ERROR(23812,
+                    "GlobalMemoryStatusEx failed with {errnoWithDescription_gle}",
+                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         fassert(28621, status);
     }
 
@@ -109,7 +88,9 @@ int ProcessInfo::getResidentSize() {
     BOOL status = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
     if (!status) {
         DWORD gle = GetLastError();
-        error() << "GetProcessMemoryInfo failed with " << errnoWithDescription(gle);
+        LOGV2_ERROR(23813,
+                    "GetProcessMemoryInfo failed with {errnoWithDescription_gle}",
+                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         fassert(28622, status);
     }
 
@@ -122,7 +103,9 @@ double ProcessInfo::getSystemMemoryPressurePercentage() {
     BOOL status = GlobalMemoryStatusEx(&mse);
     if (!status) {
         DWORD gle = GetLastError();
-        error() << "GlobalMemoryStatusEx failed with " << errnoWithDescription(gle);
+        LOGV2_ERROR(23814,
+                    "GlobalMemoryStatusEx failed with {errnoWithDescription_gle}",
+                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         fassert(28623, status);
     }
 
@@ -178,16 +161,22 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     DWORD verSize = GetFileVersionInfoSizeA(filePath, NULL);
     if (verSize == 0) {
         DWORD gle = GetLastError();
-        warning() << "GetFileVersionInfoSizeA on " << filePath << " failed with "
-                  << errnoWithDescription(gle);
+        LOGV2_WARNING(
+            23807,
+            "GetFileVersionInfoSizeA on {filePath} failed with {errnoWithDescription_gle}",
+            "filePath"_attr = filePath,
+            "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         return false;
     }
 
     std::unique_ptr<char[]> verData(new char[verSize]);
     if (GetFileVersionInfoA(filePath, NULL, verSize, verData.get()) == 0) {
         DWORD gle = GetLastError();
-        warning() << "GetFileVersionInfoSizeA on " << filePath << " failed with "
-                  << errnoWithDescription(gle);
+        LOGV2_WARNING(
+            23808,
+            "GetFileVersionInfoSizeA on {filePath} failed with {errnoWithDescription_gle}",
+            "filePath"_attr = filePath,
+            "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         return false;
     }
 
@@ -195,13 +184,17 @@ bool getFileVersion(const char* filePath, DWORD& fileVersionMS, DWORD& fileVersi
     VS_FIXEDFILEINFO* verInfo;
     if (VerQueryValueA(verData.get(), "\\", (LPVOID*)&verInfo, &size) == 0) {
         DWORD gle = GetLastError();
-        warning() << "VerQueryValueA on " << filePath << " failed with "
-                  << errnoWithDescription(gle);
+        LOGV2_WARNING(23809,
+                      "VerQueryValueA on {filePath} failed with {errnoWithDescription_gle}",
+                      "filePath"_attr = filePath,
+                      "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
         return false;
     }
 
     if (size != sizeof(VS_FIXEDFILEINFO)) {
-        warning() << "VerQueryValueA on " << filePath << " returned structure with unexpected size";
+        LOGV2_WARNING(23810,
+                      "VerQueryValueA on {filePath} returned structure with unexpected size",
+                      "filePath"_attr = filePath);
         return false;
     }
 
@@ -250,8 +243,14 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
             case 10:
                 if (osvi.wProductType == VER_NT_WORKSTATION)
                     osName += "Windows 10";
-                else
-                    osName += "Windows Server 2016";
+                else {
+                    // The only way to tell apart Windows Server versions is via build number
+                    if (osvi.dwBuildNumber >= 17763) {
+                        osName += "Windows Server 2019";
+                    } else {
+                        osName += "Windows Server 2016";
+                    }
+                }
                 break;
             case 6:
                 switch (osvi.dwMinorVersion) {
@@ -308,9 +307,6 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     osVersion = verstr.str();
     hasNuma = checkNumaEnabled();
     _extraStats = bExtra.obj();
-    if (psapiGlobal == NULL) {
-        psapiGlobal = new PsApiInit();
-    }
 }
 
 bool ProcessInfo::checkNumaEnabled() {
@@ -320,15 +316,9 @@ bool ProcessInfo::checkNumaEnabled() {
     DWORD numaNodeCount = 0;
     std::unique_ptr<SYSTEM_LOGICAL_PROCESSOR_INFORMATION[]> buffer;
 
-    LPFN_GLPI glpi(reinterpret_cast<LPFN_GLPI>(
-        GetProcAddress(GetModuleHandleW(L"kernel32"), "GetLogicalProcessorInformation")));
-    if (glpi == NULL) {
-        return false;
-    }
-
     DWORD returnCode = 0;
     do {
-        returnCode = glpi(buffer.get(), &returnLength);
+        returnCode = GetLogicalProcessorInformation(buffer.get(), &returnLength);
 
         if (returnCode == FALSE) {
             if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
@@ -336,8 +326,10 @@ bool ProcessInfo::checkNumaEnabled() {
                     new BYTE[returnLength]));
             } else {
                 DWORD gle = GetLastError();
-                warning() << "GetLogicalProcessorInformation failed with "
-                          << errnoWithDescription(gle);
+                LOGV2_WARNING(
+                    23811,
+                    "GetLogicalProcessorInformation failed with {errnoWithDescription_gle}",
+                    "errnoWithDescription_gle"_attr = errnoWithDescription(gle));
                 return false;
             }
         }
@@ -361,9 +353,7 @@ bool ProcessInfo::checkNumaEnabled() {
 }
 
 bool ProcessInfo::blockCheckSupported() {
-    sysInfo();  // Initialize SystemInfo, which calls collectSystemInfo(), which creates
-                // psapiGlobal.
-    return psapiGlobal->supported;
+    return true;
 }
 
 bool ProcessInfo::blockInMemory(const void* start) {
@@ -385,7 +375,7 @@ bool ProcessInfo::blockInMemory(const void* start) {
 #endif
     PSAPI_WORKING_SET_EX_INFORMATION wsinfo;
     wsinfo.VirtualAddress = const_cast<void*>(start);
-    BOOL result = psapiGlobal->QueryWSEx(GetCurrentProcess(), &wsinfo, sizeof(wsinfo));
+    BOOL result = QueryWorkingSetEx(GetCurrentProcess(), &wsinfo, sizeof(wsinfo));
     if (result)
         if (wsinfo.VirtualAttributes.Valid)
             return true;
@@ -403,7 +393,7 @@ bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<
             reinterpret_cast<unsigned long long>(startOfFirstPage) + i * getPageSize());
     }
 
-    BOOL result = psapiGlobal->QueryWSEx(
+    BOOL result = QueryWorkingSetEx(
         GetCurrentProcess(), wsinfo.get(), sizeof(PSAPI_WORKING_SET_EX_INFORMATION) * numPages);
 
     if (!result)

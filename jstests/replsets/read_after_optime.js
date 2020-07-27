@@ -1,4 +1,5 @@
 // Test read after opTime functionality with maxTimeMS.
+load("jstests/libs/logv2_helpers.js");
 
 (function() {
 "use strict";
@@ -38,7 +39,16 @@ var runTest = function(testDB, primaryConn) {
 
     var msg = 'Command on database ' + testDB.getName() +
         ' timed out waiting for read concern to be satisfied. Command:';
+
+    if (isJsonLog(testDB.getMongo())) {
+        msg =
+            new RegExp(`Command timed out waiting for read concern to be satisfied.*"attr":{"db":"${
+                testDB.getName()}",*`);
+    }
+
     checkLog.containsWithCount(testDB.getMongo(), msg, 1);
+    // Clear the log to not fill up the ramlog
+    assert.commandWorked(testDB.adminCommand({clearLog: 'global'}));
 
     // Read concern timed out message should not be logged.
     runTimeoutTest();
@@ -47,7 +57,7 @@ var runTest = function(testDB, primaryConn) {
     runTimeoutTest();
     testDB.setLogLevel(0, 'command');
 
-    checkLog.containsWithCount(testDB.getMongo(), msg, 2);
+    checkLog.containsWithCount(testDB.getMongo(), msg, 1);
 
     // Test read on future afterOpTime that will eventually occur.
     primaryConn.getDB(dbName).parallelShellStarted.drop();

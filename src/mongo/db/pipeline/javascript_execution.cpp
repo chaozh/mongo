@@ -31,20 +31,57 @@
 
 #include "mongo/db/pipeline/javascript_execution.h"
 
+#include <iostream>
+
+#include "mongo/base/status_with.h"
+#include "mongo/util/str.h"
+
 namespace mongo {
 
 namespace {
 const auto getExec = OperationContext::declareDecoration<std::unique_ptr<JsExecution>>();
 }  // namespace
 
-JsExecution* JsExecution::get(OperationContext* opCtx, const BSONObj& scope, StringData database) {
+JsExecution* JsExecution::get(OperationContext* opCtx,
+                              const BSONObj& scope,
+                              StringData database,
+                              bool loadStoredProcedures,
+                              boost::optional<int> jsHeapLimitMB) {
     auto& exec = getExec(opCtx);
     if (!exec) {
-        exec = std::make_unique<JsExecution>(scope);
+        exec = std::make_unique<JsExecution>(opCtx, scope, jsHeapLimitMB);
         exec->getScope()->setLocalDB(database);
-        exec->getScope()->loadStored(opCtx, true);
+        if (loadStoredProcedures) {
+            exec->getScope()->loadStored(opCtx, true);
+        }
+        exec->_storedProceduresLoaded = loadStoredProcedures;
+    } else {
+        uassert(31438,
+                "A single operation cannot use both JavaScript aggregation expressions and $where.",
+                loadStoredProcedures == exec->_storedProceduresLoaded);
     }
     return exec.get();
 }
 
+Value JsExecution::callFunction(ScriptingFunction func,
+                                const BSONObj& params,
+                                const BSONObj& thisObj) {
+    int err = _scope->invoke(func, &params, &thisObj, _fnCallTimeoutMillis, false);
+    uassert(
+        31439, str::stream() << "js function failed to execute: " << _scope->getError(), err == 0);
+
+    BSONObjBuilder returnValue;
+    _scope->append(returnValue, "", "__returnValue");
+    return Value(returnValue.done().firstElement());
+}
+
+void JsExecution::callFunctionWithoutReturn(ScriptingFunction func,
+                                            const BSONObj& params,
+                                            const BSONObj& thisObj) {
+    int err = _scope->invoke(func, &params, &thisObj, _fnCallTimeoutMillis, true);
+    uassert(
+        31470, str::stream() << "js function failed to execute: " << _scope->getError(), err == 0);
+
+    return;
+}
 }  // namespace mongo

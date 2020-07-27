@@ -93,9 +93,6 @@ selector:
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
 
-  # TODO Unblacklist (SERVER-35538).
-  - jstests/concurrency/fsm_workloads/database_versioning.js
-
   # TODO Unblacklist (SERVER-38852).
   - jstests/concurrency/fsm_workloads/agg_out_interrupt_cleanup.js
 
@@ -140,6 +137,8 @@ selector:
   - assumes_balancer_off
   - does_not_support_causal_consistency
   - requires_replication
+  # Snapshot reads in transactions are banned on capped collections.
+  - requires_capped
   # Sharing cursors between state functions will fail in this suite because it will attempt to use
   # the same cursor in multiple transactions.
   - state_functions_share_cursor
@@ -170,6 +169,7 @@ executor:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash
   - class: ValidateCollections
+  - class: CheckOrphansDeleted
   - class: CleanupConcurrencyWorkloads
   fixture:
     class: ShardedClusterFixture
@@ -182,6 +182,7 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
+        roleGraphInvalidationIsFatal: 1
     num_rs_nodes_per_shard: 3
     num_shards: 2
     num_mongos: 2

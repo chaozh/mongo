@@ -85,8 +85,7 @@ void AccumulatorSum::processInternal(const Value& input, bool merging) {
     }
 }
 
-intrusive_ptr<Accumulator> AccumulatorSum::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorSum::create(ExpressionContext* const expCtx) {
     return new AccumulatorSum(expCtx);
 }
 
@@ -127,9 +126,8 @@ Value AccumulatorSum::getValue(bool toBeMerged) {
     }
 }
 
-AccumulatorSum::AccumulatorSum(const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx) {
-    // This is a fixed size Accumulator so we never need to update this.
+AccumulatorSum::AccumulatorSum(ExpressionContext* const expCtx) : AccumulatorState(expCtx) {
+    // This is a fixed size AccumulatorState so we never need to update this.
     _memUsageBytes = sizeof(*this);
 }
 

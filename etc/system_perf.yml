@@ -4,6 +4,24 @@ command_type: system
 pre:
 
 post:
+    # Do cluster teardown first to ensure runtime is below Evergreen's post timeout. Other post tasks
+    # will not have been run if the timeout is exceeded.
+    - command: shell.exec
+      params:
+        working_dir: work
+        script: |
+          source ./dsienv.sh
+          if [ -e /data/infrastructure_provisioning/terraform/provisioned.${cluster} ]; then
+            mark_idle.sh
+          fi
+    - command: shell.exec
+      params:
+        working_dir: work
+        script: |
+          set -e
+          set -v
+          source ./dsienv.sh
+          ../src/dsi/dsi/run-dsi infrastructure_teardown.py
     - command: shell.exec
       params:
         working_dir: work
@@ -37,15 +55,6 @@ post:
       params:
          name: "perf"
          file: "work/perf.json"
-    - command: shell.exec
-      params:
-        working_dir: work
-        script: |
-          source ./dsienv.sh
-          if [ -e /data/infrastructure_provisioning/terraform/provisioned.${cluster} ]; then
-            mark_idle.sh
-          fi
-
     - func: "upload pip requirements"
     - command: shell.exec
       params:
@@ -68,10 +77,12 @@ functions:
         dsi: ${dsi_rev}
         enterprise: ${enterprise_rev}
         linkbench: ${linkbench_rev}
+        linkbench2: ${linkbench2_rev}
         genny: ${genny_rev}
         workloads: ${workloads_rev}
         wtdevelop: ${wtdevelop_rev}
         mongo-tools: ${mongo-tools_rev}
+        signal-processing: ${signal-processing_rev}
 
   "compile mongodb":
     # We create a virtual environment with the Python dependencies for compiling the server
@@ -155,7 +166,7 @@ functions:
           set -o errexit
           set -o verbose
           source "${workdir}/compile_venv/bin/activate"
-          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --install-mode=hygienic install-core MONGO_VERSION=${version} DESTDIR=$(pwd)/mongodb
+          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} install-core MONGO_VERSION=${version} DESTDIR=$(pwd)/mongodb
           mkdir -p mongodb/jstests/hooks
           if [ -d jstests/hooks ]
           then
@@ -218,11 +229,14 @@ functions:
             tfvars:
               # This is currently only used by initialsync-logkeeper. It is empty and not used for other tests.
               mongod_seeded_ebs_snapshot_id: ${snapshotId}
+              # Initially used by sb_large_scale to override expire-on-delta to allow longer runtime on otherwise standard variants
+              ${additional_tfvars|}
           workload_setup:
             local_repos:
               workloads: ../src/workloads/workloads
               ycsb: ../src/YCSB/YCSB
               linkbench: ../src/linkbench/linkbench
+              linkbench2: ../src/linkbench2/linkbench2
               tpcc: ../src/tpcc/tpcc
               genny: ../src/genny/genny
           mongodb_setup:
@@ -336,6 +350,16 @@ functions:
 
   "analyze":
     - command: shell.exec
+      type: test
+      params:
+        working_dir: work
+        script: |
+          set -o verbose
+          source ./dsienv.sh
+          ../src/dsi/dsi/run-dsi analysis.py
+          # detect outliers needs to run, so defer the post_run_check exit status to later
+          echo $? > post_run_check.status
+    - command: shell.exec
       params:
         working_dir: work
         silent: true
@@ -356,25 +380,14 @@ functions:
         script: |
           set -o verbose
           source ./signal_processing_venv/bin/activate
-          detect-changes --evergreen-api-config .evergreen.yml
-    - command: shell.exec
-      type: test
-      params:
-        working_dir: work
-        script: |
-          set -o verbose
-          TAG="4.0.2-Baseline"
-          OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
-          python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file perf.json --rev ${revision} --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
-          # detect outliers needs to run, so defer the post_run_check exit status to later
-          echo $? > post_run_check.status
+          detect-changes --config .signal-processing.yml
     - command: shell.exec
       params:
         working_dir: work
         script: |
           set -o verbose
           source ./signal_processing_venv/bin/activate
-          detect-outliers --evergreen-api-config .evergreen.yml
+          detect-outliers --config .signal-processing.yml
     - command: shell.exec
       type: setup
       params:
@@ -425,6 +438,18 @@ tasks:
     - func: "prepare environment"
       vars:
         test: "linkbench"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
+- name: linkbench2
+  priority: 5
+  exec_timeout_secs: 43200 # 12 hours
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "linkbench2"
+        additional_tfvars: "tags: {expire-on-delta: 12}"
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -857,6 +882,28 @@ tasks:
         files:
           - src/genny/genny/build/patch_tasks.json
 
+- name: sb_large_scale
+  priority: 5
+  exec_timeout_secs: 43200 # 12 hours
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "sb_large_scale"
+        additional_tfvars: "tags: {expire-on-delta: 12}"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
+- name: sb_timeseries
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "sb_timeseries"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
 #######################################
 #               Modules               #
 #######################################
@@ -888,6 +935,12 @@ modules:
   prefix: linkbench
   branch: master
 
+- name: linkbench2
+  repo: git@github.com:mdcallag/linkbench.git
+  prefix: linkbench2
+  branch: master
+  ref: 63207190657737b32eb0e81c5b81ad1b8bad0e5a
+
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
   prefix: src/mongo/db/modules
@@ -896,6 +949,11 @@ modules:
 - name: mongo-tools
   repo: git@github.com:mongodb/mongo-tools.git
   prefix: mongo-tools/src/github.com/mongodb
+  branch: master
+
+- name: signal-processing
+  repo: git@github.com:10gen/signal-processing.git
+  prefix: signal_processing
   branch: master
 
 #######################################
@@ -920,6 +978,7 @@ buildvariants:
     use_scons_cache: true
     compile_flags: >-
       --ssl
+      --separate-debug
       MONGO_DISTMOD=amazon2
       -j$(grep -c ^processor /proc/cpuinfo)
       --release
@@ -942,6 +1001,8 @@ buildvariants:
   expansions:
     <<: *compile-expansions
     compile-variant: -wtdevelop
+  tasks:
+    - name: compile
 
 - name: compile-rhel70
   display_name: Compile for Atlas-like
@@ -953,6 +1014,7 @@ buildvariants:
     <<: *compile-expansions
     compile_flags: >-
       --ssl
+      --separate-debug
       MONGO_DISTMOD=rhel70
       -j$(grep -c ^processor /proc/cpuinfo)
       --release
@@ -974,6 +1036,8 @@ buildvariants:
     - genny
     - workloads
     - linkbench
+    - linkbench2
+    - signal-processing
   expansions:
     setup: single-replica
     cluster: single
@@ -1007,14 +1071,17 @@ buildvariants:
     - name: change_streams_latency
     - name: snapshot_reads
     - name: linkbench
+    - name: linkbench2
     - name: tpcc
     - name: genny_patch_tasks
     - name: genny_auto_tasks
     - name: industry_benchmarks_wmajority
+    - name: sb_large_scale
+    - name: sb_timeseries
 
 - name: linux-standalone
   display_name: Linux Standalone
-  batchtime: 1440 # 24 hours
+  batchtime: 2880  # 48 hours
   modules: *modules
   expansions:
     setup: standalone
@@ -1076,7 +1143,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-fle
   display_name: Linux 1-Node ReplSet FLE
-  batchtime: 1440 # 24 hours
+  batchtime: 2880  # 48 hours
   modules: *modules
   expansions:
     setup: single-replica-fle
@@ -1125,7 +1192,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-cbc
   display_name: Linux 1-Node ReplSet ESE CBC
-  batchtime: 1440 # 24 hours
+  batchtime: 2880  # 48 hours
   modules: *modules
   expansions:
     setup: single-replica-ese-cbc
@@ -1146,10 +1213,11 @@ buildvariants:
     - name: smoke_test
     - name: genny_patch_tasks
     - name: genny_auto_tasks
+    - name: ycsb_60GB
 
 - name: linux-1-node-replSet-ese-gcm
   display_name: Linux 1-Node ReplSet ESE GCM
-  batchtime: 1440 # 24 hours
+  batchtime: 2880  # 48 hours
   modules: *modules
   expansions:
     setup: single-replica-ese-gcm
@@ -1170,10 +1238,11 @@ buildvariants:
     - name: smoke_test
     - name: genny_patch_tasks
     - name: genny_auto_tasks
+    - name: ycsb_60GB
 
 - name: linux-1-node-15gbwtcache
   display_name: Linux 1-Node ReplSet 15 GB WiredTiger Cache
-  batchtime: 1440 # 24 hours
+  batchtime: 2880  # 48 hours
   modules: *modules
   expansions:
     setup: single-replica-15gbwtcache
@@ -1191,6 +1260,31 @@ buildvariants:
         variant: compile-amazon2
   tasks:
     - name: industry_benchmarks
+    - name: smoke_test
+    - name: genny_patch_tasks
+    - name: genny_auto_tasks
+
+- name: linux-3-node-1dayhistory-15gbwtcache
+  display_name: Linux 3-Node ReplSet 1 Day History 15 GB WiredTiger Cache
+  batchtime: 2880  # 48 hours
+  modules: *modules
+  expansions:
+    setup: replica-1dayhistory-15gbwtcache
+    cluster: replica
+    platform: linux
+    project_dir: *project_dir
+    authentication: enabled
+    storageEngine: wiredTiger
+  run_on:
+    - "rhel70-perf-replset"
+  depends_on:
+    - name: compile
+      variant: compile-amazon2
+    - name: genny_generate_all_tasks
+      variant: compile-amazon2
+  tasks:
+    - name: crud_workloads
+    - name: crud_workloads_majority
     - name: smoke_test
     - name: genny_patch_tasks
     - name: genny_auto_tasks
@@ -1296,7 +1390,7 @@ buildvariants:
 
 - name: linux-3-node-replSet
   display_name: Linux 3-Node ReplSet
-  batchtime: 1440 # 24 hours
+  batchtime: 2880  # 48 hours
   modules: *modules
   expansions:
     setup: replica
@@ -1338,8 +1432,11 @@ buildvariants:
     - name: secondary_reads
     - name: tpcc
     - name: linkbench
+    - name: linkbench2
     - name: genny_patch_tasks
     - name: genny_auto_tasks
+    - name: sb_large_scale
+    - name: sb_timeseries
 
 - name: linux-3-node-replSet-noflowcontrol
   display_name: Linux 3-Node ReplSet (Flow Control off)
@@ -1371,6 +1468,7 @@ buildvariants:
     - name: change_streams_latency
     - name: tpcc
     - name: linkbench
+    - name: linkbench2
     - name: genny_patch_tasks
     - name: genny_auto_tasks
 
@@ -1400,7 +1498,7 @@ buildvariants:
 
 - name: linux-3-node-replSet-initialsync
   display_name: Linux 3-Node ReplSet Initial Sync
-  batchtime: 1440 # 24 hours
+  batchtime: 2880  # 48 hours
   modules: *modules
   expansions:
     setup: replica-2node
@@ -1446,6 +1544,27 @@ buildvariants:
   tasks:
     - name: initialsync-logkeeper
     - name: genny_patch_tasks
+    - name: genny_auto_tasks
+
+- name: linux-replSet-auth-delay
+  display_name: Linux 3-Node ReplSet (Auth Delay)
+  batchtime: 10080 # 7 days
+  modules: *modules
+  expansions:
+    setup: replica-auth-cluster-delay
+    cluster: replica
+    platform: linux
+    project_dir: *project_dir
+    authentication: enabled
+    storageEngine: wiredTiger
+  run_on:
+      - "rhel70-perf-replset"
+  depends_on:
+      - name: compile
+        variant: compile-amazon2
+      - name: genny_generate_all_tasks
+        variant: compile-amazon2
+  tasks:
     - name: genny_auto_tasks
 
 #######################################

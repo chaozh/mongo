@@ -82,7 +82,7 @@ public:
 
         ResourceLock(Locker* locker, ResourceId rid, LockMode mode)
             : _rid(rid), _locker(locker), _result(LOCK_INVALID) {
-            lock(mode);
+            lock(nullptr, mode);
         }
 
         ResourceLock(ResourceLock&& otherLock)
@@ -98,8 +98,17 @@ public:
             }
         }
 
-        void lock(LockMode mode);                           // Uninterruptible
-        void lock(OperationContext* opCtx, LockMode mode);  // Interruptible
+        /**
+         * Acquires lock on this specified resource in the specified mode.
+         *
+         * If 'opCtx' is provided, it will be used to interrupt a LOCK_WAITING state.
+         * If 'deadline' is provided, we will wait until 'deadline' for the lock to be granted.
+         * Otherwise, this parameter defaults to an infinite deadline.
+         *
+         * This function may throw an exception if it is interrupted.
+         */
+        void lock(OperationContext* opCtx, LockMode mode, Date_t deadline = Date_t::max());
+
         void unlock();
 
         bool isLocked() const {
@@ -165,7 +174,7 @@ public:
          * stdx::condition_variable_any
          */
         void lock() {
-            lock(MODE_X);
+            lock(nullptr, MODE_X);
         }
     };
 

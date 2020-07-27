@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,7 @@
 
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -69,7 +69,10 @@ void ShardingState::setInitialized(ShardId shardId, OID clusterId) {
 
 void ShardingState::setInitialized(Status failedStatus) {
     invariant(!failedStatus.isOK());
-    log() << "Failed to initialize sharding components" << causedBy(failedStatus);
+    LOGV2(22082,
+          "Failed to initialize sharding components {error}",
+          "Failed to initialize sharding components",
+          "error"_attr = failedStatus);
 
     stdx::unique_lock<Latch> ul(_mutex);
     invariant(_getInitializationState() == InitializationState::kNew);
@@ -105,13 +108,11 @@ Status ShardingState::canAcceptShardedCommands() const {
 
 ShardId ShardingState::shardId() {
     invariant(enabled());
-    stdx::lock_guard<Latch> lk(_mutex);
     return _shardId;
 }
 
 OID ShardingState::clusterId() {
     invariant(enabled());
-    stdx::lock_guard<Latch> lk(_mutex);
     return _clusterId;
 }
 

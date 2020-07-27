@@ -43,7 +43,7 @@
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/json.h"
-#include "mongo/db/query/plan_executor.h"
+#include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -113,24 +113,26 @@ public:
         Collection* coll) {
         // Build the mock scan stage which feeds the data.
         auto ws = std::make_unique<WorkingSet>();
-        auto queuedDataStage = std::make_unique<QueuedDataStage>(&_opCtx, ws.get());
+        _workingSet = ws.get();
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
         insertVarietyOfObjects(ws.get(), queuedDataStage.get(), coll);
 
         auto sortPattern = BSON("foo" << 1);
         auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
             _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto ss = std::make_unique<SortStage>(_expCtx,
-                                              ws.get(),
-                                              SortPattern{sortPattern, _expCtx},
-                                              limit(),
-                                              maxMemoryUsageBytes(),
-                                              std::move(keyGenStage));
+        auto ss = std::make_unique<SortStageDefault>(_expCtx,
+                                                     ws.get(),
+                                                     SortPattern{sortPattern, _expCtx},
+                                                     limit(),
+                                                     maxMemoryUsageBytes(),
+                                                     false,  // addSortKeyMetadata
+                                                     std::move(keyGenStage));
 
         // The PlanExecutor will be automatically registered on construction due to the auto
         // yield policy, so it can receive invalidations when we remove documents later.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(ss), coll, PlanExecutor::YIELD_AUTO);
+        auto statusWithPlanExecutor = plan_executor_factory::make(
+            _expCtx, std::move(ws), std::move(ss), coll, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
         invariant(statusWithPlanExecutor.isOK());
         return std::move(statusWithPlanExecutor.getValue());
     }
@@ -151,7 +153,7 @@ public:
      */
     void sortAndCheck(int direction, Collection* coll) {
         auto ws = std::make_unique<WorkingSet>();
-        auto queuedDataStage = std::make_unique<QueuedDataStage>(&_opCtx, ws.get());
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
 
         // Insert a mix of the various types of data.
         insertVarietyOfObjects(ws.get(), queuedDataStage.get(), coll);
@@ -160,19 +162,24 @@ public:
         auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
             _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto sortStage = std::make_unique<SortStage>(_expCtx,
-                                                     ws.get(),
-                                                     SortPattern{sortPattern, _expCtx},
-                                                     limit(),
-                                                     maxMemoryUsageBytes(),
-                                                     std::move(keyGenStage));
+        auto sortStage = std::make_unique<SortStageDefault>(_expCtx,
+                                                            ws.get(),
+                                                            SortPattern{sortPattern, _expCtx},
+                                                            limit(),
+                                                            maxMemoryUsageBytes(),
+                                                            false,  // addSortKeyMetadata
+                                                            std::move(keyGenStage));
 
-        auto fetchStage =
-            std::make_unique<FetchStage>(&_opCtx, ws.get(), std::move(sortStage), nullptr, coll);
+        auto fetchStage = std::make_unique<FetchStage>(
+            _expCtx.get(), ws.get(), std::move(sortStage), nullptr, coll);
 
         // Must fetch so we can look at the doc as a BSONObj.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -234,8 +241,10 @@ public:
 protected:
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
-    boost::intrusive_ptr<ExpressionContext> _expCtx = new ExpressionContext(&_opCtx, nullptr);
+    boost::intrusive_ptr<ExpressionContext> _expCtx =
+        new ExpressionContext(&_opCtx, nullptr, nss());
     DBDirectClient _client;
+    WorkingSet* _workingSet = nullptr;
 };
 
 
@@ -345,7 +354,7 @@ public:
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
-        SortStage* ss = static_cast<SortStage*>(exec->getRootStage());
+        SortStage* ss = static_cast<SortStageDefault*>(exec->getRootStage());
         SortKeyGeneratorStage* keyGenStage =
             static_cast<SortKeyGeneratorStage*>(ss->getChildren()[0].get());
         QueuedDataStage* queuedDataStage =
@@ -409,10 +418,9 @@ public:
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState status = ss->work(&id);
             if (PlanStage::ADVANCED != status) {
-                ASSERT_NE(status, PlanStage::FAILURE);
                 continue;
             }
-            WorkingSetMember* member = exec->getWorkingSet()->get(id);
+            WorkingSetMember* member = _workingSet->get(id);
             ASSERT(member->hasObj());
             if (member->doc.value().getField("_id").getOid() == updatedId) {
                 ASSERT(idBeforeUpdate == member->doc.snapshotId());
@@ -455,7 +463,7 @@ public:
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
-        SortStage* ss = static_cast<SortStage*>(exec->getRootStage());
+        SortStage* ss = static_cast<SortStageDefault*>(exec->getRootStage());
         SortKeyGeneratorStage* keyGenStage =
             static_cast<SortKeyGeneratorStage*>(ss->getChildren()[0].get());
         QueuedDataStage* queuedDataStage =
@@ -503,10 +511,9 @@ public:
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState status = ss->work(&id);
             if (PlanStage::ADVANCED != status) {
-                ASSERT_NE(status, PlanStage::FAILURE);
                 continue;
             }
-            WorkingSetMember* member = exec->getWorkingSet()->get(id);
+            WorkingSetMember* member = _workingSet->get(id);
             ASSERT(member->hasObj());
             ++count;
         }
@@ -548,7 +555,7 @@ public:
         }
 
         auto ws = std::make_unique<WorkingSet>();
-        auto queuedDataStage = std::make_unique<QueuedDataStage>(&_opCtx, ws.get());
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
 
         for (int i = 0; i < numObj(); ++i) {
             {
@@ -574,24 +581,29 @@ public:
         auto keyGenStage = std::make_unique<SortKeyGeneratorStage>(
             _expCtx, std::move(queuedDataStage), ws.get(), sortPattern);
 
-        auto sortStage = std::make_unique<SortStage>(_expCtx,
-                                                     ws.get(),
-                                                     SortPattern{sortPattern, _expCtx},
-                                                     0u,
-                                                     maxMemoryUsageBytes(),
-                                                     std::move(keyGenStage));
+        auto sortStage = std::make_unique<SortStageDefault>(_expCtx,
+                                                            ws.get(),
+                                                            SortPattern{sortPattern, _expCtx},
+                                                            0u,
+                                                            maxMemoryUsageBytes(),
+                                                            false,  // addSortKeyMetadata
+                                                            std::move(keyGenStage));
 
-        auto fetchStage =
-            std::make_unique<FetchStage>(&_opCtx, ws.get(), std::move(sortStage), nullptr, coll);
+        auto fetchStage = std::make_unique<FetchStage>(
+            _expCtx.get(), ws.get(), std::move(sortStage), nullptr, coll);
 
         // We don't get results back since we're sorting some parallel arrays.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(fetchStage), coll, PlanExecutor::NO_YIELD);
+        auto statusWithPlanExecutor =
+            plan_executor_factory::make(_expCtx,
+                                        std::move(ws),
+                                        std::move(fetchStage),
+                                        coll,
+                                        PlanYieldPolicy::YieldPolicy::NO_YIELD);
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
-        PlanExecutor::ExecState runnerState =
-            exec->getNext(static_cast<BSONObj*>(nullptr), nullptr);
-        ASSERT_EQUALS(PlanExecutor::FAILURE, runnerState);
+        ASSERT_THROWS_CODE(exec->getNext(static_cast<BSONObj*>(nullptr), nullptr),
+                           DBException,
+                           ErrorCodes::BadValue);
     }
 };
 

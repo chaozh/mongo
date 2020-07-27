@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -43,7 +43,6 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/transport/service_entry_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -167,15 +166,22 @@ unique_ptr<DBClientCursor> DBDirectClient::query(const NamespaceStringOrUUID& ns
                                                  int nToSkip,
                                                  const BSONObj* fieldsToReturn,
                                                  int queryOptions,
-                                                 int batchSize) {
+                                                 int batchSize,
+                                                 boost::optional<BSONObj> readConcernObj) {
+    invariant(!readConcernObj, "passing readConcern to DBDirectClient functions is not supported");
     return DBClientBase::query(
         nsOrUuid, query, nToReturn, nToSkip, fieldsToReturn, queryOptions, batchSize);
 }
 
-long long DBDirectClient::count(
-    const NamespaceStringOrUUID nsOrUuid, const BSONObj& query, int options, int limit, int skip) {
+long long DBDirectClient::count(const NamespaceStringOrUUID nsOrUuid,
+                                const BSONObj& query,
+                                int options,
+                                int limit,
+                                int skip,
+                                boost::optional<BSONObj> readConcernObj) {
+    invariant(!readConcernObj, "passing readConcern to DBDirectClient functions is not supported");
     DirectClientScope directClientScope(_opCtx);
-    BSONObj cmdObj = _countCmd(nsOrUuid, query, options, limit, skip);
+    BSONObj cmdObj = _countCmd(nsOrUuid, query, options, limit, skip, boost::none);
 
     auto dbName = (nsOrUuid.uuid() ? nsOrUuid.dbname() : (*nsOrUuid.nss()).db().toString());
 

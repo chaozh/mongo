@@ -31,6 +31,7 @@
 
 #include <memory>
 
+#include "mongo/config.h"
 #include "mongo/db/baton.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/rpc/message.h"
@@ -40,8 +41,14 @@
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/net/sockaddr.h"
 #include "mongo/util/time_support.h"
+#ifdef MONGO_CONFIG_SSL
+#include "mongo/util/net/ssl_types.h"
+#endif
 
 namespace mongo {
+
+class SSLManagerInterface;
+
 namespace transport {
 
 class TransportLayer;
@@ -183,6 +190,18 @@ public:
     void mutateTags(const std::function<TagMask(TagMask)>& mutateFunc);
 
     TagMask getTags() const;
+
+#ifdef MONGO_CONFIG_SSL
+    /**
+     * Get the configuration from the SSL manager.
+     */
+    virtual const SSLConfiguration* getSSLConfiguration() const = 0;
+
+    /**
+     * Get the SSL manager associated with this session.
+     */
+    virtual const std::shared_ptr<SSLManagerInterface> getSSLManager() const = 0;
+#endif
 
 protected:
     Session();

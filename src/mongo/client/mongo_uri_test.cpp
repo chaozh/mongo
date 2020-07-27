@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
+
 #include "mongo/platform/basic.h"
 
 #include <fstream>
@@ -39,6 +41,7 @@
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
+#include "mongo/logv2/log.h"
 #include <boost/filesystem/operations.hpp>
 #include <boost/optional.hpp>
 #include <boost/optional/optional_io.hpp>
@@ -84,11 +87,15 @@ void compareOptions(size_t lineNumber,
 
     for (std::size_t i = 0; i < std::min(options.size(), expectedOptions.size()); ++i) {
         if (options[i] != expectedOptions[i]) {
-            unittest::log() << "Option: \"tolower(" << options[i].first.original()
-                            << ")=" << options[i].second << "\" doesn't equal: \"tolower("
-                            << expectedOptions[i].first.original()
-                            << ")=" << expectedOptions[i].second << "\""
-                            << " data on line: " << lineNumber << std::endl;
+            LOGV2(20152,
+                  "Option: \"tolower({key})={value}\" doesn't equal: "
+                  "\"tolower({expectedKey})={expectedValue}\" data on line: {lineNumber}",
+                  "Option key-value pair doesn't equal expected pair",
+                  "key"_attr = options[i].first.original(),
+                  "value"_attr = options[i].second,
+                  "expectedKey"_attr = expectedOptions[i].first.original(),
+                  "expectedValue"_attr = expectedOptions[i].second,
+                  "lineNumber"_attr = lineNumber);
             std::cerr << "Failing URI: \"" << uri << "\""
                       << " data on line: " << lineNumber << std::endl;
             ASSERT(false);
@@ -575,7 +582,7 @@ BSONObj getBsonFromJsonFile(std::string fileName) {
     std::ifstream infile(filename.c_str());
     std::string data((std::istreambuf_iterator<char>(infile)), std::istreambuf_iterator<char>());
     BSONObj obj = fromjson(data);
-    ASSERT_TRUE(obj.valid(BSONVersion::kLatest));
+    ASSERT_TRUE(obj.valid());
     ASSERT_TRUE(obj.hasField("tests"));
     BSONObj arr = obj.getField("tests").embeddedObject().getOwned();
     ASSERT_TRUE(arr.couldBeArray());
@@ -594,7 +601,7 @@ std::string returnStringFromElementOrNull(BSONElement element) {
 
 // Helper method to take a valid test case, parse() it, and assure the output is correct
 void testValidURIFormat(URITestCase testCase) {
-    unittest::log() << "Testing URI: " << testCase.URI << '\n';
+    LOGV2(20153, "Testing URI: {mongoUri}", "Testing URI", "mongoUri"_attr = testCase.URI);
     std::string errMsg;
     const auto cs_status = MongoURI::parse(testCase.URI);
     ASSERT_OK(cs_status);
@@ -622,7 +629,7 @@ TEST(MongoURI, InvalidURIs) {
 
     for (size_t i = 0; i != numCases; ++i) {
         const InvalidURITestCase testCase = invalidCases[i];
-        unittest::log() << "Testing URI: " << testCase.URI << '\n';
+        LOGV2(20154, "Testing URI: {mongoUri}", "Testing URI", "mongoUri"_attr = testCase.URI);
         auto cs_status = MongoURI::parse(testCase.URI);
         ASSERT_NOT_OK(cs_status);
         if (testCase.code) {
@@ -704,7 +711,10 @@ TEST(MongoURI, specTests) {
             if (!valid) {
                 // This uri string is invalid --> parse the uri and ensure it fails
                 const InvalidURITestCase testCase = InvalidURITestCase{uri};
-                unittest::log() << "Testing URI: " << testCase.URI << '\n';
+                LOGV2(20155,
+                      "Testing URI: {mongoUri}",
+                      "Testing URI",
+                      "mongoUri"_attr = testCase.URI);
                 auto cs_status = MongoURI::parse(testCase.URI);
                 ASSERT_NOT_OK(cs_status);
             } else {

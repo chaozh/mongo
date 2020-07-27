@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -36,14 +36,13 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/dist_lock_catalog_impl.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/config_server_test_fixture.h"
-#include "mongo/util/log.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -179,24 +178,19 @@ TEST_F(CreateDatabaseTest, createDatabaseSuccessWithCustomPrimary) {
     ASSERT_EQUALS(primaryShardName, foundDatabase.getPrimary());
 }
 
-TEST_F(CreateDatabaseTest,
-       createDatabaseShardReturnsNamespaceNotFoundForFlushDatabaseCacheUpdates) {
-    const std::string dbname = "db1";
+TEST_F(CreateDatabaseTest, createDatabaseDBExists) {
+    const std::string dbname = "db3";
+    const ShardType shard{"shard0", "shard0:12345"};
+    setupShards({shard});
+    setupDatabase(dbname, shard.getName(), false);
 
-    const std::vector<ShardType> shards{{"shard0000", "ShardHost0:27017"},
-                                        {"shard0001", "ShardHost1:27017"},
-                                        {"shard0002", "ShardHost2:27017"}};
-    setupShards(shards);
+    targeterFactory()->addTargeterToReturn(ConnectionString(HostAndPort{shard.getHost()}), [&] {
+        auto targeter = std::make_unique<RemoteCommandTargeterMock>();
+        targeter->setFindHostReturnValue(HostAndPort{shard.getHost()});
+        return targeter;
+    }());
 
-    for (const auto& shard : shards) {
-        targeterFactory()->addTargeterToReturn(ConnectionString(HostAndPort{shard.getHost()}), [&] {
-            auto targeter = std::make_unique<RemoteCommandTargeterMock>();
-            targeter->setFindHostReturnValue(HostAndPort{shard.getHost()});
-            return targeter;
-        }());
-    }
-
-    // Prime the shard registry with information about the existing shards
+    // Prime the shard registry with information about the existing shard
     shardRegistry()->reload(operationContext());
 
     auto future = launchAsync([this, dbname] {
@@ -205,70 +199,15 @@ TEST_F(CreateDatabaseTest,
         ShardingCatalogManager::get(opCtx.get())->createDatabase(opCtx.get(), dbname, ShardId());
     });
 
-    // Return size information about first shard
-    onCommand([&](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(shards[0].getHost(), request.target.toString());
-        ASSERT_EQUALS("admin", request.dbname);
-        std::string cmdName = request.cmdObj.firstElement().fieldName();
-        ASSERT_EQUALS("listDatabases", cmdName);
-        ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
-
-        ASSERT_BSONOBJ_EQ(
-            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
-            rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        return BSON("ok" << 1 << "totalSize" << 10);
-    });
-
-    // Return size information about second shard
-    onCommand([&](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(shards[1].getHost(), request.target.toString());
-        ASSERT_EQUALS("admin", request.dbname);
-        std::string cmdName = request.cmdObj.firstElement().fieldName();
-        ASSERT_EQUALS("listDatabases", cmdName);
-        ASSERT_FALSE(request.cmdObj.hasField(repl::ReadConcernArgs::kReadConcernFieldName));
-
-        ASSERT_BSONOBJ_EQ(
-            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
-            rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        return BSON("ok" << 1 << "totalSize" << 1);
-    });
-
-    // Return size information about third shard
-    onCommand([&](const RemoteCommandRequest& request) {
-        ASSERT_EQUALS(shards[2].getHost(), request.target.toString());
-        ASSERT_EQUALS("admin", request.dbname);
-        std::string cmdName = request.cmdObj.firstElement().fieldName();
-        ASSERT_EQUALS("listDatabases", cmdName);
-
-        ASSERT_BSONOBJ_EQ(
-            ReadPreferenceSetting(ReadPreference::PrimaryPreferred).toContainingBSON(),
-            rpc::TrackingMetadata::removeTrackingData(request.metadata));
-
-        return BSON("ok" << 1 << "totalSize" << 100);
-    });
-
-    // Return NamespaceNotFound for _flushDatabaseCacheUpdates
+    // Return OK for _flushDatabaseCacheUpdates
     onCommand([&](const RemoteCommandRequest& request) {
         std::string cmdName = request.cmdObj.firstElement().fieldName();
         ASSERT_EQUALS("_flushDatabaseCacheUpdates", cmdName);
 
-        return BSON("ok" << 0 << "code" << ErrorCodes::NamespaceNotFound << "errmsg"
-                         << "dummy");
+        return BSON("ok" << 1);
     });
 
     future.default_timed_get();
-}
-
-TEST_F(CreateDatabaseTest, createDatabaseDBExists) {
-    const std::string dbname = "db3";
-
-    setupShards({{"shard0", "shard0:12345"}});
-    setupDatabase(dbname, ShardId("shard0"), false);
-
-    ShardingCatalogManager::get(operationContext())
-        ->createDatabase(operationContext(), dbname, ShardId());
 }
 
 TEST_F(CreateDatabaseTest, createDatabaseDBExistsDifferentCase) {

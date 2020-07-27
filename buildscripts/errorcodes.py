@@ -26,8 +26,7 @@ except ImportError:
 
 ASSERT_NAMES = ["uassert", "massert", "fassert", "fassertFailed"]
 MINIMUM_CODE = 10000
-# This limit is intended to be increased by 1000 when we get close.
-MAXIMUM_CODE = 51999
+MAXIMUM_CODE = 9999999  # JIRA Ticket + XX
 
 # pylint: disable=invalid-name
 codes = []  # type: ignore
@@ -42,15 +41,15 @@ list_files = False  # pylint: disable=invalid-name
 def parse_source_files(callback):
     """Walk MongoDB sourcefiles and invoke a callback for each AssertLocation found."""
 
-    quick = [r"assert", r"Exception", r"ErrorCodes::Error", r"LOGV2"]
+    quick = [r"assert", r"Exception", r"ErrorCodes::Error", r"LOGV2", r"logAndBackoff"]
 
     patterns = [
         re.compile(r"(?:u|m(?:sg)?)asser(?:t|ted)(?:NoTrace)?\s*\(\s*(\d+)", re.MULTILINE),
         re.compile(r"(?:DB|Assertion)Exception\s*[({]\s*(\d+)", re.MULTILINE),
         re.compile(r"fassert(?:Failed)?(?:WithStatus)?(?:NoTrace)?(?:StatusOK)?\s*\(\s*(\d+)",
                    re.MULTILINE),
-        re.compile(r"LOGV2(?:_INFO|_WARNING|_ERROR|_FATAL|_DEBUG)?(?:_OPTIONS)?\s*\(\s*(\d+)",
-                   re.MULTILINE),
+        re.compile(r"LOGV2(?:\w*)?\s*\(\s*(\d+)", re.MULTILINE),
+        re.compile(r"logAndBackoff\(\s*(\d+)", re.MULTILINE),
         re.compile(r"ErrorCodes::Error\s*[({]\s*(\d+)", re.MULTILINE)
     ]
 
@@ -128,8 +127,9 @@ def read_error_codes():
     errors = []
     dups = defaultdict(list)
     skips = []
+    malformed = []  # type: ignore
 
-    # define callback
+    # define validation callbacks
     def check_dups(assert_loc):
         """Check for duplicates."""
         codes.append(assert_loc)
@@ -137,13 +137,6 @@ def read_error_codes():
 
         if not code in seen:
             seen[code] = assert_loc
-            # on first occurrence of a specific excessively large code, add to skips, errors
-            if int(code) > MAXIMUM_CODE:
-                skips.append(assert_loc)
-                errors.append(assert_loc)
-            elif int(code) > MAXIMUM_CODE - 20:
-                print("Approaching maximum error code.  Consider raising the limit soon.")
-
         else:
             if not code in dups:
                 # on first duplicate, add original to dups, errors
@@ -153,7 +146,18 @@ def read_error_codes():
             dups[code].append(assert_loc)
             errors.append(assert_loc)
 
-    parse_source_files(check_dups)
+    def validate_code(assert_loc):
+        """Check for malformed codes."""
+        code = int(assert_loc.code)
+        if code > MAXIMUM_CODE:
+            malformed.append(assert_loc)
+            errors.append(assert_loc)
+
+    def callback(assert_loc):
+        validate_code(assert_loc)
+        check_dups(assert_loc)
+
+    parse_source_files(callback)
 
     if "0" in seen:
         code = "0"
@@ -173,6 +177,11 @@ def read_error_codes():
         for loc in locations:
             line, col = get_line_and_column_for_position(loc)
             print("  %s:%d:%d:%s" % (loc.sourceFile, line, col, loc.lines))
+
+    for loc in malformed:
+        line, col = get_line_and_column_for_position(loc)
+        print("MALFORMED ID: %s" % loc.code)
+        print("  %s:%d:%d:%s" % (loc.sourceFile, line, col, loc.lines))
 
     return (codes, errors)
 

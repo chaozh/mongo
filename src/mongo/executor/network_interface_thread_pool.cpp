@@ -27,15 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT mongo::logger::LogComponent::kExecutor
+#define MONGO_LOGV2_DEFAULT_COMPONENT mongo::logv2::LogComponent::kExecutor
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/executor/network_interface_thread_pool.h"
 
 #include "mongo/executor/network_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -65,8 +65,7 @@ void NetworkInterfaceThreadPool::_dtorImpl() {
 void NetworkInterfaceThreadPool::startup() {
     stdx::unique_lock<Latch> lk(_mutex);
     if (_started) {
-        severe() << "Attempting to start pool, but it has already started";
-        fassertFailed(34358);
+        LOGV2_FATAL(34358, "Attempting to start pool, but it has already started");
     }
     _started = true;
 
@@ -87,8 +86,7 @@ void NetworkInterfaceThreadPool::join() {
         stdx::unique_lock<Latch> lk(_mutex);
 
         if (_joining) {
-            severe() << "Attempted to join pool more than once";
-            fassertFailed(34357);
+            LOGV2_FATAL(34357, "Attempted to join pool more than once");
         }
 
         _joining = true;

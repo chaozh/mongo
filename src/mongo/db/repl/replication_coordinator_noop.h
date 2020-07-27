@@ -51,6 +51,10 @@ public:
 
     void enterTerminalShutdown() final;
 
+    bool enterQuiesceModeIfSecondary(Milliseconds quiesceTime) final;
+
+    bool inQuiesceMode() const final;
+
     void shutdown(OperationContext* opCtx) final;
 
     void markAsCleanShutdownIfPossible(OperationContext* opCtx) final;
@@ -72,8 +76,9 @@ public:
     bool canAcceptWritesForDatabase(OperationContext* opCtx, StringData dbName) final;
     bool canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx, StringData dbName) final;
 
-    bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceString& ns) final;
-    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx, const NamespaceString& ns) final;
+    bool canAcceptWritesFor(OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) final;
+    bool canAcceptWritesFor_UNSAFE(OperationContext* opCtx,
+                                   const NamespaceStringOrUUID& nsOrUUID) final;
 
     Status checkCanServeReadsFor(OperationContext* opCtx,
                                  const NamespaceString& ns,
@@ -112,10 +117,12 @@ public:
 
     Status checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const final;
 
+    bool isCommitQuorumSatisfied(const CommitQuorumOptions& commitQuorum,
+                                 const std::vector<mongo::HostAndPort>& members) const final;
+
     void setMyLastAppliedOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime) final;
-    void setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime,
-                                                  DataConsistency consistency) final;
+    void setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) final;
     void setMyLastDurableOpTimeAndWallTimeForward(const OpTimeAndWallTime& opTimeAndWallTime) final;
 
     void resetMyLastOpTimes() final;
@@ -127,6 +134,10 @@ public:
 
     OpTime getMyLastDurableOpTime() const final;
     OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const final;
+
+    Status waitUntilMajorityOpTime(OperationContext* opCtx,
+                                   OpTime targetOpTime,
+                                   boost::optional<Date_t> deadline) final;
 
     Status waitUntilOpTimeForReadUntil(OperationContext*,
                                        const ReadConcernArgs&,
@@ -143,7 +154,7 @@ public:
 
     Status setFollowerMode(const MemberState&) final;
 
-    Status setFollowerModeStrict(OperationContext* opCtx, const MemberState&) final;
+    Status setFollowerModeRollback(OperationContext* opCtx) final;
 
     ApplierState getApplierState() final;
 
@@ -153,8 +164,6 @@ public:
 
     void signalUpstreamUpdater() final;
 
-    Status resyncData(OperationContext*, bool) final;
-
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const final;
 
     Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle) final;
@@ -163,7 +172,9 @@ public:
 
     ReplSetConfig getConfig() const final;
 
-    void processReplSetGetConfig(BSONObjBuilder*) final;
+    void processReplSetGetConfig(BSONObjBuilder*,
+                                 bool commitmentStatus = false,
+                                 bool includeNewlyAdded = false) final;
 
     void processReplSetMetadata(const rpc::ReplSetMetadata&) final;
 
@@ -182,26 +193,31 @@ public:
                                   const ReplSetReconfigArgs&,
                                   BSONObjBuilder*) final;
 
+    Status doReplSetReconfig(OperationContext* opCtx,
+                             GetNewConfigFn getNewConfig,
+                             bool force) final;
+
+    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) final;
+
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
     Status processReplSetUpdatePosition(const UpdatePositionArgs&, long long*) final;
 
     std::vector<HostAndPort> getHostsWrittenTo(const OpTime&, bool) final;
 
-    std::vector<HostAndPort> getOtherNodesInReplSet() const final;
-
     Status checkReplEnabledForCommand(BSONObjBuilder*) final;
-
 
     HostAndPort chooseNewSyncSource(const OpTime&) final;
 
     void blacklistSyncSource(const HostAndPort&, Date_t) final;
 
-    void resetLastOpTimesFromOplog(OperationContext*, DataConsistency) final;
+    void resetLastOpTimesFromOplog(OperationContext*) final;
 
-    bool shouldChangeSyncSource(const HostAndPort&,
-                                const rpc::ReplSetMetadata&,
-                                boost::optional<rpc::OplogQueryMetadata>) final;
+    ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort&,
+                                                  const rpc::ReplSetMetadata&,
+                                                  const rpc::OplogQueryMetadata&,
+                                                  const OpTime&,
+                                                  const OpTime&) final;
 
     OpTime getLastCommittedOpTime() const final;
 
@@ -247,11 +263,13 @@ public:
 
     bool setContainsArbiter() const final;
 
+    bool replSetContainsNewlyAddedMembers() const final;
+
     void attemptToAdvanceStableTimestamp() final;
 
     void finishRecoveryIfEligible(OperationContext* opCtx) final;
 
-    void incrementTopologyVersion(OperationContext* opCtx) final;
+    void incrementTopologyVersion() final;
 
     void updateAndLogStateTransitionMetrics(
         const ReplicationCoordinator::OpsKillingStateTransitionEnum stateTransition,
@@ -264,9 +282,25 @@ public:
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
-        boost::optional<Date_t> deadline) const final;
+        boost::optional<Date_t> deadline) final;
 
-    OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
+    SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
+        const SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion) final;
+
+    StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const noexcept override;
+
+    HostAndPort getCurrentPrimaryHostAndPort() const override;
+
+    void cancelCbkHandle(executor::TaskExecutor::CallbackHandle activeHandle) override;
+
+    BSONObj runCmdOnPrimaryAndAwaitResponse(OperationContext* opCtx,
+                                            const std::string& dbName,
+                                            const BSONObj& cmdObj,
+                                            OnRemoteCmdScheduledFn onRemoteCmdScheduled,
+                                            OnRemoteCmdCompleteFn onRemoteCmdComplete) override;
+
+    virtual void restartHeartbeats_forTest() final;
 
 private:
     ServiceContext* const _service;

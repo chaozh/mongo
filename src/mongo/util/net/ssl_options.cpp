@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/net/ssl_options.h"
@@ -39,7 +37,6 @@
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/text.h"
 

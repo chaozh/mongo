@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -42,8 +42,8 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -53,12 +53,21 @@ namespace CollectionValidation {
 
 ValidateState::ValidateState(OperationContext* opCtx,
                              const NamespaceString& nss,
-                             bool background,
-                             ValidateOptions options)
-    : _nss(nss), _background(background), _options(options), _dataThrottle(opCtx) {
+                             ValidateMode mode,
+                             RepairMode repairMode,
+                             bool turnOnExtraLoggingForTest)
+    : _nss(nss),
+      _mode(mode),
+      _repairMode(repairMode),
+      _dataThrottle(opCtx),
+      _extraLoggingForTest(turnOnExtraLoggingForTest) {
 
     // Subsequent re-locks will use the UUID when 'background' is true.
-    if (_background) {
+    if (isBackground()) {
+        // We need to hold the global lock throughout the entire validation to avoid having to save
+        // and restore our cursors used throughout. This is done in order to avoid abandoning the
+        // snapshot and invalidating our cursors.
+        _globalLock.emplace(opCtx, MODE_IS);
         _databaseLock.emplace(opCtx, _nss.db(), MODE_IS);
         _collectionLock.emplace(opCtx, _nss, MODE_IS);
     } else {
@@ -79,12 +88,19 @@ ValidateState::ValidateState(OperationContext* opCtx,
                   str::stream() << "Collection '" << _nss << "' does not exist to validate.");
     }
 
+    // RepairMode is incompatible with the ValidateModes kBackground and
+    // kForegroundFullEnforceFastCount.
+    if (shouldRunRepair()) {
+        invariant(!isBackground());
+        invariant(!shouldEnforceFastCount());
+    }
+
     _uuid = _collection->uuid();
     _catalogGeneration = opCtx->getServiceContext()->getCatalogGeneration();
 }
 
 void ValidateState::yield(OperationContext* opCtx) {
-    if (_background) {
+    if (isBackground()) {
         _yieldLocks(opCtx);
     } else {
         _yieldCursors(opCtx);
@@ -92,7 +108,7 @@ void ValidateState::yield(OperationContext* opCtx) {
 }
 
 void ValidateState::_yieldLocks(OperationContext* opCtx) {
-    invariant(_background);
+    invariant(isBackground());
 
     // Drop and reacquire the locks.
     _relockDatabaseAndCollection(opCtx);
@@ -114,7 +130,7 @@ void ValidateState::_yieldLocks(OperationContext* opCtx) {
 };
 
 void ValidateState::_yieldCursors(OperationContext* opCtx) {
-    invariant(!_background);
+    invariant(!isBackground());
 
     // Save all the cursors.
     for (const auto& indexCursor : _indexCursors) {
@@ -138,107 +154,50 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
     invariant(!_traverseRecordStoreCursor && !_seekRecordStoreCursor && _indexCursors.size() == 0 &&
               _indexes.size() == 0);
 
-    // Background validation will read from the last stable checkpoint instead of the latest data.
-    // This allows concurrent writes to go ahead without interfering with validation's view of the
-    // data. The checkpoint lock must be taken around cursor creation to ensure all cursors point at
-    // the same checkpoint, i.e. a consistent view of the collection data.
-    std::unique_ptr<StorageEngine::CheckpointLock> checkpointCursorsLock;
-    if (_background) {
+    // Background validation will read from a snapshot opened on the all durable timestamp instead
+    // of the latest data. This allows concurrent writes to go ahead without interfering with
+    // validation's view of the data.
+    if (isBackground()) {
         invariant(!opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
-        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-        invariant(storageEngine->supportsCheckpoints());
         opCtx->recoveryUnit()->abandonSnapshot();
-        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kCheckpoint);
-        checkpointCursorsLock = storageEngine->getCheckpointLock(opCtx);
+        // Background validation is expecting to read from the all durable timestamp, but
+        // standalones do not support timestamps. Therefore, if this process is currently running as
+        // a standalone, don't use a timestamp.
+        RecoveryUnit::ReadSource rs;
+        if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
+            rs = RecoveryUnit::ReadSource::kAllDurableSnapshot;
+        } else {
+            rs = RecoveryUnit::ReadSource::kNoTimestamp;
+        }
+        opCtx->recoveryUnit()->setTimestampReadSource(rs);
     }
 
     // We want to share the same data throttle instance across all the cursors used during this
     // validation. Validations started on other collections will not share the same data
     // throttle instance.
-    if (!_background) {
+    if (!isBackground()) {
         _dataThrottle.turnThrottlingOff();
     }
 
-    try {
-        _traverseRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
-            opCtx, _collection->getRecordStore(), &_dataThrottle);
-        _seekRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
-            opCtx, _collection->getRecordStore(), &_dataThrottle);
-    } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
-        invariant(_background);
-        // End the validation if we can't open a checkpoint cursor on the collection.
-        log() << "Skipping background validation on collection '" << _nss
-              << "' because the collection is not yet in a checkpoint: " << ex;
-        throw;
-    }
-
-    std::vector<std::string> readyDurableIndexes;
-    try {
-        DurableCatalog::get(opCtx)->getReadyIndexes(
-            opCtx, _collection->getCatalogId(), &readyDurableIndexes);
-    } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
-        invariant(_background);
-        log() << "Skipping background validation on collection '" << _nss
-              << "' because the data is not yet in a checkpoint: " << ex;
-        throw;
-    }
+    _traverseRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
+        opCtx, _collection->getRecordStore(), &_dataThrottle);
+    _seekRecordStoreCursor = std::make_unique<SeekableRecordThrottleCursor>(
+        opCtx, _collection->getRecordStore(), &_dataThrottle);
+    _validateTs = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
 
     const IndexCatalog* indexCatalog = _collection->getIndexCatalog();
+    // The index iterator for ready indexes is timestamp-aware and will only return indexes that
+    // are visible at our read time.
     const std::unique_ptr<IndexCatalog::IndexIterator> it =
         indexCatalog->getIndexIterator(opCtx, /*includeUnfinished*/ false);
     while (it->more()) {
         const IndexCatalogEntry* entry = it->next();
         const IndexDescriptor* desc = entry->descriptor();
 
-        // Filter out any in-memory index in the collection that is not in our PIT view of the MDB
-        // catalog. This is only important when background:true because we are then reading from the
-        // checkpoint's view of the MDB catalog and data.
-        bool isIndexDurable =
-            std::find(readyDurableIndexes.begin(), readyDurableIndexes.end(), desc->indexName()) !=
-            readyDurableIndexes.end();
-        if (_background && !isIndexDurable) {
-            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
-                  << _nss << "' because the index is not yet in a checkpoint.";
-            continue;
-        }
+        _indexCursors.emplace(desc->indexName(),
+                              std::make_unique<SortedDataInterfaceThrottleCursor>(
+                                  opCtx, entry->accessMethod(), &_dataThrottle));
 
-        // Read the index's ident from disk (the checkpoint if background:true). If it does not
-        // match the in-memory ident saved in the IndexCatalogEntry, then our PIT view of the index
-        // is old and the index has been dropped and recreated. In this case we will skip it since
-        // there is no utility in checking a dropped index (we also cannot currently access it
-        // because its in-memory representation is gone).
-        auto diskIndexIdent =
-            opCtx->getServiceContext()->getStorageEngine()->getCatalog()->getIndexIdent(
-                opCtx, _collection->getCatalogId(), desc->indexName());
-        if (entry->getIdent() != diskIndexIdent) {
-            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
-                  << _nss << "' because the index was recreated and is not yet in a checkpoint.";
-            continue;
-        }
-
-        try {
-            _indexCursors.emplace(desc->indexName(),
-                                  std::make_unique<SortedDataInterfaceThrottleCursor>(
-                                      opCtx, entry->accessMethod(), &_dataThrottle));
-        } catch (const ExceptionFor<ErrorCodes::CursorNotFound>& ex) {
-            invariant(_background);
-            // This can only happen if the checkpoint has the MDB catalog entry for the index, but
-            // not the corresponding index table.
-            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
-                  << _nss << "' because the index data is not in a checkpoint: " << ex;
-            continue;
-        }
-
-        // Skip any newly created indexes that, because they were built with a WT bulk loader, are
-        // checkpoint'ed but not yet consistent with the rest of checkpoint's PIT view of the data.
-        if (_background &&
-            opCtx->getServiceContext()->getStorageEngine()->isInIndividuallyCheckpointedIndexesList(
-                diskIndexIdent)) {
-            _indexCursors.erase(desc->indexName());
-            log() << "Skipping validation on index '" << desc->indexName() << "' in collection '"
-                  << _nss << "' because the index data is not yet consistent in the checkpoint.";
-            continue;
-        }
 
         _indexes.push_back(indexCatalog->getEntryShared(desc));
     }
@@ -255,13 +214,13 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
 }
 
 void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {
-    invariant(_background);
+    invariant(isBackground());
 
     _collectionLock.reset();
     _databaseLock.reset();
 
     if (MONGO_unlikely(hangDuringYieldingLocksForValidation.shouldFail())) {
-        log() << "Hanging on fail point 'hangDuringYieldingLocksForValidation'";
+        LOGV2(20411, "Hanging on fail point 'hangDuringYieldingLocksForValidation'");
         hangDuringYieldingLocksForValidation.pauseWhileSet();
     }
 

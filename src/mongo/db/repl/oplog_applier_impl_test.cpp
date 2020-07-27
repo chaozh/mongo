@@ -56,6 +56,8 @@
 #include "mongo/db/repl/idempotency_test_fixture.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_applier.h"
+#include "mongo/db/repl/oplog_entry_test_helpers.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
@@ -79,7 +81,11 @@ namespace {
 /**
  * Creates an OplogEntry with given parameters and preset defaults for this test suite.
  */
-OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollectionUUID uuid) {
+OplogEntry makeOplogEntry(OpTypeEnum opType,
+                          NamespaceString nss,
+                          OptionalCollectionUUID uuid,
+                          BSONObj o,
+                          boost::optional<BSONObj> o2) {
     return OplogEntry(OpTime(Timestamp(1, 1), 1),  // optime
                       boost::none,                 // hash
                       opType,                      // opType
@@ -87,8 +93,8 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollec
                       uuid,                        // uuid
                       boost::none,                 // fromMigrate
                       OplogEntry::kOplogVersion,   // version
-                      BSON("_id" << 0),            // o
-                      boost::none,                 // o2
+                      o,                           // o
+                      o2,                          // o2
                       {},                          // sessionInfo
                       boost::none,                 // upsert
                       Date_t(),                    // wall clock time
@@ -98,6 +104,9 @@ OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollec
                       boost::none);  // post-image optime
 }
 
+OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollectionUUID uuid) {
+    return makeOplogEntry(opType, nss, uuid, BSON("_id" << 0), boost::none);
+}
 /**
  * Creates collection options suitable for oplog.
  */
@@ -106,6 +115,15 @@ CollectionOptions createOplogCollectionOptions() {
     options.capped = true;
     options.cappedSize = 64 * 1024 * 1024LL;
     options.autoIndexId = CollectionOptions::NO;
+    return options;
+}
+
+/*
+ * Creates collection options for recording pre-images for testing deletes
+ */
+CollectionOptions createRecordPreImageCollectionOptions() {
+    CollectionOptions options;
+    options.recordPreImages = true;
     return options;
 }
 
@@ -172,6 +190,29 @@ auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
     return OpTime(tsArray.Array()[elem].timestamp(), termArray.Array()[elem].Long());
 };
 
+template <typename T, bool enable>
+class SetSteadyStateConstraints : public T {
+protected:
+    void setUp() override {
+        T::setUp();
+        _constraintsEnabled = oplogApplicationEnforcesSteadyStateConstraints;
+        oplogApplicationEnforcesSteadyStateConstraints = enable;
+    }
+
+    void tearDown() override {
+        oplogApplicationEnforcesSteadyStateConstraints = _constraintsEnabled;
+        T::tearDown();
+    }
+
+private:
+    bool _constraintsEnabled;
+};
+
+typedef SetSteadyStateConstraints<OplogApplierImplTest, false>
+    OplogApplierImplTestDisableSteadyStateConstraints;
+typedef SetSteadyStateConstraints<OplogApplierImplTest, true>
+    OplogApplierImplTestEnableSteadyStateConstraints;
+
 TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentDatabaseMissing) {
     NamespaceString nss("test.t");
     auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, {});
@@ -180,10 +221,22 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentDataba
                   ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentDatabaseMissing) {
+TEST_F(OplogApplierImplTestDisableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteDocumentDatabaseMissing) {
     NamespaceString otherNss("test.othername");
     auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, {});
+    int prevDeleteFromMissing = replOpCounters.getDeleteFromMissingNamespace()->load();
     _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
+    ASSERT_EQ(1, replOpCounters.getDeleteFromMissingNamespace()->load() - prevDeleteFromMissing);
+}
+
+TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteDocumentDatabaseMissing) {
+    NamespaceString otherNss("test.othername");
+    auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, {});
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
 TEST_F(OplogApplierImplTest,
@@ -197,13 +250,26 @@ TEST_F(OplogApplierImplTest,
                   ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
-TEST_F(OplogApplierImplTest,
+TEST_F(OplogApplierImplTestDisableSteadyStateConstraints,
        applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionLookupByUUIDFails) {
     const NamespaceString nss("test.t");
     createDatabase(_opCtx.get(), nss.db());
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, kUuid);
+    int prevDeleteFromMissing = replOpCounters.getDeleteFromMissingNamespace()->load();
     _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
+    ASSERT_EQ(1, replOpCounters.getDeleteFromMissingNamespace()->load() - prevDeleteFromMissing);
+}
+
+TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionLookupByUUIDFails) {
+    const NamespaceString nss("test.t");
+    createDatabase(_opCtx.get(), nss.db());
+    NamespaceString otherNss(nss.getSisterNS("othername"));
+    auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, kUuid);
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
 TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollectionMissing) {
@@ -219,15 +285,30 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollec
     ASSERT_FALSE(collectionExists(_opCtx.get(), nss));
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionMissing) {
+TEST_F(OplogApplierImplTestDisableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionMissing) {
     const NamespaceString nss("test.t");
     createDatabase(_opCtx.get(), nss.db());
     // Even though the collection doesn't exist, this is handled in the actual application function,
     // which in the case of this test just ignores such errors. This tests mostly that we don't
     // implicitly create the collection.
     auto op = makeOplogEntry(OpTypeEnum::kDelete, nss, {});
+    int prevDeleteFromMissing = replOpCounters.getDeleteFromMissingNamespace()->load();
     _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
     ASSERT_FALSE(collectionExists(_opCtx.get(), nss));
+    ASSERT_EQ(1, replOpCounters.getDeleteFromMissingNamespace()->load() - prevDeleteFromMissing);
+}
+
+TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionMissing) {
+    const NamespaceString nss("test.t");
+    createDatabase(_opCtx.get(), nss.db());
+    // With steady state constraints enabled, attempting to delete from a missing collection is an
+    // error.
+    auto op = makeOplogEntry(OpTypeEnum::kDelete, nss, {});
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NamespaceNotFound>);
 }
 
 TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollectionExists) {
@@ -237,11 +318,72 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollec
     _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, true);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionExists) {
+TEST_F(OplogApplierImplTestDisableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteDocumentDocMissing) {
     const NamespaceString nss("test.t");
     createCollection(_opCtx.get(), nss, {});
     auto op = makeOplogEntry(OpTypeEnum::kDelete, nss, {});
+    int prevDeleteWasEmpty = replOpCounters.getDeleteWasEmpty()->load();
     _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
+    ASSERT_EQ(1, replOpCounters.getDeleteWasEmpty()->load() - prevDeleteWasEmpty);
+}
+
+TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteDocumentDocMissing) {
+    const NamespaceString nss("test.t");
+    createCollection(_opCtx.get(), nss, {});
+    auto op = makeOplogEntry(OpTypeEnum::kDelete, nss, {});
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NoSuchKey>);
+}
+
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionAndDocExist) {
+    const NamespaceString nss("test.t");
+    createCollection(_opCtx.get(), nss, createRecordPreImageCollectionOptions());
+    ASSERT_OK(getStorageInterface()->insertDocument(_opCtx.get(), nss, {BSON("_id" << 0)}, 0));
+    auto op = makeOplogEntry(OpTypeEnum::kDelete, nss, {});
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, true);
+}
+
+TEST_F(OplogApplierImplTestDisableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsInsertExistingDocument) {
+    const NamespaceString nss("test.t");
+    auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
+    ASSERT_OK(getStorageInterface()->insertDocument(_opCtx.get(), nss, {BSON("_id" << 0)}, 0));
+    auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, uuid);
+    int prevInsertOnExistingDoc = replOpCounters.getInsertOnExistingDoc()->load();
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
+    ASSERT_EQ(1, replOpCounters.getInsertOnExistingDoc()->load() - prevInsertOnExistingDoc);
+}
+
+TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsInsertExistingDocument) {
+    const NamespaceString nss("test.t");
+    auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
+    ASSERT_OK(getStorageInterface()->insertDocument(_opCtx.get(), nss, {BSON("_id" << 0)}, 0));
+    auto op = makeOplogEntry(OpTypeEnum::kInsert, nss, uuid);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::DuplicateKey, op, false);
+}
+
+TEST_F(OplogApplierImplTestDisableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsUpdateMissingDocument) {
+    const NamespaceString nss("test.t");
+    auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
+    auto op = makeOplogEntry(
+        repl::OpTypeEnum::kUpdate, nss, uuid, BSON("$set" << BSON("a" << 1)), BSON("_id" << 0));
+    int prevUpdateOnMissingDoc = replOpCounters.getUpdateOnMissingDoc()->load();
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, true);
+    ASSERT_EQ(1, replOpCounters.getUpdateOnMissingDoc()->load() - prevUpdateOnMissingDoc);
+}
+
+TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsUpdateMissingDocument) {
+    const NamespaceString nss("test.t");
+    auto uuid = createCollectionWithUuid(_opCtx.get(), nss);
+    auto op = makeOplogEntry(
+        repl::OpTypeEnum::kUpdate, nss, uuid, BSON("$set" << BSON("a" << 1)), BSON("_id" << 0));
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::UpdateOperationFailed, op, false);
 }
 
 TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollectionLockedByUUID) {
@@ -253,7 +395,8 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsInsertDocumentCollec
     _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, true);
 }
 
-TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionLockedByUUID) {
+TEST_F(OplogApplierImplTestDisableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteMissingDocCollectionLockedByUUID) {
     const NamespaceString nss("test.t");
     CollectionOptions options;
     options.uuid = kUuid;
@@ -262,7 +405,38 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollec
     // Test that the collection to lock is determined by the UUID and not the 'ns' field.
     NamespaceString otherNss(nss.getSisterNS("othername"));
     auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, options.uuid);
+    int prevDeleteWasEmpty = replOpCounters.getDeleteWasEmpty()->load();
     _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, false);
+    ASSERT_EQ(1, replOpCounters.getDeleteWasEmpty()->load() - prevDeleteWasEmpty);
+}
+
+TEST_F(OplogApplierImplTestEnableSteadyStateConstraints,
+       applyOplogEntryOrGroupedInsertsDeleteMissingDocCollectionLockedByUUID) {
+    const NamespaceString nss("test.t");
+    CollectionOptions options;
+    options.uuid = kUuid;
+    createCollection(_opCtx.get(), nss, options);
+
+    NamespaceString otherNss(nss.getSisterNS("othername"));
+    auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, options.uuid);
+    ASSERT_THROWS(_applyOplogEntryOrGroupedInsertsWrapper(
+                      _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  ExceptionFor<ErrorCodes::NoSuchKey>);
+}
+
+TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsDeleteDocumentCollectionLockedByUUID) {
+    const NamespaceString nss("test.t");
+    CollectionOptions options = createRecordPreImageCollectionOptions();
+    options.uuid = kUuid;
+    createCollection(_opCtx.get(), nss, options);
+
+    // Make sure the document to be deleted exists.
+    ASSERT_OK(getStorageInterface()->insertDocument(_opCtx.get(), nss, {BSON("_id" << 0)}, 0));
+
+    // Test that the collection to lock is determined by the UUID and not the 'ns' field.
+    NamespaceString otherNss(nss.getSisterNS("othername"));
+    auto op = makeOplogEntry(OpTypeEnum::kDelete, otherNss, options.uuid);
+    _testApplyOplogEntryOrGroupedInsertsCrudOperation(ErrorCodes::OK, op, true);
 }
 
 TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsCommand) {
@@ -452,9 +626,15 @@ protected:
         _opObserver->onInsertsFn =
             [&](OperationContext*, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
                 stdx::lock_guard<Latch> lock(_insertMutex);
-                if (nss.isOplog() || nss == _nss1 || nss == _nss2 ||
-                    nss == NamespaceString::kSessionTransactionsTableNamespace) {
-                    _insertedDocs[nss].insert(_insertedDocs[nss].end(), docs.begin(), docs.end());
+                if (nss.isOplog()) {
+                    _insertedOplogDocs.insert(_insertedOplogDocs.end(), docs.begin(), docs.end());
+                } else if (nss == _nss1 || nss == _nss2 ||
+                           nss == NamespaceString::kSessionTransactionsTableNamespace) {
+                    // Storing the inserted documents in a sorted data structure to make checking
+                    // for valid results easier. On a document level locking storage engine the
+                    // inserts will be performed by different threads and there's no guarantee of
+                    // the order.
+                    _insertedDocs[nss].insert(docs.begin(), docs.end());
                 } else
                     FAIL("Unexpected insert") << " into " << nss << " first doc: " << docs.front();
             };
@@ -482,7 +662,7 @@ protected:
     }
 
     std::vector<BSONObj>& oplogDocs() {
-        return _insertedDocs[NamespaceString::kRsOplogNamespace];
+        return _insertedOplogDocs;
     }
 
 protected:
@@ -494,7 +674,8 @@ protected:
     TxnNumber _txnNum;
     boost::optional<OplogEntry> _insertOp1, _insertOp2;
     boost::optional<OplogEntry> _commitOp;
-    std::map<NamespaceString, std::vector<BSONObj>> _insertedDocs;
+    std::map<NamespaceString, SimpleBSONObjSet> _insertedDocs;
+    std::vector<BSONObj> _insertedOplogDocs;
     std::unique_ptr<ThreadPool> _writerPool;
 
 private:
@@ -660,12 +841,12 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyUnpreparedTransactionTwoBa
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 
-    // Check docs and ordering of docs in nss1.
-    // The insert into nss2 is unordered with respect to those.
-    ASSERT_BSONOBJ_EQ(insertDocs[0], _insertedDocs[_nss1][0]);
-    ASSERT_BSONOBJ_EQ(insertDocs[1], _insertedDocs[_nss2].front());
-    ASSERT_BSONOBJ_EQ(insertDocs[2], _insertedDocs[_nss1][1]);
-    ASSERT_BSONOBJ_EQ(insertDocs[3], _insertedDocs[_nss1][2]);
+    // Check that we inserted the expected documents
+    auto nss1It = _insertedDocs[_nss1].begin();
+    ASSERT_BSONOBJ_EQ(insertDocs[0], *(nss1It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[1], *_insertedDocs[_nss2].begin());
+    ASSERT_BSONOBJ_EQ(insertDocs[2], *(nss1It++));
+    ASSERT_BSONOBJ_EQ(insertDocs[3], *(nss1It++));
 }
 
 TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyTwoTransactionsOneBatch) {
@@ -771,11 +952,12 @@ TEST_F(MultiOplogEntryOplogApplierImplTest, MultiApplyTwoTransactionsOneBatch) {
                   boost::none,
                   DurableTxnStateEnum::kCommitted);
 
-    // Check docs and ordering of docs in nss1.
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 1), _insertedDocs[_nss1][0]);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 2), _insertedDocs[_nss1][1]);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 3), _insertedDocs[_nss1][2]);
-    ASSERT_BSONOBJ_EQ(BSON("_id" << 4), _insertedDocs[_nss1][3]);
+    // Check docs in nss1.
+    auto nss1It = _insertedDocs[_nss1].begin();
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 1), *(nss1It++));
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 2), *(nss1It++));
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 3), *(nss1It++));
+    ASSERT_BSONOBJ_EQ(BSON("_id" << 4), *(nss1It++));
 }
 
 
@@ -1313,7 +1495,11 @@ void testWorkerMultikeyPaths(OperationContext* opCtx,
 }
 
 TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncAddsWorkerMultikeyPathInfoOnInsert) {
-    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
+    // Set the state as secondary as we are going to apply createIndexes oplog entry.
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
+
+    NamespaceString nss("test." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     {
         auto op = makeCreateCollectionOplogEntry(
@@ -1334,7 +1520,11 @@ TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncAddsWorkerMultikeyPathInf
 }
 
 TEST_F(OplogApplierImplTest, OplogApplicationThreadFuncAddsMultipleWorkerMultikeyPathInfo) {
-    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
+    // Set the state as secondary as we are going to apply createIndexes oplog entry.
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
+
+    NamespaceString nss("test." + _agent.getSuiteName() + "_" + _agent.getTestName());
 
     {
         auto op = makeCreateCollectionOplogEntry(
@@ -2240,13 +2430,15 @@ TEST_F(OplogApplierImplTest, LogSlowOpApplicationWhenSuccessful) {
     ASSERT_OK(_applyOplogEntryOrGroupedInsertsWrapper(
         _opCtx.get(), &entry, OplogApplication::Mode::kSecondary));
 
-    // Use a builder for easier escaping. We expect the operation to be logged.
-    StringBuilder expected;
-    expected << "applied op: CRUD { ts: Timestamp(1, 1), t: 1, v: 2, op: \"i\", ns: \"test.t\", "
-                "wall: new Date(0), o: "
-                "{ _id: 0 } }, took "
-             << applyDuration << "ms";
-    ASSERT_EQUALS(1, countTextFormatLogLinesContaining(expected.str()));
+    ASSERT_EQUALS(
+        1,
+        countBSONFormatLogLinesIsSubset(BSON(
+            "attr" << BSON("CRUD" << BSON("ts" << Timestamp(1, 1) << "t" << 1 << "v" << 2 << "op"
+                                               << "i"
+                                               << "ns"
+                                               << "test.t"
+                                               << "wall" << Date_t::fromMillisSinceEpoch(0))
+                                  << "durationMillis" << applyDuration))));
 }
 
 TEST_F(OplogApplierImplTest, DoNotLogSlowOpApplicationWhenFailed) {
@@ -2948,6 +3140,37 @@ TEST_F(IdempotencyTest, ConvertToCappedNamespaceNotFound) {
     // Ensure that autoColl.getCollection() and autoColl.getDb() are both null.
     ASSERT_FALSE(autoColl.getCollection());
     ASSERT_FALSE(autoColl.getDb());
+}
+
+typedef SetSteadyStateConstraints<IdempotencyTest, false>
+    IdempotencyTestDisableSteadyStateConstraints;
+typedef SetSteadyStateConstraints<IdempotencyTest, true>
+    IdempotencyTestEnableSteadyStateConstraints;
+
+TEST_F(IdempotencyTestDisableSteadyStateConstraints, AcceptableErrorsRecordedInSteadyStateMode) {
+    // Create a BSON "convertToCapped" command.
+    auto convertToCappedCmd = BSON("convertToCapped" << nss.coll());
+
+    // Create a "convertToCapped" oplog entry.
+    auto convertToCappedOp = makeCommandOplogEntry(nextOpTime(), nss, convertToCappedCmd);
+
+    // Ensure that NamespaceNotFound is "acceptable" but counted.
+    int prevAcceptableError = replOpCounters.getAcceptableErrorInCommand()->load();
+    ASSERT_OK(runOpSteadyState(convertToCappedOp));
+
+    ASSERT_EQ(1, replOpCounters.getAcceptableErrorInCommand()->load() - prevAcceptableError);
+}
+
+TEST_F(IdempotencyTestEnableSteadyStateConstraints,
+       AcceptableErrorsNotAcceptableInSteadyStateMode) {
+    // Create a BSON "convertToCapped" command.
+    auto convertToCappedCmd = BSON("convertToCapped" << nss.coll());
+
+    // Create a "convertToCapped" oplog entry.
+    auto convertToCappedOp = makeCommandOplogEntry(nextOpTime(), nss, convertToCappedCmd);
+
+    // Ensure that NamespaceNotFound is returned.
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, runOpSteadyState(convertToCappedOp));
 }
 
 class IdempotencyTestTxns : public IdempotencyTest {};

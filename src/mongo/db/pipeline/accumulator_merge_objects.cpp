@@ -49,14 +49,12 @@ const char* AccumulatorMergeObjects::getOpName() const {
     return "$mergeObjects";
 }
 
-intrusive_ptr<Accumulator> AccumulatorMergeObjects::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorMergeObjects::create(ExpressionContext* const expCtx) {
     return new AccumulatorMergeObjects(expCtx);
 }
 
-AccumulatorMergeObjects::AccumulatorMergeObjects(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx)
-    : Accumulator(expCtx) {
+AccumulatorMergeObjects::AccumulatorMergeObjects(ExpressionContext* const expCtx)
+    : AccumulatorState(expCtx) {
     _memUsageBytes = sizeof(*this);
 }
 

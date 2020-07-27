@@ -27,12 +27,15 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/storage/write_unit_of_work.h"
 
 #include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
 
@@ -50,6 +53,9 @@ WriteUnitOfWork::WriteUnitOfWork(OperationContext* opCtx)
         _opCtx->recoveryUnit()->beginUnitOfWork(_opCtx);
         _opCtx->_ruState = RecoveryUnitState::kActiveUnitOfWork;
     }
+    // Make sure we don't silently proceed after a previous WriteUnitOfWork under the same parent
+    // WriteUnitOfWork fails.
+    invariant(_opCtx->_ruState != RecoveryUnitState::kFailedUnitOfWork);
 }
 
 WriteUnitOfWork::~WriteUnitOfWork() {

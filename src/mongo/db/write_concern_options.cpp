@@ -72,6 +72,12 @@ const BSONObj WriteConcernOptions::Default = BSONObj();
 const BSONObj WriteConcernOptions::Acknowledged(BSON("w" << W_NORMAL));
 const BSONObj WriteConcernOptions::Unacknowledged(BSON("w" << W_NONE));
 const BSONObj WriteConcernOptions::Majority(BSON("w" << WriteConcernOptions::kMajority));
+
+// The "kImplicitDefault" write concern, used by internal operations, is deliberately empty (no
+// 'w' or 'wtimeout' specified). This allows internal operations to specify a write concern, while
+// still allowing it to be either w:1 or automatically upconverted to w:majority on configsvrs.
+const BSONObj WriteConcernOptions::kImplicitDefault;
+
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutSystem;
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutMigration;
 constexpr Seconds WriteConcernOptions::kWriteConcernTimeoutSharding;
@@ -131,6 +137,13 @@ StatusWith<WriteConcernOptions> WriteConcernOptions::parse(const BSONObj& obj) {
             // Ignore.
         } else if (fieldName.equalCaseInsensitive(kGetLastErrorFieldName)) {
             // Ignore GLE field.
+        } else if (fieldName == ReadWriteConcernProvenance::kSourceFieldName) {
+            try {
+                writeConcern._provenance = ReadWriteConcernProvenance::parse(
+                    IDLParserErrorContext("WriteConcernOptions::parse"), obj);
+            } catch (const DBException&) {
+                return exceptionToStatus();
+            }
         } else {
             return Status(ErrorCodes::FailedToParse,
                           str::stream() << "unrecognized write concern field: " << fieldName);
@@ -234,11 +247,19 @@ BSONObj WriteConcernOptions::toBSON() const {
 
     builder.append("wtimeout", wTimeout);
 
+    _provenance.serialize(&builder);
+
     return builder.obj();
 }
 
 bool WriteConcernOptions::needToWaitForOtherNodes() const {
     return !wMode.empty() || wNumNodes > 1;
+}
+
+bool WriteConcernOptions::operator==(const WriteConcernOptions& other) const {
+    return syncMode == other.syncMode && wMode == other.wMode && wNumNodes == other.wNumNodes &&
+        wDeadline == other.wDeadline && wTimeout == other.wTimeout &&
+        _provenance == other._provenance;
 }
 
 }  // namespace mongo

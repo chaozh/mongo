@@ -34,6 +34,7 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 
@@ -42,16 +43,14 @@ namespace mongo {
  */
 class AuthorizationManagerImpl : public AuthorizationManager {
 public:
-    ~AuthorizationManagerImpl() override;
-
-    AuthorizationManagerImpl();
-
     struct InstallMockForTestingOrAuthImpl {
         explicit InstallMockForTestingOrAuthImpl() = default;
     };
 
-    AuthorizationManagerImpl(std::unique_ptr<AuthzManagerExternalState> externalState,
-                             InstallMockForTestingOrAuthImpl);
+    AuthorizationManagerImpl(ServiceContext* service,
+                             std::unique_ptr<AuthzManagerExternalState> externalState);
+    ~AuthorizationManagerImpl();
+
 
     std::unique_ptr<AuthorizationSession> makeAuthorizationSession() override;
 
@@ -122,39 +121,28 @@ public:
     std::vector<CachedUserInfo> getUserCacheInfo() const override;
 
 private:
-    /**
-     * Given the objects describing an oplog entry that affects authorization data, invalidates
-     * the portion of the user cache that is affected by that operation.  Should only be called
-     * with oplog entries that have been pre-verified to actually affect authorization data.
-     */
-    void _invalidateRelevantCacheData(OperationContext* opCtx,
-                                      const char* op,
-                                      const NamespaceString& ns,
-                                      const BSONObj& o,
-                                      const BSONObj* o2);
+    void _updateCacheGeneration();
 
     void _pinnedUsersThreadRoutine() noexcept;
 
     std::unique_ptr<AuthzManagerExternalState> _externalState;
 
-    /**
-     * True if AuthSchema startup checks should be applied in this AuthorizationManager.
-     *
-     * Changes to its value are not synchronized, so it should only be set at initalization-time.
-     */
+    // True if AuthSchema startup checks should be applied in this AuthorizationManager. Changes to
+    // its value are not synchronized, so it should only be set once, at initalization time.
     bool _startupAuthSchemaValidation{true};
 
-    /**
-     * True if access control enforcement is enabled in this AuthorizationManager.
-     *
-     * Changes to its value are not synchronized, so it should only be set at initalization-time.
-     */
+    // True if access control enforcement is enabled in this AuthorizationManager. Changes to its
+    // value are not synchronized, so it should only be set once, at initalization time.
     bool _authEnabled{false};
 
-    /**
-     * A cache of whether there are any users set up for the cluster.
-     */
+    // A cache of whether there are any users set up for the cluster.
     AtomicWord<bool> _privilegeDocsExist{false};
+
+    // Serves as a source for the return value of getCacheGeneration(). Refer to this method for
+    // more details.
+    Mutex _cacheGenerationMutex =
+        MONGO_MAKE_LATCH("AuthorizationManagerImpl::_cacheGenerationMutex");
+    OID _cacheGeneration{OID::gen()};
 
     /**
      * Cache which contains at most a single entry (which has key 0), whose value is the version of
@@ -162,14 +150,18 @@ private:
      */
     class AuthSchemaVersionCache : public ReadThroughCache<int, int> {
     public:
-        AuthSchemaVersionCache(AuthzManagerExternalState* externalState);
+        AuthSchemaVersionCache(ServiceContext* service,
+                               ThreadPoolInterface& threadPool,
+                               AuthzManagerExternalState* externalState);
 
+    private:
         // Even though the dist cache permits for lookup to return boost::none for non-existent
         // values, the contract of the authorization manager is that it should throw an exception if
         // the value can not be loaded, so if it returns, the value will always be set.
-        boost::optional<int> lookup(OperationContext* opCtx, const int& unusedKey) override;
+        LookupResult _lookup(OperationContext* opCtx,
+                             int unusedKey,
+                             const ValueHandle& unusedCachedValue);
 
-    private:
         Mutex _mutex =
             MONGO_MAKE_LATCH("AuthorizationManagerImpl::AuthSchemaVersionDistCache::_mutex");
 
@@ -181,22 +173,30 @@ private:
      */
     class UserCacheImpl : public UserCache {
     public:
-        UserCacheImpl(AuthSchemaVersionCache* authSchemaVersionCache,
-                      AuthzManagerExternalState* externalState,
-                      int cacheSize);
+        UserCacheImpl(ServiceContext* service,
+                      ThreadPoolInterface& threadPool,
+                      int cacheSize,
+                      AuthSchemaVersionCache* authSchemaVersionCache,
+                      AuthzManagerExternalState* externalState);
 
+    private:
         // Even though the dist cache permits for lookup to return boost::none for non-existent
         // values, the contract of the authorization manager is that it should throw an exception if
         // the value can not be loaded, so if it returns, the value will always be set.
-        boost::optional<User> lookup(OperationContext* opCtx, const UserName& userName) override;
+        LookupResult _lookup(OperationContext* opCtx,
+                             const UserRequest& user,
+                             const UserHandle& unusedCachedUser);
 
-    private:
         Mutex _mutex = MONGO_MAKE_LATCH("AuthorizationManagerImpl::UserDistCacheImpl::_mutex");
 
         AuthSchemaVersionCache* const _authSchemaVersionCache;
 
         AuthzManagerExternalState* const _externalState;
     } _userCache;
+
+    // Thread pool on which to perform the blocking activities that load the user credentials from
+    // storage
+    ThreadPool _threadPool;
 
     Mutex _pinnedUsersMutex = MONGO_MAKE_LATCH("AuthorizationManagerImpl::_pinnedUsersMutex");
     stdx::condition_variable _pinnedUsersCond;

@@ -27,72 +27,58 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/collection_sharding_state_factory_shard.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 
 namespace mongo {
-namespace {
+CollectionShardingStateFactoryShard::CollectionShardingStateFactoryShard(
+    ServiceContext* serviceContext)
+    : CollectionShardingStateFactory(serviceContext) {}
 
-class CollectionShardingStateFactoryShard final : public CollectionShardingStateFactory {
-public:
-    CollectionShardingStateFactoryShard(ServiceContext* serviceContext)
-        : CollectionShardingStateFactory(serviceContext) {}
+CollectionShardingStateFactoryShard::~CollectionShardingStateFactoryShard() {
+    join();
+}
 
-    ~CollectionShardingStateFactoryShard() {
-        join();
+void CollectionShardingStateFactoryShard::join() {
+    if (_rangeDeletionExecutor) {
+        _rangeDeletionExecutor->shutdown();
+        _rangeDeletionExecutor->join();
+    }
+}
+
+std::unique_ptr<CollectionShardingState> CollectionShardingStateFactoryShard::make(
+    const NamespaceString& nss) {
+    return std::make_unique<CollectionShardingRuntime>(
+        _serviceContext, nss, _getRangeDeletionExecutor());
+}
+
+std::shared_ptr<executor::TaskExecutor>
+CollectionShardingStateFactoryShard::_getRangeDeletionExecutor() {
+    stdx::lock_guard<Latch> lg(_mutex);
+    if (!_rangeDeletionExecutor) {
+        const std::string kExecName("CollectionRangeDeleter-TaskExecutor");
+
+        // CAUTION: The safety of range deletion depends on using a task executor that schedules
+        // work on a single thread.
+        auto net = executor::makeNetworkInterface(kExecName);
+        auto pool = std::make_unique<executor::NetworkInterfaceThreadPool>(net.get());
+        auto taskExecutor =
+            std::make_shared<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
+        taskExecutor->startup();
+
+        _rangeDeletionExecutor = std::move(taskExecutor);
     }
 
-    void join() override {
-        if (_taskExecutor) {
-            _taskExecutor->shutdown();
-            _taskExecutor->join();
-        }
-    }
+    return _rangeDeletionExecutor;
+}
 
-    std::unique_ptr<CollectionShardingState> make(const NamespaceString& nss) override {
-        return std::make_unique<CollectionShardingRuntime>(_serviceContext, nss, _getExecutor());
-    }
-
-private:
-    std::shared_ptr<executor::TaskExecutor> _getExecutor() {
-        stdx::lock_guard<Latch> lg(_mutex);
-        if (!_taskExecutor) {
-            const std::string kExecName("CollectionRangeDeleter-TaskExecutor");
-
-            auto net = executor::makeNetworkInterface(kExecName);
-            auto pool = std::make_unique<executor::NetworkInterfaceThreadPool>(net.get());
-            auto taskExecutor =
-                std::make_shared<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
-            taskExecutor->startup();
-
-            _taskExecutor = std::move(taskExecutor);
-        }
-
-        return _taskExecutor;
-    }
-
-    // Serializes the instantiation of the task executor
-    Mutex _mutex = MONGO_MAKE_LATCH("CollectionShardingStateFactoryShard::_mutex");
-
-    // Required to be a shared_ptr since it is used as an executor for ExecutorFutures.
-    std::shared_ptr<executor::TaskExecutor> _taskExecutor{nullptr};
-};
-
-}  // namespace
-
-ServiceContext::ConstructorActionRegisterer collectionShardingStateFactoryRegisterer{
-    "CollectionShardingStateFactory",
-    [](ServiceContext* service) {
-        CollectionShardingStateFactory::set(
-            service, std::make_unique<CollectionShardingStateFactoryShard>(service));
-    },
-    [](ServiceContext* service) { CollectionShardingStateFactory::clear(service); }};
 
 }  // namespace mongo

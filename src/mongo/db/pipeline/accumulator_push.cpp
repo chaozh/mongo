@@ -81,9 +81,9 @@ Value AccumulatorPush::getValue(bool toBeMerged) {
     return Value(_array);
 }
 
-AccumulatorPush::AccumulatorPush(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+AccumulatorPush::AccumulatorPush(ExpressionContext* const expCtx,
                                  boost::optional<int> maxMemoryUsageBytes)
-    : Accumulator(expCtx),
+    : AccumulatorState(expCtx),
       _maxMemUsageBytes(maxMemoryUsageBytes.value_or(internalQueryMaxPushBytes.load())) {
     _memUsageBytes = sizeof(*this);
 }
@@ -93,8 +93,7 @@ void AccumulatorPush::reset() {
     _memUsageBytes = sizeof(*this);
 }
 
-intrusive_ptr<Accumulator> AccumulatorPush::create(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<AccumulatorState> AccumulatorPush::create(ExpressionContext* const expCtx) {
     return new AccumulatorPush(expCtx, boost::none);
 }
 }  // namespace mongo

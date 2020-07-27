@@ -26,7 +26,7 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -46,8 +46,8 @@
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/query/projection_parser.h"
+#include "mongo/logv2/log.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo::projection_executor {
 namespace {
@@ -82,8 +82,11 @@ public:
                 base->run();
             }
         } catch (...) {
-            log() << "exception while testing with allowFastPath=" << _allowFastPath
-                  << " and allowFallBackToDefault=" << AllowFallBackToDefault;
+            LOGV2(20587,
+                  "exception while testing with allowFastPath={allowFastPath} and "
+                  "allowFallBackToDefault={AllowFallBackToDefault}",
+                  "allowFastPath"_attr = _allowFastPath,
+                  "AllowFallBackToDefault"_attr = AllowFallBackToDefault);
             throw;
         }
     }

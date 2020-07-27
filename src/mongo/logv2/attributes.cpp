@@ -29,9 +29,7 @@
 
 #include <boost/log/attributes/attribute_name.hpp>
 
-namespace mongo {
-namespace logv2 {
-namespace attributes {
+namespace mongo::logv2::attributes {
 
 const boost::log::attribute_name& domain() {
     static const boost::log::attribute_name attr("domain");
@@ -78,6 +76,14 @@ const boost::log::attribute_name& attributes() {
     return attr;
 }
 
-}  // namespace attributes
-}  // namespace logv2
-}  // namespace mongo
+const boost::log::attribute_name& truncation() {
+    static const boost::log::attribute_name attr("truncation");
+    return attr;
+}
+
+const boost::log::attribute_name& userassert() {
+    static const boost::log::attribute_name attr("userassert");
+    return attr;
+}
+
+}  // namespace mongo::logv2::attributes

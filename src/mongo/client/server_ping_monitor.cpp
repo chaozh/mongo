@@ -27,75 +27,271 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
+
+#include <iterator>
+
+#include "mongo/platform/basic.h"
+
 #include "mongo/client/server_ping_monitor.h"
 
+#include "mongo/client/sdam/sdam.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(serverPingMonitorFailWithHostUnreachable);
 
 using executor::NetworkInterface;
 using executor::NetworkInterfaceThreadPool;
 using executor::TaskExecutor;
 using executor::ThreadPoolTaskExecutor;
+using CallbackArgs = TaskExecutor::CallbackArgs;
+using CallbackHandle = TaskExecutor::CallbackHandle;
 
-SingleServerPingMonitor::SingleServerPingMonitor(sdam::ServerAddress hostAndPort,
+SingleServerPingMonitor::SingleServerPingMonitor(const MongoURI& setUri,
+                                                 const HostAndPort& hostAndPort,
                                                  sdam::TopologyListener* rttListener,
-                                                 Seconds pingFrequency,
+                                                 Milliseconds pingFrequency,
                                                  std::shared_ptr<TaskExecutor> executor)
-    : _hostAndPort(hostAndPort),
+    : _setUri(setUri),
+      _hostAndPort(hostAndPort),
       _rttListener(rttListener),
       _pingFrequency(pingFrequency),
       _executor(executor) {}
 
-void SingleServerPingMonitor::drop() { /** TODO SERVER-45051: Implement drop() functionality. **/
+void SingleServerPingMonitor::init() {
+    _scheduleServerPing();
 }
 
-ServerPingMonitor::ServerPingMonitor(sdam::TopologyListener* rttListener,
-                                     Seconds pingFrequency,
-                                     boost::optional<std::shared_ptr<TaskExecutor>> executor)
-    : _rttListener(rttListener), _pingFrequency(pingFrequency) {
-    // Create an executor by default. Don't create an executor if one was passed in for testing.
-    _setupTaskExecutor(executor);
-}
-
-void ServerPingMonitor::_setupTaskExecutor(
-    boost::optional<std::shared_ptr<TaskExecutor>> executor) {
-    if (executor) {
-        // An executor was already provided for testing.
-        _executor = std::move(executor.value());
-    } else {
-        auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-        auto net = executor::makeNetworkInterface(
-            "ServerPingMonitor-TaskExecutor", nullptr, std::move(hookList));
-        auto pool = std::make_unique<NetworkInterfaceThreadPool>(net.get());
-        _executor = std::make_shared<ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
+void SingleServerPingMonitor::drop() {
+    stdx::lock_guard lk(_mutex);
+    _isDropped = true;
+    if (auto handle = std::exchange(_pingHandle, {})) {
+        _executor->cancel(handle);
     }
-    _executor->startup();
 }
 
-void ServerPingMonitor::onServerHandshakeCompleteEvent(sdam::ServerAddress address,
-                                                       OID topologyId) {
+template <typename Callback>
+auto SingleServerPingMonitor::_scheduleWorkAt(Date_t when, Callback&& cb) const {
+    auto wrappedCallback = [cb = std::forward<Callback>(cb),
+                            anchor = shared_from_this()](const CallbackArgs& cbArgs) mutable {
+        if (ErrorCodes::isCancelationError(cbArgs.status)) {
+            return;
+        }
+
+        stdx::lock_guard lk(anchor->_mutex);
+        if (anchor->_isDropped) {
+            return;
+        }
+        cb(cbArgs);
+    };
+    return _executor->scheduleWorkAt(std::move(when), std::move(wrappedCallback));
+}
+
+void SingleServerPingMonitor::_scheduleServerPing() {
+    auto schedulePingHandle = _scheduleWorkAt(
+        _nextPingStartDate, [anchor = shared_from_this()](const CallbackArgs& cbArgs) mutable {
+            anchor->_doServerPing();
+        });
+
     stdx::lock_guard lk(_mutex);
-    invariant(_serverPingMonitorMap.find(address) == _serverPingMonitorMap.end());
-    _serverPingMonitorMap.emplace(address,
-                                  std::make_unique<SingleServerPingMonitor>(
-                                      address, _rttListener, _pingFrequency, _executor));
-    LOG(1) << "ServerPingMonitor is now monitoring " << address;
+    if (_isDropped) {
+        return;
+    }
+
+    if (ErrorCodes::isShutdownError(schedulePingHandle.getStatus().code())) {
+        LOGV2_DEBUG(23727,
+                    kLogLevel,
+                    "Can't schedule ping for {host}. Executor shutdown in progress",
+                    "Can't schedule ping for host. Executor shutdown in progress",
+                    "host"_attr = _hostAndPort,
+                    "replicaSet"_attr = _setUri.getSetName());
+        return;
+    }
+
+    if (!schedulePingHandle.isOK()) {
+        LOGV2_FATAL(23732,
+                    "Can't continue scheduling pings to {host} due to {error}",
+                    "Can't continue scheduling pings to host",
+                    "host"_attr = _hostAndPort,
+                    "error"_attr = redact(schedulePingHandle.getStatus()),
+                    "replicaSet"_attr = _setUri.getSetName());
+        fassertFailed(31434);
+    }
+
+    _pingHandle = std::move(schedulePingHandle.getValue());
 }
 
-void ServerPingMonitor::onServerClosedEvent(sdam::ServerAddress address, OID topologyId) {
+void SingleServerPingMonitor::_doServerPing() {
+    // Compute _nextPingStartDate before making the request to ensure the next ping is scheduled
+    // _pingFrequency in the future and independent of how long it takes to ping the server and get
+    // a response.
+    _nextPingStartDate = now() + _pingFrequency;
+
+    // Ensure the ping request will timeout if it exceeds _pingFrequency time to complete.
+    auto request = executor::RemoteCommandRequest(
+        HostAndPort(_hostAndPort), "admin", BSON("ping" << 1), nullptr, _pingFrequency);
+    request.sslMode = _setUri.getSSLMode();
+
+    auto remotePingHandle = _executor->scheduleRemoteCommand(
+        std::move(request),
+        [anchor = shared_from_this(),
+         timer = Timer()](const executor::TaskExecutor::RemoteCommandCallbackArgs& result) mutable {
+            if (ErrorCodes::isCancelationError(result.response.status)) {
+                // Do no more work if the SingleServerPingMonitor is removed or the request is
+                // canceled.
+                return;
+            }
+            {
+                stdx::lock_guard lk(anchor->_mutex);
+                if (anchor->_isDropped) {
+                    return;
+                }
+
+                if (MONGO_unlikely(serverPingMonitorFailWithHostUnreachable.shouldFail(
+                        [&](const BSONObj& data) {
+                            return anchor->_hostAndPort.toString() ==
+                                data.getStringField("hostAndPort");
+                        }))) {
+                    const std::string reason = str::stream()
+                        << "Failing the ping command to " << (anchor->_hostAndPort);
+                    anchor->_rttListener->onServerPingFailedEvent(
+                        anchor->_hostAndPort, {ErrorCodes::HostUnreachable, reason});
+                } else if (!result.response.isOK()) {
+                    anchor->_rttListener->onServerPingFailedEvent(anchor->_hostAndPort,
+                                                                  result.response.status);
+                } else {
+                    auto rtt = sdam::IsMasterRTT(timer.micros());
+                    anchor->_rttListener->onServerPingSucceededEvent(rtt, anchor->_hostAndPort);
+                }
+            }
+            anchor->_scheduleServerPing();
+        });
+
+    if (ErrorCodes::isShutdownError(remotePingHandle.getStatus().code())) {
+        LOGV2_DEBUG(23728,
+                    kLogLevel,
+                    "Can't ping {host}. Executor shutdown in progress",
+                    "Can't ping host. Executor shutdown in progress",
+                    "host"_attr = _hostAndPort,
+                    "replicaSet"_attr = _setUri.getSetName());
+        return;
+    }
+
+    if (!remotePingHandle.isOK()) {
+        LOGV2_FATAL(23733,
+                    "Can't continue pinging {host} due to {error}",
+                    "Can't continue pinging host",
+                    "host"_attr = _hostAndPort,
+                    "error"_attr = redact(remotePingHandle.getStatus()),
+                    "replicaSet"_attr = _setUri.getSetName());
+        fassertFailed(31435);
+    }
+
+    // Update the _pingHandle so the ping can be canceled if the SingleServerPingMonitor gets
+    // dropped.
+    _pingHandle = std::move(remotePingHandle.getValue());
+}
+
+ServerPingMonitor::ServerPingMonitor(const MongoURI& setUri,
+                                     sdam::TopologyListener* rttListener,
+                                     Milliseconds pingFrequency,
+                                     std::shared_ptr<TaskExecutor> executor)
+    : _setUri(setUri),
+      _rttListener(rttListener),
+      _pingFrequency(pingFrequency),
+      _executor(executor) {}
+
+ServerPingMonitor::~ServerPingMonitor() {
+    shutdown();
+}
+
+void ServerPingMonitor::shutdown() {
+    decltype(_serverPingMonitorMap) serverPingMonitorMap;
+    decltype(_executor) executor;
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        if (std::exchange(_isShutdown, true)) {
+            return;
+        }
+
+        // Store _serverPingMonitorMap locally to prevent calling drop() on an already destroyed
+        // SingleServerPingMonitor once the lock is released.
+        serverPingMonitorMap = std::exchange(_serverPingMonitorMap, {});
+        executor = std::exchange(_executor, {});
+    }
+
+    for (auto& [hostAndPort, singleMonitor] : serverPingMonitorMap) {
+        singleMonitor->drop();
+    }
+}
+
+void ServerPingMonitor::onServerHandshakeCompleteEvent(sdam::IsMasterRTT durationMs,
+                                                       const HostAndPort& address,
+                                                       const BSONObj reply) {
     stdx::lock_guard lk(_mutex);
-    auto it = _serverPingMonitorMap.find(address);
-    invariant(it != _serverPingMonitorMap.end());
-    it->second->drop();
-    _serverPingMonitorMap.erase(it);
-    LOG(1) << "ServerPingMonitor stopped  monitoring " << address;
+    if (_isShutdown) {
+        return;
+    }
+
+    if (_serverPingMonitorMap.find(address) != _serverPingMonitorMap.end()) {
+        LOGV2_DEBUG(466811,
+                    kLogLevel + 1,
+                    "ServerPingMonitor already monitoring {host}",
+                    "ServerPingMonitor already monitoring host",
+                    "host"_attr = address,
+                    "replicaSet"_attr = _setUri.getSetName());
+        return;
+    }
+    auto newSingleMonitor = std::make_shared<SingleServerPingMonitor>(
+        _setUri, address, _rttListener, _pingFrequency, _executor);
+    _serverPingMonitorMap[address] = newSingleMonitor;
+    newSingleMonitor->init();
+    LOGV2_DEBUG(23729,
+                kLogLevel,
+                "ServerPingMonitor is now monitoring {host}",
+                "ServerPingMonitor is now monitoring host",
+                "host"_attr = address,
+                "replicaSet"_attr = _setUri.getSetName());
 }
 
+void ServerPingMonitor::onTopologyDescriptionChangedEvent(
+    sdam::TopologyDescriptionPtr previousDescription, sdam::TopologyDescriptionPtr newDescription) {
+    stdx::lock_guard lk(_mutex);
+    if (_isShutdown) {
+        return;
+    }
+
+    const auto startingSize = _serverPingMonitorMap.size();
+    size_t numRemoved = 0;
+
+    // Remove monitors that are missing from the topology.
+    auto it = _serverPingMonitorMap.begin();
+    while (it != _serverPingMonitorMap.end()) {
+        const auto& serverAddress = it->first;
+        if (newDescription->findServerByAddress(serverAddress) == boost::none) {
+            auto& singleMonitor = _serverPingMonitorMap[serverAddress];
+            singleMonitor->drop();
+            LOGV2_DEBUG(462899,
+                        kLogLevel,
+                        "ServerPingMonitor for host {host} was removed from being monitored",
+                        "ServerPingMonitor for host was removed from being monitored",
+                        "host"_attr = serverAddress,
+                        "replicaSet"_attr = _setUri.getSetName());
+            it = _serverPingMonitorMap.erase(it, std::next(it));
+            numRemoved++;
+        } else {
+            ++it;
+        }
+    }
+
+    invariant(_serverPingMonitorMap.size() == (startingSize - numRemoved));
+}
 
 }  // namespace mongo

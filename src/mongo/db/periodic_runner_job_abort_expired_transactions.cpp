@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/platform/basic.h"
 
@@ -38,7 +38,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/periodic_runner.h"
 
 namespace mongo {
@@ -88,35 +88,42 @@ void PeriodicThreadToAbortExpiredTransactions::_init(ServiceContext* serviceCont
     auto periodicRunner = serviceContext->getPeriodicRunner();
     invariant(periodicRunner);
 
-    PeriodicRunner::PeriodicJob job("abortExpiredTransactions",
-                                    [](Client* client) {
-                                        // The opCtx destructor handles unsetting itself from the
-                                        // Client. (The PeriodicRunner's Client must be reset before
-                                        // returning.)
-                                        auto opCtx = client->makeOperationContext();
+    PeriodicRunner::PeriodicJob job(
+        "abortExpiredTransactions",
+        [](Client* client) {
+            // The opCtx destructor handles unsetting itself from the
+            // Client. (The PeriodicRunner's Client must be reset before
+            // returning.)
+            auto opCtx = client->makeOperationContext();
 
-                                        // Set the Locker such that all lock requests' timeouts will
-                                        // be overridden and set to 0. This prevents the expired
-                                        // transaction aborter thread from stalling behind any
-                                        // non-transaction, exclusive lock taking operation blocked
-                                        // behind an active transaction's intent lock.
-                                        opCtx->lockState()->setMaxLockTimeout(Milliseconds(0));
-
-                                        killAllExpiredTransactions(opCtx.get());
-                                    },
-                                    getPeriod(gTransactionLifetimeLimitSeconds.load()));
+            // Set the Locker such that all lock requests' timeouts will
+            // be overridden and set to 0. This prevents the expired
+            // transaction aborter thread from stalling behind any
+            // non-transaction, exclusive lock taking operation blocked
+            // behind an active transaction's intent lock.
+            opCtx->lockState()->setMaxLockTimeout(Milliseconds(0));
+            try {
+                killAllExpiredTransactions(opCtx.get());
+            } catch (ExceptionForCat<ErrorCategory::CancelationError>& ex) {
+                LOGV2_DEBUG(4684101, 2, "Periodic job canceled", "{reason}"_attr = ex.reason());
+            }
+        },
+        getPeriod(gTransactionLifetimeLimitSeconds.load()));
 
     _anchor = std::make_shared<PeriodicJobAnchor>(periodicRunner->makeJob(std::move(job)));
 
-    TransactionParticipant::observeTransactionLifetimeLimitSeconds.addObserver(
-        [anchor = _anchor](const Argument& secs) {
-            try {
-                anchor->setPeriod(getPeriod(secs));
-            } catch (const DBException& ex) {
-                log() << "Failed to update period of thread which aborts expired transactions "
-                      << ex.toStatus();
-            }
-        });
+    TransactionParticipant::observeTransactionLifetimeLimitSeconds.addObserver([anchor = _anchor](
+                                                                                   const Argument&
+                                                                                       secs) {
+        try {
+            anchor->setPeriod(getPeriod(secs));
+        } catch (const DBException& ex) {
+            LOGV2(
+                20892,
+                "Failed to update period of thread which aborts expired transactions {ex_toStatus}",
+                "ex_toStatus"_attr = ex.toStatus());
+        }
+    });
 }
 
 }  // namespace mongo

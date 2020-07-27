@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -54,12 +54,19 @@
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/ttl_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
+
+class TTLMonitor;
+
+namespace {
+
+const auto getTTLMonitor = ServiceContext::declareDecoration<std::unique_ptr<TTLMonitor>>();
+
+}  // namespace
 
 MONGO_FAIL_POINT_DEFINE(hangTTLMonitorWithLock);
 
@@ -72,17 +79,29 @@ ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocume
 
 class TTLMonitor : public BackgroundJob {
 public:
-    TTLMonitor(ServiceContext* serviceContext) : _serviceContext(serviceContext) {}
-    virtual ~TTLMonitor() {}
+    explicit TTLMonitor() : BackgroundJob(false /* selfDelete */) {}
 
-    virtual std::string name() const {
+    static TTLMonitor* get(ServiceContext* serviceCtx) {
+        return getTTLMonitor(serviceCtx).get();
+    }
+
+    static void set(ServiceContext* serviceCtx, std::unique_ptr<TTLMonitor> monitor) {
+        auto& ttlMonitor = getTTLMonitor(serviceCtx);
+        if (ttlMonitor) {
+            invariant(!ttlMonitor->running(),
+                      "Tried to reset the TTLMonitor without shutting down the original instance.");
+        }
+
+        invariant(monitor);
+        ttlMonitor = std::move(monitor);
+    }
+
+    std::string name() const {
         return "TTLMonitor";
     }
 
-    static std::string secondsExpireField;
-
-    virtual void run() {
-        ThreadClient tc(name(), _serviceContext);
+    void run() {
+        ThreadClient tc(name(), getGlobalServiceContext());
         AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
 
         {
@@ -90,37 +109,66 @@ public:
             tc.get()->setSystemOperationKillable(lk);
         }
 
-        while (!globalInShutdownDeprecated()) {
+        while (true) {
             {
+                // Wait until either ttlMonitorSleepSecs passes or a shutdown is requested.
+                auto deadline = Date_t::now() + Seconds(ttlMonitorSleepSecs.load());
+                stdx::unique_lock<Latch> lk(_stateMutex);
+
                 MONGO_IDLE_THREAD_BLOCK;
-                sleepsecs(ttlMonitorSleepSecs.load());
+                _shuttingDownCV.wait_until(
+                    lk, deadline.toSystemTimePoint(), [&] { return _shuttingDown; });
+
+                if (_shuttingDown) {
+                    return;
+                }
             }
 
-            LOG(3) << "thread awake";
+            LOGV2_DEBUG(22528, 3, "thread awake");
 
             if (!ttlMonitorEnabled.load()) {
-                LOG(1) << "disabled";
+                LOGV2_DEBUG(22529, 1, "disabled");
                 continue;
             }
 
             if (lockedForWriting()) {
                 // Note: this is not perfect as you can go into fsync+lock between this and actually
                 // doing the delete later.
-                LOG(3) << "locked for writing";
+                LOGV2_DEBUG(22530, 3, "locked for writing");
                 continue;
             }
 
             try {
                 doTTLPass();
             } catch (const WriteConflictException&) {
-                LOG(1) << "got WriteConflictException";
+                LOGV2_DEBUG(22531, 1, "got WriteConflictException");
             } catch (const ExceptionForCat<ErrorCategory::Interruption>& interruption) {
-                LOG(1) << "TTLMonitor was interrupted: " << interruption;
+                LOGV2_DEBUG(22532,
+                            1,
+                            "TTLMonitor was interrupted: {interruption}",
+                            "interruption"_attr = interruption);
             }
         }
     }
 
+    /**
+     * Signals the thread to quit and then waits until it does.
+     */
+    void shutdown() {
+        LOGV2(3684100, "Shutting down TTL collection monitor thread");
+        {
+            stdx::lock_guard<Latch> lk(_stateMutex);
+            _shuttingDown = true;
+            _shuttingDownCV.notify_one();
+        }
+        wait();
+        LOGV2(3684101, "Finished shutting down TTL collection monitor thread");
+    }
+
 private:
+    /**
+     * Gets all TTL indexes from every collection and performs doTTLForIndex().
+     */
     void doTTLPass() {
         const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
         OperationContext& opCtx = *opCtxPtr;
@@ -144,7 +192,15 @@ private:
             auto uuid = ttlInfo.first;
             auto indexName = ttlInfo.second;
 
-            auto nss = CollectionCatalog::get(opCtxPtr.get()).lookupNSSByUUID(&opCtx, uuid);
+            // Skip collections that have not been made visible yet. The TTLCollectionCache already
+            // has the index information available, so we want to avoid removing it until the
+            // collection is visible.
+            const CollectionCatalog& collectionCatalog = CollectionCatalog::get(opCtxPtr.get());
+            if (collectionCatalog.isCollectionAwaitingVisibility(uuid)) {
+                continue;
+            }
+
+            auto nss = collectionCatalog.lookupNSSByUUID(&opCtx, uuid);
             if (!nss) {
                 ttlCollectionCache.deregisterTTLInfo(ttlInfo);
                 continue;
@@ -165,7 +221,7 @@ private:
 
             BSONObj spec = DurableCatalog::get(opCtxPtr.get())
                                ->getIndexSpec(&opCtx, coll->getCatalogId(), indexName);
-            if (!spec.hasField(secondsExpireField)) {
+            if (!spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
                 ttlCollectionCache.deregisterTTLInfo(ttlInfo);
                 continue;
             }
@@ -181,11 +237,18 @@ private:
             try {
                 doTTLForIndex(&opCtx, it.first, it.second);
             } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
-                warning() << "TTLMonitor was interrupted, waiting " << ttlMonitorSleepSecs.load()
-                          << " seconds before doing another pass";
+                LOGV2_WARNING(22537,
+                              "TTLMonitor was interrupted, waiting {ttlMonitorSleepSecs_load} "
+                              "seconds before doing another pass",
+                              "TTLMonitor was interrupted, waiting before doing another pass",
+                              "wait"_attr = Milliseconds(Seconds(ttlMonitorSleepSecs.load())));
                 return;
             } catch (const DBException& dbex) {
-                error() << "Error processing ttl index: " << it.second << " -- " << dbex.toString();
+                LOGV2_ERROR(22538,
+                            "Error processing ttl index: {it_second} -- {dbex}",
+                            "Error processing TTL index",
+                            "index"_attr = it.second,
+                            "error"_attr = dbex);
                 // Continue on to the next index.
                 continue;
             }
@@ -193,7 +256,7 @@ private:
     }
 
     /**
-     * Remove documents from the collection using the specified TTL index after a sufficient amount
+     * Removes documents from the collection using the specified TTL index after a sufficient amount
      * of time has passed according to its expiry specification.
      */
     void doTTLForIndex(OperationContext* opCtx, NamespaceString collectionNSS, BSONObj idx) {
@@ -201,23 +264,35 @@ private:
             return;
         }
         if (!userAllowedWriteNS(collectionNSS).isOK()) {
-            error() << "namespace '" << collectionNSS
-                    << "' doesn't allow deletes, skipping ttl job for: " << idx;
+            LOGV2_ERROR(
+                22539,
+                "namespace '{namespace}' doesn't allow deletes, skipping ttl job for: {index}",
+                "Namespace doesn't allow deletes, skipping TTL job",
+                logAttrs(collectionNSS),
+                "index"_attr = idx);
             return;
         }
 
         const BSONObj key = idx["key"].Obj();
         const StringData name = idx["name"].valueStringData();
         if (key.nFields() != 1) {
-            error() << "key for ttl index can only have 1 field, skipping ttl job for: " << idx;
+            LOGV2_ERROR(22540,
+                        "key for ttl index can only have 1 field, skipping ttl job for: {index}",
+                        "Key for ttl index can only have 1 field, skipping TTL job",
+                        "index"_attr = idx);
             return;
         }
 
-        LOG(1) << "ns: " << collectionNSS << " key: " << key << " name: " << name;
+        LOGV2_DEBUG(22533,
+                    1,
+                    "ns: {collectionNSS} key: {key} name: {name}",
+                    "collectionNSS"_attr = collectionNSS,
+                    "key"_attr = key,
+                    "name"_attr = name);
 
         AutoGetCollection autoGetCollection(opCtx, collectionNSS, MODE_IX);
         if (MONGO_unlikely(hangTTLMonitorWithLock.shouldFail())) {
-            log() << "Hanging due to hangTTLMonitorWithLock fail point";
+            LOGV2(22534, "Hanging due to hangTTLMonitorWithLock fail point");
             hangTTLMonitorWithLock.pauseWhileSet(opCtx);
         }
 
@@ -234,8 +309,11 @@ private:
 
         const IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName(opCtx, name);
         if (!desc) {
-            LOG(1) << "index not found (index build in progress? index dropped?), skipping "
-                   << "ttl job for: " << idx;
+            LOGV2_DEBUG(22535,
+                        1,
+                        "index not found (index build in progress? index dropped?), skipping ttl "
+                        "job for: {idx}",
+                        "idx"_attr = idx);
             return;
         }
 
@@ -244,15 +322,22 @@ private:
         idx = desc->infoObj();
 
         if (IndexType::INDEX_BTREE != IndexNames::nameToType(desc->getAccessMethodName())) {
-            error() << "special index can't be used as a ttl index, skipping ttl job for: " << idx;
+            LOGV2_ERROR(22541,
+                        "special index can't be used as a ttl index, skipping ttl job for: {index}",
+                        "Special index can't be used as a TTL index, skipping TTL job",
+                        "index"_attr = idx);
             return;
         }
 
-        BSONElement secondsExpireElt = idx[secondsExpireField];
+        BSONElement secondsExpireElt = idx[IndexDescriptor::kExpireAfterSecondsFieldName];
         if (!secondsExpireElt.isNumber()) {
-            error() << "ttl indexes require the " << secondsExpireField << " field to be "
-                    << "numeric but received a type of " << typeName(secondsExpireElt.type())
-                    << ", skipping ttl job for: " << idx;
+            LOGV2_ERROR(22542,
+                        "ttl indexes require the {expireField} field to be numeric but received a "
+                        "type of {typeName_secondsExpireElt_type}, skipping ttl job for: {idx}",
+                        "TTL indexes require the expire field to be numeric, skipping TTL job",
+                        "field"_attr = IndexDescriptor::kExpireAfterSecondsFieldName,
+                        "type"_attr = typeName(secondsExpireElt.type()),
+                        "index"_attr = idx);
             return;
         }
 
@@ -290,35 +375,52 @@ private:
                                                  startKey,
                                                  endKey,
                                                  BoundInclusion::kIncludeBothStartAndEndKeys,
-                                                 PlanExecutor::YIELD_AUTO,
+                                                 PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                                  direction);
 
-        Status result = exec->executePlan();
-        if (!result.isOK()) {
-            error() << "ttl query execution for index " << idx
-                    << " failed with status: " << redact(result);
+        try {
+            exec->executePlan();
+        } catch (const ExceptionFor<ErrorCodes::QueryPlanKilled>&) {
+            // It is expected that a collection drop can kill a query plan while the TTL monitor is
+            // deleting an old document, so ignore this error.
+            return;
+        } catch (const DBException& exception) {
+            LOGV2_WARNING(22543,
+                          "ttl query execution for index {index} failed with status: {error}",
+                          "TTL query execution failed",
+                          "index"_attr = idx,
+                          "error"_attr = redact(exception.toStatus()));
             return;
         }
 
         const long long numDeleted = DeleteStage::getNumDeleted(*exec);
         ttlDeletedDocuments.increment(numDeleted);
-        LOG(1) << "deleted: " << numDeleted;
+        LOGV2_DEBUG(22536, 1, "deleted: {numDeleted}", "numDeleted"_attr = numDeleted);
     }
 
-    ServiceContext* _serviceContext;
+    // Protects the state below.
+    mutable Mutex _stateMutex = MONGO_MAKE_LATCH("TTLMonitorStateMutex");
+
+    // Signaled to wake up the thread, if the thread is waiting. The thread will check whether
+    // _shuttingDown is set and stop accordingly.
+    mutable stdx::condition_variable _shuttingDownCV;
+
+    bool _shuttingDown = false;
 };
 
-namespace {
-// The global TTLMonitor object is intentionally leaked.  Even though it is only used in one
-// function, we declare it here to indicate to the leak sanitizer that the leak of this object
-// should not be reported.
-TTLMonitor* ttlMonitor = nullptr;
-}  // namespace
-
-void startTTLBackgroundJob(ServiceContext* serviceContext) {
-    ttlMonitor = new TTLMonitor(serviceContext);
+void startTTLMonitor(ServiceContext* serviceContext) {
+    std::unique_ptr<TTLMonitor> ttlMonitor = std::make_unique<TTLMonitor>();
     ttlMonitor->go();
+    TTLMonitor::set(serviceContext, std::move(ttlMonitor));
 }
 
-std::string TTLMonitor::secondsExpireField = "expireAfterSeconds";
+void shutdownTTLMonitor(ServiceContext* serviceContext) {
+    TTLMonitor* ttlMonitor = TTLMonitor::get(serviceContext);
+    // We allow the TTLMonitor not to be set in case shutdown occurs before the thread has been
+    // initialized.
+    if (ttlMonitor) {
+        ttlMonitor->shutdown();
+    }
+}
+
 }  // namespace mongo

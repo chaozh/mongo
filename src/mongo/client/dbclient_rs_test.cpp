@@ -44,6 +44,8 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/replica_set_monitor_protocol_test_util.h"
+#include "mongo/client/scanning_replica_set_monitor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_replica_set.h"
@@ -62,7 +64,7 @@ using std::unique_ptr;
 using std::vector;
 
 MONGO_INITIALIZER(DisableReplicaSetMonitorRefreshRetries)(InitializerContext*) {
-    ReplicaSetMonitor::disableRefreshRetries_forTest();
+    ScanningReplicaSetMonitor::disableRefreshRetries_forTest();
     return Status::OK();
 }
 
@@ -74,11 +76,29 @@ BSONObj makeMetadata(ReadPreference rp, TagSet tagSet) {
 }
 
 /**
- * Basic fixture with one primary and one secondary.
+ * Ensures a global ServiceContext exists and the ScanningReplicaSetMonitor is used for each test.
  */
-class BasicRS : public unittest::Test {
+class DBClientRSTest : public unittest::Test {
 protected:
     void setUp() {
+        auto serviceContext = ServiceContext::make();
+        setGlobalServiceContext(std::move(serviceContext));
+
+        ReplicaSetMonitorProtocolTestUtil::setRSMProtocol(ReplicaSetMonitorProtocol::kScanning);
+    }
+
+    void tearDown() {
+        ReplicaSetMonitorProtocolTestUtil::resetRSMProtocol();
+    }
+};
+
+/**
+ * Basic fixture with one primary and one secondary.
+ */
+class BasicRS : public DBClientRSTest {
+protected:
+    void setUp() {
+        DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
         _replSet.reset(new MockReplicaSet("test", 2));
@@ -91,6 +111,7 @@ protected:
         mongo::ScopedDbConnection::clearPool();
 
         ReplicaSetMonitor::shutdown();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -201,9 +222,10 @@ TEST_F(BasicRS, CommandSecondaryPreferred) {
 /**
  * Setup for 2 member replica set will all of the nodes down.
  */
-class AllNodesDown : public unittest::Test {
+class AllNodesDown : public DBClientRSTest {
 protected:
     void setUp() {
+        DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
         _replSet.reset(new MockReplicaSet("test", 2));
@@ -221,6 +243,7 @@ protected:
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -309,9 +332,10 @@ TEST_F(AllNodesDown, CommandNearest) {
 /**
  * Setup for 2 member replica set with the primary down.
  */
-class PrimaryDown : public unittest::Test {
+class PrimaryDown : public DBClientRSTest {
 protected:
     void setUp() {
+        DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
         _replSet.reset(new MockReplicaSet("test", 2));
@@ -324,6 +348,7 @@ protected:
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -415,9 +440,10 @@ TEST_F(PrimaryDown, Nearest) {
 /**
  * Setup for 2 member replica set with the secondary down.
  */
-class SecondaryDown : public unittest::Test {
+class SecondaryDown : public DBClientRSTest {
 protected:
     void setUp() {
+        DBClientRSTest::setUp();
         ReplicaSetMonitor::cleanup();
 
         _replSet.reset(new MockReplicaSet("test", 2));
@@ -431,6 +457,7 @@ protected:
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {
@@ -526,11 +553,13 @@ TEST_F(SecondaryDown, CommandNearest) {
  * Warning: Tests running this fixture cannot be run in parallel with other tests
  * that uses ConnectionString::setConnectionHook
  */
-class TaggedFiveMemberRS : public unittest::Test {
+class TaggedFiveMemberRS : public DBClientRSTest {
 protected:
     void setUp() {
+        DBClientRSTest::setUp();
+
         // Tests for pinning behavior require this.
-        ReplicaSetMonitor::useDeterministicHostSelection = true;
+        ScanningReplicaSetMonitor::useDeterministicHostSelection = true;
 
         // This shuts down the background RSMWatcher thread and prevents it from running. These
         // tests depend on controlling when the RSMs are updated.
@@ -625,21 +654,21 @@ protected:
             }
 
             membersBuilder.done();
-            mongo::repl::ReplSetConfig newConfig;
-            fassert(28569, newConfig.initialize(newConfigBuilder.done()));
+            auto newConfig = mongo::repl::ReplSetConfig::parse(newConfigBuilder.done());
             fassert(28568, newConfig.validate());
             _replSet->setConfig(newConfig);
         }
     }
 
     void tearDown() {
-        ReplicaSetMonitor::useDeterministicHostSelection = false;
+        ScanningReplicaSetMonitor::useDeterministicHostSelection = false;
 
         ConnectionString::setConnectionHook(_originalConnectionHook);
         ReplicaSetMonitor::cleanup();
         _replSet.reset();
 
         mongo::ScopedDbConnection::clearPool();
+        DBClientRSTest::tearDown();
     }
 
     MockReplicaSet* getReplSet() {

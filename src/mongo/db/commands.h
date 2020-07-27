@@ -58,6 +58,8 @@ namespace mongo {
 extern FailPoint failCommand;
 extern FailPoint waitInCommandMarkKillOnClientDisconnect;
 extern const OperationContext::Decoration<boost::optional<BSONArray>> errorLabelsOverride;
+extern const std::set<std::string> kNoApiVersions;
+extern const std::set<std::string> kApiVersions1;
 
 class Command;
 class CommandInvocation;
@@ -66,6 +68,36 @@ class OperationContext;
 namespace mutablebson {
 class Document;
 }  // namespace mutablebson
+
+/**
+ * A simple set of type-erased hooks for pre and post command actions.
+ *
+ * These hooks will only run on external requests that form CommandInvocations (a.k.a. OP_MSG
+ * requests). They are not applied for runCommandDirectly() or raw CommandInvocation::run() calls.
+ */
+class CommandInvocationHooks {
+public:
+    /**
+     * Set the current hooks
+     */
+    static void set(ServiceContext* serviceContext, std::shared_ptr<CommandInvocationHooks> hooks);
+
+    virtual ~CommandInvocationHooks() = default;
+
+    /**
+     * A behavior to perform before CommandInvocation::run()
+     */
+    virtual void onBeforeRun(OperationContext* opCtx,
+                             const OpMsgRequest& request,
+                             CommandInvocation* invocation) = 0;
+
+    /**
+     * A behavior to perform after CommandInvocation::run()
+     */
+    virtual void onAfterRun(OperationContext* opCtx,
+                            const OpMsgRequest& request,
+                            CommandInvocation* invocation) = 0;
+};
 
 // Various helpers unrelated to any single command or to the command registry.
 // Would be a namespace, but want to keep it closed rather than open.
@@ -194,6 +226,16 @@ struct CommandHelpers {
     static BSONObj runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request);
 
     /**
+     * Runs a previously parsed CommandInvocation and propagates the result to the
+     * ReplyBuilderInterface. This function is agnostic to the derived type of the CommandInvocation
+     * but may mirror, forward, or do other supplementary actions with the request.
+     */
+    static void runCommandInvocation(OperationContext* opCtx,
+                                     const OpMsgRequest& request,
+                                     CommandInvocation* invocation,
+                                     rpc::ReplyBuilderInterface* response);
+
+    /**
      * If '!invocation', we're logging about a Command pre-parse. It has to punt on the logged
      * namespace, giving only the request's $db. Since the Command hasn't parsed the request body,
      * we can't know the collection part of that namespace, so we leave it blank in the audit log.
@@ -229,6 +271,14 @@ struct CommandHelpers {
      */
     static bool shouldActivateFailCommandFailPoint(const BSONObj& data,
                                                    const CommandInvocation* invocation,
+                                                   Client* client);
+
+    /**
+     * Checks if the command passed in is in the list of failCommands defined in the fail point.
+     */
+    static bool shouldActivateFailCommandFailPoint(const BSONObj& data,
+                                                   const NamespaceString& nss,
+                                                   const Command* cmd,
                                                    Client* client);
 
     /**
@@ -305,6 +355,16 @@ public:
         return false;
     }
 
+    // List of API versions that include this command.
+    virtual const std::set<std::string>& apiVersions() const {
+        return kNoApiVersions;
+    };
+
+    // API versions in which this command is deprecated.
+    virtual const std::set<std::string>& deprecatedApiVersions() const {
+        return kNoApiVersions;
+    };
+
     /**
      * Like adminOnly, but even stricter: we must either be authenticated for admin db,
      * or, if running without auth, on the local interface.  Used for things which
@@ -331,6 +391,14 @@ public:
      */
     virtual bool shouldAffectCommandCounter() const {
         return true;
+    }
+
+    /**
+     * Override and return true if the readConcernCounters in serverStatus should not be incremented
+     * on behalf of this command.
+     */
+    virtual bool shouldAffectReadConcernCounter() const {
+        return false;
     }
 
     /**
@@ -466,6 +534,9 @@ public:
 
     virtual ~CommandInvocation();
 
+    static void set(OperationContext* opCtx, std::shared_ptr<CommandInvocation> invocation);
+    static std::shared_ptr<CommandInvocation> get(OperationContext* opCtx);
+
     /**
      * Runs the command, filling in result. Any exception thrown from here will cause result
      * to be reset and filled in with the error. Non-const to permit modifying the request
@@ -504,6 +575,20 @@ public:
                                                             "default read concern not permitted"};
         return {{level != repl::ReadConcernLevel::kLocalReadConcern, kReadConcernNotSupported},
                 {kDefaultReadConcernNotPermitted}};
+    }
+
+    /**
+     * Return if this invocation can be mirrored to secondaries
+     */
+    virtual bool supportsReadMirroring() const {
+        return false;
+    }
+
+    /**
+     * Return a BSONObj that can be safely mirrored to secondaries for cache warming
+     */
+    virtual void appendMirrorableRequest(BSONObjBuilder*) const {
+        MONGO_UNREACHABLE;
     }
 
     /**
@@ -640,10 +725,6 @@ public:
      * If a readConcern level argument is sent to a command that returns false the command processor
      * will reject the command, returning an appropriate error message.
      *
-     * This only applies when running outside transactions because all commands that are allowed to
-     * run in a transaction must support all the read concerns that can be used in a
-     * transaction.
-     *
      * Note that this is never called on mongos. Sharded commands are responsible for forwarding
      * the option to the shards as needed. We rely on the shards to fail the commands in the
      * cases where it isn't supported.
@@ -656,6 +737,20 @@ public:
                                                             "default read concern not permitted"};
         return {{level != repl::ReadConcernLevel::kLocalReadConcern, kReadConcernNotSupported},
                 {kDefaultReadConcernNotPermitted}};
+    }
+
+    /**
+     * Return if the cmdObj can be mirrored to secondaries in some form
+     */
+    virtual bool supportsReadMirroring(const BSONObj& cmdObj) const {
+        return false;
+    }
+
+    /**
+     * Return a modified form of cmdObj that can be safely mirrored to secondaries for cache warming
+     */
+    virtual void appendMirrorableRequest(BSONObjBuilder*, const BSONObj&) const {
+        MONGO_UNREACHABLE;
     }
 
     virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const {
@@ -921,12 +1016,15 @@ CommandRegistry* globalCommandRegistry();
  * Prefer this syntax to using MONGO_INITIALIZER directly.
  * The created Command object is "leaked" intentionally, since it will register itself.
  */
-#define MONGO_REGISTER_TEST_COMMAND(CmdType)                                \
-    MONGO_INITIALIZER(RegisterTestCommand_##CmdType)(InitializerContext*) { \
-        if (getTestCommandsEnabled()) {                                     \
-            new CmdType();                                                  \
-        }                                                                   \
-        return Status::OK();                                                \
+#define MONGO_REGISTER_TEST_COMMAND(CmdType)                                     \
+    MONGO_INITIALIZER_WITH_PREREQUISITES(                                        \
+        RegisterTestCommand_##CmdType,                                           \
+        (::mongo::defaultInitializerName().c_str(), "EndStartupOptionHandling")) \
+    (InitializerContext*) {                                                      \
+        if (getTestCommandsEnabled()) {                                          \
+            new CmdType();                                                       \
+        }                                                                        \
+        return Status::OK();                                                     \
     }
 
 }  // namespace mongo

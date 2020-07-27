@@ -15,7 +15,6 @@ const expectedParamDefaults = {
     internalQueryPlanEvaluationCollFraction: 0.3,
     internalQueryPlanEvaluationMaxResults: 101,
     internalQueryCacheSize: 5000,
-    internalQueryCacheFeedbacksStored: 20,
     internalQueryCacheEvictionRatio: 10.0,
     internalQueryCacheWorksGrowthCoefficient: 2.0,
     internalQueryCacheDisableInactiveEntries: false,
@@ -28,7 +27,7 @@ const expectedParamDefaults = {
     internalQueryPlanOrChildrenIndependently: true,
     internalQueryMaxScansToExplode: 200,
     internalQueryMaxBlockingSortMemoryUsageBytes: 100 * 1024 * 1024,
-    internalQueryExecYieldIterations: 128,
+    internalQueryExecYieldIterations: 1000,
     internalQueryExecYieldPeriodMS: 10,
     internalQueryFacetBufferSizeBytes: 100 * 1024 * 1024,
     internalDocumentSourceCursorBatchSizeBytes: 4 * 1024 * 1024,
@@ -39,10 +38,11 @@ const expectedParamDefaults = {
     internalQueryMaxPushBytes: 100 * 1024 * 1024,
     internalQueryMaxAddToSetBytes: 100 * 1024 * 1024,
     // Should be half the value of 'internalQueryExecYieldIterations' parameter.
-    internalInsertMaxBatchSize: 64,
+    internalInsertMaxBatchSize: 500,
     internalQueryPlannerGenerateCoveredWholeIndexScans: false,
     internalQueryIgnoreUnknownJSONSchemaKeywords: false,
     internalQueryProhibitBlockingMergeOnMongoS: false,
+    internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals: 1000,
 };
 
 function assertDefaultParameterValues() {
@@ -89,10 +89,6 @@ assertSetParameterFails("internalQueryPlanEvaluationMaxResults", -1);
 assertSetParameterSucceeds("internalQueryCacheSize", 1);
 assertSetParameterSucceeds("internalQueryCacheSize", 0);
 assertSetParameterFails("internalQueryCacheSize", -1);
-
-assertSetParameterSucceeds("internalQueryCacheFeedbacksStored", 1);
-assertSetParameterSucceeds("internalQueryCacheFeedbacksStored", 0);
-assertSetParameterFails("internalQueryCacheFeedbacksStored", -1);
 
 assertSetParameterSucceeds("internalQueryCacheEvictionRatio", 1.0);
 assertSetParameterSucceeds("internalQueryCacheEvictionRatio", 0.0);
@@ -174,6 +170,10 @@ assertSetParameterFails("internalDocumentSourceCursorBatchSizeBytes", -1);
 assertSetParameterSucceeds("internalDocumentSourceLookupCacheSizeBytes", 11);
 assertSetParameterSucceeds("internalDocumentSourceLookupCacheSizeBytes", 0);
 assertSetParameterFails("internalDocumentSourceLookupCacheSizeBytes", -1);
+
+assertSetParameterSucceeds("internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals", 1001);
+assertSetParameterFails("internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals", 0);
+assertSetParameterFails("internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals", -1);
 
 MongoRunner.stopMongod(conn);
 })();

@@ -100,11 +100,6 @@ public:
     MockDBClientConnection(MockRemoteDBServer* remoteServer, bool autoReconnect = false);
     virtual ~MockDBClientConnection();
 
-    /**
-     * Create a mock connection that only supports call() and recv().
-     */
-    MockDBClientConnection();
-
     //
     // DBClientBase methods
     //
@@ -115,7 +110,7 @@ public:
     Status connect(const HostAndPort& host, StringData applicationName) override {
         std::string errmsg;
         if (!connect(host.toString().c_str(), applicationName, errmsg)) {
-            return {ErrorCodes::HostNotFound, errmsg};
+            return {ErrorCodes::HostUnreachable, errmsg};
         }
         return Status::OK();
     }
@@ -123,21 +118,32 @@ public:
     using DBClientBase::runCommandWithTarget;
     std::pair<rpc::UniqueReply, DBClientBase*> runCommandWithTarget(OpMsgRequest request) override;
 
-    std::unique_ptr<mongo::DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                                 mongo::Query query = mongo::Query(),
-                                                 int nToReturn = 0,
-                                                 int nToSkip = 0,
-                                                 const mongo::BSONObj* fieldsToReturn = nullptr,
-                                                 int queryOptions = 0,
-                                                 int batchSize = 0) override;
+    std::unique_ptr<mongo::DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        mongo::Query query = mongo::Query(),
+        int nToReturn = 0,
+        int nToSkip = 0,
+        const mongo::BSONObj* fieldsToReturn = nullptr,
+        int queryOptions = 0,
+        int batchSize = 0,
+        boost::optional<BSONObj> readConcernObj = boost::none) override;
 
     uint64_t getSockCreationMicroSec() const override;
 
-    void insert(const std::string& ns, BSONObj obj, int flags = 0) override;
+    void insert(const std::string& ns,
+                BSONObj obj,
+                int flags = 0,
+                boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    void insert(const std::string& ns, const std::vector<BSONObj>& objList, int flags = 0) override;
+    void insert(const std::string& ns,
+                const std::vector<BSONObj>& objList,
+                int flags = 0,
+                boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
-    void remove(const std::string& ns, Query query, int flags = 0) override;
+    void remove(const std::string& ns,
+                Query query,
+                int flags = 0,
+                boost::optional<BSONObj> writeConcernObj = boost::none) override;
 
     bool call(mongo::Message& toSend,
               mongo::Message& response,
@@ -145,6 +151,7 @@ public:
               std::string* actualServer) override;
     Status recv(mongo::Message& m, int lastRequestId) override;
 
+    void shutdown() override;
     void shutdownAndDisallowReconnect() override;
 
     // Methods to simulate network responses.
@@ -157,7 +164,6 @@ public:
     //
 
     mongo::ConnectionString::ConnectionType type() const override;
-    bool isFailed() const override;
     std::string getServerAddress() const override;
     std::string toString() const override;
 
@@ -180,7 +186,8 @@ public:
                              mongo::Query query,
                              const mongo::BSONObj* fieldsToReturn = nullptr,
                              int queryOptions = 0,
-                             int batchSize = 0) override;
+                             int batchSize = 0,
+                             boost::optional<BSONObj> readConcernObj = boost::none) override;
 
     //
     // Unsupported methods (these are pure virtuals in the base class)
@@ -197,9 +204,7 @@ private:
 
     MockRemoteDBServer::InstanceID _remoteServerInstanceID;
     MockRemoteDBServer* _remoteServer;
-    bool _isFailed;
     uint64_t _sockCreationTime;
-    bool _autoReconnect;
     boost::optional<OpMsgRequest> _lastCursorMessage;
 
     Mutex _netMutex = MONGO_MAKE_LATCH("MockDBClientConnection");

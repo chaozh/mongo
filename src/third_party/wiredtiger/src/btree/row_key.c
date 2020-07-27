@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -120,7 +120,7 @@ __wt_row_leaf_key_copy(WT_SESSION_IMPL *session, WT_PAGE *page, WT_ROW *rip, WT_
 
 /*
  * __wt_row_leaf_key_work --
- *     Return a reference to, a row-store leaf-page key, optionally instantiate the key into the
+ *     Return a reference to a row-store leaf-page key, optionally instantiate the key into the
  *     in-memory page.
  */
 int
@@ -130,15 +130,12 @@ __wt_row_leaf_key_work(
     enum { FORWARD, BACKWARD } direction;
     WT_BTREE *btree;
     WT_CELL *cell;
-    WT_CELL_UNPACK *unpack, _unpack;
+    WT_CELL_UNPACK_KV *unpack, _unpack;
     WT_DECL_ITEM(tmp);
     WT_DECL_RET;
     WT_IKEY *ikey;
     WT_ROW *rip, *jump_rip;
     size_t size;
-#ifdef HAVE_DIAGNOSTIC
-    uint32_t current, start;
-#endif
     u_int last_prefix;
     int jump_slot_offset, slot_offset;
     void *copy;
@@ -163,9 +160,6 @@ __wt_row_leaf_key_work(
     size = 0; /* -Werror=maybe-uninitialized */
 
     direction = BACKWARD;
-#ifdef HAVE_DIAGNOSTIC
-    __wt_seconds32(session, &start);
-#endif
     for (slot_offset = 0;;) {
         if (0) {
 switch_and_jump:
@@ -178,18 +172,6 @@ switch_and_jump:
             slot_offset = jump_slot_offset;
         }
         copy = WT_ROW_KEY_COPY(rip);
-#ifdef HAVE_DIAGNOSTIC
-        /*
-         * Debugging added to detect and gather information for rare hang, WT-5043. Detect and abort
-         * if the current function call or operation takes too long (and 5 minutes is an eternity).
-         */
-        __wt_seconds32(session, &current);
-        WT_ERR_ASSERT(session, (current - start) < WT_MINUTE * 5, EINVAL,
-          "call tracking for WT-5043: %s took longer than 5 minutes", __func__);
-        WT_ERR_ASSERT(session,
-          (session->op_5043_seconds == 0 || (current - session->op_5043_seconds) < WT_MINUTE * 5),
-          EINVAL, "operation tracking for WT-5043: %s took longer than 5 minutes", session->name);
-#endif
 
         /*
          * Figure out what the key looks like.
@@ -271,7 +253,7 @@ switch_and_jump:
         /*
          * It must be an on-page cell, unpack it.
          */
-        __wt_cell_unpack(session, page, cell, unpack);
+        __wt_cell_unpack_kv(session, page->dsk, cell, unpack);
 
         /* 3: the test for an on-page reference to an overflow key. */
         if (unpack->type == WT_CELL_KEY_OVFL) {
@@ -290,7 +272,7 @@ switch_and_jump:
                 __wt_readlock(session, &btree->ovfl_lock);
                 copy = WT_ROW_KEY_COPY(rip);
                 if (!__wt_row_leaf_key_info(page, copy, NULL, &cell, &keyb->data, &keyb->size)) {
-                    __wt_cell_unpack(session, page, cell, unpack);
+                    __wt_cell_unpack_kv(session, page->dsk, cell, unpack);
                     ret = __wt_dsk_cell_data_ref(session, WT_PAGE_ROW_LEAF, unpack, keyb);
                 }
                 __wt_readunlock(session, &btree->ovfl_lock);
@@ -315,13 +297,6 @@ switch_and_jump:
          * prefix compressed.
          */
         if (unpack->prefix == 0) {
-            /*
-             * The only reason to be here is a Huffman encoded key, a non-encoded key with no prefix
-             * compression should have been directly referenced, and we should not have needed to
-             * unpack its cell.
-             */
-            WT_ASSERT(session, btree->huffman_key != NULL);
-
             /*
              * If this is the key we originally wanted, we don't
              * care if we're rolling forward or backward, it's

@@ -205,7 +205,13 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
 
         // Wait for collection drops to complete so that we don't get spurious failures during
         // consistency checks.
-        rst.nodes.forEach(TwoPhaseDropCollectionTest.waitForAllCollectionDropsToComplete);
+        rst.nodes.forEach(node => {
+            if (node.getDB('admin').isMaster('admin').arbiterOnly === true) {
+                log(`Skipping waiting for collection drops on arbiter ${node.host}`);
+                return;
+            }
+            TwoPhaseDropCollectionTest.waitForAllCollectionDropsToComplete(node);
+        });
 
         const name = rst.name;
         // Check collection counts except when unclean shutdowns are allowed, as such a shutdown is
@@ -334,12 +340,7 @@ function RollbackTestDeluxe(name = "FiveNodeDoubleRollbackTest", replSet) {
                     return false;
                 }
 
-                // Fail early if the rbid is greater than lastRBID+1.
-                let rbid = res.rbid;
-                assert.lte(rbid,
-                           lastRBID + 1,
-                           `RBID is too large. current RBID: ${rbid}, last RBID: ${lastRBID}`);
-                return rbid === lastRBID + 1;
+                return res.rbid > lastRBID;
             }, `Timed out waiting for RBID to increment on ${node.host}`);
         }
 

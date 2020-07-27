@@ -1,15 +1,13 @@
 /**
  * Tests aggregation on views for proper pipeline concatenation and semantics.
  *
- * The conditions under which sorts are pushed down were changed between 4.2 and 4.4. This test
- * expects the 4.4 version output of explain().
- * @tags: [requires_find_command,
- *         does_not_support_stepdowns,
- *         requires_getmore,
- *         requires_non_retryable_commands,
- *         # Requires FCV 4.4 because the test checks explain() output, and in 4.4 the conditions
- *         # under which sorts are pushed down were changed.
- *         requires_fcv_44]
+ * @tags: [
+ *   does_not_support_stepdowns,
+ *   requires_find_command,
+ *   requires_getmore,
+ *   requires_non_retryable_commands,
+ *   uses_$out,
+ * ]
  */
 (function() {
 "use strict";
@@ -132,13 +130,13 @@ assert.commandWorked(viewsDB.runCommand({
     }
     assertErrorCode(viewsDB.largeColl,
                     [{$sort: {x: -1}}],
-                    16819,
+                    ErrorCodes.QueryExceededMemoryLimitNoDiskUseAllowed,
                     "Expected in-memory sort to fail due to excessive memory usage");
     viewsDB.largeView.drop();
     assert.commandWorked(viewsDB.createView("largeView", "largeColl", []));
     assertErrorCode(viewsDB.largeView,
                     [{$sort: {x: -1}}],
-                    16819,
+                    ErrorCodes.QueryExceededMemoryLimitNoDiskUseAllowed,
                     "Expected in-memory sort to fail due to excessive memory usage");
 
     assert.commandWorked(
@@ -337,11 +335,6 @@ assert.commandWorked(viewsDB.runCommand({
     })();
 
 (function testUnionReadFromView() {
-    if (FixtureHelpers.isMongos(db)) {
-        // TODO SERVER-45563 enable these tests in sharded environments.
-        jsTest.log("Tests are being run on a mongos; skipping all $unionWith view tests.");
-        return;
-    }
     assert.eq(allDocuments.length, coll.aggregate([]).itcount());
     assert.eq(2 * allDocuments.length,
               coll.aggregate([{$unionWith: "emptyPipelineView"}]).itcount());
@@ -356,5 +349,45 @@ assert.commandWorked(viewsDB.runCommand({
         coll.aggregate(
                 [{$unionWith: {coll: "identityView", pipeline: [{$match: {_id: "New York"}}]}}])
             .itcount());
+}());
+
+(function testUnionInViewDefinition() {
+    const secondCollection = viewsDB.secondCollection;
+    secondCollection.drop();
+    assert.commandWorked(secondCollection.insert(allDocuments));
+    const viewName = "unionView";
+
+    // Test with a simple $unionWith with no custom pipeline.
+    assert.commandWorked(viewsDB.runCommand({
+        create: viewName,
+        viewOn: coll.getName(),
+        pipeline: [{$unionWith: secondCollection.getName()}]
+    }));
+    assert.eq(2 * allDocuments.length, viewsDB[viewName].find().itcount());
+    assert.eq(allDocuments.length,
+              viewsDB[viewName].aggregate([{$group: {_id: "$_id"}}]).itcount());
+    assert.eq(
+        [
+            {_id: "New York"},
+            {_id: "Newark"},
+            {_id: "Palo Alto"},
+            {_id: "San Francisco"},
+            {_id: "Trenton"}
+        ],
+        viewsDB[viewName].aggregate([{$group: {_id: "$_id"}}, {$sort: {_id: 1}}]).toArray());
+    assert.eq(allDocuments.length, viewsDB[viewName].distinct("_id").length);
+    viewsDB[viewName].drop();
+
+    // Now test again with a custom pipeline in the view definition.
+    assert.commandWorked(viewsDB.runCommand({
+        create: viewName,
+        viewOn: coll.getName(),
+        pipeline:
+            [{$unionWith: {coll: secondCollection.getName(), pipeline: [{$match: {state: "NY"}}]}}]
+    }));
+    assert.eq(allDocuments.length + 1, viewsDB[viewName].find().itcount());
+    assert.eq(allDocuments.length,
+              viewsDB[viewName].aggregate([{$group: {_id: "$_id"}}]).itcount());
+    assert.eq(allDocuments.length, viewsDB[viewName].distinct("_id").length);
 })();
 })();

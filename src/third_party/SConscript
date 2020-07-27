@@ -1,5 +1,7 @@
 # -*- mode: python -*-
 
+import SCons
+
 import libdeps
 import json
 
@@ -12,7 +14,7 @@ Import("wiredtiger")
 boostSuffix = "-1.70.0"
 snappySuffix = '-1.1.7'
 zlibSuffix = '-1.2.11'
-zstdSuffix = '-1.4.3'
+zstdSuffix = '-1.4.4'
 pcreSuffix = "-8.42"
 mozjsSuffix = '-60'
 yamlSuffix = '-0.6.2'
@@ -20,7 +22,7 @@ icuSuffix = '-57.1'
 gperftoolsSuffix = '-2.7'
 timelibSuffix = '-2018.01'
 tomcryptSuffix = '-1.18.2'
-benchmarkSuffix = '-1.4.1'
+variantSuffix = '-1.4.0'
 
 thirdPartyEnvironmentModifications = {
    'fmt' : {
@@ -38,6 +40,9 @@ thirdPartyEnvironmentModifications = {
         'CPPPATH' : ['#/src/third_party/timelib' + timelibSuffix],
    },
    'unwind' : {
+   },
+   'variant' : {
+        'CPPPATH' : ['#src/third_party/variant' + variantSuffix + '/include'],
    },
 }
 
@@ -121,7 +126,7 @@ if not use_system_version_of_library('zstd'):
 
 if not use_system_version_of_library('google-benchmark'):
     thirdPartyEnvironmentModifications['benchmark'] = {
-        'CPPPATH' : ['#/src/third_party/benchmark' + benchmarkSuffix + '/benchmark/include'],
+        'CPPPATH' : ['#/src/third_party/benchmark/dist/include'],
     }
 
 # TODO: figure out if we want to offer system versions of mozjs.  Mozilla
@@ -157,7 +162,7 @@ if wiredtiger and not use_system_version_of_library('wiredtiger'):
 
 if not use_system_version_of_library('yaml'):
     thirdPartyEnvironmentModifications['yaml'] = {
-        'CPPPATH' : ['#/src/third_party/yaml-cpp' + yamlSuffix + '/include'],
+        'CPPPATH' : ['#/src/third_party/yaml-cpp' + yamlSuffix + '/yaml-cpp/include'],
         'CPPDEFINES' : ['_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING'] if env.ToolchainIs('msvc') else [],
     }
 
@@ -185,13 +190,10 @@ if not use_system_version_of_library('kms-message'):
 
 if use_system_libunwind:
     thirdPartyEnvironmentModifications['unwind'] = {
-        'CPPDEFINES' : ['MONGO_USE_LIBUNWIND', 'UNW_LOCAL_ONLY'],
         'SYSLIBDEPS' : [env['LIBDEPS_UNWIND_SYSLIBDEP'], 'lzma'],
     }
 elif use_vendored_libunwind:
     thirdPartyEnvironmentModifications['unwind'] = {
-        'CPPDEFINES' : ['MONGO_USE_LIBUNWIND', 'UNW_LOCAL_ONLY'],
-        'LIBDEPS' : ['$BUILD_DIR/third_party/shim_unwind'],
         'SYSLIBDEPS' : ['lzma'],
     }
 
@@ -210,6 +212,39 @@ def injectThirdParty(thisEnv, libraries=[], parts=[]):
 
 env.AddMethod(injectThirdParty, 'InjectThirdParty')
 
+for builder_name in ('Program', 'SharedLibrary', 'LoadableModule', 'StaticLibrary'):
+    builder = env['BUILDERS'][builder_name]
+    base_emitter = builder.emitter
+
+    def add_shim_allocator_hack(target, source, env):
+
+        # If we allowed conftests to become dependent, any TryLink
+        # that happened after we made the below modifications would
+        # cause the configure steps to try to compile tcmalloc and any
+        # of its dependencies. Oops!
+        if any('conftest' in str(t) for t in target):
+            return target, source
+
+        # It is possible that 'env' isn't a unique
+        # OverrideEnvironment, since if you didn't pass any kw args
+        # into your builder call, you just reuse the env you were
+        # called with. That could mean that we see the same
+        # environment here multiple times. But that is really OK,
+        # since the operation we are performing would be performed on
+        # all of them anyway. The flag serves as a way to disable the
+        # auto-injection for the handful of libraries where we must do
+        # so to avoid forming a cycle.
+        if not env.get('DISABLE_ALLOCATOR_SHIM_INJECTION', False):
+            lds = env.get('LIBDEPS', [])
+            shim_allocator = '$BUILD_DIR/third_party/shim_allocator'
+            if shim_allocator not in lds:
+                lds.append(shim_allocator)
+                env['LIBDEPS'] = lds
+
+        return target, source
+
+    builder.emitter = SCons.Builder.ListEmitter([add_shim_allocator_hack, base_emitter])
+
 env = env.Clone()
 
 murmurEnv = env.Clone()
@@ -218,7 +253,14 @@ murmurEnv.SConscript('murmurhash3/SConscript', exports={ 'env' : murmurEnv })
 
 
 s2Env = env.Clone()
-s2Env.InjectThirdParty(libraries=['s2', 'boost', 'abseil-cpp', 'fmt', 'safeint'])
+s2Env.InjectThirdParty(libraries=[
+    's2',
+    'boost',
+    'abseil-cpp',
+    'fmt',
+    'safeint',
+    'variant',
+])
 s2Env.InjectMongoIncludePaths()
 s2Env.SConscript('s2/SConscript', exports={'env' : s2Env})
 
@@ -251,7 +293,12 @@ if use_libunwind:
         target="shim_unwind",
         source=[
             'shim_unwind.cpp',
-        ])
+        ],
+        # We don't want the shim_allocator hack to apply to this library, since
+        # otherwise we would create a loop, since tcmalloc might use us. That should
+        # be OK, unless libunwind had static initializers that invoked malloc.
+        DISABLE_ALLOCATOR_SHIM_INJECTION=True,
+    )
 
 if use_system_version_of_library("fmt"):
     fmtEnv = env.Clone(
@@ -425,11 +472,11 @@ else:
     benchmarkEnv = env.Clone()
     benchmarkEnv.InjectThirdParty(libraries=['benchmark'])
     benchmarkEnv.SConscript(
-        'benchmark' + benchmarkSuffix + '/SConscript',
+        'benchmark/SConscript',
         exports={ 'env' : benchmarkEnv })
     benchmarkEnv = benchmarkEnv.Clone(
         LIBDEPS_INTERFACE=[
-            'benchmark' + benchmarkSuffix + '/benchmark',
+            'benchmark/benchmark',
         ])
 
 benchmarkEnv.Library(
@@ -495,7 +542,9 @@ gperftoolsEnv.Library(
     target="shim_allocator",
     source=[
         "shim_allocator.cpp",
-    ])
+    ],
+    DISABLE_ALLOCATOR_SHIM_INJECTION=True,
+)
 
 
 if use_system_version_of_library("stemmer"):

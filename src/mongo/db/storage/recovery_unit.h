@@ -133,8 +133,8 @@ public:
      * Should be called through WriteUnitOfWork rather than directly.
      */
     void commitUnitOfWork() {
-        assignNextSnapshotId();
         doCommitUnitOfWork();
+        assignNextSnapshotId();
     }
 
     /**
@@ -145,8 +145,8 @@ public:
      * Should be called through WriteUnitOfWork rather than directly.
      */
     void abortUnitOfWork() {
-        assignNextSnapshotId();
         doAbortUnitOfWork();
+        assignNextSnapshotId();
     }
 
     /**
@@ -206,8 +206,7 @@ public:
      * This must not be called by a system taking user writes until after a stable timestamp is
      * passed to the storage engine.
      */
-    virtual bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx,
-                                                   bool stableCheckpoint = true) {
+    virtual bool waitUntilUnjournaledWritesDurable(OperationContext* opCtx, bool stableCheckpoint) {
         return waitUntilDurable(opCtx);
     }
 
@@ -216,8 +215,8 @@ public:
      * cannot be called inside of a WriteUnitOfWork, and should fail if it is.
      */
     void abandonSnapshot() {
-        assignNextSnapshotId();
         doAbandonSnapshot();
+        assignNextSnapshotId();
     }
 
     /**
@@ -254,7 +253,6 @@ public:
      *  - when using ReadSource::kNoOverlap, the timestamp chosen by the storage engine.
      *  - when using ReadSource::kAllDurableSnapshot, the timestamp chosen using the storage
      * engine's all_durable timestamp.
-     *  - when using ReadSource::kLastApplied, the timestamp chosen using the storage engine's last
      * applied timestamp. Can return boost::none if no timestamp has been established.
      *  - when using ReadSource::kMajorityCommitted, the majority committed timestamp chosen by the
      * storage engine after a transaction has been opened or after a call to
@@ -291,6 +289,14 @@ public:
      */
     virtual Status setTimestamp(Timestamp timestamp) {
         return Status::OK();
+    }
+
+    /**
+     * Returns true if a commit timestamp has been assigned to writes in this transaction.
+     * Otherwise, returns false.
+     */
+    virtual bool isTimestamped() const {
+        return false;
     }
 
     /**
@@ -392,7 +398,7 @@ public:
          */
         kNoTimestamp,
         /**
-         * Read from the majority all-commmitted timestamp.
+         * Read from the majority all-committed timestamp.
          */
         kMajorityCommitted,
         /**
@@ -400,8 +406,7 @@ public:
          */
         kNoOverlap,
         /**
-         * Read from the last applied timestamp. New transactions start at the most up-to-date
-         * timestamp.
+         * Read from the lastApplied timestamp.
          */
         kLastApplied,
         /**
@@ -412,12 +417,28 @@ public:
         /**
          * Read from the timestamp provided to setTimestampReadSource.
          */
-        kProvided,
-        /**
-         * Read from the latest checkpoint.
-         */
-        kCheckpoint
+        kProvided
     };
+
+    static std::string toString(ReadSource rs) {
+        switch (rs) {
+            case ReadSource::kUnset:
+                return "kUnset";
+            case ReadSource::kNoTimestamp:
+                return "kNoTimestamp";
+            case ReadSource::kMajorityCommitted:
+                return "kMajorityCommitted";
+            case ReadSource::kNoOverlap:
+                return "kNoOverlap";
+            case ReadSource::kLastApplied:
+                return "kLastApplied";
+            case ReadSource::kAllDurableSnapshot:
+                return "kAllDurableSnapshot";
+            case ReadSource::kProvided:
+                return "kProvided";
+        }
+        MONGO_UNREACHABLE;
+    }
 
     /**
      * Sets which timestamp to use for read transactions. If 'provided' is supplied, only kProvided

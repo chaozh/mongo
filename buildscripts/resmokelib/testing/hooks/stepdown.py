@@ -11,10 +11,10 @@ import pymongo.errors
 
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib import utils
-from buildscripts.resmokelib.testing.hooks import interface
+from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
 from buildscripts.resmokelib.testing.fixtures import replicaset
 from buildscripts.resmokelib.testing.fixtures import shardedcluster
-from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
+from buildscripts.resmokelib.testing.hooks import interface
 
 
 class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-attributes
@@ -27,7 +27,7 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
             self, hook_logger, fixture, config_stepdown=True, shard_stepdown=True,
             stepdown_interval_ms=8000, terminate=False, kill=False,
             use_stepdown_permitted_file=False, wait_for_mongos_retarget=False,
-            stepdown_via_heartbeats=True):
+            stepdown_via_heartbeats=True, background_reconfig=False):
         """Initialize the ContinuousStepdown.
 
         Args:
@@ -64,6 +64,8 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
         self._terminate = terminate or kill
         self._kill = kill
 
+        self._background_reconfig = background_reconfig
+
         # The stepdown file names need to match the same construction as found in
         # jstests/concurrency/fsm_libs/resmoke_runner.js.
         dbpath_prefix = fixture.get_dbpath_prefix()
@@ -87,7 +89,7 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
         self._stepdown_thread = _StepdownThread(
             self.logger, self._mongos_fixtures, self._rs_fixtures, self._stepdown_interval_secs,
             self._terminate, self._kill, lifecycle, self._wait_for_mongos_retarget,
-            self._stepdown_via_heartbeats)
+            self._stepdown_via_heartbeats, self._background_reconfig)
         self.logger.info("Starting the stepdown thread.")
         self._stepdown_thread.start()
 
@@ -99,23 +101,15 @@ class ContinuousStepdown(interface.Hook):  # pylint: disable=too-many-instance-a
 
     def before_test(self, test, test_report):
         """Before test."""
-        self._check_thread()
         self.logger.info("Resuming the stepdown thread.")
         self._stepdown_thread.pause()
         self._stepdown_thread.resume()
 
     def after_test(self, test, test_report):
         """After test."""
-        self._check_thread()
         self.logger.info("Pausing the stepdown thread.")
         self._stepdown_thread.pause()
         self.logger.info("Paused the stepdown thread.")
-
-    def _check_thread(self):
-        if not self._stepdown_thread.is_alive():
-            msg = "The stepdown thread is not running."
-            self.logger.error(msg)
-            raise errors.ServerFailure(msg)
 
     def _add_fixture(self, fixture):
         if isinstance(fixture, replicaset.ReplicaSetFixture):
@@ -348,7 +342,8 @@ class FileBasedStepdownLifecycle(object):
 class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-attributes
     def __init__(  # pylint: disable=too-many-arguments
             self, logger, mongos_fixtures, rs_fixtures, stepdown_interval_secs, terminate, kill,
-            stepdown_lifecycle, wait_for_mongos_retarget, stepdown_via_heartbeats):
+            stepdown_lifecycle, wait_for_mongos_retarget, stepdown_via_heartbeats,
+            background_reconfig):
         """Initialize _StepdownThread."""
         threading.Thread.__init__(self, name="StepdownThread")
         self.daemon = True
@@ -365,6 +360,7 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
         self.__lifecycle = stepdown_lifecycle
         self._should_wait_for_mongos_retarget = wait_for_mongos_retarget
         self._stepdown_via_heartbeats = stepdown_via_heartbeats
+        self._background_reconfig = background_reconfig
 
         self._last_exec = time.time()
         # Event set when the thread has been stopped using the 'stop()' method.
@@ -415,6 +411,8 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
             # Proactively log the exception when it happens so it will be
             # flushed immediately.
             self.logger.exception("Stepdown Thread threw exception")
+            # The event should be signaled whenever the thread is not performing stepdowns.
+            self._is_idle_evt.set()
 
     def stop(self):
         """Stop the thread."""
@@ -430,10 +428,24 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
 
         # Wait until we are no longer executing stepdowns.
         self._is_idle_evt.wait()
+        # Check if the thread is alive in case it has thrown an exception while running.
+        self._check_thread()
         # Wait until we all the replica sets have primaries.
         self._await_primaries()
         # Wait for Mongos to retarget the primary for each shard and the config server.
         self._do_wait_for_mongos_retarget()
+
+        # Check that fixtures are still running
+        for rs_fixture in self._rs_fixtures:
+            if not rs_fixture.is_running():
+                raise errors.ServerFailure(
+                    "ReplicaSetFixture with pids {} expected to be running in"
+                    " ContinuousStepdown, but wasn't.".format(rs_fixture.pids()))
+        for mongos_fixture in self._mongos_fixtures:
+            if not mongos_fixture.is_running():
+                raise errors.ServerFailure("MongoSFixture with pids {} expected to be running in"
+                                           " ContinuousStepdown, but wasn't.".format(
+                                               mongos_fixture.pids()))
 
     def resume(self):
         """Resume the thread."""
@@ -447,6 +459,12 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
         # Wait until stop or timeout.
         self._is_stopped_evt.wait(timeout)
 
+    def _check_thread(self):
+        if not self.is_alive():
+            msg = "The stepdown thread is not running."
+            self.logger.error(msg)
+            raise errors.ServerFailure(msg)
+
     def _await_primaries(self):
         for fixture in self._rs_fixtures:
             fixture.get_primary()
@@ -455,7 +473,7 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
         for rs_fixture in self._rs_fixtures:
             self._step_down(rs_fixture)
 
-    # pylint: disable=R0912,R0915
+    # pylint: disable=R0912,R0914,R0915
     def _step_down(self, rs_fixture):
         try:
             primary = rs_fixture.get_primary(timeout_secs=self._stepdown_interval_secs)
@@ -474,6 +492,22 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
                                            rs_fixture.replset_name))
 
         if self._terminate:
+            # If we're running with background reconfigs, it's possible to be in a scenario
+            # where we kill a necessary voting node (i.e. in a 5 node repl set), only 2 are
+            # voting. In this scenario, we want to avoid killing the primary because no
+            # secondary can step up.
+            if self._background_reconfig:
+                # stagger the kill thread so that it runs a little after the reconfig thread
+                time.sleep(1)
+                voting_members = rs_fixture.get_voting_members()
+
+                self.logger.info("Current voting members: %s", voting_members)
+
+                if len(voting_members) <= 3:
+                    # Do not kill or terminate the primary if we don't have enough voting nodes to
+                    # elect a new primary.
+                    return
+
             should_kill = self._kill and random.choice([True, False])
             action = "Killing" if should_kill else "Terminating"
             self.logger.info("%s the primary on port %d of replica set '%s'.", action, primary.port,
@@ -531,6 +565,10 @@ class _StepdownThread(threading.Thread):  # pylint: disable=too-many-instance-at
                 self.logger.info("Failed to step up the secondary on port %d of replica set '%s'.",
                                  chosen.port, rs_fixture.replset_name)
                 secondaries.remove(chosen)
+            except pymongo.errors.AutoReconnect:
+                # It is possible for a replSetStepUp to fail with AutoReconnect if that node goes
+                # into Rollback (which causes it to close any open connections).
+                pass
 
         if self._terminate:
             self.logger.info("Waiting for the old primary on port %d of replica set '%s' to exit.",

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
 
 #include "mongo/platform/basic.h"
 
@@ -37,9 +37,10 @@
 
 #include "mongo/db/auth/restriction_environment.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
+#include "mongo/transport/ismaster_metrics.h"
 #include "mongo/transport/service_state_machine.h"
 #include "mongo/transport/session.h"
-#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/scopeguard.h"
 
@@ -91,8 +92,13 @@ ServiceEntryPointImpl::ServiceEntryPointImpl(ServiceContext* svcCtx) : _svcCtx(s
 
         size_t max = (size_t)(limit.rlim_cur * .8);
 
-        LOG(1) << "fd limit"
-               << " hard:" << limit.rlim_max << " soft:" << limit.rlim_cur << " max conn: " << max;
+        LOGV2_DEBUG(22940,
+                    1,
+                    "fd limit hard:{hard} soft:{soft} max conn: {conn}",
+                    "file descriptor and connection resource limits",
+                    "hard"_attr = limit.rlim_max,
+                    "soft"_attr = limit.rlim_cur,
+                    "conn"_attr = max);
 
         return std::min(max, serverGlobalParams.maxConns);
 #endif
@@ -101,7 +107,10 @@ ServiceEntryPointImpl::ServiceEntryPointImpl(ServiceContext* svcCtx) : _svcCtx(s
     // If we asked for more connections than supported, inform the user.
     if (supportedMax < serverGlobalParams.maxConns &&
         serverGlobalParams.maxConns != DEFAULT_MAX_CONN) {
-        log() << " --maxConns too high, can only handle " << supportedMax;
+        LOGV2(22941,
+              " --maxConns too high, can only handle {limit}",
+              " --maxConns too high",
+              "limit"_attr = supportedMax);
     }
 
     _maxNumConnections = supportedMax;
@@ -154,7 +163,9 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
     // while holding it.
     if (connectionCount > _maxNumConnections && !usingMaxConnOverride) {
         if (!quiet) {
-            log() << "connection refused because too many open connections: " << connectionCount;
+            LOGV2(22942,
+                  "connection refused because too many open connections",
+                  "connectionCount"_attr = connectionCount);
         }
         return;
     } else if (usingMaxConnOverride && _adminInternalPool) {
@@ -162,9 +173,11 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
     }
 
     if (!quiet) {
-        const auto word = (connectionCount == 1 ? " connection"_sd : " connections"_sd);
-        log() << "connection accepted from " << session->remote() << " #" << session->id() << " ("
-              << connectionCount << word << " now open)";
+        LOGV2(22943,
+              "connection accepted",
+              "remote"_attr = session->remote(),
+              "sessionId"_attr = session->id(),
+              "connectionCount"_attr = connectionCount);
     }
 
     ssm->setCleanupHook([this, ssmIt, quiet, session = std::move(session)] {
@@ -179,8 +192,10 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
         _shutdownCondition.notify_one();
 
         if (!quiet) {
-            const auto word = (connectionCount == 1 ? " connection"_sd : " connections"_sd);
-            log() << "end connection " << remote << " (" << connectionCount << word << " now open)";
+            LOGV2(22944,
+                  "connection ended",
+                  "remote"_attr = remote,
+                  "connectionCount"_attr = connectionCount);
         }
     });
 
@@ -203,7 +218,7 @@ void ServiceEntryPointImpl::endAllSessions(transport::Session::TagMask tags) {
 }
 
 bool ServiceEntryPointImpl::shutdown(Milliseconds timeout) {
-    using logger::LogComponent;
+    using logv2::LogComponent;
 
     stdx::unique_lock<decltype(_sessionsMutex)> lk(_sessionsMutex);
 
@@ -223,17 +238,23 @@ bool ServiceEntryPointImpl::shutdown(Milliseconds timeout) {
     auto noWorkersLeft = [this] { return numOpenSessions() == 0; };
     while (timeSpent < timeout &&
            !_shutdownCondition.wait_for(lk, checkInterval.toSystemDuration(), noWorkersLeft)) {
-        log(LogComponent::kNetwork)
-            << "shutdown: still waiting on " << numOpenSessions() << " active workers to drain... ";
+        LOGV2(22945,
+              "shutdown: still waiting on {workers} active workers to drain... ",
+              "shutdown: still waiting on active workers to drain... ",
+              "workers"_attr = numOpenSessions());
         timeSpent += checkInterval;
     }
 
     bool result = noWorkersLeft();
     if (result) {
-        log(LogComponent::kNetwork) << "shutdown: no running workers found...";
+        LOGV2(22946, "shutdown: no running workers found...");
     } else {
-        log(LogComponent::kNetwork) << "shutdown: exhausted grace period for" << numOpenSessions()
-                                    << " active workers to drain; continuing with shutdown... ";
+        LOGV2(
+            22947,
+            "shutdown: exhausted grace period for {workers} active workers to "
+            "drain; continuing with shutdown...",
+            "shutdown: exhausted grace period active workers to drain; continuing with shutdown...",
+            "workers"_attr = numOpenSessions());
     }
     return result;
 }
@@ -247,6 +268,10 @@ void ServiceEntryPointImpl::appendStats(BSONObjBuilder* bob) const {
     bob->append("totalCreated", static_cast<int>(_createdConnections.load()));
     if (auto sc = getGlobalServiceContext()) {
         bob->append("active", static_cast<int>(sc->getActiveClientOperations()));
+        bob->append("exhaustIsMaster",
+                    static_cast<int>(IsMasterMetrics::get(sc)->getNumExhaustIsMaster()));
+        bob->append("awaitingTopologyChanges",
+                    static_cast<int>(IsMasterMetrics::get(sc)->getNumAwaitingTopologyChanges()));
     }
 
     if (_adminInternalPool) {

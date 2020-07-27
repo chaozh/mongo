@@ -34,6 +34,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify_common.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -81,9 +82,36 @@ BSONObj getCollation(const BSONObj& cmdObj) {
     return BSONObj();
 }
 
-BSONObj getShardKey(OperationContext* opCtx, const ChunkManager& chunkMgr, const BSONObj& query) {
+boost::optional<BSONObj> getLet(const BSONObj& cmdObj) {
+    if (auto letElem = cmdObj.getField("let"_sd); letElem.type() == BSONType::Object) {
+        auto bob = BSONObjBuilder();
+        bob.appendElementsUnique(letElem.embeddedObject());
+        return bob.obj();
+    }
+    return boost::none;
+}
+
+boost::optional<RuntimeConstants> getRuntimeConstants(const BSONObj& cmdObj) {
+    if (auto rcElem = cmdObj.getField("runtimeConstants"_sd); rcElem.type() == BSONType::Object) {
+        IDLParserErrorContext ctx("internalRuntimeConstants");
+        return RuntimeConstants::parse(ctx, rcElem.embeddedObject());
+    }
+    return boost::none;
+}
+
+BSONObj getShardKey(OperationContext* opCtx,
+                    const ChunkManager& chunkMgr,
+                    const NamespaceString& nss,
+                    const BSONObj& query,
+                    const BSONObj& collation,
+                    const boost::optional<ExplainOptions::Verbosity> verbosity,
+                    const boost::optional<BSONObj>& let,
+                    const boost::optional<RuntimeConstants>& runtimeConstants) {
+    auto expCtx = makeExpressionContextWithDefaultsForTargeter(
+        opCtx, nss, collation, verbosity, let, runtimeConstants);
+
     BSONObj shardKey =
-        uassertStatusOK(chunkMgr.getShardKeyPattern().extractShardKeyFromQuery(opCtx, query));
+        uassertStatusOK(chunkMgr.getShardKeyPattern().extractShardKeyFromQuery(expCtx, query));
     uassert(ErrorCodes::ShardKeyNotFound,
             "Query for sharded findAndModify must contain the shard key",
             !shardKey.isEmpty());
@@ -139,7 +167,8 @@ void updateShardKeyValueOnWouldChangeOwningShardError(OperationContext* opCtx,
 
 class FindAndModifyCmd : public BasicCommand {
 public:
-    FindAndModifyCmd() : BasicCommand("findAndModify", "findandmodify") {}
+    FindAndModifyCmd()
+        : BasicCommand("findAndModify", "findandmodify"), _updateMetrics{"findAndModify"} {}
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
@@ -188,7 +217,10 @@ public:
 
             const BSONObj query = cmdObj.getObjectField("query");
             const BSONObj collation = getCollation(cmdObj);
-            const BSONObj shardKey = getShardKey(opCtx, *chunkMgr, query);
+            const auto let = getLet(cmdObj);
+            const auto rc = getRuntimeConstants(cmdObj);
+            const BSONObj shardKey =
+                getShardKey(opCtx, *chunkMgr, nss, query, collation, verbosity, let, rc);
             const auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
             shard = uassertStatusOK(
@@ -222,17 +254,16 @@ public:
 
         const auto millisElapsed = timer.millis();
 
-        Strategy::CommandResult cmdResult;
-        cmdResult.shardTargetId = shard->getId();
-        cmdResult.target = shard->getConnString();
-        cmdResult.result = bob.obj();
+        executor::RemoteCommandResponse response(bob.obj(), Milliseconds(millisElapsed));
 
-        std::vector<Strategy::CommandResult> shardResults;
-        shardResults.push_back(cmdResult);
+        // We fetch an arbitrary host from the ConnectionString, since
+        // ClusterExplain::buildExplainResult() doesn't use the given HostAndPort.
+        AsyncRequestsSender::Response arsResponse{
+            shard->getId(), response, shard->getConnString().getServers().front()};
 
         auto bodyBuilder = result->getBodyBuilder();
         return ClusterExplain::buildExplainResult(
-            opCtx, shardResults, ClusterExplain::kSingleShard, millisElapsed, &bodyBuilder);
+            opCtx, {arsResponse}, ClusterExplain::kSingleShard, millisElapsed, &bodyBuilder);
     }
 
     bool run(OperationContext* opCtx,
@@ -240,6 +271,9 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
+
+        // Collect metrics.
+        _updateMetrics.collectMetrics(cmdObj);
 
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
@@ -264,7 +298,10 @@ public:
 
         const BSONObj query = cmdObjForShard.getObjectField("query");
         const BSONObj collation = getCollation(cmdObjForShard);
-        const BSONObj shardKey = getShardKey(opCtx, *chunkMgr, query);
+        const auto let = getLet(cmdObjForShard);
+        const auto rc = getRuntimeConstants(cmdObjForShard);
+        const BSONObj shardKey =
+            getShardKey(opCtx, *chunkMgr, nss, query, collation, boost::none, let, rc);
         auto chunk = chunkMgr->findIntersectingChunk(shardKey, collation);
 
         _runCommand(opCtx,
@@ -381,6 +418,9 @@ private:
         result->appendElementsUnique(
             CommandHelpers::filterCommandReplyForPassthrough(response.data));
     }
+
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } findAndModifyCmd;
 
 }  // namespace

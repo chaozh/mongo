@@ -27,10 +27,10 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#define LOG_FOR_TRANSACTION(level) \
-    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kTransaction)
+#define LOGV2_FOR_TRANSACTION(ID, DLEVEL, MESSAGE, ...) \
+    LOGV2_DEBUG_OPTIONS(ID, DLEVEL, {logv2::LogComponent::kTransaction}, MESSAGE, ##__VA_ARGS__)
 
 #include "mongo/platform/basic.h"
 
@@ -61,10 +61,12 @@
 #include "mongo/db/server_recovery.h"
 #include "mongo/db/server_transactions_metrics.h"
 #include "mongo/db/stats/fill_locker_info.h"
+#include "mongo/db/storage/flow_control.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/transaction_participant_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
+#include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
@@ -85,6 +87,8 @@ MONGO_FAIL_POINT_DEFINE(skipCommitTxnCheckPrepareMajorityCommitted);
 
 MONGO_FAIL_POINT_DEFINE(restoreLocksFail);
 
+MONGO_FAIL_POINT_DEFINE(failTransactionNoopWrite);
+
 const auto getTransactionParticipant = Session::declareDecoration<TransactionParticipant>();
 
 // The command names that are allowed in a prepared transaction.
@@ -96,12 +100,19 @@ void fassertOnRepeatedExecution(const LogicalSessionId& lsid,
                                 StmtId stmtId,
                                 const repl::OpTime& firstOpTime,
                                 const repl::OpTime& secondOpTime) {
-    severe() << "Statement id " << stmtId << " from transaction [ " << lsid.toBSON() << ":"
-             << txnNumber << " ] was committed once with opTime " << firstOpTime
-             << " and a second time with opTime " << secondOpTime
-             << ". This indicates possible data corruption or server bug and the process will be "
-                "terminated.";
-    fassertFailed(40526);
+    LOGV2_FATAL(
+        40526,
+        "Statement id {stmtId} from transaction [ {lsid}:{txnNumber} ] was committed once "
+        "with opTime {firstCommitOpTime} and a second time with opTime {secondCommitOpTime}. This "
+        "indicates possible data corruption or server bug and the process will be "
+        "terminated.",
+        "Statement from transaction was committed twice. This indicates possible data corruption "
+        "or server bug and the process will be terminated",
+        "stmtId"_attr = stmtId,
+        "lsid"_attr = lsid.toBSON(),
+        "txnNumber"_attr = txnNumber,
+        "firstCommitOpTime"_attr = firstOpTime,
+        "secondCommitOpTime"_attr = secondOpTime);
 }
 
 struct ActiveTransactionHistory {
@@ -119,6 +130,10 @@ ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
 
     result.lastTxnRecord = [&]() -> boost::optional<SessionTxnRecord> {
         DBDirectClient client(opCtx);
+        // Even though the request only performs a read, the OpCtx's "in multi document transaction"
+        // field has been set, bumping the global lock acquisition to an IX. That upconvert would
+        // require a flow control ticket to be obtained.
+        FlowControl::Bypass flowControlBypass(opCtx);
         auto result =
             client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                            {BSON(SessionTxnRecord::kSessionIdFieldName << lsid.toBSON())});
@@ -235,7 +250,8 @@ void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequ
     auto originalDoc = originalRecordData.toBson();
 
     invariant(collection->getDefaultCollator() == nullptr);
-    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, nullptr));
+    boost::intrusive_ptr<ExpressionContext> expCtx(
+        new ExpressionContext(opCtx, nullptr, updateRequest.getNamespaceString()));
 
     auto matcher =
         fassert(40673, MatchExpressionParser::parse(updateRequest.getQuery(), std::move(expCtx)));
@@ -303,10 +319,15 @@ void TransactionParticipant::performNoopWrite(OperationContext* opCtx, StringDat
     // been satisfied.
     invariant(!opCtx->lockState()->hasMaxLockTimeout());
 
-    {
-        Lock::DBLock dbLock(opCtx, "local", MODE_IX);
-        Lock::CollectionLock collectionLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IX);
+    // Simulate an operation timeout and fail the noop write if the fail point is enabled. This is
+    // to test that NoSuchTransaction error is not considered transient if the noop write cannot
+    // occur.
+    if (MONGO_unlikely(failTransactionNoopWrite.shouldFail())) {
+        uasserted(ErrorCodes::MaxTimeMSExpired, "failTransactionNoopWrite fail point enabled");
+    }
 
+    {
+        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
         uassert(ErrorCodes::NotMaster,
                 "Not primary when performing noop write for {}"_format(msg),
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
@@ -487,11 +508,25 @@ void TransactionParticipant::Participant::beginOrContinue(OperationContext* opCt
                     getTestCommandsEnabled());
     }
 
-    uassert(ErrorCodes::TransactionTooOld,
-            str::stream() << "Cannot start transaction " << txnNumber << " on session "
-                          << _sessionId() << " because a newer transaction " << o().activeTxnNumber
-                          << " has already started.",
-            txnNumber >= o().activeTxnNumber);
+    if (txnNumber < o().activeTxnNumber) {
+        const std::string currOperation =
+            o().txnState.isInRetryableWriteMode() ? "retryable write" : "transaction";
+        if (!autocommit) {
+            uasserted(ErrorCodes::TransactionTooOld,
+                      str::stream()
+                          << "Retryable write with txnNumber " << txnNumber
+                          << " is prohibited on session " << _sessionId() << " because a newer "
+                          << currOperation << " with txnNumber " << o().activeTxnNumber
+                          << " has already started on this session.");
+        } else {
+            uasserted(ErrorCodes::TransactionTooOld,
+                      str::stream() << "Cannot start transaction " << txnNumber << " on session "
+                                    << _sessionId() << " because a newer " << currOperation
+                                    << " with txnNumber " << o().activeTxnNumber
+                                    << " has already started on this session.");
+        }
+    }
+
 
     // Requests without an autocommit field are interpreted as retryable writes. They cannot specify
     // startTransaction, which is verified earlier when parsing the request.
@@ -652,9 +687,9 @@ TransactionParticipant::OplogSlotReserver::OplogSlotReserver(OperationContext* o
 
 TransactionParticipant::OplogSlotReserver::~OplogSlotReserver() {
     if (MONGO_unlikely(hangBeforeReleasingTransactionOplogHole.shouldFail())) {
-        log()
-            << "transaction - hangBeforeReleasingTransactionOplogHole fail point enabled. Blocking "
-               "until fail point is disabled.";
+        LOGV2(22520,
+              "transaction - hangBeforeReleasingTransactionOplogHole fail point enabled. Blocking "
+              "until fail point is disabled");
         hangBeforeReleasingTransactionOplogHole.pauseWhileSet();
     }
 
@@ -1069,9 +1104,13 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
         } catch (...) {
             // It is illegal for aborting a prepared transaction to fail for any reason, so we crash
             // instead.
-            severe() << "Caught exception during abort of prepared transaction "
-                     << opCtx->getTxnNumber() << " on " << _sessionId().toBSON() << ": "
-                     << exceptionToStatus();
+            LOGV2_FATAL_CONTINUE(22525,
+                                 "Caught exception during abort of prepared transaction "
+                                 "{txnNumber} on {lsid}: {error}",
+                                 "Caught exception during abort of prepared transaction",
+                                 "txnNumber"_attr = opCtx->getTxnNumber(),
+                                 "lsid"_attr = _sessionId().toBSON(),
+                                 "error"_attr = exceptionToStatus());
             std::terminate();
         }
     });
@@ -1116,7 +1155,8 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
     } else {
         // Even if the prepared transaction contained no statements, we always reserve at least
         // 1 oplog slot for the prepare oplog entry.
-        const auto numSlotsToReserve = retrieveCompletedTransactionOperations(opCtx).size();
+        auto numSlotsToReserve = retrieveCompletedTransactionOperations(opCtx).size();
+        numSlotsToReserve += p().numberOfPreImagesToWrite;
         oplogSlotReserver.emplace(opCtx, std::max(1, static_cast<int>(numSlotsToReserve)));
         invariant(oplogSlotReserver->getSlots().size() >= 1);
         prepareOplogSlot = oplogSlotReserver->getLastSlot();
@@ -1132,9 +1172,11 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
 
         if (MONGO_unlikely(hangAfterReservingPrepareTimestamp.shouldFail())) {
             // This log output is used in js tests so please leave it.
-            log() << "transaction - hangAfterReservingPrepareTimestamp fail point "
-                     "enabled. Blocking until fail point is disabled. Prepare OpTime: "
-                  << prepareOplogSlot;
+            LOGV2(22521,
+                  "transaction - hangAfterReservingPrepareTimestamp fail point "
+                  "enabled. Blocking until fail point is disabled. Prepare OpTime: "
+                  "{prepareOpTime}",
+                  "prepareOpTime"_attr = prepareOplogSlot);
             hangAfterReservingPrepareTimestamp.pauseWhileSet();
         }
     }
@@ -1142,7 +1184,7 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
     opCtx->getWriteUnitOfWork()->prepare();
     p().needToWriteAbortEntry = true;
     opCtx->getServiceContext()->getOpObserver()->onTransactionPrepare(
-        opCtx, reservedSlots, completedTransactionOperations);
+        opCtx, reservedSlots, &completedTransactionOperations, p().numberOfPreImagesToWrite);
 
     abortGuard.dismiss();
 
@@ -1160,8 +1202,9 @@ Timestamp TransactionParticipant::Participant::prepareTransaction(
     }
 
     if (MONGO_unlikely(hangAfterSettingPrepareStartTime.shouldFail())) {
-        log() << "transaction - hangAfterSettingPrepareStartTime fail point enabled. Blocking "
-                 "until fail point is disabled.";
+        LOGV2(22522,
+              "transaction - hangAfterSettingPrepareStartTime fail point enabled. Blocking "
+              "until fail point is disabled");
         hangAfterSettingPrepareStartTime.pauseWhileSet();
     }
 
@@ -1194,6 +1237,10 @@ void TransactionParticipant::Participant::addTransactionOperation(
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
     p().transactionOperations.push_back(operation);
     p().transactionOperationBytes += repl::OplogEntry::getDurableReplOperationSize(operation);
+    if (!operation.getPreImage().isEmpty()) {
+        p().transactionOperationBytes += operation.getPreImage().objsize();
+        ++p().numberOfPreImagesToWrite;
+    }
 
     auto transactionSizeLimitBytes = gTransactionSizeLimitBytes.load();
     uassert(ErrorCodes::TransactionTooLarge,
@@ -1229,6 +1276,7 @@ void TransactionParticipant::Participant::clearOperationsInMemory(OperationConte
     invariant(p().autoCommit);
     p().transactionOperationBytes = 0;
     p().transactionOperations.clear();
+    p().numberOfPreImagesToWrite = 0;
 }
 
 void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationContext* opCtx) {
@@ -1240,7 +1288,7 @@ void TransactionParticipant::Participant::commitUnpreparedTransaction(OperationC
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
     invariant(opObserver);
 
-    opObserver->onUnpreparedTransactionCommit(opCtx, txnOps);
+    opObserver->onUnpreparedTransactionCommit(opCtx, &txnOps, p().numberOfPreImagesToWrite);
 
     // Read-only transactions with all read concerns must wait for any data they read to be majority
     // committed. For local read concern this is to match majority read concern. For both local and
@@ -1382,9 +1430,13 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
     } catch (...) {
         // It is illegal for committing a prepared transaction to fail for any reason, other than an
         // invalid command, so we crash instead.
-        severe() << "Caught exception during commit of prepared transaction "
-                 << opCtx->getTxnNumber() << " on " << _sessionId().toBSON() << ": "
-                 << exceptionToStatus();
+        LOGV2_FATAL_CONTINUE(22526,
+                             "Caught exception during commit of prepared transaction {txnNumber} "
+                             "on {lsid}: {error}",
+                             "Caught exception during commit of prepared transaction",
+                             "txnNumber"_attr = opCtx->getTxnNumber(),
+                             "lsid"_attr = _sessionId().toBSON(),
+                             "error"_attr = exceptionToStatus());
         std::terminate();
     }
 }
@@ -1414,7 +1466,7 @@ void TransactionParticipant::Participant::_finishCommitTransaction(
         o(lk).transactionMetricsObserver.onCommit(opCtx,
                                                   ServerTransactionsMetrics::get(opCtx),
                                                   tickSource,
-                                                  &Top::get(getGlobalServiceContext()),
+                                                  &Top::get(opCtx->getServiceContext()),
                                                   operationCount,
                                                   oplogOperationBytes);
         o(lk).transactionMetricsObserver.onTransactionOperation(
@@ -1510,10 +1562,15 @@ void TransactionParticipant::Participant::_abortActiveTransaction(
         } catch (...) {
             // It is illegal for aborting a transaction that must write an abort oplog entry to fail
             // after aborting the storage transaction, so we crash instead.
-            severe()
-                << "Caught exception during abort of transaction that must write abort oplog entry "
-                << opCtx->getTxnNumber() << " on " << _sessionId().toBSON() << ": "
-                << exceptionToStatus();
+            LOGV2_FATAL_CONTINUE(
+                22527,
+                "Caught exception during abort of transaction that must write abort oplog "
+                "entry {txnNumber} on {lsid}: {error}",
+                "Caught exception during abort of transaction that must write abort oplog "
+                "entry",
+                "txnNumber"_attr = opCtx->getTxnNumber(),
+                "lsid"_attr = _sessionId().toBSON(),
+                "error"_attr = exceptionToStatus());
             std::terminate();
         }
     } else {
@@ -1610,6 +1667,7 @@ void TransactionParticipant::Participant::_cleanUpTxnResourceOnOpCtx(
                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
     opCtx->lockState()->unsetMaxLockTimeout();
+    invariant(UncommittedCollections::get(opCtx).isEmpty());
 }
 
 void TransactionParticipant::Participant::_checkIsCommandValidWithTxnState(
@@ -1876,6 +1934,150 @@ std::string TransactionParticipant::Participant::_transactionInfoForLog(
     return s.str();
 }
 
+
+void TransactionParticipant::Participant::_transactionInfoForLog(
+    OperationContext* opCtx,
+    const SingleThreadedLockStats* lockStats,
+    TerminationCause terminationCause,
+    repl::ReadConcernArgs readConcernArgs,
+    logv2::DynamicAttributes* pAttrs) const {
+    invariant(lockStats);
+
+    // User specified transaction parameters.
+    BSONObjBuilder parametersBuilder;
+
+    BSONObjBuilder lsidBuilder(parametersBuilder.subobjStart("lsid"));
+    _sessionId().serialize(&lsidBuilder);
+    lsidBuilder.doneFast();
+
+    parametersBuilder.append("txnNumber", o().activeTxnNumber);
+    parametersBuilder.append("autocommit", p().autoCommit ? *p().autoCommit : true);
+    readConcernArgs.appendInfo(&parametersBuilder);
+
+    pAttrs->add("parameters", parametersBuilder.obj());
+
+    const auto& singleTransactionStats = o().transactionMetricsObserver.getSingleTransactionStats();
+
+    pAttrs->addDeepCopy("readTimestamp", singleTransactionStats.getReadTimestamp().toString());
+
+    singleTransactionStats.getOpDebug()->additiveMetrics.report(pAttrs);
+
+    StringData terminationCauseString =
+        terminationCause == TerminationCause::kCommitted ? "committed" : "aborted";
+    pAttrs->add("terminationCause", terminationCauseString);
+
+    auto tickSource = opCtx->getServiceContext()->getTickSource();
+    auto curTick = tickSource->getTicks();
+
+    pAttrs->add("timeActive", singleTransactionStats.getTimeActiveMicros(tickSource, curTick));
+    pAttrs->add("timeInactive", singleTransactionStats.getTimeInactiveMicros(tickSource, curTick));
+
+    // Number of yields is always 0 in multi-document transactions, but it is included mainly to
+    // match the format with other slow operation logging messages.
+    pAttrs->add("numYields", 0);
+    // Aggregate lock statistics.
+
+    BSONObjBuilder locks;
+    lockStats->report(&locks);
+    pAttrs->add("locks", locks.obj());
+
+    if (singleTransactionStats.getOpDebug()->storageStats)
+        pAttrs->add("storage", singleTransactionStats.getOpDebug()->storageStats->toBSON());
+
+    // It is possible for a slow transaction to have aborted in the prepared state if an
+    // exception was thrown before prepareTransaction succeeds.
+    const auto totalPreparedDuration = durationCount<Microseconds>(
+        singleTransactionStats.getPreparedDuration(tickSource, curTick));
+    const bool txnWasPrepared = totalPreparedDuration > 0;
+    pAttrs->add("wasPrepared", txnWasPrepared);
+    if (txnWasPrepared) {
+        pAttrs->add("totalPreparedDuration", Microseconds(totalPreparedDuration));
+        pAttrs->add("prepareOpTime", o().prepareOpTime);
+    }
+
+    // Total duration of the transaction.
+    pAttrs->add(
+        "duration",
+        duration_cast<Milliseconds>(singleTransactionStats.getDuration(tickSource, curTick)));
+}
+
+// Needs to be kept in sync with _transactionInfoForLog
+BSONObj TransactionParticipant::Participant::_transactionInfoBSONForLog(
+    OperationContext* opCtx,
+    const SingleThreadedLockStats* lockStats,
+    TerminationCause terminationCause,
+    repl::ReadConcernArgs readConcernArgs) const {
+    invariant(lockStats);
+
+    // User specified transaction parameters.
+    BSONObjBuilder parametersBuilder;
+
+    BSONObjBuilder lsidBuilder(parametersBuilder.subobjStart("lsid"));
+    _sessionId().serialize(&lsidBuilder);
+    lsidBuilder.doneFast();
+
+    parametersBuilder.append("txnNumber", o().activeTxnNumber);
+    parametersBuilder.append("autocommit", p().autoCommit ? *p().autoCommit : true);
+    readConcernArgs.appendInfo(&parametersBuilder);
+
+    BSONObjBuilder logLine;
+    {
+        BSONObjBuilder attrs = logLine.subobjStart("attr");
+        attrs.append("parameters", parametersBuilder.obj());
+
+        const auto& singleTransactionStats =
+            o().transactionMetricsObserver.getSingleTransactionStats();
+
+        attrs.append("readTimestamp", singleTransactionStats.getReadTimestamp().toString());
+
+        attrs.appendElements(singleTransactionStats.getOpDebug()->additiveMetrics.reportBSON());
+
+        StringData terminationCauseString =
+            terminationCause == TerminationCause::kCommitted ? "committed" : "aborted";
+        attrs.append("terminationCause", terminationCauseString);
+
+        auto tickSource = opCtx->getServiceContext()->getTickSource();
+        auto curTick = tickSource->getTicks();
+
+        attrs.append("timeActiveMicros",
+                     durationCount<Microseconds>(
+                         singleTransactionStats.getTimeActiveMicros(tickSource, curTick)));
+        attrs.append("timeInactiveMicros",
+                     durationCount<Microseconds>(
+                         singleTransactionStats.getTimeInactiveMicros(tickSource, curTick)));
+
+        // Number of yields is always 0 in multi-document transactions, but it is included mainly to
+        // match the format with other slow operation logging messages.
+        attrs.append("numYields", 0);
+        // Aggregate lock statistics.
+
+        BSONObjBuilder locks;
+        lockStats->report(&locks);
+        attrs.append("locks", locks.obj());
+
+        if (singleTransactionStats.getOpDebug()->storageStats)
+            attrs.append("storage", singleTransactionStats.getOpDebug()->storageStats->toBSON());
+
+        // It is possible for a slow transaction to have aborted in the prepared state if an
+        // exception was thrown before prepareTransaction succeeds.
+        const auto totalPreparedDuration = durationCount<Microseconds>(
+            singleTransactionStats.getPreparedDuration(tickSource, curTick));
+        const bool txnWasPrepared = totalPreparedDuration > 0;
+        attrs.append("wasPrepared", txnWasPrepared);
+        if (txnWasPrepared) {
+            attrs.append("totalPreparedDurationMicros", totalPreparedDuration);
+            attrs.append("prepareOpTime", o().prepareOpTime.toBSON());
+        }
+
+        // Total duration of the transaction.
+        attrs.append(
+            "durationMillis",
+            duration_cast<Milliseconds>(singleTransactionStats.getDuration(tickSource, curTick))
+                .count());
+    }
+    return logLine.obj();
+}
+
 void TransactionParticipant::Participant::_logSlowTransaction(
     OperationContext* opCtx,
     const SingleThreadedLockStats* lockStats,
@@ -1884,14 +2086,18 @@ void TransactionParticipant::Participant::_logSlowTransaction(
     // Only log multi-document transactions.
     if (!o().txnState.isInRetryableWriteMode()) {
         const auto tickSource = opCtx->getServiceContext()->getTickSource();
-        // Log the transaction if log message verbosity for transaction component is >= 1 or its
-        // duration is longer than the slowMS command threshold.
-        if (shouldLog(logger::LogComponent::kTransaction, logger::LogSeverity::Debug(1)) ||
+        const auto opDuration = duration_cast<Milliseconds>(
             o().transactionMetricsObserver.getSingleTransactionStats().getDuration(
-                tickSource, tickSource->getTicks()) > Milliseconds(serverGlobalParams.slowMS)) {
-            log(logger::LogComponent::kTransaction)
-                << "transaction "
-                << _transactionInfoForLog(opCtx, lockStats, terminationCause, readConcernArgs);
+                tickSource, tickSource->getTicks()));
+
+        if (shouldLogSlowOpWithSampling(opCtx,
+                                        logv2::LogComponent::kTransaction,
+                                        opDuration,
+                                        Milliseconds(serverGlobalParams.slowMS))
+                .first) {
+            logv2::DynamicAttributes attr;
+            _transactionInfoForLog(opCtx, lockStats, terminationCause, readConcernArgs, &attr);
+            LOGV2_OPTIONS(51802, {logv2::LogComponent::kTransaction}, "transaction", attr);
         }
     }
 }
@@ -1902,8 +2108,14 @@ void TransactionParticipant::Participant::_setNewTxnNumber(OperationContext* opC
             "Cannot change transaction number while the session has a prepared transaction",
             !o().txnState.isInSet(TransactionState::kPrepared));
 
-    LOG_FOR_TRANSACTION(4) << "New transaction started with txnNumber: " << txnNumber
-                           << " on session with lsid " << _sessionId().getId();
+    LOGV2_FOR_TRANSACTION(
+        23984,
+        4,
+        "New transaction started with txnNumber: {txnNumber} on session with lsid "
+        "{lsid}",
+        "New transaction started",
+        "txnNumber"_attr = txnNumber,
+        "lsid"_attr = _sessionId().getId());
 
     // Abort the existing transaction if it's not prepared, committed, or aborted.
     if (o().txnState.isInProgress()) {
@@ -1956,8 +2168,9 @@ void TransactionParticipant::Participant::refreshFromStorageIfNeeded(OperationCo
                         TransactionState::kAbortedWithPrepare,
                         TransactionState::TransitionValidation::kRelaxTransitionValidation);
                     break;
-                // We should never be refreshing a prepared or in-progress transaction from storage
-                // since it should already be in a valid state after replication recovery.
+                // We should never be refreshing a prepared or in-progress transaction from
+                // storage since it should already be in a valid state after replication
+                // recovery.
                 case DurableTxnStateEnum::kPrepared:
                 case DurableTxnStateEnum::kInProgress:
                     MONGO_UNREACHABLE;
@@ -2031,8 +2244,8 @@ void TransactionParticipant::Participant::_resetRetryableWriteState() {
 void TransactionParticipant::Participant::_resetTransactionState(
     WithLock wl, TransactionState::StateFlag state) {
     // If we are transitioning to kNone, we are either starting a new transaction or aborting a
-    // prepared transaction for rollback. In the latter case, we will need to relax the invariant
-    // that prevents transitioning from kPrepared to kNone.
+    // prepared transaction for rollback. In the latter case, we will need to relax the
+    // invariant that prevents transitioning from kPrepared to kNone.
     if (o().txnState.isPrepared() && state == TransactionState::kNone) {
         o(wl).txnState.transitionTo(
             state, TransactionState::TransitionValidation::kRelaxTransitionValidation);
@@ -2107,7 +2320,8 @@ boost::optional<repl::OpTime> TransactionParticipant::Participant::_checkStateme
 
 UpdateRequest TransactionParticipant::Participant::_makeUpdateRequest(
     const SessionTxnRecord& sessionTxnRecord) const {
-    UpdateRequest updateRequest(NamespaceString::kSessionTransactionsTableNamespace);
+    auto updateRequest = UpdateRequest();
+    updateRequest.setNamespaceString(NamespaceString::kSessionTransactionsTableNamespace);
 
     updateRequest.setUpdateModification(sessionTxnRecord.toBSON());
     updateRequest.setQuery(BSON(SessionTxnRecord::kSessionIdFieldName << _sessionId().toBSON()));

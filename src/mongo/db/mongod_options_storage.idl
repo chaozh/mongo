@@ -84,7 +84,7 @@ configs:
         hidden: true
 
     'storage.syncPeriodSecs':
-        description: 'Seconds between disk syncs (0=never, but not recommended)'
+        description: 'Seconds between disk syncs'
         short_name: syncdelay
         arg_vartype: Double
         default: 60.0
@@ -100,19 +100,6 @@ configs:
         validator:
             gte: 1
             lte: { expr: 'StorageGlobalParams::kMaxJournalCommitIntervalMs' }
-
-    'storage.indexBuildRetry':
-        description: "Do not retry any index builds that were interrupted by shutdown"
-        arg_vartype: Switch
-        conflicts: ['replication.replSet', 'replication.replSetName']
-        source: yaml
-
-    noIndexBuildRetry:
-        description: "Do not retry any index builds that were interrupted by shutdown"
-        short_name: noIndexBuildRetry
-        arg_vartype: Switch
-        conflicts: ['replication.replSet', 'replication.replSetName']
-        source: [ cli, ini ]
 
     upgrade:
         description: 'Upgrade db if needed'
@@ -135,3 +122,11 @@ configs:
         deprecated_short_name: nodur
         arg_vartype: Switch
         source: [ cli, ini ]
+
+    'storage.oplogMinRetentionHours':
+        description: 'Minimum number of hours to preserve in the oplog. Default is 0 (turned off). Fractions are allowed (e.g. 1.5 hours)'
+        short_name: oplogMinRetentionHours
+        arg_vartype: Double
+        default: 0.0
+        validator:
+            gte: 0.0

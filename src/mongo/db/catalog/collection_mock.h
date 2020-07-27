@@ -48,6 +48,10 @@ public:
         : _ns(ns), _catalogId(catalogId) {}
     ~CollectionMock() = default;
 
+    SharedCollectionDecorations* getSharedDecorations() const {
+        return nullptr;
+    }
+
     void init(OperationContext* opCtx) {
         std::abort();
     }
@@ -170,16 +174,15 @@ public:
         std::abort();
     }
 
-    StatusWithMatchExpression parseValidator(
-        OperationContext* opCtx,
-        const BSONObj& validator,
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures,
-        boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
-            maxFeatureCompatibilityVersion) const {
+    Validator parseValidator(OperationContext* opCtx,
+                             const BSONObj& validator,
+                             MatchExpressionParser::AllowedFeatureSet allowedFeatures,
+                             boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
+                                 maxFeatureCompatibilityVersion) const {
         std::abort();
     }
 
-    Status setValidator(OperationContext* opCtx, BSONObj validator) {
+    void setValidator(OperationContext* opCtx, Validator validator) {
         std::abort();
     }
 
@@ -205,6 +208,14 @@ public:
     }
 
     bool isTemporary(OperationContext* opCtx) const {
+        std::abort();
+    }
+
+    bool getRecordPreImages() const {
+        std::abort();
+    }
+
+    void setRecordPreImages(OperationContext* opCtx, bool val) {
         std::abort();
     }
 
@@ -259,7 +270,7 @@ public:
 
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         ScanDirection scanDirection) {
         std::abort();
     }
@@ -272,6 +283,14 @@ public:
         return _uuid;
     }
 
+    bool isCommitted() const final {
+        return _committed;
+    }
+
+    void setCommitted(bool val) final {
+        _committed = val;
+    }
+
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
         std::abort();
     }
@@ -281,6 +300,7 @@ private:
     NamespaceString _ns;
     RecordId _catalogId{0};
     std::unique_ptr<IndexCatalog> _indexCatalog;
+    bool _committed = true;
 };
 
 }  // namespace mongo

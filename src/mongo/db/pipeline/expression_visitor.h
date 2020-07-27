@@ -103,6 +103,7 @@ class ExpressionSize;
 class ExpressionReverseArray;
 class ExpressionSlice;
 class ExpressionIsArray;
+class ExpressionRandom;
 class ExpressionRound;
 class ExpressionSecond;
 class ExpressionSplit;
@@ -147,7 +148,7 @@ class ExpressionInternalFindSlice;
 class ExpressionInternalFindPositional;
 class ExpressionInternalFindElemMatch;
 class ExpressionInternalJsEmit;
-class ExpressionInternalJs;
+class ExpressionFunction;
 class ExpressionDegreesToRadians;
 class ExpressionRadiansToDegrees;
 
@@ -158,7 +159,7 @@ class AccumulatorStdDevPop;
 class AccumulatorStdDevSamp;
 class AccumulatorSum;
 class AccumulatorMergeObjects;
-template <typename Accumulator>
+template <typename AccumulatorState>
 class ExpressionFromAccumulator;
 
 /**
@@ -235,6 +236,7 @@ public:
     virtual void visit(ExpressionReverseArray*) = 0;
     virtual void visit(ExpressionSlice*) = 0;
     virtual void visit(ExpressionIsArray*) = 0;
+    virtual void visit(ExpressionRandom*) = 0;
     virtual void visit(ExpressionRound*) = 0;
     virtual void visit(ExpressionSplit*) = 0;
     virtual void visit(ExpressionSqrt*) = 0;
@@ -293,7 +295,7 @@ public:
     virtual void visit(ExpressionFromAccumulator<AccumulatorMergeObjects>*) = 0;
     virtual void visit(ExpressionTests::Testable*) = 0;
     virtual void visit(ExpressionInternalJsEmit*) = 0;
-    virtual void visit(ExpressionInternalJs*) = 0;
+    virtual void visit(ExpressionFunction*) = 0;
     virtual void visit(ExpressionInternalFindSlice*) = 0;
     virtual void visit(ExpressionInternalFindPositional*) = 0;
     virtual void visit(ExpressionInternalFindElemMatch*) = 0;

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
@@ -41,7 +41,6 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -183,15 +182,6 @@ public:
                 "admin",
                 BSON("_flushDatabaseCacheUpdates" << dbname),
                 Shard::RetryPolicy::kIdempotent));
-
-            // If the shard had binary version v4.2 when it received the
-            // _flushDatabaseCacheUpdates, it will have responded with NamespaceNotFound,
-            // because the shard no longer has the database (see SERVER-34431). Ignore this
-            // error, since once the shard is restarted in v4.4, its in-memory database version
-            // will be cleared anyway.
-            if (cmdResponse.commandStatus == ErrorCodes::NamespaceNotFound) {
-                continue;
-            }
             uassertStatusOK(cmdResponse.commandStatus);
         }
 

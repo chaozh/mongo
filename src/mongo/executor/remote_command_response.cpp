@@ -31,6 +31,8 @@
 
 #include "mongo/executor/remote_command_response.h"
 
+#include <fmt/format.h>
+
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/rpc/reply_interface.h"
 #include "mongo/util/str.h"
@@ -55,8 +57,10 @@ RemoteCommandResponseBase::RemoteCommandResponseBase(Status s, Milliseconds mill
     invariant(!isOK());
 };
 
-RemoteCommandResponseBase::RemoteCommandResponseBase(BSONObj dataObj, Milliseconds millis)
-    : data(std::move(dataObj)), elapsedMillis(millis) {
+RemoteCommandResponseBase::RemoteCommandResponseBase(BSONObj dataObj,
+                                                     Milliseconds millis,
+                                                     bool moreToCome)
+    : data(std::move(dataObj)), elapsedMillis(millis), moreToCome(moreToCome) {
     // The buffer backing the default empty BSONObj has static duration so it is effectively
     // owned.
     invariant(data.isOwned() || data.objdata() == BSONObj().objdata());
@@ -65,16 +69,24 @@ RemoteCommandResponseBase::RemoteCommandResponseBase(BSONObj dataObj, Millisecon
 // TODO(amidvidy): we currently discard output docs when we use this constructor. We should
 // have RCR hold those too, but we need more machinery before that is possible.
 RemoteCommandResponseBase::RemoteCommandResponseBase(const rpc::ReplyInterface& rpcReply,
-                                                     Milliseconds millis)
-    : RemoteCommandResponseBase(rpcReply.getCommandReply(), std::move(millis)) {}
+                                                     Milliseconds millis,
+                                                     bool moreToCome)
+    : RemoteCommandResponseBase(rpcReply.getCommandReply(), std::move(millis), moreToCome) {}
 
 bool RemoteCommandResponseBase::isOK() const {
     return status.isOK();
 }
 
 std::string RemoteCommandResponse::toString() const {
-    return str::stream() << "RemoteResponse -- "
-                         << " cmd:" << data.toString();
+    return format(FMT_STRING("RemoteResponse --"
+                             " cmd: {}"
+                             " status: {}"
+                             " elapsedMillis: {}"
+                             " moreToCome: {}"),
+                  data.toString(),
+                  status.toString(),
+                  elapsedMillis ? StringData(elapsedMillis->toString()) : "n/a"_sd,
+                  moreToCome);
 }
 
 bool RemoteCommandResponse::operator==(const RemoteCommandResponse& rhs) const {
@@ -143,9 +155,17 @@ bool RemoteCommandOnAnyResponse::operator!=(const RemoteCommandOnAnyResponse& rh
 }
 
 std::string RemoteCommandOnAnyResponse::toString() const {
-    return str::stream() << "RemoteOnAnyResponse -- "
-                         << " cmd:" << data.toString() << " target: "
-                         << (!target ? StringData("[none]") : StringData(target->toString()));
+    return format(FMT_STRING("RemoteOnAnyResponse -- "
+                             " cmd: {}"
+                             " target: {}"
+                             " status: {}"
+                             " elapsedMillis: {}"
+                             " moreToCome: {}"),
+                  data.toString(),
+                  target ? StringData(target->toString()) : "[none]"_sd,
+                  status.toString(),
+                  elapsedMillis ? StringData(elapsedMillis.get().toString()) : "n/a"_sd,
+                  moreToCome);
 }
 
 std::ostream& operator<<(std::ostream& os, const RemoteCommandOnAnyResponse& response) {

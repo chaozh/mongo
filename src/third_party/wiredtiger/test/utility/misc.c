@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2019 MongoDB, Inc.
+ * Public Domain 2014-2020 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -61,7 +61,7 @@ testutil_die(int e, const char *fmt, ...)
     if (e != 0)
         fprintf(stderr, ": %s", wiredtiger_strerror(e));
     fprintf(stderr, "\n");
-    fprintf(stderr, "process aborting\n");
+    fprintf(stderr, "%s: process aborting\n", progname);
 
     abort();
 }

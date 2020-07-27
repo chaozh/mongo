@@ -11,8 +11,6 @@
 //   does_not_support_stepdowns,
 //   assumes_balancer_off,
 //   assumes_unsharded_collection,
-//   # Sharding support for $planCacheStats requires all nodes to be binary version 4.4.
-//   requires_fcv_44,
 // ]
 
 (function() {
@@ -111,8 +109,10 @@ assert.commandWorked(nonExistentColl.runCommand('planCacheClear'));
 //     Populate the cache with 1 entry.
 //     Run reIndex on the collection.
 //     Confirm that cache is empty.
+// (Only standalone mode supports the reIndex command.)
 const isMongos = db.adminCommand({isdbgrid: 1}).isdbgrid;
-if (!isMongos) {
+const isStandalone = !isMongos && !db.runCommand({isMaster: 1}).hasOwnProperty('setName');
+if (isStandalone) {
     assert.eq(1, coll.find({a: 1, b: 1}).itcount());
     assert.eq(1, numPlanCacheEntries(), dumpPlanCacheState());
     assert.commandWorked(coll.reIndex());

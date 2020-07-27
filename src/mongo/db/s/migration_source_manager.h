@@ -168,7 +168,7 @@ public:
      * Aborts the migration after observing a concurrent index operation by marking its operation
      * context as killed.
      */
-    void abortDueToConflictingIndexOperation();
+    void abortDueToConflictingIndexOperation(OperationContext* opCtx);
 
     /**
      * Returns the cloner which is being used for this migration. This value is available only if
@@ -201,20 +201,20 @@ private:
         kDone
     };
 
-    ScopedCollectionMetadata _getCurrentMetadataAndCheckEpoch();
+    CollectionMetadata _getCurrentMetadataAndCheckEpoch();
 
     /**
      * If this donation moves the first chunk to the recipient (i.e., the recipient didn't have any
      * chunks), this function writes a no-op message to the oplog, so that change stream will notice
      * that and close the cursor in order to notify mongos to target the new shard as well.
      */
-    void _notifyChangeStreamsOnRecipientFirstChunk(const ScopedCollectionMetadata& metadata);
+    void _notifyChangeStreamsOnRecipientFirstChunk(const CollectionMetadata& metadata);
 
     /**
      * Called when any of the states fails. May only be called once and will put the migration
      * manager into the kDone state.
      */
-    void _cleanup();
+    void _cleanup(bool completeMigration);
 
     // This is the opCtx of the moveChunk request that constructed the MigrationSourceManager.
     // The caller must guarantee it outlives the MigrationSourceManager.
@@ -252,10 +252,6 @@ private:
     // collection doesn't have UUID.
     boost::optional<UUID> _collectionUuid;
 
-    // Whether to use the resumable range deleter. This decision is based on whether the FCV 4.2 or
-    // FCV 4.4 protocol are in use and the disableResumableRangeDeleter option is off.
-    bool _enableResumableRangeDeleter;
-
     // Contains logic for ensuring the donor's and recipient's config.rangeDeletions entries are
     // correctly updated based on whether the migration committed or aborted.
     std::unique_ptr<migrationutil::MigrationCoordinator> _coordinator;
@@ -270,7 +266,11 @@ private:
     BSONObj _recipientCloneCounts;
 
     boost::optional<CollectionCriticalSection> _critSec;
-    LogicalSessionId _lsid;
+
+    // Optional future that is populated if the migration succeeds and range deletion is scheduled
+    // on this node. The future is set when the range deletion completes. Used if the moveChunk was
+    // sent with waitForDelete.
+    boost::optional<SemiFuture<void>> _cleanupCompleteFuture;
 };
 
 }  // namespace mongo

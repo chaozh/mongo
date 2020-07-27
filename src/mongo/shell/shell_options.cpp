@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -43,11 +43,11 @@
 #include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/protocol.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/transport/message_compressor_options_client_gen.h"
 #include "mongo/transport/message_compressor_registry.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/str.h"
@@ -65,6 +65,7 @@ const std::set<std::string> kSetShellParameterWhitelist = {
     "awsEC2InstanceMetadataUrl",
     "awsECSInstanceMetadataUrl",
     "ocspEnabled",
+    "ocspClientHttpTimeoutSecs",
     "disabledSecureAllocatorDomains",
     "newLineAfterPasswordPromptForTest",
     "skipShellCursorFinalize",
@@ -86,15 +87,16 @@ std::string getMongoShellHelp(StringData name, const moe::OptionSection& options
 
 bool handlePreValidationMongoShellOptions(const moe::Environment& params,
                                           const std::vector<std::string>& args) {
-    auto&& vii = VersionInfoInterface::instance();
-    if (params.count("version") || params.count("help")) {
-        setPlainConsoleLogger();
-        log() << mongoShellVersion(vii);
-        if (params.count("help")) {
-            log() << getMongoShellHelp(args[0], moe::startupOptions);
-        } else {
-            vii.logBuildInfo();
-        }
+    if (params.count("help")) {
+        auto&& vii = VersionInfoInterface::instance();
+        std::cout << mongoShellVersion(vii) << std::endl;
+        std::cout << getMongoShellHelp(args[0], moe::startupOptions) << std::endl;
+        return false;
+    }
+    if (params.count("version")) {
+        auto&& vii = VersionInfoInterface::instance();
+        std::cout << mongoShellVersion(vii) << std::endl;
+        vii.logBuildInfo(&std::cout);
         return false;
     }
     return true;
@@ -111,9 +113,12 @@ Status storeMongoShellOptions(const moe::Environment& params,
         shellGlobalParams.enableIPv6 = true;
     }
 
+    auto minimumLoggedSeveity = logv2::LogSeverity::Info();
     if (params.count("verbose")) {
-        setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
+        minimumLoggedSeveity = logv2::LogSeverity::Debug(1);
     }
+    logv2::LogManager::global().getGlobalSettings().setMinimumLoggedSeverity(
+        mongo::logv2::LogComponent::kDefault, minimumLoggedSeveity);
 
     // `objcheck` option is part of `serverGlobalParams` to avoid making common parts depend upon
     // the client options.  The option is set to false in clients by default.
@@ -337,27 +342,6 @@ Status storeMongoShellOptions(const moe::Environment& params,
                         str::stream()
                             << "Bad value for parameter '" << name << "': " << status.reason()};
             }
-        }
-    }
-
-    if (params.count("logv2")) {
-        logV2Set(true);
-    }
-
-    if (params.count("logFormat")) {
-        std::string formatStr = params["logFormat"].as<string>();
-        if (!logV2Enabled() && formatStr != "default")
-            return Status(ErrorCodes::BadValue, "Can only use logFormat if logv2 is enabled.");
-        if (formatStr == "default") {
-            shellGlobalParams.logFormat = logv2::LogFormat::kDefault;
-        } else if (formatStr == "text") {
-            shellGlobalParams.logFormat = logv2::LogFormat::kText;
-        } else if (formatStr == "json") {
-            shellGlobalParams.logFormat = logv2::LogFormat::kJson;
-        } else {
-            return Status(ErrorCodes::BadValue,
-                          "Unsupported value for logFormat: " + formatStr +
-                              ". Valid values are: default, text or json");
         }
     }
 

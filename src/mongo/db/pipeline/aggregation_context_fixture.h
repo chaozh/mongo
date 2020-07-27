@@ -47,22 +47,26 @@ public:
     AggregationContextFixture()
         : AggregationContextFixture(NamespaceString("unittests.pipeline_test")) {}
 
-    AggregationContextFixture(NamespaceString nss) {
-        TimeZoneDatabase::set(getServiceContext(), std::make_unique<TimeZoneDatabase>());
-        // Must instantiate ExpressionContext _after_ setting the TZ database on the service
-        // context.
-        _expCtx = new ExpressionContext(_opCtx.get(), nullptr);
-        _expCtx->ns = std::move(nss);
+    AggregationContextFixture(NamespaceString nss)
+        : _expCtx(new ExpressionContextForTest(_opCtx.get(), nss)) {
         unittest::TempDir tempDir("AggregationContextFixture");
         _expCtx->tempDir = tempDir.path();
     }
 
-    boost::intrusive_ptr<ExpressionContext> getExpCtx() {
+    auto getExpCtx() {
+        return _expCtx;
+    }
+
+    auto getExpCtxRaw() {
         return _expCtx.get();
+    }
+
+    auto getOpCtx() {
+        return _opCtx.get();
     }
 
 private:
     ServiceContext::UniqueOperationContext _opCtx = makeOperationContext();
-    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    boost::intrusive_ptr<ExpressionContextForTest> _expCtx;
 };
 }  // namespace mongo

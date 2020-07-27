@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -38,8 +38,8 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/repl/scatter_gather_algorithm.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -105,8 +105,11 @@ StatusWith<EventHandle> ScatterGatherRunner::RunnerImpl::start(
 
     std::vector<RemoteCommandRequest> requests = _algorithm->getRequests();
     for (size_t i = 0; i < requests.size(); ++i) {
-        log() << "Scheduling remote command request for " << _logMessage << ": "
-              << requests[i].toString();
+        LOGV2(21752,
+              "Scheduling remote command request for {context}: {request}",
+              "Scheduling remote command request",
+              "context"_attr = _logMessage,
+              "request"_attr = requests[i].toString());
         const StatusWith<CallbackHandle> cbh =
             _executor->scheduleRemoteCommand(requests[i], processResponseCB);
         if (cbh.getStatus() == ErrorCodes::ShutdownInProgress) {

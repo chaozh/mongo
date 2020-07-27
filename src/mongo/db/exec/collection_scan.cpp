@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/db/exec/collection_scan.h"
 
@@ -43,8 +43,8 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/storage/oplog_hack.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 
 #include "mongo/db/client.h"  // XXX-ERH
 
@@ -56,14 +56,14 @@ using std::vector;
 // static
 const char* CollectionScan::kStageType = "COLLSCAN";
 
-CollectionScan::CollectionScan(OperationContext* opCtx,
+CollectionScan::CollectionScan(ExpressionContext* expCtx,
                                const Collection* collection,
                                const CollectionScanParams& params,
                                WorkingSet* workingSet,
                                const MatchExpression* filter)
-    : RequiresCollectionStage(kStageType, opCtx, collection),
+    : RequiresCollectionStage(kStageType, expCtx, collection),
       _workingSet(workingSet),
-      _filter(filter),
+      _filter((filter && !filter->isTriviallyTrue()) ? filter : nullptr),
       _params(params) {
     // Explain reports the direction of the collection scan.
     _specificStats.direction = params.direction;
@@ -117,11 +117,11 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // snapshot where the oplog entries are not yet visible even after the wait.
                 invariant(!_params.tailable && collection()->ns().isOplog());
 
-                getOpCtx()->recoveryUnit()->abandonSnapshot();
-                collection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(getOpCtx());
+                opCtx()->recoveryUnit()->abandonSnapshot();
+                collection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx());
             }
 
-            _cursor = collection()->getCursor(getOpCtx(), forward);
+            _cursor = collection()->getCursor(opCtx(), forward);
 
             if (!_lastSeenId.isNull()) {
                 invariant(_params.tailable);
@@ -133,12 +133,10 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // only time we'd need to create a cursor after already getting a record out of it
                 // and updating our _lastSeenId.
                 if (!_cursor->seekExact(_lastSeenId)) {
-                    Status status(ErrorCodes::CappedPositionLost,
-                                  str::stream() << "CollectionScan died due to failure to restore "
-                                                << "tailable cursor position. "
-                                                << "Last seen record id: " << _lastSeenId);
-                    *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-                    return PlanStage::FAILURE;
+                    uasserted(ErrorCodes::CappedPositionLost,
+                              str::stream() << "CollectionScan died due to failure to restore "
+                                            << "tailable cursor position. "
+                                            << "Last seen record id: " << _lastSeenId);
                 }
             }
 
@@ -152,14 +150,12 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // returned this one prior to the resume.
                 auto recordIdToSeek = *_params.resumeAfterRecordId;
                 if (!_cursor->seekExact(recordIdToSeek)) {
-                    Status status(
+                    uasserted(
                         ErrorCodes::KeyNotFound,
                         str::stream()
                             << "Failed to resume collection scan: the recordId from which we are "
                             << "attempting to resume no longer exists in the collection. "
                             << "recordId: " << recordIdToSeek);
-                    *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-                    return PlanStage::FAILURE;
                 }
             }
 
@@ -171,9 +167,9 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
             StatusWith<RecordId> goal = oploghack::keyForOptime(*_params.minTs);
             if (goal.isOK()) {
                 boost::optional<RecordId> startLoc =
-                    collection()->getRecordStore()->oplogStartHack(getOpCtx(), goal.getValue());
+                    collection()->getRecordStore()->oplogStartHack(opCtx(), goal.getValue());
                 if (startLoc && !startLoc->isNull()) {
-                    LOG(3) << "Using direct oplog seek";
+                    LOGV2_DEBUG(20584, 3, "Using direct oplog seek");
                     record = _cursor->seekExact(*startLoc);
                 }
             }
@@ -205,34 +201,26 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
 
     _lastSeenId = record->id;
     if (_params.shouldTrackLatestOplogTimestamp) {
-        auto status = setLatestOplogEntryTimestamp(*record);
-        if (!status.isOK()) {
-            *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-            return PlanStage::FAILURE;
-        }
+        setLatestOplogEntryTimestamp(*record);
     }
 
     WorkingSetID id = _workingSet->allocate();
     WorkingSetMember* member = _workingSet->get(id);
     member->recordId = record->id;
-    member->resetDocument(getOpCtx()->recoveryUnit()->getSnapshotId(),
-                          record->data.releaseToBson());
+    member->resetDocument(opCtx()->recoveryUnit()->getSnapshotId(), record->data.releaseToBson());
     _workingSet->transitionToRecordIdAndObj(id);
 
     return returnIfMatches(member, id, out);
 }
 
-Status CollectionScan::setLatestOplogEntryTimestamp(const Record& record) {
+void CollectionScan::setLatestOplogEntryTimestamp(const Record& record) {
     auto tsElem = record.data.toBson()[repl::OpTime::kTimestampFieldName];
-    if (tsElem.type() != BSONType::bsonTimestamp) {
-        Status status(ErrorCodes::InternalError,
-                      str::stream() << "CollectionScan was asked to track latest operation time, "
-                                       "but found a result without a valid 'ts' field: "
-                                    << record.data.toBson().toString());
-        return status;
-    }
+    uassert(ErrorCodes::Error(4382100),
+            str::stream() << "CollectionScan was asked to track latest operation time, "
+                             "but found a result without a valid 'ts' field: "
+                          << record.data.toBson().toString(),
+            tsElem.type() == BSONType::bsonTimestamp);
     _latestOplogEntryTimestamp = std::max(_latestOplogEntryTimestamp, tsElem.timestamp());
-    return Status::OK();
 }
 
 PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
@@ -283,7 +271,7 @@ void CollectionScan::doDetachFromOperationContext() {
 
 void CollectionScan::doReattachToOperationContext() {
     if (_cursor)
-        _cursor->reattachToOperationContext(getOpCtx());
+        _cursor->reattachToOperationContext(opCtx());
 }
 
 unique_ptr<PlanStageStats> CollectionScan::getStats() {

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -36,13 +36,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/operation_key_manager.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 #include "mongo/transport/baton.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/system_tick_source.h"
 
@@ -87,9 +87,7 @@ OperationContext::OperationContext(Client* client, OperationId opId)
                           : SystemTickSource::get()) {}
 
 OperationContext::~OperationContext() {
-    if (_opKey) {
-        OperationKeyManager::get(_client).remove(*_opKey);
-    }
+    releaseOperationKey();
 }
 
 void OperationContext::setDeadlineAndMaxTime(Date_t when,
@@ -97,7 +95,9 @@ void OperationContext::setDeadlineAndMaxTime(Date_t when,
                                              ErrorCodes::Error timeoutError) {
     invariant(!getClient()->isInDirectClient() || _hasArtificialDeadline);
     invariant(ErrorCodes::isExceededTimeLimitError(timeoutError));
-    invariant(!ErrorExtraInfo::parserFor(timeoutError));
+    if (ErrorCodes::mustHaveExtraInfo(timeoutError)) {
+        invariant(!ErrorExtraInfo::parserFor(timeoutError));
+    }
     uassert(40120,
             "Illegal attempt to change operation deadline",
             _hasArtificialDeadline || !hasDeadline());
@@ -181,6 +181,27 @@ Microseconds OperationContext::getRemainingMaxTimeMicros() const {
     return _maxTime - getElapsedTime();
 }
 
+void OperationContext::restoreMaxTimeMS() {
+    if (!_storedMaxTime) {
+        return;
+    }
+
+    auto maxTime = *_storedMaxTime;
+    _storedMaxTime = boost::none;
+
+    if (maxTime <= Microseconds::zero()) {
+        maxTime = Microseconds::max();
+    }
+
+    if (maxTime == Microseconds::max()) {
+        _deadline = Date_t::max();
+    } else {
+        auto clock = getServiceContext()->getFastClockSource();
+        _deadline = clock->now() + clock->getPrecision() + maxTime - _elapsedTime.elapsed();
+    }
+    _maxTime = maxTime;
+}
+
 namespace {
 
 // Helper function for checkForInterrupt fail point.  Decides whether the operation currently
@@ -203,10 +224,17 @@ bool opShouldFail(Client* client, const BSONObj& failPointInfo) {
 }  // namespace
 
 Status OperationContext::checkForInterruptNoAssert() noexcept {
-    // TODO: Remove the MONGO_likely(getClient()) once all operation contexts are constructed with
-    // clients.
-    if (MONGO_likely(getClient() && getServiceContext()) &&
-        getServiceContext()->getKillAllOperations() && !_isExecutingShutdown) {
+    // TODO: Remove the MONGO_likely(hasClientAndServiceContext) once all operation contexts are
+    // constructed with clients.
+    const auto hasClientAndServiceContext = getClient() && getServiceContext();
+
+    if (MONGO_likely(hasClientAndServiceContext) && getClient()->getKilled() &&
+        !_isExecutingShutdown) {
+        return Status(ErrorCodes::ClientMarkedKilled, "client has been killed");
+    }
+
+    if (MONGO_likely(hasClientAndServiceContext) && getServiceContext()->getKillAllOperations() &&
+        !_isExecutingShutdown) {
         return Status(ErrorCodes::InterruptedAtShutdown, "interrupted at shutdown");
     }
 
@@ -223,7 +251,7 @@ Status OperationContext::checkForInterruptNoAssert() noexcept {
 
     checkForInterruptFail.executeIf(
         [&](auto&&) {
-            log() << "set pending kill on op " << getOpID() << ", for checkForInterruptFail";
+            LOGV2(20882, "Marking operation as killed for failpoint", "opId"_attr = getOpID());
             markKilled();
         },
         [&](auto&& data) { return opShouldFail(getClient(), data); });
@@ -321,10 +349,12 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
 
 void OperationContext::markKilled(ErrorCodes::Error killCode) {
     invariant(killCode != ErrorCodes::OK);
-    invariant(!ErrorExtraInfo::parserFor(killCode));
+    if (ErrorCodes::mustHaveExtraInfo(killCode)) {
+        invariant(!ErrorExtraInfo::parserFor(killCode));
+    }
 
     if (killCode == ErrorCodes::ClientDisconnect) {
-        log() << "operation was interrupted because a client disconnected";
+        LOGV2(20883, "Interrupted operation as its client disconnected", "opId"_attr = getOpID());
     }
 
     if (auto status = ErrorCodes::OK; _killCode.compareAndSwap(&status, killCode)) {
@@ -370,6 +400,13 @@ void OperationContext::setOperationKey(OperationKey opKey) {
 
     _opKey.emplace(std::move(opKey));
     OperationKeyManager::get(_client).add(*_opKey, _opId);
+}
+
+void OperationContext::releaseOperationKey() {
+    if (_opKey) {
+        OperationKeyManager::get(_client).remove(*_opKey);
+    }
+    _opKey = boost::none;
 }
 
 void OperationContext::setTxnNumber(TxnNumber txnNumber) {

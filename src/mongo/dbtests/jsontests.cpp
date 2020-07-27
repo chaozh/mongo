@@ -31,7 +31,7 @@
  * Tests for json.{h,cpp} code and BSONObj::jsonString()
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
@@ -45,9 +45,9 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 
 namespace {
@@ -95,6 +95,63 @@ TEST(JsonStringTest, BasicTest) {
          R"({ "a" : "\u0001 \u001f" })"},                    // AdditionalControlCharacters
         {B().append("\t", "b").obj(), R"({ "\t" : "b" })"},  // EscapeFieldName
     });
+}
+
+/**
+ * JavaScript's JSON.stringify(x,null,4) is the goal with our pretty==true formatting.
+ * Expected string captured from node.js interpreter.
+ * E.g.:
+ * node -e 'console.log(JSON.stringify([123,[],{},{"a":1},{"a":1,"b":2,"c":[1,2,3]}],null,4))'
+ */
+TEST(JsonStringTest, PrettyFormatTest) {
+    auto validate = [&](int line, BSONObj obj, bool arr, std::string out) {
+        ASSERT_EQUALS(obj.jsonString(ExtendedRelaxedV2_0_0, true, arr), out)
+            << format(FMT_STRING(", line {}"), line);
+    };
+    validate(__LINE__, B().obj(), 0, "{}");
+    validate(__LINE__, B{}.obj(), 1, "[]");
+    validate(__LINE__,
+             (B{} << "a"
+                  << "b")
+                 .obj(),
+             0,
+             R"({
+    "a": "b"
+})");
+    validate(__LINE__, (Arr{} << "a").arr(), 1, R"([
+    "a"
+])");
+    validate(__LINE__,
+             (Arr{} << "a"
+                    << "b")
+                 .arr(),
+             1,
+             R"([
+    "a",
+    "b"
+])");
+    validate(__LINE__,
+             (Arr{} << 123 << Arr{}.arr() << B{}.obj() << (B{} << "a" << 1).obj()
+                    << (B{} << "a" << 1 << "b" << 2 << "c" << (Arr{} << 1 << 2 << 3).arr()).obj())
+                 .arr(),
+             1,
+             R"([
+    123,
+    [],
+    {},
+    {
+        "a": 1
+    },
+    {
+        "a": 1,
+        "b": 2,
+        "c": [
+            1,
+            2,
+            3
+        ]
+    }
+])");
 }
 
 TEST(JsonStringTest, UnicodeTest) {
@@ -392,9 +449,15 @@ TEST(JsonStringTest, Date) {
     BSONObj built = b.done();
     ASSERT_JSON_EQUALS(R"({ "a" : { "$date" : { "$numberLong" : "0" } } })",
                        built.jsonString(ExtendedCanonicalV2_0_0));
-    ASSERT_JSON_EQUALS(R"({ "a" : { "$date" : "1969-12-31T19:00:00.000-0500" } })",
+    bool prev = dateFormatIsLocalTimezone();
+    setDateFormatIsLocalTimezone(true);
+    ASSERT_JSON_EQUALS(R"({ "a" : { "$date" : "1969-12-31T19:00:00.000-05:00" } })",
                        built.jsonString(ExtendedRelaxedV2_0_0));
-    ASSERT_EQUALS(R"({ "a" : { "$date" : "1969-12-31T19:00:00.000-0500" } })",
+    setDateFormatIsLocalTimezone(false);
+    ASSERT_JSON_EQUALS(R"({ "a" : { "$date" : "1970-01-01T00:00:00.000Z" } })",
+                       built.jsonString(ExtendedRelaxedV2_0_0));
+    setDateFormatIsLocalTimezone(prev);
+    ASSERT_EQUALS(R"({ "a" : { "$date" : "1969-12-31T19:00:00.000-05:00" } })",
                   built.jsonString(LegacyStrict));
 
     // Test dates above our maximum formattable date.  See SERVER-13760.
@@ -544,20 +607,24 @@ void assertEquals(const std::string& json,
                   const char* msg) {
     const bool bad = expected.woCompare(actual);
     if (bad) {
-        ::mongo::log() << "want:" << expected.jsonString() << " size: " << expected.objsize()
-                       << std::endl;
-        ::mongo::log() << "got :" << actual.jsonString() << " size: " << actual.objsize()
-                       << std::endl;
-        ::mongo::log() << expected.hexDump() << std::endl;
-        ::mongo::log() << actual.hexDump() << std::endl;
-        ::mongo::log() << msg << std::endl;
-        ::mongo::log() << "orig json:" << json;
+        LOGV2(22494,
+              "want:{expected_jsonString} size: {expected_objsize}",
+              "expected_jsonString"_attr = expected.jsonString(),
+              "expected_objsize"_attr = expected.objsize());
+        LOGV2(22495,
+              "got :{actual_jsonString} size: {actual_objsize}",
+              "actual_jsonString"_attr = actual.jsonString(),
+              "actual_objsize"_attr = actual.objsize());
+        LOGV2(22496, "{expected_hexDump}", "expected_hexDump"_attr = expected.hexDump());
+        LOGV2(22497, "{actual_hexDump}", "actual_hexDump"_attr = actual.hexDump());
+        LOGV2(22498, "{msg}", "msg"_attr = msg);
+        LOGV2(22499, "orig json:{json}", "json"_attr = json);
     }
     ASSERT(!bad);
 }
 
 void checkEquivalence(const std::string& json, const BSONObj& bson) {
-    ASSERT(fromjson(json).valid(BSONVersion::kLatest));
+    ASSERT(fromjson(json).valid());
     assertEquals(json, bson, fromjson(json), "mode: json-to-bson");
     assertEquals(json, bson, fromjson(tojson(bson)), "mode: <default>");
     assertEquals(json, bson, fromjson(tojson(bson, LegacyStrict)), "mode: strict");

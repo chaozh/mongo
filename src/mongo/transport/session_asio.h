@@ -41,6 +41,7 @@
 #include "mongo/util/net/socket_utils.h"
 #ifdef MONGO_CONFIG_SSL
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #endif
 
@@ -108,6 +109,9 @@ public:
 
         _local = HostAndPort(_localAddr.toString(true));
         _remote = HostAndPort(_remoteAddr.toString(true));
+#ifdef MONGO_CONFIG_SSL
+        _sslManager = tl->getSSLManager();
+#endif
     } catch (const DBException&) {
         throw;
     } catch (const asio::system_error& error) {
@@ -145,7 +149,10 @@ public:
             std::error_code ec;
             getSocket().shutdown(GenericSocket::shutdown_both, ec);
             if ((ec) && (ec != asio::error::not_connected)) {
-                error() << "Error shutting down socket: " << ec.message();
+                LOGV2_ERROR(23841,
+                            "Error shutting down socket: {error}",
+                            "Error shutting down socket",
+                            "error"_attr = ec.message());
             }
         }
     }
@@ -183,12 +190,17 @@ public:
     }
 
     void cancelAsyncOperations(const BatonHandle& baton = nullptr) override {
-        LOG(3) << "Cancelling outstanding I/O operations on connection to " << _remote;
-        if (baton && baton->networking()) {
-            baton->networking()->cancelSession(*this);
-        } else {
-            getSocket().cancel();
+        LOGV2_DEBUG(4615608,
+                    3,
+                    "Cancelling outstanding I/O operations on connection to {remote}",
+                    "Cancelling outstanding I/O operations on connection to remote",
+                    "remote"_attr = _remote);
+        if (baton && baton->networking() && baton->networking()->cancelSession(*this)) {
+            // If we have a baton, it was for networking, and it owned our session, then we're done.
+            return;
         }
+
+        getSocket().cancel();
     }
 
     void setTimeout(boost::optional<Milliseconds> timeout) override {
@@ -205,8 +217,10 @@ public:
         auto swPollEvents = pollASIOSocket(getSocket(), POLLIN, Milliseconds{0});
         if (!swPollEvents.isOK()) {
             if (swPollEvents != ErrorCodes::NetworkTimeout) {
-                warning() << "Failed to poll socket for connectivity check: "
-                          << swPollEvents.getStatus();
+                LOGV2_WARNING(4615609,
+                              "Failed to poll socket for connectivity check: {error}",
+                              "Failed to poll socket for connectivity check",
+                              "error"_attr = swPollEvents.getStatus());
                 return false;
             }
             return true;
@@ -219,14 +233,29 @@ public:
             if (size == sizeof(testByte)) {
                 return true;
             } else if (size == -1) {
-                auto errDesc = errnoWithDescription(errno);
-                warning() << "Failed to check socket connectivity: " << errDesc;
+                LOGV2_WARNING(4615610,
+                              "Failed to check socket connectivity: {error}",
+                              "Failed to check socket connectivity",
+                              "error"_attr = errnoWithDescription(errno));
             }
             // If size == 0 then we got disconnected and we should return false.
         }
 
         return false;
     }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() const override {
+        if (_sslManager) {
+            return &_sslManager->getSSLConfiguration();
+        }
+        return nullptr;
+    }
+
+    const std::shared_ptr<SSLManagerInterface> getSSLManager() const override {
+        return _sslManager;
+    }
+#endif
 
 protected:
     friend class TransportLayerASIO;
@@ -236,7 +265,8 @@ protected:
     // The unique_lock here is held by TransportLayerASIO to synchronize with the asyncConnect
     // timeout callback. It will be unlocked before the SSL actually handshake begins.
     Future<void> handshakeSSLForEgressWithLock(stdx::unique_lock<Latch> lk,
-                                               const HostAndPort& target) {
+                                               const HostAndPort& target,
+                                               const ReactorHandle& reactor) {
         if (!_tl->_egressSSLContext) {
             return Future<void>::makeReady(Status(ErrorCodes::SSLHandshakeFailed,
                                                   "SSL requested but SSL support is disabled"));
@@ -255,12 +285,15 @@ protected:
                 return _sslSocket->async_handshake(asio::ssl::stream_base::client, UseFuture{});
             }
         };
-        return doHandshake().then([this, target] {
+        return doHandshake().then([this, target, reactor] {
             _ranHandshake = true;
 
             return getSSLManager()
-                ->parseAndValidatePeerCertificate(
-                    _sslSocket->native_handle(), _sslSocket->get_sni(), target.host(), target)
+                ->parseAndValidatePeerCertificate(_sslSocket->native_handle(),
+                                                  _sslSocket->get_sni(),
+                                                  target.host(),
+                                                  target,
+                                                  reactor)
                 .then([this](SSLPeerInfo info) {
                     SSLPeerInfo::forSession(shared_from_this()) = info;
                 });
@@ -271,7 +304,7 @@ protected:
     // pass it to the WithLock version of handshakeSSLForEgress
     Future<void> handshakeSSLForEgress(const HostAndPort& target) {
         auto mutex = MONGO_MAKE_LATCH();
-        return handshakeSSLForEgressWithLock(stdx::unique_lock<Latch>(mutex), target);
+        return handshakeSSLForEgressWithLock(stdx::unique_lock<Latch>(mutex), target, nullptr);
     }
 #endif
 
@@ -380,7 +413,12 @@ private:
                     sb << "recv(): message msgLen " << msgLen << " is invalid. "
                        << "Min " << kHeaderSize << " Max: " << MaxMessageSizeBytes;
                     const auto str = sb.str();
-                    LOG(0) << str;
+                    LOGV2(4615638,
+                          "recv(): message msgLen {msgLen} is invalid. Min: {min} Max: {max}",
+                          "recv(): message mstLen is invalid.",
+                          "msgLen"_attr = msgLen,
+                          "min"_attr = kHeaderSize,
+                          "max"_attr = MaxMessageSizeBytes);
 
                     return Future<Message>::makeReady(Status(ErrorCodes::ProtocolError, str));
                 }
@@ -409,6 +447,7 @@ private:
 
     template <typename MutableBufferSequence>
     Future<void> read(const MutableBufferSequence& buffers, const BatonHandle& baton = nullptr) {
+        // TODO SERVER-47229 Guard active ops for cancelation here.
 #ifdef MONGO_CONFIG_SSL
         if (_sslSocket) {
             return opportunisticRead(*_sslSocket, buffers, baton);
@@ -434,6 +473,7 @@ private:
 
     template <typename ConstBufferSequence>
     Future<void> write(const ConstBufferSequence& buffers, const BatonHandle& baton = nullptr) {
+        // TODO SERVER-47229 Guard active ops for cancelation here.
 #ifdef MONGO_CONFIG_SSL
         _ranHandshake = true;
         if (_sslSocket) {
@@ -470,12 +510,17 @@ private:
                 localBuffer = asio::mutable_buffer(buffers.data(), 1);
             }
 
-            size = asio::read(stream, localBuffer, ec);
+            do {
+                size = asio::read(stream, localBuffer, ec);
+            } while (ec == asio::error::interrupted);  // retry syscall EINTR
+
             if (!ec && buffers.size() > 1) {
                 ec = asio::error::would_block;
             }
         } else {
-            size = asio::read(stream, buffers, ec);
+            do {
+                size = asio::read(stream, buffers, ec);
+            } while (ec == asio::error::interrupted);  // retry syscall EINTR
         }
 
         if (((ec == asio::error::would_block) || (ec == asio::error::try_again)) &&
@@ -488,9 +533,19 @@ private:
                 asyncBuffers += size;
             }
 
-            if (baton && baton->networking()) {
-                return baton->networking()
-                    ->addSession(*this, NetworkingBaton::Type::In)
+            if (auto networkingBaton = baton ? baton->networking() : nullptr;
+                networkingBaton && networkingBaton->canWait()) {
+                return networkingBaton->addSession(*this, NetworkingBaton::Type::In)
+                    .onError([](Status error) {
+                        if (ErrorCodes::isShutdownError(error)) {
+                            // If the baton has detached, it will cancel its polling. We catch that
+                            // error here and return Status::OK so that we invoke
+                            // opportunisticRead() again and switch to asio::async_read() below.
+                            return Status::OK();
+                        }
+
+                        return error;
+                    })
                     .then([&stream, asyncBuffers, baton, this] {
                         return opportunisticRead(stream, asyncBuffers, baton);
                     });
@@ -553,12 +608,16 @@ private:
                 localBuffer = asio::const_buffer(buffers.data(), 1);
             }
 
-            size = asio::write(stream, localBuffer, ec);
+            do {
+                size = asio::write(stream, localBuffer, ec);
+            } while (ec == asio::error::interrupted);  // retry syscall EINTR
             if (!ec && buffers.size() > 1) {
                 ec = asio::error::would_block;
             }
         } else {
-            size = asio::write(stream, buffers, ec);
+            do {
+                size = asio::write(stream, buffers, ec);
+            } while (ec == asio::error::interrupted);  // retry syscall EINTR
         }
 
         if (((ec == asio::error::would_block) || (ec == asio::error::try_again)) &&
@@ -576,9 +635,19 @@ private:
                 return std::move(*more);
             }
 
-            if (baton && baton->networking()) {
-                return baton->networking()
-                    ->addSession(*this, NetworkingBaton::Type::Out)
+            if (auto networkingBaton = baton ? baton->networking() : nullptr;
+                networkingBaton && networkingBaton->canWait()) {
+                return networkingBaton->addSession(*this, NetworkingBaton::Type::Out)
+                    .onError([](Status error) {
+                        if (ErrorCodes::isCancelationError(error)) {
+                            // If the baton has detached, it will cancel its polling. We catch that
+                            // error here and return Status::OK so that we invoke
+                            // opportunisticWrite() again and switch to asio::async_write() below.
+                            return Status::OK();
+                        }
+
+                        return error;
+                    })
                     .then([&stream, asyncBuffers, baton, this] {
                         return opportunisticWrite(stream, asyncBuffers, baton);
                     });
@@ -639,8 +708,11 @@ private:
             return doHandshake().then([this](size_t size) {
                 if (SSLPeerInfo::forSession(shared_from_this()).subjectName.empty()) {
                     return getSSLManager()
-                        ->parseAndValidatePeerCertificate(
-                            _sslSocket->native_handle(), _sslSocket->get_sni(), "", _remote)
+                        ->parseAndValidatePeerCertificate(_sslSocket->native_handle(),
+                                                          _sslSocket->get_sni(),
+                                                          "",
+                                                          _remote,
+                                                          nullptr)
                         .then([this](SSLPeerInfo info) -> bool {
                             SSLPeerInfo::forSession(shared_from_this()) = info;
                             return true;
@@ -655,8 +727,12 @@ private:
         } else {
             if (!sslGlobalParams.disableNonSSLConnectionLogging &&
                 _tl->_sslMode() == SSLParams::SSLMode_preferSSL) {
-                LOG(0) << "SSL mode is set to 'preferred' and connection " << id() << " to "
-                       << remote() << " is not using SSL.";
+                LOGV2(23838,
+                      "SSL mode is set to 'preferred' and connection {connectionId} to {remote} is "
+                      "not using SSL.",
+                      "SSL mode is set to 'preferred' and connection to remote is not using SSL.",
+                      "connectionId"_attr = id(),
+                      "remote"_attr = remote());
             }
             return Future<bool>::makeReady(false);
         }
@@ -723,6 +799,7 @@ private:
 #ifdef MONGO_CONFIG_SSL
     boost::optional<asio::ssl::stream<decltype(_socket)>> _sslSocket;
     bool _ranHandshake = false;
+    std::shared_ptr<SSLManagerInterface> _sslManager;
 #endif
 
     TransportLayerASIO* const _tl;

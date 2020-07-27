@@ -36,7 +36,8 @@
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/rename_collection.h"
+#include "mongo/db/commands/rename_collection_common.h"
+#include "mongo/db/commands/rename_collection_gen.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -84,21 +85,13 @@ public:
                            const BSONObj& cmdObj,
                            string& errmsg,
                            BSONObjBuilder& result) {
-        const auto sourceNsElt = cmdObj[getName()];
-        const auto targetNsElt = cmdObj["to"];
-
-        uassert(ErrorCodes::TypeMismatch,
-                "'renameCollection' must be of type String",
-                sourceNsElt.type() == BSONType::String);
-        uassert(ErrorCodes::TypeMismatch,
-                "'to' must be of type String",
-                targetNsElt.type() == BSONType::String);
-
-        const NamespaceString source(sourceNsElt.valueStringData());
-        const NamespaceString target(targetNsElt.valueStringData());
-        bool dropTarget = cmdObj["dropTarget"].trueValue();
-        bool stayTemp = cmdObj["stayTemp"].trueValue();
-        validateAndRunRenameCollection(opCtx, source, target, dropTarget, stayTemp);
+        auto renameRequest =
+            RenameCollectionCommand::parse(IDLParserErrorContext("renameCollection"), cmdObj);
+        RenameCollectionOptions options;
+        options.dropTarget = renameRequest.getDropTarget();
+        options.stayTemp = renameRequest.getStayTemp();
+        validateAndRunRenameCollection(
+            opCtx, renameRequest.getCommandParameter(), renameRequest.getTo(), options);
         return true;
     }
 

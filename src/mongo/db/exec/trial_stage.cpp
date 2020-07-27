@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -40,19 +40,19 @@
 #include "mongo/db/exec/or.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
 const char* TrialStage::kStageType = "TRIAL";
 
-TrialStage::TrialStage(OperationContext* opCtx,
+TrialStage::TrialStage(ExpressionContext* expCtx,
                        WorkingSet* ws,
                        std::unique_ptr<PlanStage> trialPlan,
                        std::unique_ptr<PlanStage> backupPlan,
                        size_t maxTrialWorks,
                        double minWorkAdvancedRatio)
-    : PlanStage(kStageType, opCtx), _ws(ws) {
+    : PlanStage(kStageType, expCtx), _ws(ws) {
     invariant(minWorkAdvancedRatio > 0);
     invariant(minWorkAdvancedRatio <= 1);
     invariant(maxTrialWorks > 0);
@@ -64,7 +64,7 @@ TrialStage::TrialStage(OperationContext* opCtx,
     _backupPlan = std::move(backupPlan);
 
     // We need to cache results during the trial phase in case it succeeds.
-    _queuedData = std::make_unique<QueuedDataStage>(opCtx, _ws);
+    _queuedData = std::make_unique<QueuedDataStage>(expCtx, _ws);
 
     // Set up stats tracking specific to this stage.
     _specificStats.successThreshold = minWorkAdvancedRatio;
@@ -76,11 +76,11 @@ Status TrialStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     while (!_specificStats.trialCompleted) {
         WorkingSetID id = WorkingSet::INVALID_ID;
         const bool mustYield = (work(&id) == PlanStage::NEED_YIELD);
-        if (mustYield || yieldPolicy->shouldYieldOrInterrupt()) {
+        if (mustYield || yieldPolicy->shouldYieldOrInterrupt(expCtx()->opCtx)) {
             if (mustYield && !yieldPolicy->canAutoYield()) {
                 throw WriteConflictException();
             }
-            auto yieldStatus = yieldPolicy->yieldOrInterrupt();
+            auto yieldStatus = yieldPolicy->yieldOrInterrupt(expCtx()->opCtx);
             if (!yieldStatus.isOK()) {
                 return yieldStatus;
             }
@@ -141,15 +141,6 @@ PlanStage::StageState TrialStage::_workTrialPlan(WorkingSetID* out) {
             _specificStats.trialCompleted = _specificStats.trialSucceeded = true;
             _replaceCurrentPlan(_queuedData);
             return NEED_TIME;
-        case PlanStage::FAILURE:
-            // Either of these cause us to immediately end the trial phase and switch to the backup.
-            auto statusDoc = WorkingSetCommon::getStatusMemberDocument(*_ws, *out);
-            BSONObj statusObj = statusDoc ? statusDoc->toBson() : BSONObj();
-            LOG(1) << "Trial plan failed; switching to backup plan. Status: " << redact(statusObj);
-            _specificStats.trialCompleted = true;
-            _replaceCurrentPlan(_backupPlan);
-            *out = WorkingSet::INVALID_ID;
-            return NEED_TIME;
     }
 
     MONGO_UNREACHABLE;
@@ -172,8 +163,7 @@ void TrialStage::_assessTrialAndBuildFinalPlan() {
 
     // The trial plan succeeded, but we need to build a plan that includes the queued data. Create a
     // final plan which UNIONs across the QueuedDataStage and the trial plan.
-    std::unique_ptr<PlanStage> unionPlan =
-        std::make_unique<OrStage>(getOpCtx(), _ws, false, nullptr);
+    std::unique_ptr<PlanStage> unionPlan = std::make_unique<OrStage>(expCtx(), _ws, false, nullptr);
     static_cast<OrStage*>(unionPlan.get())->addChild(std::move(_queuedData));
     static_cast<OrStage*>(unionPlan.get())->addChild(std::move(_children.front()));
     _replaceCurrentPlan(unionPlan);
@@ -205,19 +195,19 @@ void TrialStage::doDetachFromOperationContext() {
 
 void TrialStage::doReattachToOperationContext() {
     if (_backupPlan) {
-        _backupPlan->reattachToOperationContext(getOpCtx());
+        _backupPlan->reattachToOperationContext(opCtx());
     }
     if (_queuedData) {
-        _queuedData->reattachToOperationContext(getOpCtx());
+        _queuedData->reattachToOperationContext(opCtx());
     }
 }
 
 void TrialStage::doDispose() {
     if (_backupPlan) {
-        _backupPlan->dispose(getOpCtx());
+        _backupPlan->dispose(opCtx());
     }
     if (_queuedData) {
-        _queuedData->dispose(getOpCtx());
+        _queuedData->dispose(opCtx());
     }
 }
 

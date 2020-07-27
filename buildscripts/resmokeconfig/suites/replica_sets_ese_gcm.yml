@@ -7,6 +7,7 @@ test_kind: js_test
 selector:
   roots:
   - jstests/replsets/*.js
+  exclude_files:
 
 executor:
   config:

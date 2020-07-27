@@ -1,9 +1,11 @@
 """Tools for detecting changes in a commit."""
-from typing import Any, Set
+import os
+from itertools import chain
+from typing import Any, Dict, Iterable, Set, Optional
 
-from git import Repo, DiffIndex
 import structlog
 from structlog.stdlib import LoggerFactory
+from git import DiffIndex, Repo
 
 structlog.configure(logger_factory=LoggerFactory())
 LOGGER = structlog.get_logger(__name__)
@@ -45,22 +47,45 @@ def _modified_files_for_diff(diff: DiffIndex, log: Any) -> Set:
     return modified_files.union(added_files).union(renamed_files).union(deleted_files)
 
 
-def find_changed_files(repo: Repo) -> Set[str]:
+def find_changed_files(repo: Repo, revision_map: Optional[Dict[str, str]] = None) -> Set[str]:
     """
     Find files that were new or added to the repository between commits.
 
     :param repo: Git repository.
+    :param revision_map: Map of revisions to compare against for repos.
 
     :return: Set of changed files.
     """
+    LOGGER.info("Getting diff for repo", repo=repo.git_dir)
+    if not revision_map:
+        revision_map = {}
     diff = repo.index.diff(None)
     work_tree_files = _modified_files_for_diff(diff, LOGGER.bind(diff="working tree diff"))
 
     commit = repo.index
-    diff = commit.diff(repo.head.commit)
+    diff = commit.diff(revision_map.get(repo.git_dir, repo.head.commit))
     index_files = _modified_files_for_diff(diff, LOGGER.bind(diff="index diff"))
 
     untracked_files = set(repo.untracked_files)
     LOGGER.info("untracked files", files=untracked_files, diff="untracked diff")
 
-    return work_tree_files.union(index_files).union(untracked_files)
+    paths = work_tree_files.union(index_files).union(untracked_files)
+
+    return [
+        os.path.relpath(f"{repo.working_dir}/{os.path.normpath(path)}", os.getcwd())
+        for path in paths
+    ]
+
+
+def find_changed_files_in_repos(repos: Iterable[Repo],
+                                revision_map: Optional[Dict[str, str]] = None) -> Set[str]:
+    """
+    Find the changed files.
+
+    Use git to find which files have changed in this patch.
+
+    :param repos: List of repos containing changed files.
+    :param revision_map: Map of revisions to compare against for repos.
+    :returns: Set of changed files.
+    """
+    return set(chain.from_iterable([find_changed_files(repo, revision_map) for repo in repos]))

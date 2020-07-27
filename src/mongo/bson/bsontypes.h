@@ -56,11 +56,6 @@ extern const BSONObj kMaxBSONKey;
 extern const BSONObj kMinBSONKey;
 
 /**
-    determines BSON types considered valid by validate
-*/
-enum class BSONVersion { kV1_0, kV1_1, kLatest = kV1_1 };
-
-/**
     the complete list of valid BSON types
     see also bsonspec.org
 */
@@ -79,7 +74,7 @@ enum BSONType {
     Array = 4,
     /** binary data */
     BinData = 5,
-    /** Undefined type */
+    /** (Deprecated) Undefined type */
     Undefined = 6,
     /** ObjectId */
     jstOID = 7,
@@ -91,13 +86,13 @@ enum BSONType {
     jstNULL = 10,
     /** regular expression, a pattern with options */
     RegEx = 11,
-    /** deprecated / will be redesigned */
+    /** (Deprecated) */
     DBRef = 12,
-    /** deprecated / use CodeWScope */
+    /** code type */
     Code = 13,
-    /** a programming language (e.g., Python) symbol */
+    /** (Deprecated) a programming language (e.g., Python) symbol */
     Symbol = 14,
-    /** javascript code that can execute on the database server, with SavedContext */
+    /** (Deprecated) javascript code that can execute on the database server, with SavedContext */
     CodeWScope = 15,
     /** 32 bit signed integer */
     NumberInt = 16,
@@ -267,6 +262,13 @@ struct FormatKind : std::integral_constant<BSONType, value> {};
 
 template <typename T>
 struct BSONObjAppendFormat;
+
+/**
+ * Returns whether conversion to JSON should format the Date type as local timezone.
+ * This is a global setting set by the systemLog.timeStampFormat server option.
+ */
+void setDateFormatIsLocalTimezone(bool localTimeZone);
+bool dateFormatIsLocalTimezone();
 
 namespace bsontype_detail {
 

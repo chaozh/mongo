@@ -51,6 +51,7 @@
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/snapshot.h"
+#include "mongo/logv2/log_attr.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/util/decorable.h"
@@ -93,6 +94,10 @@ struct CollectionUpdateArgs {
     bool fromMigrate = false;
 
     StoreDocOption storeDocOption = StoreDocOption::None;
+    bool preImageRecordingEnabledForCollection = false;
+
+    // Set if an OpTime was reserved for the update ahead of time.
+    boost::optional<OplogSlot> oplogSlot = boost::none;
 };
 
 /**
@@ -148,6 +153,15 @@ private:
     bool _dead = false;
 };
 
+/**
+ * A decorable object that is shared across all Collection instances for the same collection. There
+ * may be several Collection instances simultaneously in existence representing different versions
+ * of a collection's persisted state. A single instance of SharedCollectionDecorations will be
+ * associated with all of the Collection instances for a collection, sharing whatever data may
+ * decorate it across all point in time views of the collection.
+ */
+class SharedCollectionDecorations : public Decorable<SharedCollectionDecorations> {};
+
 class Collection : public Decorable<Collection> {
 public:
     enum class StoreDeletedDoc { Off, On };
@@ -184,6 +198,53 @@ public:
     };
 
     /**
+     * A Collection::Validator represents a filter that is applied to all documents that are
+     * inserted. Enforcement of Validators being well formed is done lazily, so the 'Validator'
+     * class may represent a validator which is not well formed.
+     */
+    struct Validator {
+
+        /**
+         * Returns whether the validator's filter is well formed.
+         */
+        bool isOK() const {
+            return filter.isOK();
+        }
+
+        /**
+         * Returns OK or the error encounter when parsing the validator.
+         */
+        Status getStatus() const {
+            return filter.getStatus();
+        }
+
+        /**
+         * Empty means no validator. This must outlive 'filter'.
+         */
+        BSONObj validatorDoc;
+
+        /**
+         * A special ExpressionContext used to evaluate the filter match expression. This should
+         * outlive 'filter'.
+         */
+        boost::intrusive_ptr<ExpressionContext> expCtxForFilter;
+
+        /**
+         * The collection validator MatchExpression. This is stored as a StatusWith, as we lazily
+         * enforce that collection validators are well formed.
+         *
+         * -A non-OK Status indicates that the validator is not well formed, and any attempts to
+         * enforce the validator should error.
+         *
+         * -A value of Status::OK/nullptr indicates that there is no validator.
+         *
+         * -Anything else indicates a well formed validator. The MatchExpression will maintain
+         * pointers into _validatorDoc.
+         */
+        StatusWithMatchExpression filter = {nullptr};
+    };
+
+    /**
      * Callback function for callers of insertDocumentForBulkLoader().
      */
     using OnRecordInsertedFn = std::function<Status(const RecordId& loc)>;
@@ -191,7 +252,29 @@ public:
     Collection() = default;
     virtual ~Collection() = default;
 
-    virtual RecordId getCatalogId() const = 0;
+    /**
+     * Fetches the shared state across Collection instances for the a collection. Returns an object
+     * decorated by state shared across Collection instances for the same namespace. Its decorations
+     * are unversioned (not associated with any point in time view of the collection) data related
+     * to the collection.
+     */
+    virtual SharedCollectionDecorations* getSharedDecorations() const = 0;
+
+    virtual void init(OperationContext* opCtx) {}
+
+    virtual bool isCommitted() const {
+        return true;
+    }
+
+    /**
+     * Update the visibility of this collection in the Collection Catalog. Updates to this value
+     * are not idempotent, as successive updates with the same `val` should not occur.
+     */
+    virtual void setCommitted(bool val) {}
+
+    virtual bool isInitialized() const {
+        return false;
+    }
 
     virtual const NamespaceString& ns() const = 0;
 
@@ -203,6 +286,8 @@ public:
      * CollectionCatalog::setCollectionNamespace().
      */
     virtual void setNs(NamespaceString nss) = 0;
+
+    virtual RecordId getCatalogId() const = 0;
 
     virtual UUID uuid() const = 0;
 
@@ -353,7 +438,7 @@ public:
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
      */
-    virtual StatusWithMatchExpression parseValidator(
+    virtual Validator parseValidator(
         OperationContext* opCtx,
         const BSONObj& validator,
         MatchExpressionParser::AllowedFeatureSet allowedFeatures,
@@ -369,7 +454,7 @@ public:
      * An empty validator removes all validation.
      * Requires an exclusive lock on the collection.
      */
-    virtual Status setValidator(OperationContext* const opCtx, const BSONObj validator) = 0;
+    virtual void setValidator(OperationContext* const opCtx, Validator validator) = 0;
 
     virtual Status setValidationLevel(OperationContext* const opCtx, const StringData newLevel) = 0;
     virtual Status setValidationAction(OperationContext* const opCtx,
@@ -382,6 +467,9 @@ public:
                                    BSONObj newValidator,
                                    StringData newLevel,
                                    StringData newAction) = 0;
+
+    virtual bool getRecordPreImages() const = 0;
+    virtual void setRecordPreImages(OperationContext* opCtx, bool val) = 0;
 
     /**
      * Returns true if this is a temporary collection.
@@ -458,7 +546,7 @@ public:
      */
     virtual std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
-        PlanExecutor::YieldPolicy yieldPolicy,
+        PlanYieldPolicy::YieldPolicy yieldPolicy,
         ScanDirection scanDirection) = 0;
 
     virtual void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) = 0;
@@ -471,10 +559,8 @@ public:
      */
     virtual void establishOplogCollectionForLogging(OperationContext* opCtx) = 0;
 
-    virtual void init(OperationContext* opCtx) {}
-
-    virtual bool isInitialized() const {
-        return false;
+    friend auto logAttrs(const Collection& col) {
+        return logv2::multipleAttrs(col.ns(), col.uuid());
     }
 };
 

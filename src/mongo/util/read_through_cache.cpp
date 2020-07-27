@@ -31,19 +31,76 @@
 
 #include "mongo/util/read_through_cache.h"
 
+#include "mongo/stdx/condition_variable.h"
+
 namespace mongo {
 
-ReadThroughCacheBase::ReadThroughCacheBase(Mutex& mutex) : _cacheWriteMutex(mutex) {}
+ReadThroughCacheBase::ReadThroughCacheBase(Mutex& mutex,
+                                           ServiceContext* service,
+                                           ThreadPoolInterface& threadPool)
+    : _serviceContext(service), _threadPool(threadPool), _mutex(mutex) {}
 
 ReadThroughCacheBase::~ReadThroughCacheBase() = default;
 
-OID ReadThroughCacheBase::getCacheGeneration() const {
-    stdx::lock_guard<Latch> lk(_cacheWriteMutex);
-    return _fetchGeneration;
+struct ReadThroughCacheBase::CancelToken::TaskInfo {
+    TaskInfo(ServiceContext* service, Mutex& mutex) : service(service), mutex(mutex) {}
+
+    ServiceContext* const service;
+
+    Mutex& mutex;
+    Status cancelStatus{Status::OK()};
+    OperationContext* opCtxToCancel{nullptr};
+};
+
+ReadThroughCacheBase::CancelToken::CancelToken(std::shared_ptr<TaskInfo> info)
+    : _info(std::move(info)) {}
+
+ReadThroughCacheBase::CancelToken::CancelToken(CancelToken&&) = default;
+
+ReadThroughCacheBase::CancelToken::~CancelToken() = default;
+
+void ReadThroughCacheBase::CancelToken::tryCancel() {
+    stdx::lock_guard lg(_info->mutex);
+    _info->cancelStatus =
+        Status(ErrorCodes::ReadThroughCacheLookupCanceled, "Internal only: task canceled");
+    if (_info->opCtxToCancel) {
+        stdx::lock_guard clientLock(*_info->opCtxToCancel->getClient());
+        _info->service->killOperation(clientLock, _info->opCtxToCancel, _info->cancelStatus.code());
+    }
 }
 
-void ReadThroughCacheBase::_updateCacheGeneration(const CacheGuard&) {
-    _fetchGeneration = OID::gen();
+ReadThroughCacheBase::CancelToken ReadThroughCacheBase::_asyncWork(
+    WorkWithOpContext work) noexcept {
+    auto taskInfo = std::make_shared<CancelToken::TaskInfo>(_serviceContext, _cancelTokenMutex);
+
+    _threadPool.schedule([work = std::move(work), taskInfo](Status status) mutable {
+        if (!status.isOK()) {
+            work(nullptr, status);
+            return;
+        }
+
+        ThreadClient tc(taskInfo->service);
+        auto opCtxHolder = tc->makeOperationContext();
+
+        const auto cancelStatusAtTaskBegin = [&] {
+            stdx::lock_guard lg(taskInfo->mutex);
+            taskInfo->opCtxToCancel = opCtxHolder.get();
+            return taskInfo->cancelStatus;
+        }();
+
+        ON_BLOCK_EXIT([&] {
+            stdx::lock_guard lg(taskInfo->mutex);
+            taskInfo->opCtxToCancel = nullptr;
+        });
+
+        work(taskInfo->opCtxToCancel, cancelStatusAtTaskBegin);
+    });
+
+    return CancelToken(std::move(taskInfo));
+}
+
+Date_t ReadThroughCacheBase::_now() {
+    return _serviceContext->getFastClockSource()->now();
 }
 
 }  // namespace mongo

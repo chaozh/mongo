@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -35,18 +35,20 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_destination_manager.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -89,8 +91,7 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& result) override {
-        auto shardingState = ShardingState::get(opCtx);
-        uassertStatusOK(shardingState->canAcceptShardedCommands());
+        uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
         auto nss = NamespaceString(parseNs(dbname, cmdObj));
 
@@ -105,18 +106,29 @@ public:
         // Ensure this shard is not currently receiving or donating any chunks.
         auto scopedReceiveChunk(
             uassertStatusOK(ActiveMigrationsRegistry::get(opCtx).registerReceiveChunk(
-                nss, chunkRange, cloneRequest.getFromShardId())));
+                opCtx, nss, chunkRange, cloneRequest.getFromShardId())));
 
         // We force a refresh immediately after registering this migration to guarantee that this
         // shard will not receive a chunk after refreshing.
-        const auto shardVersion = forceShardFilteringMetadataRefresh(opCtx, nss);
+        onShardVersionMismatch(opCtx, nss, boost::none);
+
+        const auto collectionEpoch = [&] {
+            AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+            auto const optMetadata =
+                CollectionShardingRuntime::get(opCtx, nss)->getCurrentMetadataIfKnown();
+            uassert(
+                ErrorCodes::StaleShardVersion,
+                "Collection's metadata have been found UNKNOWN after a refresh on the recipient",
+                optMetadata);
+            return optMetadata->getShardVersion().epoch();
+        }();
 
         uassertStatusOK(
             MigrationDestinationManager::get(opCtx)->start(opCtx,
                                                            nss,
                                                            std::move(scopedReceiveChunk),
                                                            cloneRequest,
-                                                           shardVersion.epoch(),
+                                                           collectionEpoch,
                                                            writeConcern));
 
         result.appendBool("started", true);
@@ -202,7 +214,10 @@ public:
         Status const status = mdm->startCommit(sessionId);
         mdm->report(result, opCtx, false);
         if (!status.isOK()) {
-            log() << status.reason();
+            LOGV2(22014,
+                  "_recvChunkCommit failed: {error}",
+                  "_recvChunkCommit failed",
+                  "error"_attr = redact(status));
             uassertStatusOK(status);
         }
         return true;
@@ -250,7 +265,10 @@ public:
             Status const status = mdm->abort(migrationSessionIdStatus.getValue());
             mdm->report(result, opCtx, false);
             if (!status.isOK()) {
-                log() << status.reason();
+                LOGV2(22015,
+                      "_recvChunkAbort failed: {error}",
+                      "_recvChunkAbort failed",
+                      "error"_attr = redact(status));
                 uassertStatusOK(status);
             }
         } else if (migrationSessionIdStatus == ErrorCodes::NoSuchKey) {

@@ -27,10 +27,9 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/db/concurrency/write_conflict_exception.h"
-#include "mongo/util/log.h"
 #include "mongo/util/log_and_backoff.h"
 #include "mongo/util/stacktrace.h"
 
@@ -50,10 +49,12 @@ WriteConflictException::WriteConflictException()
 }
 
 void WriteConflictException::logAndBackoff(int attempt, StringData operation, StringData ns) {
-    mongo::logAndBackoff(::mongo::logger::LogComponent::kWrite,
-                         logger::LogSeverity::Debug(1),
+    mongo::logAndBackoff(4640401,
+                         ::mongo::logv2::LogComponent::kWrite,
+                         logv2::LogSeverity::Debug(1),
                          static_cast<size_t>(attempt),
-                         str::stream() << "Caught WriteConflictException doing " << operation
-                                       << " on " << ns);
+                         "Caught WriteConflictException",
+                         "operation"_attr = operation,
+                         "ns"_attr = ns);
 }
 }  // namespace mongo

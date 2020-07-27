@@ -32,6 +32,7 @@
 #include <string>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/read_write_concern_provenance.h"
 
 namespace mongo {
 
@@ -41,6 +42,10 @@ struct WriteConcernOptions {
 public:
     enum class SyncMode { UNSET, NONE, FSYNC, JOURNAL };
 
+    // This specifies the condition to check to satisfy given tags.
+    // Users can only provide OpTime condition, the others are used internally.
+    enum class CheckCondition { OpTime, Config };
+
     static constexpr int kNoTimeout = 0;
     static constexpr int kNoWaiting = -1;
 
@@ -48,6 +53,7 @@ public:
     static const BSONObj Acknowledged;
     static const BSONObj Unacknowledged;
     static const BSONObj Majority;
+    static const BSONObj kImplicitDefault;
 
     static constexpr StringData kWriteConcernField = "writeConcern"_sd;
     static const char kMajority[];  // = "majority"
@@ -97,9 +103,22 @@ public:
      */
     bool needToWaitForOtherNodes() const;
 
+    ReadWriteConcernProvenance& getProvenance() {
+        return _provenance;
+    }
+    const ReadWriteConcernProvenance& getProvenance() const {
+        return _provenance;
+    }
+
     // Returns the BSON representation of this object.
     // Warning: does not return the same object passed on the last parse() call.
     BSONObj toBSON() const;
+
+    bool operator==(const WriteConcernOptions& other) const;
+
+    bool operator!=(const WriteConcernOptions& other) const {
+        return !operator==(other);
+    }
 
     SyncMode syncMode;
 
@@ -119,6 +138,11 @@ public:
 
     // True if the default 'w' value of w:1 was used.
     bool usedDefaultW = false;
+
+    CheckCondition checkCondition = CheckCondition::OpTime;
+
+private:
+    ReadWriteConcernProvenance _provenance;
 };
 
 }  // namespace mongo

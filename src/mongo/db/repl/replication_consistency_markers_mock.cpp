@@ -95,6 +95,23 @@ Timestamp ReplicationConsistencyMarkersMock::getOplogTruncateAfterPoint(
     return _oplogTruncateAfterPoint;
 }
 
+void ReplicationConsistencyMarkersMock::startUsingOplogTruncateAfterPointForPrimary() {}
+
+void ReplicationConsistencyMarkersMock::stopUsingOplogTruncateAfterPointForPrimary() {}
+
+bool ReplicationConsistencyMarkersMock::isOplogTruncateAfterPointBeingUsedForPrimary() const {
+    return true;
+}
+
+void ReplicationConsistencyMarkersMock::setOplogTruncateAfterPointToTopOfOplog(
+    OperationContext* opCtx){};
+
+boost::optional<OpTimeAndWallTime>
+ReplicationConsistencyMarkersMock::refreshOplogTruncateAfterPointIfPrimary(
+    OperationContext* opCtx) {
+    return boost::none;
+}
+
 void ReplicationConsistencyMarkersMock::setAppliedThrough(OperationContext* opCtx,
                                                           const OpTime& optime,
                                                           bool setTimestamp) {
@@ -116,6 +133,14 @@ OpTime ReplicationConsistencyMarkersMock::getAppliedThrough(OperationContext* op
 
 Status ReplicationConsistencyMarkersMock::createInternalCollections(OperationContext* opCtx) {
     return Status::OK();
+}
+
+void ReplicationConsistencyMarkersMock::setInitialSyncIdIfNotSet(OperationContext* opCtx) {}
+
+void ReplicationConsistencyMarkersMock::clearInitialSyncId(OperationContext* opCtx) {}
+
+BSONObj ReplicationConsistencyMarkersMock::getInitialSyncId(OperationContext* opCtx) {
+    return BSONObj();
 }
 
 }  // namespace repl

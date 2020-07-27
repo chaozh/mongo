@@ -27,14 +27,19 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/s/op_observer_sharding_impl.h"
 
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/s/active_move_primaries_registry.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
 #include "mongo/db/s/migration_source_manager.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
@@ -50,19 +55,18 @@ const auto getIsMigrating = OperationContext::declareDecoration<bool>();
  * restarted.
  */
 void assertIntersectingChunkHasNotMoved(OperationContext* opCtx,
-                                        CollectionShardingRuntime* csr,
+                                        CollectionMetadata const& metadata,
                                         const BSONObj& doc) {
-    if (!repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime())
+    const auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+    if (!atClusterTime)
         return;
 
-    const auto collectionFilter = csr->getOwnershipFilter(opCtx, true /* isCollection */);
-    if (!collectionFilter.isSharded())
-        return;
-
-    auto shardKey = collectionFilter.extractShardKeyFromDoc(doc);
+    auto shardKey = metadata.getShardKeyPattern().extractShardKeyFromDoc(doc);
 
     // We can assume the simple collation because shard keys do not support non-simple collations.
-    auto chunk = collectionFilter.findIntersectingChunkWithSimpleCollation(shardKey);
+    ChunkManager chunkManagerAtClusterTime(metadata.getChunkManager()->getRoutingHistory(),
+                                           atClusterTime->asTimestamp());
+    auto chunk = chunkManagerAtClusterTime.findIntersectingChunkWithSimpleCollation(shardKey);
 
     // Throws if the chunk has moved since the timestamp of the running transaction's atClusterTime
     // read concern parameter.
@@ -74,6 +78,28 @@ bool isMigratingWithCSRLock(CollectionShardingRuntime* csr,
                             BSONObj const& docToDelete) {
     auto msm = MigrationSourceManager::get(csr, csrLock);
     return msm && msm->getCloner()->isDocumentInMigratingChunk(docToDelete);
+}
+
+void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
+    if (!nss.isNormalCollection() && nss.coll() != "system.views") {
+        return;
+    }
+
+    Lock::DBLock dblock(opCtx, nss.db(), MODE_IS);
+    auto dss = DatabaseShardingState::get(opCtx, nss.db().toString());
+    if (!dss) {
+        return;
+    }
+
+    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+    auto mpsm = dss->getMovePrimarySourceManager(dssLock);
+
+    if (mpsm) {
+        LOGV2(4908600, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = nss.toString());
+
+        uasserted(ErrorCodes::MovePrimaryInProgress,
+                  "movePrimary is in progress for namespace " + nss.toString());
+    }
 }
 
 }  // namespace
@@ -98,18 +124,20 @@ void OpObserverShardingImpl::shardObserveInsertOp(OperationContext* opCtx,
                                                   const repl::OpTime& opTime,
                                                   const bool fromMigrate,
                                                   const bool inMultiDocumentTransaction) {
-    auto* const csr = (nss == NamespaceString::kSessionTransactionsTableNamespace || fromMigrate)
-        ? nullptr
-        : CollectionShardingRuntime::get(opCtx, nss);
+    if (nss == NamespaceString::kSessionTransactionsTableNamespace || fromMigrate)
+        return;
 
-    if (!csr) {
+    auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+    csr->checkShardVersionOrThrow(opCtx);
+
+    auto metadata = csr->getCurrentMetadataIfKnown();
+    if (!metadata || !metadata->isSharded()) {
+        assertMovePrimaryInProgress(opCtx, nss);
         return;
     }
 
-    csr->checkShardVersionOrThrow(opCtx, true /* isCollection */);
-
     if (inMultiDocumentTransaction) {
-        assertIntersectingChunkHasNotMoved(opCtx, csr, insertedDoc);
+        assertIntersectingChunkHasNotMoved(opCtx, *metadata, insertedDoc);
         return;
     }
 
@@ -128,10 +156,16 @@ void OpObserverShardingImpl::shardObserveUpdateOp(OperationContext* opCtx,
                                                   const repl::OpTime& prePostImageOpTime,
                                                   const bool inMultiDocumentTransaction) {
     auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-    csr->checkShardVersionOrThrow(opCtx, true /* isCollection */);
+    csr->checkShardVersionOrThrow(opCtx);
+
+    auto metadata = csr->getCurrentMetadataIfKnown();
+    if (!metadata || !metadata->isSharded()) {
+        assertMovePrimaryInProgress(opCtx, nss);
+        return;
+    }
 
     if (inMultiDocumentTransaction) {
-        assertIntersectingChunkHasNotMoved(opCtx, csr, postImageDoc);
+        assertIntersectingChunkHasNotMoved(opCtx, *metadata, postImageDoc);
         return;
     }
 
@@ -149,10 +183,16 @@ void OpObserverShardingImpl::shardObserveDeleteOp(OperationContext* opCtx,
                                                   const repl::OpTime& preImageOpTime,
                                                   const bool inMultiDocumentTransaction) {
     auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-    csr->checkShardVersionOrThrow(opCtx, true /* isCollection */);
+    csr->checkShardVersionOrThrow(opCtx);
+
+    auto metadata = csr->getCurrentMetadataIfKnown();
+    if (!metadata || !metadata->isSharded()) {
+        assertMovePrimaryInProgress(opCtx, nss);
+        return;
+    }
 
     if (inMultiDocumentTransaction) {
-        assertIntersectingChunkHasNotMoved(opCtx, csr, documentKey);
+        assertIntersectingChunkHasNotMoved(opCtx, *metadata, documentKey);
         return;
     }
 

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -40,10 +40,10 @@
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -65,7 +65,10 @@ TaskRunner::NextAction runSingleTask(const TaskRunner::Task& task,
     try {
         return task(opCtx, status);
     } catch (...) {
-        log() << "Unhandled exception in task runner: " << redact(exceptionToStatus());
+        LOGV2(21777,
+              "Unhandled exception in task runner: {error}",
+              "Unhandled exception in task runner",
+              "error"_attr = redact(exceptionToStatus()));
     }
     return TaskRunner::NextAction::kCancel;
 }

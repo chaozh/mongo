@@ -52,6 +52,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_metrics_observer.h"
 #include "mongo/idl/mutable_observer_registry.h"
+#include "mongo/logv2/attribute_storage.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -598,6 +599,18 @@ public:
             return _transactionInfoForLog(opCtx, lockStats, terminationCause, readConcernArgs);
         }
 
+        BSONObj getTransactionInfoBSONForLogForTest(
+            OperationContext* opCtx,
+            const SingleThreadedLockStats* lockStats,
+            bool committed,
+            const repl::ReadConcernArgs& readConcernArgs) const {
+
+            TerminationCause terminationCause =
+                committed ? TerminationCause::kCommitted : TerminationCause::kAborted;
+            return _transactionInfoBSONForLog(opCtx, lockStats, terminationCause, readConcernArgs);
+        }
+
+
         SingleTransactionStats getSingleTransactionStatsForTest() const {
             return o().transactionMetricsObserver.getSingleTransactionStats();
         }
@@ -695,6 +708,17 @@ public:
         // transaction must be completed (committed or aborted) and a valid LockStats reference must
         // be passed in order for this method to be called.
         std::string _transactionInfoForLog(OperationContext* opCtx,
+                                           const SingleThreadedLockStats* lockStats,
+                                           TerminationCause terminationCause,
+                                           repl::ReadConcernArgs readConcernArgs) const;
+
+        void _transactionInfoForLog(OperationContext* opCtx,
+                                    const SingleThreadedLockStats* lockStats,
+                                    TerminationCause terminationCause,
+                                    repl::ReadConcernArgs readConcernArgs,
+                                    logv2::DynamicAttributes* pAttrs) const;
+
+        BSONObj _transactionInfoBSONForLog(OperationContext* opCtx,
                                            const SingleThreadedLockStats* lockStats,
                                            TerminationCause terminationCause,
                                            repl::ReadConcernArgs readConcernArgs) const;
@@ -899,6 +923,9 @@ private:
 
         // Total size in bytes of all operations within the _transactionOperations vector.
         size_t transactionOperationBytes{0};
+
+        // Number of operations that have pre-images to be written to noop oplog entries.
+        size_t numberOfPreImagesToWrite{0};
 
         // The autocommit setting of this transaction. Should always be false for multi-statement
         // transaction. Currently only needed for diagnostics reporting.

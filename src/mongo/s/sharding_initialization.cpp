@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -54,6 +54,7 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/s/balancer_configuration.h"
@@ -67,7 +68,7 @@
 #include "mongo/s/client/sharding_network_connection_hook.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/mongos_server_parameters_gen.h"
+#include "mongo/s/mongod_and_mongos_server_parameters_gen.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/sharding_task_executor.h"
 #include "mongo/s/sharding_task_executor_pool_controller.h"
@@ -75,7 +76,6 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/str.h"
 
@@ -192,7 +192,9 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
                                      rpc::ShardingEgressMetadataHookBuilder hookBuilder,
                                      boost::optional<size_t> taskExecutorPoolSize) {
     ConnectionPool::Options connPoolOptions;
-    connPoolOptions.controller = std::make_shared<ShardingTaskExecutorPoolController>();
+    connPoolOptions.controllerFactory = []() noexcept {
+        return std::make_shared<ShardingTaskExecutorPoolController>();
+    };
 
     auto network = executor::makeNetworkInterface(
         "ShardRegistry", std::make_unique<ShardingNetworkConnectionHook>(), hookBuilder());
@@ -255,9 +257,11 @@ Status waitForShardRegistryReload(OperationContext* opCtx) {
             continue;
         } catch (const DBException& ex) {
             Status status = ex.toStatus();
-            warning()
-                << "Error initializing sharding state, sleeping for 2 seconds and trying again"
-                << causedBy(status);
+            LOGV2_WARNING(
+                23834,
+                "Error {error} initializing sharding state, sleeping for 2 seconds and retrying",
+                "Error initializing sharding state, sleeping for 2 seconds and retrying",
+                "error"_attr = status);
             sleepFor(kRetryInterval);
             continue;
         }

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -36,6 +36,7 @@
 #include <functional>
 
 #include "mongo/config.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
@@ -45,7 +46,6 @@
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/hierarchical_acquisition.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/timer.h"
 
@@ -55,6 +55,10 @@ namespace {
 
 class PeriodicTaskRunner : public BackgroundJob {
 public:
+    // Tasks are expected to finish reasonably quickly, so when a task run takes longer
+    // than `kMinLog`, the verbosity of its summary log statement is upgraded from 3 to 0.
+    static constexpr auto kMinLog = Milliseconds(100);
+
     PeriodicTaskRunner() : _shutdownRequested(false) {}
 
     void add(PeriodicTask* task);
@@ -147,7 +151,11 @@ void BackgroundJob::jobBody() {
         setThreadName(threadName);
     }
 
-    LOG(1) << "BackgroundJob starting: " << threadName;
+    LOGV2_DEBUG(23098,
+                1,
+                "BackgroundJob starting: {threadName}",
+                "BackgroundJob starting",
+                "threadName"_attr = threadName);
 
     run();
 
@@ -333,14 +341,26 @@ void PeriodicTaskRunner::_runTask(PeriodicTask* const task) {
     try {
         task->taskDoWork();
     } catch (const std::exception& e) {
-        error() << "task: " << taskName << " failed: " << redact(e.what());
+        LOGV2_ERROR(23100,
+                    "Task: {taskName} failed: {error}",
+                    "Task failed",
+                    "taskName"_attr = taskName,
+                    "error"_attr = redact(e.what()));
     } catch (...) {
-        error() << "task: " << taskName << " failed with unknown error";
+        LOGV2_ERROR(23101,
+                    "Task: {taskName} failed with unknown error",
+                    "Task failed with unknown error",
+                    "taskName"_attr = taskName);
     }
 
-    const int ms = timer.millis();
-    const int kMinLogMs = 100;
-    LOG(ms <= kMinLogMs ? 3 : 0) << "task: " << taskName << " took: " << ms << "ms";
+    const auto duration = timer.elapsed();
+
+    LOGV2_DEBUG(23099,
+                duration <= kMinLog ? 3 : 0,
+                "Task: {taskName} took: {duration}",
+                "Task finished",
+                "taskName"_attr = taskName,
+                "duration"_attr = duration_cast<Milliseconds>(duration));
 }
 
 }  // namespace mongo

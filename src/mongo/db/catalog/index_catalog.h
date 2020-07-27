@@ -66,16 +66,13 @@ enum class IndexBuildMethod {
      */
     kHybrid,
     /**
-     * Perform a collection scan by writing each document's generated key directly into the index.
-     * Accept writes in the background into the index as well.
-     */
-    kBackground,
-    /**
      * Perform a collection scan to dump all keys into the exteral sorter, then into the index.
      * During this process, callers guarantee that no writes will be accepted on this collection.
      */
     kForeground,
 };
+
+StringData toString(IndexBuildMethod method);
 
 enum class CreateIndexEntryFlags : int {
     kNone = 0x0,
@@ -218,19 +215,15 @@ public:
         const bool includeUnfinishedIndexes = false) const = 0;
 
     /**
-     * Find index by matching key pattern and collation spec.  The key pattern and collation spec
-     * uniquely identify an index.
+     * Find index by matching key pattern and options. The key pattern, collation spec, and partial
+     * filter expression together uniquely identify an index.
      *
-     * Collation is specified as a normalized collation spec as returned by
-     * CollationInterface::getSpec.  An empty object indicates the simple collation.
-     *
-     * @return null if cannot find index, otherwise the index with a matching key pattern and
-     * collation.
+     * @return null if cannot find index, otherwise the index with a matching signature.
      */
-    virtual const IndexDescriptor* findIndexByKeyPatternAndCollationSpec(
+    virtual const IndexDescriptor* findIndexByKeyPatternAndOptions(
         OperationContext* const opCtx,
         const BSONObj& key,
-        const BSONObj& collationSpec,
+        const BSONObj& indexSpec,
         const bool includeUnfinishedIndexes = false) const = 0;
 
     /**
@@ -410,28 +403,12 @@ public:
     // ---- modify single index
 
     /**
-     * Returns true if the index 'idx' is multikey, and returns false otherwise.
-     */
-    virtual bool isMultikey(const IndexDescriptor* const idx) = 0;
-
-    /**
-     * Returns the path components that cause the index 'idx' to be multikey if the index supports
-     * path-level multikey tracking, and returns an empty vector if path-level multikey tracking
-     * isn't supported.
-     *
-     * If the index supports path-level multikey tracking but isn't multikey, then this function
-     * returns a vector with size equal to the number of elements in the index key pattern where
-     * each element in the vector is an empty set.
-     */
-    virtual MultikeyPaths getMultikeyPaths(OperationContext* const opCtx,
-                                           const IndexDescriptor* const idx) = 0;
-
-    /**
      * Sets the index 'desc' to be multikey with the provided 'multikeyPaths'.
      *
      * See IndexCatalogEntry::setMultikey().
      */
     virtual void setMultikeyPaths(OperationContext* const opCtx,
+                                  Collection* coll,
                                   const IndexDescriptor* const desc,
                                   const MultikeyPaths& multikeyPaths) = 0;
 
@@ -444,6 +421,7 @@ public:
      * This method may throw.
      */
     virtual Status indexRecords(OperationContext* const opCtx,
+                                Collection* collection,
                                 const std::vector<BsonRecord>& bsonRecords,
                                 int64_t* const keysInsertedOut) = 0;
 
@@ -454,6 +432,7 @@ public:
      * This method may throw.
      */
     virtual Status updateRecord(OperationContext* const opCtx,
+                                Collection* coll,
                                 const BSONObj& oldDoc,
                                 const BSONObj& newDoc,
                                 const RecordId& recordId,
@@ -496,9 +475,12 @@ public:
      * index constraints, as needed by replication.
      */
     virtual void prepareInsertDeleteOptions(OperationContext* opCtx,
+                                            const NamespaceString& ns,
                                             const IndexDescriptor* desc,
                                             InsertDeleteOptions* options) const = 0;
 
-    virtual void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) = 0;
+    virtual void indexBuildSuccess(OperationContext* opCtx,
+                                   const Collection* coll,
+                                   IndexCatalogEntry* index) = 0;
 };
 }  // namespace mongo

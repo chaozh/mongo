@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -40,8 +40,8 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/oplog_applier_impl.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace repl {
@@ -133,15 +133,24 @@ StatusWith<InsertGroup::ConstIterator> InsertGroup::groupAndApplyInserts(ConstIt
     } catch (...) {
         // The group insert failed, log an error and fall through to the
         // application of an individual op.
+        static constexpr char message[] =
+            "Error applying inserts in bulk. Trying first insert as a lone insert";
         auto status = exceptionToStatus().withContext(
-            str::stream() << "Error applying inserts in bulk: " << redact(groupedInserts.toBSON())
-                          << ". Trying first insert as a lone insert: " << redact(entry.getRaw()));
+            str::stream() << message << ". Grouped inserts: " << redact(groupedInserts.toBSON())
+                          << ". First insert: " << redact(entry.getRaw()));
 
         // It's not an error during initial sync to encounter DuplicateKey errors.
         if (Mode::kInitialSync == _mode && ErrorCodes::DuplicateKey == status) {
-            LOG(2) << status;
+            LOGV2_DEBUG(21203,
+                        2,
+                        message,
+                        "groupedInserts"_attr = redact(groupedInserts.toBSON()),
+                        "firstInsert"_attr = redact(entry.getRaw()));
         } else {
-            error() << status;
+            LOGV2_ERROR(21204,
+                        message,
+                        "groupedInserts"_attr = redact(groupedInserts.toBSON()),
+                        "firstInsert"_attr = redact(entry.getRaw()));
         }
 
         // Avoid quadratic run time from failed insert by not retrying until we

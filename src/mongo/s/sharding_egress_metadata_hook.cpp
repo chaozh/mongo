@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -56,8 +56,6 @@ ShardingEgressMetadataHook::ShardingEgressMetadataHook(ServiceContext* serviceCo
 Status ShardingEgressMetadataHook::writeRequestMetadata(OperationContext* opCtx,
                                                         BSONObjBuilder* metadataBob) {
     try {
-        writeAuthDataToImpersonatedUserMetadata(opCtx, metadataBob);
-        ClientMetadataIsMasterState::writeToMetadata(opCtx, metadataBob);
         rpc::ConfigServerMetadata(_getConfigServerOpTime()).writeToMetadata(metadataBob);
         return Status::OK();
     } catch (...) {

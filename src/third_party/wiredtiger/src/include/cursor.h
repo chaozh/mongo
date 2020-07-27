@@ -1,10 +1,13 @@
 /*-
- * Copyright (c) 2014-2019 MongoDB, Inc.
+ * Copyright (c) 2014-2020 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
  * See the file LICENSE for redistribution information.
  */
+
+/* Get the session from any cursor. */
+#define CUR2S(c) ((WT_SESSION_IMPL *)((WT_CURSOR *)c)->session)
 
 /*
  * Initialize a static WT_CURSOR structure.
@@ -32,21 +35,6 @@
       0                      /* uint32_t flags */                                               \
     }
 
-/*
- * Block based incremental backup structure. These live in the connection.
- */
-#define WT_BLKINCR_MAX 2
-struct __wt_blkincr {
-    const char *id_str;    /* User's name for this backup. */
-    const char *ckpt_name; /* Requires WT-5115. All checkpoints must be this name */
-    void *data;
-/* AUTOMATIC FLAG VALUE GENERATION START */
-#define WT_BLKINCR_INUSE 0x1u /* This entry is active */
-#define WT_BLKINCR_VALID 0x2u /* This entry is valid */
-                              /* AUTOMATIC FLAG VALUE GENERATION STOP */
-    uint64_t flags;
-};
-
 struct __wt_cursor_backup {
     WT_CURSOR iface;
 
@@ -61,42 +49,40 @@ struct __wt_cursor_backup {
     size_t list_next;
 
     /* File offset-based incremental backup. */
-    WT_BLKINCR *incr;          /* Incremental backup in use */
-    char *incr_file;           /* File name */
-    char *incr_src;            /* Source identifier */
-    char *incr_this;           /* New base identifier */
-    uint64_t incr_granularity; /* Maximum transfer size */
+    WT_BLKINCR *incr_src; /* Incremental backup source */
+    char *incr_file;      /* File name */
 
     WT_CURSOR *incr_cursor; /* File cursor */
-    /* Start/stop checkpoints */
-    char *incr_checkpoint_start;
-    char *incr_checkpoint_stop;
 
-#define WT_BACKUP_INCR_COMPONENTS 3
-    bool incr_init;            /* Cursor traversal initialized */
-    uint64_t *incr_list;       /* List of file offset/size/type triples */
-    uint64_t incr_list_count;  /* Count of file offset/size/type triples */
-    uint64_t incr_list_offset; /* Current offset */
-    uint64_t incr_size;        /* Maximum transfer size */
-    WT_ITEM *incr_block;       /* Current block of data */
+    WT_ITEM bitstring;    /* List of modified blocks */
+    uint64_t nbits;       /* Number of bits in bitstring */
+    uint64_t offset;      /* Zero bit offset in bitstring */
+    uint64_t bit_offset;  /* Current offset */
+    uint64_t granularity; /* Length, transfer size */
 
 /* AUTOMATIC FLAG VALUE GENERATION START */
-#define WT_CURBACKUP_DUP 0x1u        /* Duplicated backup cursor */
-#define WT_CURBACKUP_FORCE_STOP 0x2u /* Force stop incremental backup */
-#define WT_CURBACKUP_INCR 0x4u       /* Incremental backup cursor */
-#define WT_CURBACKUP_LOCKER 0x8u     /* Hot-backup started */
-                                     /* AUTOMATIC FLAG VALUE GENERATION STOP */
-    uint8_t flags;
+#define WT_CURBACKUP_CKPT_FAKE 0x001u   /* Object has fake checkpoint */
+#define WT_CURBACKUP_DUP 0x002u         /* Duplicated backup cursor */
+#define WT_CURBACKUP_FORCE_FULL 0x004u  /* Force full file copy for this cursor */
+#define WT_CURBACKUP_FORCE_STOP 0x008u  /* Force stop incremental backup */
+#define WT_CURBACKUP_HAS_CB_INFO 0x010u /* Object has checkpoint backup info */
+#define WT_CURBACKUP_INCR 0x020u        /* Incremental backup cursor */
+#define WT_CURBACKUP_INCR_INIT 0x040u   /* Cursor traversal initialized */
+#define WT_CURBACKUP_LOCKER 0x080u      /* Hot-backup started */
+#define WT_CURBACKUP_RENAME 0x100u      /* Object had a rename */
+                                        /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint32_t flags;
 };
+
+/* Get the WT_BTREE from any WT_CURSOR/WT_CURSOR_BTREE. */
+#define CUR2BT(c)                                \
+    (((WT_CURSOR_BTREE *)(c))->dhandle == NULL ? \
+        NULL :                                   \
+        (WT_BTREE *)((WT_CURSOR_BTREE *)(c))->dhandle->handle)
 
 struct __wt_cursor_btree {
     WT_CURSOR iface;
 
-    /*
-     * The btree field is safe to use when the cursor is open. When the cursor is cached, the btree
-     * may be closed, so it is only safe initially to look at the underlying data handle.
-     */
-    WT_BTREE *btree;         /* Enclosing btree */
     WT_DATA_HANDLE *dhandle; /* Data handle for the btree */
 
     /*
@@ -199,7 +185,10 @@ struct __wt_cursor_btree {
      * The update structure allocated by the row- and column-store modify functions, used to avoid a
      * data copy in the WT_CURSOR.update call.
      */
-    WT_UPDATE *modify_update;
+    WT_UPDATE_VALUE *modify_update, _modify_update;
+
+    /* An intermediate structure to hold the update value to be assigned to the cursor buffer. */
+    WT_UPDATE_VALUE *upd_value, _upd_value;
 
     /*
      * Fixed-length column-store items are a single byte, and it's simpler and cheaper to allocate
@@ -228,10 +217,11 @@ struct __wt_cursor_btree {
 #define WT_CBT_ITERATE_PREV 0x008u       /* Prev iteration configuration */
 #define WT_CBT_ITERATE_RETRY_NEXT 0x010u /* Prepare conflict by next. */
 #define WT_CBT_ITERATE_RETRY_PREV 0x020u /* Prepare conflict by prev. */
-#define WT_CBT_NO_TXN 0x040u             /* Non-txn cursor (e.g. a checkpoint) */
-#define WT_CBT_READ_ONCE 0x080u          /* Page in with WT_READ_WONT_NEED */
-#define WT_CBT_SEARCH_SMALLEST 0x100u    /* Row-store: small-key insert list */
-#define WT_CBT_VAR_ONPAGE_MATCH 0x200u   /* Var-store: on-page recno match */
+#define WT_CBT_NO_TRACKING 0x040u        /* Non tracking cursor. */
+#define WT_CBT_NO_TXN 0x080u             /* Non-txn cursor (e.g. a checkpoint) */
+#define WT_CBT_READ_ONCE 0x100u          /* Page in with WT_READ_WONT_NEED */
+#define WT_CBT_SEARCH_SMALLEST 0x200u    /* Row-store: small-key insert list */
+#define WT_CBT_VAR_ONPAGE_MATCH 0x400u   /* Var-store: on-page recno match */
 /* AUTOMATIC FLAG VALUE GENERATION STOP */
 
 #define WT_CBT_POSITION_MASK /* Flags associated with position */                      \
@@ -516,4 +506,5 @@ struct __wt_cursor_table {
 
 #define WT_CURSOR_RECNO(cursor) WT_STREQ((cursor)->key_format, "r")
 
-#define WT_CURSOR_RAW_OK (WT_CURSTD_DUMP_HEX | WT_CURSTD_DUMP_PRINT | WT_CURSTD_RAW)
+#define WT_CURSOR_RAW_OK \
+    (WT_CURSTD_DUMP_HEX | WT_CURSTD_DUMP_PRETTY | WT_CURSTD_DUMP_PRINT | WT_CURSTD_RAW)

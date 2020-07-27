@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include <string>
 
@@ -45,7 +45,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/service_context.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -80,7 +80,10 @@ public:
                            string& errmsg,
                            BSONObjBuilder& result) {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-        log() << "test only command godinsert invoked coll:" << nss.coll();
+        LOGV2(20505,
+              "Test-only command 'godinsert' invoked coll:{collection}",
+              "Test-only command 'godinsert' invoked",
+              "collection"_attr = nss.coll());
         BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
 
         Lock::DBLock lk(opCtx, dbname, MODE_X);
@@ -158,8 +161,11 @@ public:
             // Scan backwards through the collection to find the document to start truncating from.
             // We will remove 'n' documents, so start truncating from the (n + 1)th document to the
             // end.
-            auto exec = InternalPlanner::collectionScan(
-                opCtx, fullNs.ns(), collection, PlanExecutor::NO_YIELD, InternalPlanner::BACKWARD);
+            auto exec = InternalPlanner::collectionScan(opCtx,
+                                                        fullNs.ns(),
+                                                        collection,
+                                                        PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                        InternalPlanner::BACKWARD);
 
             for (int i = 0; i < n + 1; ++i) {
                 PlanExecutor::ExecState state = exec->getNext(static_cast<BSONObj*>(nullptr), &end);
@@ -171,7 +177,6 @@ public:
             }
         }
 
-        BackgroundOperation::assertNoBgOpInProgForNs(fullNs.ns());
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
             collection->uuid());
 

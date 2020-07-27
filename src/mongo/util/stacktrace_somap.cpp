@@ -27,13 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/stacktrace_somap.h"
 
 #include <climits>
 #include <cstdlib>
+#include <fmt/format.h>
 #include <string>
 
 #if defined(__linux__)
@@ -52,8 +53,8 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/version.h"
 
@@ -144,36 +145,55 @@ void processLoadSegment(const dl_phdr_info& info, const ElfW(Phdr) & phdr, BSONO
     // Segment includes beginning of file and is large enough to hold the ELF header
     memcpy(&eHeader, (char*)(info.dlpi_addr + phdr.p_vaddr), sizeof(eHeader));
 
-    std::string quotedFileName = "\"" + str::escape(info.dlpi_name) + "\"";
+    const char* filename = info.dlpi_name;
 
-    if (memcmp(&eHeader.e_ident[0], ELFMAG, SELFMAG)) {
-        warning() << "Bad ELF magic number in image of " << quotedFileName;
+    if (memcmp(&eHeader.e_ident[EI_MAG0], ELFMAG, SELFMAG)) {
+        LOGV2_WARNING(23842,
+                      "Bad ELF magic number",
+                      "filename"_attr = filename,
+                      "magic"_attr = hexdump((const char*)&eHeader.e_ident[EI_MAG0], SELFMAG),
+                      "magicExpected"_attr = hexdump(ELFMAG, SELFMAG));
         return;
     }
 
-    static constexpr int kArchBits = ARCH_BITS;
-    if (eHeader.e_ident[EI_CLASS] != ARCH_ELFCLASS) {
-        warning() << "Expected elf file class of " << quotedFileName << " to be " << ARCH_ELFCLASS
-                  << "(" << kArchBits << "-bit), but found " << int(eHeader.e_ident[4]);
+    if (uint8_t elfClass = eHeader.e_ident[EI_CLASS]; elfClass != ARCH_ELFCLASS) {
+        auto elfClassStr = [](uint8_t c) -> std::string {
+            switch (c) {
+                case ELFCLASS32:
+                    return "ELFCLASS32";
+                case ELFCLASS64:
+                    return "ELFCLASS64";
+            }
+            return format(FMT_STRING("[elfClass unknown: {}]"), c);
+        };
+        LOGV2_WARNING(23843,
+                      "Unexpected ELF class (i.e. bit width)",
+                      "filename"_attr = filename,
+                      "elfClass"_attr = elfClassStr(elfClass),
+                      "elfClassExpected"_attr = elfClassStr(ARCH_ELFCLASS));
         return;
     }
 
-    if (eHeader.e_ident[EI_VERSION] != EV_CURRENT) {
-        warning() << "Wrong ELF version in " << quotedFileName << ".  Expected " << EV_CURRENT
-                  << " but found " << int(eHeader.e_ident[EI_VERSION]);
+    if (uint32_t elfVersion = eHeader.e_ident[EI_VERSION]; elfVersion != EV_CURRENT) {
+        LOGV2_WARNING(23844,
+                      "Wrong ELF version",
+                      "filename"_attr = filename,
+                      "elfVersion"_attr = elfVersion,
+                      "elfVersionExpected"_attr = EV_CURRENT);
         return;
     }
 
-    soInfo->append("elfType", eHeader.e_type);
+    uint16_t elfType = eHeader.e_type;
+    soInfo->append("elfType", elfType);
 
-    switch (eHeader.e_type) {
+    switch (elfType) {
         case ET_EXEC:
             break;
         case ET_DYN:
             return;
         default:
-            warning() << "Surprised to find " << quotedFileName << " is ELF file of type "
-                      << eHeader.e_type;
+            LOGV2_WARNING(
+                23845, "Unexpected ELF type", "filename"_attr = filename, "elfType"_attr = elfType);
             return;
     }
 

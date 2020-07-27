@@ -74,10 +74,6 @@ static ServerStatusMetricField<Counter64> dCursorStatsOpenNoTimeout("cursor.open
 static ServerStatusMetricField<Counter64> dCursorStatusTimedout("cursor.timedOut",
                                                                 &cursorStatsTimedOut);
 
-long long ClientCursor::totalOpen() {
-    return cursorStatsOpen.get();
-}
-
 ClientCursor::ClientCursor(ClientCursorParams params,
                            CursorId cursorId,
                            OperationContext* operationUsingCursor,
@@ -92,13 +88,12 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _originatingCommand(params.originatingCommandObj),
       _originatingPrivileges(std::move(params.originatingPrivileges)),
       _queryOptions(params.queryOptions),
-      _lockPolicy(params.lockPolicy),
-      _needsMerge(params.needsMerge),
       _exec(std::move(params.exec)),
       _operationUsingCursor(operationUsingCursor),
       _lastUseDate(now),
       _createdDate(now),
-      _planSummary(Explain::getPlanSummary(_exec.get())) {
+      _planSummary(_exec->getPlanSummary()),
+      _opKey(operationUsingCursor->getOperationKey()) {
     invariant(_exec);
     invariant(_operationUsingCursor);
 

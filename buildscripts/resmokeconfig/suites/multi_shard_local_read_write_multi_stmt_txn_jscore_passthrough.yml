@@ -127,6 +127,7 @@ selector:
   - jstests/core/sortf.js
   - jstests/core/sortg.js
   - jstests/core/sortj.js
+  - jstests/core/sort_with_meta_operator.js
   - jstests/core/tailable_skip_limit.js
   - jstests/core/type_array.js
   - jstests/core/uniqueness.js
@@ -144,9 +145,6 @@ selector:
 
   # TODO: SERVER-38207 Cannot insert document with MaxKey shard key.
   - jstests/core/type8.js
-
-  # TODO: SERVER-38690 Mongos should throw write targeting errors in a transaction.
-  - jstests/core/update_setOnInsert.js
 
   ##
   ## Some aggregation stages aren't allowed in a transaction.
@@ -332,11 +330,10 @@ executor:
           networkErrorAndTxnOverrideConfig:
             wrapCRUDinTransactions: true
           sessionOptions:
-            # Causal consistency is not required because tests in this suite only read from
-            # primaries, only one node is electable in each shard, and they use transactions with
-            # "local" level read concern, which should see all applied writes, including those that
-            # have not been majority replicated.
-            causalConsistency: false
+            # Read your own writes is not guaranteed without causal consistency since the
+            # coordinateCommit commmand returns as soon as the decision is made durable, and
+            # prepare conflicts are explicity ignored for non-causal reads.
+            causalConsistency: true
       readMode: commands
   hooks:
   - class: CheckReplDBHashInBackground
@@ -367,5 +364,6 @@ executor:
           transaction: 4
         enableTestCommands: 1
         numInitialSyncAttempts: 1
+        coordinateCommitReturnImmediatelyAfterPersistingDecision: true
     num_rs_nodes_per_shard: 2
     num_shards: 2

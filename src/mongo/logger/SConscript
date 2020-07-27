@@ -4,10 +4,6 @@ Import("env")
 
 env = env.Clone()
 
-env.Library('parse_log_component_settings',
-            ['parse_log_component_settings.cpp'],
-            LIBDEPS=['$BUILD_DIR/mongo/base',])
-
 # writes multi-byte sequences to console
 # to support manual testing of console stream  under Windows
 # output should be visually verified under Command Prompt or Power Shell
@@ -20,20 +16,15 @@ env.Program(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/unittest/unittest_main'
     ],
+    AIB_COMPONENT="standalone-console-test",
 )
 
 env.CppUnitTest(
     target='logger_test',
     source=[
-        'log_component_settings_test.cpp',
-        'log_function_test.cpp',
-        'log_test.cpp',
-        'parse_log_component_settings_test.cpp',
-        'redaction_test.cpp',
         'rotatable_file_writer_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        'parse_log_component_settings',
     ],
 )

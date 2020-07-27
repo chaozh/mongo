@@ -70,9 +70,14 @@ var $config = extendWorkload($config, function($config, $super) {
      * acceptable errors, e.g. ConflictingOperationInProgress, and is not guaranteed to succeed.
      */
     $config.states.moveChunk = function moveChunk(db, collName, connCache) {
+        // Committing a chunk migration requires acquiring the global X lock on the CSRS primary.
+        // This state function is unsafe to automatically run inside a multi-statement transaction
+        // because it'll have left an idle transaction on the CSRS primary before attempting to run
+        // the moveChunk command, which can lead to a hang.
+        fsm.forceRunningOutsideTransaction(this);
+
         // Choose a random chunk in our partition to move.
-        const chunk =
-            this.getRandomChunkInPartition(collName, ChunkHelper.getPrimary(connCache.config));
+        const chunk = this.getRandomChunkInPartition(collName, connCache.rsConns.config);
         const fromShard = chunk.shard;
 
         // Choose a random shard to move the chunk to.
@@ -88,8 +93,9 @@ var $config = extendWorkload($config, function($config, $super) {
         // limited number of retries with exponential backoff.
         const bounds = this.calculateChunkBoundsForShardKey(collName, chunk);
         const waitForDelete = Random.rand() < 0.5;
+        const secondaryThrottle = Random.rand() < 0.5;
         try {
-            ChunkHelper.moveChunk(db, collName, bounds, toShard, waitForDelete);
+            ChunkHelper.moveChunk(db, collName, bounds, toShard, waitForDelete, secondaryThrottle);
         } catch (e) {
             // Failed moveChunks are thrown by the moveChunk helper with the response included as a
             // JSON string in the error's message.

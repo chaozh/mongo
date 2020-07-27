@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -39,9 +39,16 @@
 #include <fstream>
 #include <iostream>
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
+
+namespace {
+MONGO_INITIALIZER(initApplicationInfo)(InitializerContext* context) {
+    ProcessInfo().appInfo().init(context->args());
+    return Status::OK();
+}
+}  // namespace
 
 class PidFileWiper {
 public:
@@ -61,11 +68,14 @@ public:
         if (!out.good()) {
             auto errAndStr = errnoAndDescription();
             if (errAndStr.first == 0) {
-                log() << "ERROR: Cannot write pid file to " << path.string()
-                      << ": Unable to determine OS error";
+                LOGV2(23329,
+                      "ERROR: Cannot write pid file to {path_string}: Unable to determine OS error",
+                      "path_string"_attr = path.string());
             } else {
-                log() << "ERROR: Cannot write pid file to " << path.string() << ": "
-                      << errAndStr.second;
+                LOGV2(23330,
+                      "ERROR: Cannot write pid file to {path_string}: {errAndStr_second}",
+                      "path_string"_attr = path.string(),
+                      "errAndStr_second"_attr = errAndStr.second);
             }
         } else {
             boost::system::error_code ec;
@@ -75,8 +85,10 @@ public:
                     boost::filesystem::group_read | boost::filesystem::others_read,
                 ec);
             if (ec) {
-                log() << "Could not set permissions on pid file " << path.string() << ": "
-                      << ec.message();
+                LOGV2(23331,
+                      "Could not set permissions on pid file {path_string}: {ec_message}",
+                      "path_string"_attr = path.string(),
+                      "ec_message"_attr = ec.message());
                 return false;
             }
         }

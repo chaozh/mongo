@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/bson/json.h"
 
@@ -36,14 +36,15 @@
 
 #include "mongo/base/parse_number.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/platform/strtoll.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/hex.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
@@ -53,9 +54,14 @@ using std::unique_ptr;
 using namespace fmt::literals;
 
 #if 0
-#define MONGO_JSON_DEBUG(message)                                                          \
-    log() << "JSON DEBUG @ " << __FILE__ << ":" << __LINE__ << " " << __FUNCTION__ << ": " \
-          << message << endl;
+#define MONGO_JSON_DEBUG(message)                                \
+    LOGV2(20107,                                                 \
+          "JSON DEBUG @ {FILE_}:{LINE_} {FUNCTION_}{}{message}", \
+          "FILE_"_attr = __FILE__,                               \
+          "LINE_"_attr = __LINE__,                               \
+          "FUNCTION_"_attr = __FUNCTION__,                       \
+          ""_attr = ": " \,                                      \
+          "message"_attr = message);
 #else
 #define MONGO_JSON_DEBUG(message)
 #endif
@@ -228,6 +234,14 @@ Status JParse::object(StringData fieldName, BSONObjBuilder& builder, bool subObj
             return parseError("Reserved field name in base object: $binary");
         }
         Status ret = binaryObject(fieldName, builder);
+        if (ret != Status::OK()) {
+            return ret;
+        }
+    } else if (firstField == "$uuid") {
+        if (!subObject) {
+            return parseError("Reserved field name in base object: $uuid");
+        }
+        Status ret = uuidObject(fieldName, builder);
         if (ret != Status::OK()) {
             return ret;
         }
@@ -473,6 +487,28 @@ Status JParse::binaryObject(StringData fieldName, BSONObjBuilder& builder) {
 
     builder.appendBinData(
         fieldName, binData.length(), BinDataType(binDataTypeNumeric), binData.data());
+    return Status::OK();
+}
+
+Status JParse::uuidObject(StringData fieldName, BSONObjBuilder& builder) {
+    if (!readToken(COLON)) {
+        return parseError("Expected ':'");
+    }
+    std::string uuidString;
+    uuidString.reserve(40);
+
+    Status dataRet = quotedString(&uuidString);
+    if (dataRet != Status::OK()) {
+        return dataRet;
+    }
+
+    auto uuid = UUID::parse(uuidString);
+    if (!uuid.isOK()) {
+        return uuid.getStatus();
+    }
+
+    uuid.getValue().appendToBuilder(&builder, fieldName);
+
     return Status::OK();
 }
 

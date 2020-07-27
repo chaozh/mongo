@@ -595,6 +595,8 @@ private:
     Value _value;
 };
 
+inline namespace literals {
+
 inline Decimal128 operator"" _dec128(const char* s) {
     return Decimal128(s);
 }
@@ -602,5 +604,31 @@ inline Decimal128 operator"" _dec128(const char* s) {
 inline Decimal128 operator"" _dec128(const char* s, std::size_t len) {
     return Decimal128(std::string(s, len));
 }
+
+inline bool operator<(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isLess(rhs);
+}
+
+inline bool operator<=(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isLessEqual(rhs);
+}
+
+inline bool operator>(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isGreater(rhs);
+}
+
+inline bool operator>=(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isGreaterEqual(rhs);
+}
+
+inline bool operator==(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isEqual(rhs);
+}
+
+inline bool operator!=(const Decimal128& lhs, const Decimal128& rhs) {
+    return lhs.isNotEqual(rhs);
+}
+
+}  // namespace literals
 
 }  // namespace mongo

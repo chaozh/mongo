@@ -175,10 +175,10 @@ public:
                    OptionalCollectionUUID uuid,
                    const BSONObj& collModCmd,
                    const CollectionOptions& oldCollOptions,
-                   boost::optional<TTLCollModInfo> ttlInfo) override {
+                   boost::optional<IndexCollModInfo> indexInfo) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onCollMod(opCtx, nss, uuid, collModCmd, oldCollOptions, ttlInfo);
+            o->onCollMod(opCtx, nss, uuid, collModCmd, oldCollOptions, indexInfo);
     }
 
     void onDropDatabase(OperationContext* const opCtx, const std::string& dbName) override {
@@ -268,11 +268,12 @@ public:
             o->onEmptyCapped(opCtx, collectionName, uuid);
     }
 
-    void onUnpreparedTransactionCommit(
-        OperationContext* opCtx, const std::vector<repl::ReplOperation>& statements) override {
+    void onUnpreparedTransactionCommit(OperationContext* opCtx,
+                                       std::vector<repl::ReplOperation>* statements,
+                                       size_t numberOfPreImagesToWrite) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onUnpreparedTransactionCommit(opCtx, statements);
+            o->onUnpreparedTransactionCommit(opCtx, statements, numberOfPreImagesToWrite);
     }
 
     void onPreparedTransactionCommit(
@@ -288,10 +289,12 @@ public:
 
     void onTransactionPrepare(OperationContext* opCtx,
                               const std::vector<OplogSlot>& reservedSlots,
-                              std::vector<repl::ReplOperation>& statements) override {
+                              std::vector<repl::ReplOperation>* statements,
+                              size_t numberOfPreImagesToWrite) override {
         ReservedTimes times{opCtx};
         for (auto& observer : _observers) {
-            observer->onTransactionPrepare(opCtx, reservedSlots, statements);
+            observer->onTransactionPrepare(
+                opCtx, reservedSlots, statements, numberOfPreImagesToWrite);
         }
     }
 
@@ -306,6 +309,12 @@ public:
                                const RollbackObserverInfo& rbInfo) override {
         for (auto& o : _observers)
             o->onReplicationRollback(opCtx, rbInfo);
+    }
+
+    void onMajorityCommitPointUpdate(ServiceContext* service,
+                                     const repl::OpTime& newCommitPoint) override {
+        for (auto& o : _observers)
+            o->onMajorityCommitPointUpdate(service, newCommitPoint);
     }
 
 private:

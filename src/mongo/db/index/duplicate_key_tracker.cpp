@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kIndex
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kIndex
 
 #include "mongo/platform/basic.h"
 
@@ -37,8 +37,9 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/storage/execution_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -54,43 +55,39 @@ DuplicateKeyTracker::DuplicateKeyTracker(OperationContext* opCtx, const IndexCat
     invariant(_indexCatalogEntry->descriptor()->unique());
 }
 
-void DuplicateKeyTracker::deleteTemporaryTable(OperationContext* opCtx) {
-    _keyConstraintsTable->deleteTemporaryTable(opCtx);
+void DuplicateKeyTracker::finalizeTemporaryTable(OperationContext* opCtx,
+                                                 TemporaryRecordStore::FinalizationAction action) {
+    _keyConstraintsTable->finalizeTemporaryTable(opCtx, action);
 }
 
-Status DuplicateKeyTracker::recordKeys(OperationContext* opCtx, const std::vector<BSONObj>& keys) {
-    if (keys.size() == 0)
-        return Status::OK();
+Status DuplicateKeyTracker::recordKey(OperationContext* opCtx, const KeyString::Value& key) {
+    invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
-    std::vector<BSONObj> toInsert;
-    toInsert.reserve(keys.size());
-    for (auto&& key : keys) {
-        BSONObjBuilder builder;
-        builder.append(kKeyField, key);
+    LOGV2_DEBUG(20676,
+                1,
+                "Index build: recording duplicate key conflict on unique index",
+                "index"_attr = _indexCatalogEntry->descriptor()->indexName());
 
-        BSONObj obj = builder.obj();
+    // The KeyString::Value will be serialized in the format [KeyString][TypeBits]. We need to
+    // store the TypeBits for error reporting later on. The RecordId does not need to be stored, so
+    // we exclude it from the serialization.
+    BufBuilder builder;
+    key.serializeWithoutRecordId(builder);
 
-        toInsert.emplace_back(std::move(obj));
+    auto status =
+        _keyConstraintsTable->rs()->insertRecord(opCtx, builder.buf(), builder.len(), Timestamp());
+    if (!status.isOK())
+        return status.getStatus();
+
+    auto numDuplicates = _duplicateCounter.addAndFetch(1);
+    opCtx->recoveryUnit()->onRollback([this]() { _duplicateCounter.fetchAndAdd(-1); });
+
+    if (numDuplicates % 1000 == 0) {
+        LOGV2_INFO(4806700,
+                   "Index build: high number of duplicate keys on unique index",
+                   "index"_attr = _indexCatalogEntry->descriptor()->indexName(),
+                   "numDuplicateKeys"_attr = numDuplicates);
     }
-
-    std::vector<Record> records;
-    records.reserve(keys.size());
-    for (auto&& obj : toInsert) {
-        records.emplace_back(Record{RecordId(), RecordData(obj.objdata(), obj.objsize())});
-    }
-
-    LOG(1) << "recording " << records.size() << " duplicate key conflicts on unique index: "
-           << _indexCatalogEntry->descriptor()->indexName();
-
-    WriteUnitOfWork wuow(opCtx);
-    std::vector<Timestamp> timestamps(records.size());
-    Status s = _keyConstraintsTable->rs()->insertRecords(opCtx, &records, timestamps);
-    if (!s.isOK())
-        return s;
-
-    wuow.commit();
-
-    _duplicateCounter.fetchAndAdd(records.size());
 
     return Status::OK();
 }
@@ -111,15 +108,14 @@ Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
             CurOp::get(opCtx)->setProgress_inlock(curopMessage, _duplicateCounter.load(), 1));
     }
 
-
     int resolved = 0;
     while (record) {
         resolved++;
-        BSONObj conflict = record->data.toBson();
-        BSONObj keyObj = conflict[kKeyField].Obj();
 
-        KeyString::Builder keyString(index->getKeyStringVersion(), keyObj, index->getOrdering());
-        auto status = index->dupKeyCheck(opCtx, keyString.getValueCopy());
+        BufReader reader(record->data.data(), record->data.size());
+        auto key = KeyString::Value::deserialize(reader, index->getKeyStringVersion());
+
+        auto status = index->dupKeyCheck(opCtx, key);
         if (!status.isOK())
             return status;
 
@@ -138,21 +134,12 @@ Status DuplicateKeyTracker::checkConstraints(OperationContext* opCtx) const {
     invariant(resolved == _duplicateCounter.load());
 
     int logLevel = (resolved > 0) ? 0 : 1;
-    LOG(logLevel) << "index build: resolved " << resolved
-                  << " duplicate key conflicts for unique index: "
-                  << _indexCatalogEntry->descriptor()->indexName();
+    LOGV2_DEBUG(20677,
+                logLevel,
+                "index build: resolved duplicate key conflicts for unique index",
+                "numResolved"_attr = resolved,
+                "indexName"_attr = _indexCatalogEntry->descriptor()->indexName());
     return Status::OK();
-}
-
-bool DuplicateKeyTracker::areAllConstraintsChecked(OperationContext* opCtx) const {
-    auto cursor = _keyConstraintsTable->rs()->getCursor(opCtx);
-    auto record = cursor->next();
-
-    // The table is empty only when there are no more constraints to check.
-    if (!record)
-        return true;
-
-    return false;
 }
 
 }  // namespace mongo

@@ -27,14 +27,15 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/stats/counters.h"
 
+#include "mongo/client/authenticate.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -62,7 +63,7 @@ void OpCounters::gotOp(int op, bool isCommand) {
         case opReply:
             break;
         default:
-            log() << "OpCounters::gotOp unknown op: " << op << std::endl;
+            LOGV2(22205, "OpCounters::gotOp unknown op: {op}", "op"_attr = op);
     }
 }
 
@@ -147,6 +148,14 @@ void NetworkCounter::hitLogicalOut(long long bytes) {
     }
 }
 
+void NetworkCounter::incrementNumSlowDNSOperations() {
+    _numSlowDNSOperations.fetchAndAdd(1);
+}
+
+void NetworkCounter::incrementNumSlowSSLOperations() {
+    _numSlowSSLOperations.fetchAndAdd(1);
+}
+
 void NetworkCounter::acceptedTFOIngress() {
     _tfo.accepted.fetchAndAddRelaxed(1);
 }
@@ -156,6 +165,8 @@ void NetworkCounter::append(BSONObjBuilder& b) {
     b.append("bytesOut", static_cast<long long>(_logicalBytesOut.loadRelaxed()));
     b.append("physicalBytesIn", static_cast<long long>(_physicalBytesIn.loadRelaxed()));
     b.append("physicalBytesOut", static_cast<long long>(_physicalBytesOut.loadRelaxed()));
+    b.append("numSlowDNSOperations", static_cast<long long>(_numSlowDNSOperations.loadRelaxed()));
+    b.append("numSlowSSLOperations", static_cast<long long>(_numSlowSSLOperations.loadRelaxed()));
     b.append("numRequests", static_cast<long long>(_together.requests.loadRelaxed()));
 
     BSONObjBuilder tfo;
@@ -168,7 +179,120 @@ void NetworkCounter::append(BSONObjBuilder& b) {
     b.append("tcpFastOpen", tfo.obj());
 }
 
+void AuthCounter::initializeMechanismMap(const std::vector<std::string>& mechanisms) {
+    invariant(_mechanisms.empty());
+
+    const auto addMechanism = [this](const auto& mech) {
+        _mechanisms.emplace(
+            std::piecewise_construct, std::forward_as_tuple(mech), std::forward_as_tuple());
+    };
+
+    for (const auto& mech : mechanisms) {
+        addMechanism(mech);
+    }
+
+    // When clusterAuthMode == `x509` or `sendX509`, we'll use MONGODB-X509 for intra-cluster auth
+    // even if it's not explicitly enabled by authenticationMechanisms.
+    // Ensure it's always included in counts.
+    addMechanism(auth::kMechanismMongoX509.toString());
+
+    // SERVER-46399 Use only configured SASL mechanisms for intra-cluster auth.
+    // It's possible for intracluster auth to use a default fallback mechanism of SCRAM-SHA-1/256
+    // even if it's not configured to do so.
+    // Explicitly add these to the map for now so that they can be incremented if this happens.
+    addMechanism(auth::kMechanismScramSha1.toString());
+    addMechanism(auth::kMechanismScramSha256.toString());
+}
+
+Status AuthCounter::incSpeculativeAuthenticateReceived(const std::string& mechanism) try {
+    _mechanisms.at(mechanism).speculativeAuthenticate.received.fetchAndAddRelaxed(1);
+    return Status::OK();
+} catch (const std::out_of_range&) {
+    return {ErrorCodes::BadValue,
+            str::stream() << "Received " << auth::kSpeculativeAuthenticate << " for mechanism "
+                          << mechanism << " which is unknown or not enabled"};
+}
+
+Status AuthCounter::incSpeculativeAuthenticateSuccessful(const std::string& mechanism) try {
+    _mechanisms.at(mechanism).speculativeAuthenticate.successful.fetchAndAddRelaxed(1);
+    return Status::OK();
+} catch (const std::out_of_range&) {
+    // Should never actually occur since it'd mean we succeeded at a mechanism
+    // we're not configured for.
+    return {ErrorCodes::BadValue,
+            str::stream() << "Unexpectedly succeeded at " << auth::kSpeculativeAuthenticate
+                          << " for " << mechanism << " which is not enabled"};
+}
+
+Status AuthCounter::incAuthenticateReceived(const std::string& mechanism) try {
+    _mechanisms.at(mechanism).authenticate.received.fetchAndAddRelaxed(1);
+    return Status::OK();
+} catch (const std::out_of_range&) {
+    return {ErrorCodes::BadValue,
+            str::stream() << "Received authentication for mechanism " << mechanism
+                          << " which is unknown or not enabled"};
+}
+
+Status AuthCounter::incAuthenticateSuccessful(const std::string& mechanism) try {
+    _mechanisms.at(mechanism).authenticate.successful.fetchAndAddRelaxed(1);
+    return Status::OK();
+} catch (const std::out_of_range&) {
+    // Should never actually occur since it'd mean we succeeded at a mechanism
+    // we're not configured for.
+    return {ErrorCodes::BadValue,
+            str::stream() << "Unexpectedly succeeded at authentication for " << mechanism
+                          << " which is not enabled"};
+}
+
+/**
+ * authentication: {
+ *   "mechanisms": {
+ *     "SCRAM-SHA-256": {
+ *       "speculativeAuthenticate": { received: ###, successful: ### },
+ *       "authenticate": { received: ###, successful: ### },
+ *     },
+ *     "MONGODB-X509": {
+ *       "speculativeAuthenticate": { received: ###, successful: ### },
+ *       "authenticate": { received: ###, successful: ### },
+ *     },
+ *   },
+ * }
+ */
+void AuthCounter::append(BSONObjBuilder* b) {
+    BSONObjBuilder mechsBuilder(b->subobjStart("mechanisms"));
+
+    for (const auto& it : _mechanisms) {
+        BSONObjBuilder mechBuilder(mechsBuilder.subobjStart(it.first));
+
+        {
+            const auto received = it.second.speculativeAuthenticate.received.load();
+            const auto successful = it.second.speculativeAuthenticate.successful.load();
+
+            BSONObjBuilder specAuthBuilder(mechBuilder.subobjStart(auth::kSpeculativeAuthenticate));
+            specAuthBuilder.append("received", received);
+            specAuthBuilder.append("successful", successful);
+            specAuthBuilder.done();
+        }
+
+        {
+            const auto received = it.second.authenticate.received.load();
+            const auto successful = it.second.authenticate.successful.load();
+
+            BSONObjBuilder authBuilder(mechBuilder.subobjStart(auth::kAuthenticateCommand));
+            authBuilder.append("received", received);
+            authBuilder.append("successful", successful);
+            authBuilder.done();
+        }
+
+        mechBuilder.done();
+    }
+
+    mechsBuilder.done();
+}
+
 OpCounters globalOpCounters;
 OpCounters replOpCounters;
 NetworkCounter networkCounter;
+AuthCounter authCounter;
+AggStageCounters aggStageCounters;
 }  // namespace mongo

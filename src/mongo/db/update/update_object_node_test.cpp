@@ -1535,9 +1535,9 @@ TEST(UpdateObjectNodeTest, MergeWithConflictingPositionalFails) {
         "Update created a conflict at 'root.a.$'");
 }
 
-DEATH_TEST(UpdateObjectNodeTest,
-           MergingArrayNodesWithDifferentArrayFiltersFails,
-           "Invariant failure &leftNode._arrayFilters == &rightNode._arrayFilters") {
+DEATH_TEST_REGEX(UpdateObjectNodeTest,
+                 MergingArrayNodesWithDifferentArrayFiltersFails,
+                 "Invariant failure.*leftNode._arrayFilters == &rightNode._arrayFilters") {
     auto setUpdate1 = fromjson("{$set: {'a.$[i]': 5}}");
     auto setUpdate2 = fromjson("{$set: {'a.$[j]': 6}}");
     FieldRef fakeFieldRef("root");
@@ -2017,9 +2017,10 @@ TEST_F(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
 
 TEST_F(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
     auto setUpdate = fromjson("{$set: {abc: 5, cba: 6}}");
-    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    auto collator =
+        std::make_unique<CollatorInterfaceMock>(CollatorInterfaceMock::MockType::kReverseString);
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
-    expCtx->setCollator(&collator);
+    expCtx->setCollator(std::move(collator));
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;

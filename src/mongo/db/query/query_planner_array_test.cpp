@@ -1137,7 +1137,7 @@ TEST_F(QueryPlannerTest, MultikeyElemMatchAllCompound3) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsNotMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$gte: 0, $lt: 10}}"));
 
@@ -1149,7 +1149,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsNotMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsOnFirstFieldWhenItAndSharedPrefixAreNotMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {1U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {1U}};
     addIndex(BSON("a.b" << 1 << "a.c" << 1), multikeyPaths);
     runQuery(fromjson("{'a.b': {$gte: 0, $lt: 10}}"));
 
@@ -1161,7 +1161,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsOnFirstFieldWhenItAndSharedPrefixAreN
 }
 
 TEST_F(QueryPlannerTest, CannotIntersectBoundsWhenFirstFieldIsMultikey) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$gte: 0, $lt: 10}}"));
 
@@ -1176,7 +1176,7 @@ TEST_F(QueryPlannerTest, CannotIntersectBoundsWhenFirstFieldIsMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsMultikeyButHasElemMatch) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$elemMatch: {$gte: 0, $lt: 10}}}"));
 
@@ -1190,7 +1190,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsMultikeyButHasElemMat
 TEST_F(QueryPlannerTest, CanComplementBoundsOnFirstFieldWhenItIsMultikeyAndHasNotEqualExpr) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$ne: 3}, b: 2}"));
 
@@ -1204,7 +1204,7 @@ TEST_F(QueryPlannerTest, CanComplementBoundsOnFirstFieldWhenItIsMultikeyAndHasNo
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenFirstFieldIsMultikeyAndHasNotInsideElemMatch) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: {$elemMatch: {$not: {$gte: 10}, $gte: 0}}, b: 2}"));
 
@@ -1243,7 +1243,7 @@ TEST_F(QueryPlannerTest, CannotIntersectBoundsOnFirstFieldWhenItAndSharedPrefixA
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsNotMultikey) {
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$gte: 0, $lt: 10}}"));
 
@@ -1255,7 +1255,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsNotMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsOnSecondFieldWhenItAndSharedPrefixAreNotMultikey) {
-    MultikeyPaths multikeyPaths{{1U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{1U}, MultikeyComponents{}};
     addIndex(BSON("a.b" << 1 << "a.c" << 1), multikeyPaths);
     runQuery(fromjson("{'a.b': 2, 'a.c': {$gte: 0, $lt: 10}}"));
 
@@ -1267,7 +1267,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsOnSecondFieldWhenItAndSharedPrefixAre
 }
 
 TEST_F(QueryPlannerTest, CannotIntersectBoundsWhenSecondFieldIsMultikey) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$gte: 0, $lt: 10}}"));
 
@@ -1279,7 +1279,7 @@ TEST_F(QueryPlannerTest, CannotIntersectBoundsWhenSecondFieldIsMultikey) {
 }
 
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsMultikeyButHasElemMatch) {
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$elemMatch: {$gte: 0, $lt: 10}}}"));
 
@@ -1293,7 +1293,7 @@ TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsMultikeyButHasElemMa
 TEST_F(QueryPlannerTest, CanComplementBoundsOnSecondFieldWhenItIsMultikeyAndHasNotEqualExpr) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$ne: 3}}"));
 
@@ -1307,7 +1307,7 @@ TEST_F(QueryPlannerTest, CanComplementBoundsOnSecondFieldWhenItIsMultikeyAndHasN
 TEST_F(QueryPlannerTest, CanIntersectBoundsWhenSecondFieldIsMultikeyAndHasNotInsideElemMatch) {
     params.options = QueryPlannerParams::NO_TABLE_SCAN;
 
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b" << 1), multikeyPaths);
     runQuery(fromjson("{a: 2, b: {$elemMatch: {$not: {$gte: 10}, $gte: 0}}}"));
 
@@ -2384,28 +2384,28 @@ TEST_F(QueryPlannerTest, CantExplodeMultikeyIxscanForSort) {
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {b: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{sort: {pattern: {b: 1}, limit: 0, type: 'simple', node:"
         "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, b: 1}, filter: null, bounds: {a: "
-        "[[1,1,true,true], [2,2,true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}}}}}");
+        "[[1,1,true,true], [2,2,true,true]], b: [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CantExplodeMultikeyIxscanForSortWithPathLevelMultikeyMetadata) {
     params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
-    MultikeyPaths multikeyPaths{std::set<size_t>{}, {0U}};
+    MultikeyPaths multikeyPaths{MultikeyComponents{}, {0U}};
     addIndex(BSON("a" << 1 << "b.c" << 1), multikeyPaths);
 
     runQueryAsCommand(fromjson("{find: 'testns', filter: {a: {$in: [1, 2]}}, sort: {'b.c': 1}}"));
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {'b.c': 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{sort: {pattern: {'b.c': 1}, limit: 0, type: 'simple', node: "
         "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, 'b.c': 1}, filter: null, bounds: "
-        "{a: [[1,1,true,true], [2,2,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}}}}}");
+        "{a: [[1,1,true,true], [2,2,true,true]], 'b.c': [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, CanExplodeMultikeyIndexScanForSortWhenSortFieldsAreNotMultikey) {
     params.options &= ~QueryPlannerParams::INCLUDE_COLLSCAN;
-    MultikeyPaths multikeyPaths{{0U}, std::set<size_t>{}};
+    MultikeyPaths multikeyPaths{{0U}, MultikeyComponents{}};
     addIndex(BSON("a" << 1 << "b.c" << 1), multikeyPaths);
 
     runQueryAsCommand(fromjson("{find: 'testns', filter: {a: {$in: [1, 2]}}, sort: {'b.c': 1}}"));
@@ -2465,9 +2465,9 @@ TEST_F(QueryPlannerTest,
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {'a.b': 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{sort: {pattern: {'a.b': 1}, limit: 0, type: 'simple', node: "
         "{fetch: {filter: null, node: {ixscan: {pattern: {a: 1, 'a.b': 1}, filter: null, bounds: "
-        "{a: [[3, Infinity, true,true]], 'a.b': [['MinKey','MaxKey',true,true]]}}}}}}}}}");
+        "{a: [[3, Infinity, true,true]], 'a.b': [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest,
@@ -2479,9 +2479,9 @@ TEST_F(QueryPlannerTest,
 
     assertNumSolutions(1U);
     assertSolutionExists(
-        "{sort: {pattern: {a: 1}, limit: 0, node: {sortKeyGen: {node: "
+        "{sort: {pattern: {a: 1}, limit: 0, type: 'simple', node: "
         "{fetch: {filter: null, node: {ixscan: {pattern: {'a.b': 1, a: 1}, filter: null, bounds: "
-        "{'a.b': [[3, Infinity, true,true]], a: [['MinKey','MaxKey',true,true]]}}}}}}}}}");
+        "{'a.b': [[3, Infinity, true,true]], a: [['MinKey','MaxKey',true,true]]}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, ElemMatchValueNENull) {
@@ -2696,53 +2696,47 @@ TEST_F(QueryPlannerTest, MustFetchBeforeDottedMultiKeyPathSort) {
 
     assertNumSolutions(3U);
     assertSolutionExists(
-        "{sort: {pattern: {'a.x': 1}, limit: 0, node: {sortKeyGen: {node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {'a.x': 1}, limit: 0, type: 'simple', node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: {'a.x': 4},"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [['MinKey', 'MaxKey', true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: {'a.x': 4},"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [['MinKey', 'MaxKey', true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: null,"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [[4, 4, true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: null,"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [[4, 4, true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
 
@@ -2751,29 +2745,26 @@ TEST_F(QueryPlannerTest, MustFetchBeforeDottedMultiKeyPathSort) {
 
     assertNumSolutions(2U);
     assertSolutionExists(
-        "{sort: {pattern: {'a.x': 1}, limit: 0, node: {sortKeyGen: {node: {cscan: {dir: 1}}}}}}");
+        "{sort: {pattern: {'a.x': 1}, limit: 0, type: 'simple', node: {cscan: {dir: 1}}}}");
     assertSolutionExists(
         "{sort: {"
         "  pattern: {'a.x': 1},"
         "  limit: 0,"
+        "  type: 'simple',"
         "  node: {"
-        "    sortKeyGen: {"
-        "      node: {"
-        "        fetch: {"
-        "          filter: null,"
-        "          node: {"
-        "            ixscan: {"
-        "              filter: null, "
-        "              pattern: {'a.x': 1},"
-        "              bounds: {"
-        "                'a.x': [['MinKey', 'MaxKey', true, true]]"
-        "              },"
-        "              dir: 1"
-        "            }"
-        "          }"
-        "        }"
-        "      }"
-        "    }"
+        "   fetch: {"
+        "     filter: null,"
+        "     node: {"
+        "       ixscan: {"
+        "         filter: null, "
+        "         pattern: {'a.x': 1},"
+        "         bounds: {"
+        "           'a.x': [['MinKey', 'MaxKey', true, true]]"
+        "         },"
+        "         dir: 1"
+        "       }"
+        "     }"
+        "   }"
         "  }"
         "}}");
 }

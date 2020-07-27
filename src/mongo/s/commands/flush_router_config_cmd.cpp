@@ -27,14 +27,14 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -86,16 +86,22 @@ public:
 
         const auto argumentElem = cmdObj.firstElement();
         if (argumentElem.isNumber() || argumentElem.isBoolean()) {
-            LOG(0) << "Routing metadata flushed for all databases";
+            LOGV2(22761, "Routing metadata flushed for all databases");
             catalogCache->purgeAllDatabases();
         } else {
             const auto ns = argumentElem.checkAndGetStringData();
             if (nsIsDbOnly(ns)) {
-                LOG(0) << "Routing metadata flushed for database " << ns;
+                LOGV2(22762,
+                      "Routing metadata flushed for database {db}",
+                      "Routing metadata flushed for database",
+                      "db"_attr = ns);
                 catalogCache->purgeDatabase(ns);
             } else {
                 const NamespaceString nss(ns);
-                LOG(0) << "Routing metadata flushed for collection " << nss;
+                LOGV2(22763,
+                      "Routing metadata flushed for collection {namespace}",
+                      "Routing metadata flushed for collection",
+                      "namespace"_attr = nss);
                 catalogCache->purgeCollection(nss);
             }
         }

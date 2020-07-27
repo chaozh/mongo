@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -40,11 +40,13 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/client.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/clock_source.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/interruptible.h"
-#include "mongo/util/log.h"
 
 using namespace fmt::literals;
 
@@ -100,29 +102,29 @@ void BlockedOp::start(ServiceContext* serviceContext) {
     _latchState.thread = stdx::thread([this, serviceContext]() mutable {
         ThreadClient tc("DiagnosticCaptureTestLatch", serviceContext);
 
-        log() << "Entered currentOpSpawnsThreadWaitingForLatch thread";
+        LOGV2(23123, "Entered currentOpSpawnsThreadWaitingForLatch thread");
 
         stdx::lock_guard testLock(_latchState.mutex);
 
-        log() << "Joining currentOpSpawnsThreadWaitingForLatch thread";
+        LOGV2(23124, "Joining currentOpSpawnsThreadWaitingForLatch thread");
     });
 
     _interruptibleState.thread = stdx::thread([this, serviceContext]() mutable {
         ThreadClient tc("DiagnosticCaptureTestInterruptible", serviceContext);
         auto opCtx = tc->makeOperationContext();
 
-        log() << "Entered currentOpSpawnsThreadWaitingForLatch thread for interruptibles";
+        LOGV2(23125, "Entered currentOpSpawnsThreadWaitingForLatch thread for interruptibles");
         stdx::unique_lock lk(_interruptibleState.mutex);
         opCtx->waitForConditionOrInterrupt(
             _interruptibleState.cv, lk, [&] { return _interruptibleState.isDone; });
         _interruptibleState.isDone = false;
 
-        log() << "Joining currentOpSpawnsThreadWaitingForLatch thread for interruptibles";
+        LOGV2(23126, "Joining currentOpSpawnsThreadWaitingForLatch thread for interruptibles");
     });
 
 
     _cv.wait(lk, [this] { return _latchState.isContended && _interruptibleState.isWaiting; });
-    log() << "Started threads for currentOpSpawnsThreadWaitingForLatch";
+    LOGV2(23127, "Started threads for currentOpSpawnsThreadWaitingForLatch");
 }
 
 // This function unlocks testMutex and joins if there are no more callers of BlockedOp::start()
@@ -155,14 +157,20 @@ void BlockedOp::join() {
 }
 
 void BlockedOp::setIsContended(bool value) {
-    log() << "Setting isContended to " << (value ? "true" : "false");
+    LOGV2(23128,
+          "Setting isContended to {value}",
+          "Setting isContended",
+          "value"_attr = (value ? "true" : "false"));
     stdx::lock_guard lk(_m);
     _latchState.isContended = value;
     _cv.notify_one();
 }
 
 void BlockedOp::setIsWaiting(bool value) {
-    log() << "Setting isWaiting to " << (value ? "true" : "false");
+    LOGV2(23129,
+          "Setting isWaiting to {value}",
+          "Setting isWaiting",
+          "value"_attr = (value ? "true" : "false"));
     stdx::lock_guard lk(_m);
     _interruptibleState.isWaiting = value;
     _cv.notify_one();
@@ -179,9 +187,7 @@ MONGO_INITIALIZER_GENERAL(DiagnosticInfo, (/* NO PREREQS */), ("FinalizeDiagnost
     class DiagnosticListener : public latch_detail::DiagnosticListener {
         void onContendedLock(const Identity& id) override {
             if (auto client = Client::getCurrent()) {
-                auto& handle = getDiagnosticInfoHandle(client);
-                stdx::lock_guard<stdx::mutex> lk(handle.mutex);
-                handle.list.emplace_front(DiagnosticInfo::capture(id.name()));
+                DiagnosticInfo::capture(client, id.name());
 
                 if (currentOpSpawnsThreadWaitingForLatch.shouldFail() &&
                     (id.name() == kBlockedOpMutexName)) {
@@ -221,9 +227,7 @@ MONGO_INITIALIZER(InterruptibleWaitListener)(InitializerContext* context) {
 
         void addInfo(const StringData& name) {
             if (auto client = Client::getCurrent()) {
-                auto& handle = getDiagnosticInfoHandle(client);
-                stdx::lock_guard<stdx::mutex> lk(handle.mutex);
-                handle.list.emplace_front(DiagnosticInfo::capture(name));
+                DiagnosticInfo::capture(client, name);
 
                 if (currentOpSpawnsThreadWaitingForLatch.shouldFail() &&
                     (name == kBlockedOpInterruptibleName)) {
@@ -253,9 +257,7 @@ MONGO_INITIALIZER(InterruptibleWaitListener)(InitializerContext* context) {
         }
     };
 
-    // Intentionally leaked, people can use in detached threads
-    static auto& listener = *new WaitListener();
-    Interruptible::addWaitListener(&listener);
+    Interruptible::installWaitListener<WaitListener>();
 
     return Status::OK();
 }
@@ -272,13 +274,23 @@ std::string DiagnosticInfo::toString() const {
         _captureName.toString(), _timestamp.toString(), _backtrace.data.size());
 }
 
-DiagnosticInfo DiagnosticInfo::capture(const StringData& captureName, Options options) {
+const DiagnosticInfo& DiagnosticInfo::capture(Client* client,
+                                              const StringData& captureName,
+                                              Options options) noexcept {
+    auto currentTime = client->getServiceContext()->getFastClockSource()->now();
+
     // Since we don't have a fast enough backtrace implementation at the moment, the Backtrace is
     // always empty. If SERVER-44091 happens, this should branch on options.shouldTakeBacktrace
     auto backtrace = Backtrace{};
-    auto currentTime = getGlobalServiceContext()->getFastClockSource()->now();
 
-    return DiagnosticInfo(currentTime, captureName, std::move(backtrace));
+    auto info = DiagnosticInfo(currentTime, captureName, std::move(backtrace));
+
+    auto& handle = getDiagnosticInfoHandle(client);
+
+    stdx::lock_guard<stdx::mutex> lk(handle.mutex);
+    handle.list.emplace_front(std::move(info));
+
+    return handle.list.front();
 }
 
 DiagnosticInfo::BlockedOpGuard::~BlockedOpGuard() {

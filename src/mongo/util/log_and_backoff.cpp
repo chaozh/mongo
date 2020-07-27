@@ -27,22 +27,16 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/util/log_and_backoff.h"
 
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/time_support.h"
 
-namespace mongo {
+namespace mongo::log_backoff_detail {
 
-void logAndBackoff(logger::LogComponent logComponent,
-                   logger::LogSeverity logLevel,
-                   size_t numAttempts,
-                   StringData message) {
-    MONGO_LOG_COMPONENT(logLevel, logComponent)
-        << message << ". Retrying, attempt: " << numAttempts;
-
+void logAndBackoffImpl(size_t numAttempts) {
     if (numAttempts < 4) {
         // no-op
     } else if (numAttempts < 10) {
@@ -56,4 +50,4 @@ void logAndBackoff(logger::LogComponent logComponent,
     }
 }
 
-}  // namespace mongo
+}  // namespace mongo::log_backoff_detail

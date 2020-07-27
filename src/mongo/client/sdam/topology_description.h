@@ -36,55 +36,13 @@
 
 #include "mongo/bson/oid.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/client/sdam/sdam_configuration.h"
 #include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/client/sdam/server_description.h"
 #include "mongo/platform/basic.h"
 
 namespace mongo::sdam {
-class SdamConfiguration {
-public:
-    SdamConfiguration() : SdamConfiguration(boost::none){};
-
-    /**
-     * Initialize the TopologyDescription. This constructor may uassert if the provided
-     * configuration options are not valid according to the Server Discovery & Monitoring Spec.
-     *
-     * Initial Servers
-     * initial servers may be set to a seed list of one or more server addresses.
-     *
-     * Initial TopologyType
-     * The initial TopologyType may be set to Single, Unknown, or ReplicaSetNoPrimary.
-     *
-     * Initial setName
-     * The client's initial replica set name is required in order to initially configure the
-     * topology type as ReplicaSetNoPrimary.
-     *
-     * Allowed configuration combinations
-     * TopologyType Single cannot be used with multiple seeds.
-     * If setName is not null, only TopologyType ReplicaSetNoPrimary and Single, are
-     * allowed.
-     */
-    SdamConfiguration(boost::optional<std::vector<ServerAddress>> seedList,
-                      TopologyType initialType = TopologyType::kUnknown,
-                      mongo::Milliseconds heartBeatFrequencyMs = kDefaultHeartbeatFrequencyMs,
-                      boost::optional<std::string> setName = boost::none);
-
-    const boost::optional<std::vector<ServerAddress>>& getSeedList() const;
-    TopologyType getInitialType() const;
-    Milliseconds getHeartBeatFrequency() const;
-    const boost::optional<std::string>& getSetName() const;
-
-    static inline const mongo::Milliseconds kDefaultHeartbeatFrequencyMs = mongo::Seconds(10);
-    static inline const mongo::Milliseconds kMinHeartbeatFrequencyMS = mongo::Milliseconds(500);
-
-private:
-    boost::optional<std::vector<ServerAddress>> _seedList;
-    TopologyType _initialType;
-    mongo::Milliseconds _heartBeatFrequencyMs;
-    boost::optional<std::string> _setName;
-};
-
-class TopologyDescription {
+class TopologyDescription : public std::enable_shared_from_this<TopologyDescription> {
 public:
     TopologyDescription() : TopologyDescription(SdamConfiguration()) {}
     TopologyDescription(const TopologyDescription& source) = default;
@@ -109,19 +67,20 @@ public:
     const boost::optional<int>& getLogicalSessionTimeoutMinutes() const;
     const Milliseconds& getHeartBeatFrequency() const;
 
-    const boost::optional<ServerDescriptionPtr> findServerByAddress(ServerAddress address) const;
-    bool containsServerAddress(const ServerAddress& address) const;
+    const boost::optional<ServerDescriptionPtr> findServerByAddress(HostAndPort address) const;
+    bool containsServerAddress(const HostAndPort& address) const;
     std::vector<ServerDescriptionPtr> findServers(
         std::function<bool(const ServerDescriptionPtr&)> predicate) const;
+    boost::optional<ServerDescriptionPtr> getPrimary();
 
     /**
      * Adds the given ServerDescription or swaps it with an existing one
-     * using the description's ServerAddress as the lookup key. If present, the previous server
+     * using the description's HostAndPort as the lookup key. If present, the previous server
      * description is returned.
      */
     boost::optional<ServerDescriptionPtr> installServerDescription(
         const ServerDescriptionPtr& newServerDescription);
-    void removeServerDescription(const ServerAddress& serverAddress);
+    void removeServerDescription(const HostAndPort& HostAndPort);
 
     void setType(TopologyType type);
 
@@ -129,12 +88,29 @@ public:
     std::string toString();
 
 private:
+    friend bool operator==(const TopologyDescription& lhs, const TopologyDescription& rhs) {
+        return std::tie(lhs._setName,
+                        lhs._type,
+                        lhs._maxSetVersion,
+                        lhs._maxElectionId,
+                        lhs._servers,
+                        lhs._compatible,
+                        lhs._logicalSessionTimeoutMinutes) ==
+            std::tie(rhs._setName,
+                     rhs._type,
+                     rhs._maxSetVersion,
+                     rhs._maxElectionId,
+                     rhs._servers,
+                     rhs._compatible,
+                     rhs._logicalSessionTimeoutMinutes);
+    }
+
     /**
      * Checks if all server descriptions are compatible with this server's WireVersion. If an
-     * incompatible description is found, we set the topologyDescription's _compatible flag to false
-     * and store an error message in _compatibleError. A ServerDescription which is not Unknown is
-     * incompatible if:
-     *  minWireVersion > serverMaxWireVersion, or maxWireVersion < serverMinWireVersion
+     * incompatible description is found, we set the topologyDescription's _compatible flag to
+     * false and store an error message in _compatibleError. A ServerDescription which is not
+     * Unknown is incompatible if: minWireVersion > serverMaxWireVersion, or maxWireVersion <
+     * serverMinWireVersion
      */
     void checkWireCompatibilityVersions();
 
@@ -177,7 +153,7 @@ private:
     // servers: a set of ServerDescription instances. Default contains one server:
     // "localhost:27017", ServerType Unknown.
     std::vector<ServerDescriptionPtr> _servers{
-        std::make_shared<ServerDescription>("localhost:27017")};
+        std::make_shared<ServerDescription>(HostAndPort("localhost:27017"))};
 
     // compatible: a boolean. False if any server's wire protocol version range is incompatible with
     // the client's. Default true.

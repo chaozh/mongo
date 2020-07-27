@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
 
@@ -40,8 +40,8 @@
 #include "mongo/db/repl/scatter_gather_algorithm.h"
 #include "mongo/db/repl/scatter_gather_runner.h"
 #include "mongo/db/server_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
-#include "mongo/util/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -88,10 +88,13 @@ std::vector<RemoteCommandRequest> QuorumChecker::getRequests() const {
     ReplSetHeartbeatArgsV1 hbArgs;
     hbArgs.setSetName(_rsConfig->getReplSetName());
     hbArgs.setConfigVersion(_rsConfig->getConfigVersion());
+    hbArgs.setConfigTerm(_rsConfig->getConfigTerm());
     hbArgs.setHeartbeatVersion(1);
     if (isInitialConfig) {
         hbArgs.setCheckEmpty();
     }
+    // hbArgs allows (but doesn't require) us to pass the current primary id as an optimization,
+    // but it is not readily available within QuorumChecker.
     hbArgs.setSenderHost(myConfig.getHostAndPort());
     hbArgs.setSenderId(myConfig.getId().getData());
     hbArgs.setTerm(_term);
@@ -187,8 +190,11 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
                                                const executor::RemoteCommandResponse& response) {
     ++_numResponses;
     if (!response.isOK()) {
-        warning() << "Failed to complete heartbeat request to " << request.target << "; "
-                  << response.status;
+        LOGV2_WARNING(23722,
+                      "Failed to complete heartbeat request to {requestTarget}; {responseStatus}",
+                      "Failed to complete heartbeat request to target",
+                      "requestTarget"_attr = request.target,
+                      "responseStatus"_attr = response.status);
         _badResponses.push_back(std::make_pair(request.target, response.status));
         return;
     }
@@ -198,30 +204,27 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
     Status hbStatus = hbResp.initialize(resBSON, 0);
 
     if (hbStatus.code() == ErrorCodes::InconsistentReplicaSetNames) {
-        std::string message = str::stream()
-            << "Our set name did not match that of " << request.target.toString();
-        _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-        warning() << message;
+        static constexpr char message[] = "Our set name did not match that of the request target";
+        _vetoStatus =
+            Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                   str::stream() << message << ", requestTarget:" << request.target.toString());
+        LOGV2_WARNING(23723,
+                      "Our set name did not match that of {requestTarget}",
+                      message,
+                      "requestTarget"_attr = request.target.toString());
         return;
     }
 
     if (!hbStatus.isOK() && hbStatus != ErrorCodes::InvalidReplicaSetConfig) {
-        warning() << "Got error (" << hbStatus << ") response on heartbeat request to "
-                  << request.target << "; " << hbResp;
+        LOGV2_WARNING(
+            23724,
+            "Got error ({hbStatus}) response on heartbeat request to {requestTarget}; {hbResp}",
+            "Got error response on heartbeat request",
+            "hbStatus"_attr = hbStatus,
+            "requestTarget"_attr = request.target,
+            "hbResp"_attr = hbResp);
         _badResponses.push_back(std::make_pair(request.target, hbStatus));
         return;
-    }
-
-    if (!hbResp.getReplicaSetName().empty()) {
-        if (hbResp.getConfigVersion() >= _rsConfig->getConfigVersion()) {
-            std::string message = str::stream()
-                << "Our config version of " << _rsConfig->getConfigVersion()
-                << " is no larger than the version on " << request.target.toString()
-                << ", which is " << hbResp.getConfigVersion();
-            _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-            warning() << message;
-            return;
-        }
     }
 
     if (_rsConfig->hasReplicaSetId()) {
@@ -229,12 +232,22 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
             rpc::ReplSetMetadata::readFromMetadata(response.data);
         if (replMetadata.isOK() && replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig->getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
-            std::string message = str::stream()
-                << "Our replica set ID of " << _rsConfig->getReplicaSetId()
-                << " did not match that of " << request.target.toString() << ", which is "
-                << replMetadata.getValue().getReplicaSetId();
-            _vetoStatus = Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, message);
-            warning() << message;
+            static constexpr char message[] =
+                "Our replica set ID did not match that of our request target";
+            _vetoStatus =
+                Status(ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                       str::stream() << message << ", replSetId: " << _rsConfig->getReplicaSetId()
+                                     << ", requestTarget: " << request.target.toString()
+                                     << ", requestTargetReplSetId: "
+                                     << replMetadata.getValue().getReplicaSetId());
+            LOGV2_WARNING(23726,
+                          "Our replica set ID of {replSetId} did not match that of "
+                          "{requestTarget}, which is {requestTargetId}",
+                          message,
+                          "replSetId"_attr = _rsConfig->getReplicaSetId(),
+                          "requestTarget"_attr = request.target.toString(),
+                          "requestTargetReplSetId"_attr =
+                              replMetadata.getValue().getReplicaSetId());
         }
     }
 

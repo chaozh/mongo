@@ -31,10 +31,9 @@
 
 #include "mongo/db/repl/rollback_source_impl.h"
 
-#include "mongo/client/dbclient_connection.h"
-#include "mongo/db/cloner.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/replication_auth.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
@@ -68,36 +67,21 @@ int RollbackSourceImpl::getRollbackId() const {
 
 BSONObj RollbackSourceImpl::getLastOperation() const {
     const Query query = Query().sort(BSON("$natural" << -1));
-    return _getConnection()->findOne(_collectionName, query, nullptr, QueryOption_SlaveOk);
+    return _getConnection()->findOne(
+        _collectionName, query, nullptr, QueryOption_SlaveOk, ReadConcernArgs::kImplicitDefault);
 }
 
 BSONObj RollbackSourceImpl::findOne(const NamespaceString& nss, const BSONObj& filter) const {
     return _getConnection()
-        ->findOne(nss.toString(), filter, nullptr, QueryOption_SlaveOk)
+        ->findOne(
+            nss.toString(), filter, nullptr, QueryOption_SlaveOk, ReadConcernArgs::kImplicitDefault)
         .getOwned();
 }
 
 std::pair<BSONObj, NamespaceString> RollbackSourceImpl::findOneByUUID(const std::string& db,
                                                                       UUID uuid,
                                                                       const BSONObj& filter) const {
-    return _getConnection()->findOneByUUID(db, uuid, filter);
-}
-
-void RollbackSourceImpl::copyCollectionFromRemote(OperationContext* opCtx,
-                                                  const NamespaceString& nss) const {
-    std::string errmsg;
-    auto tmpConn = std::make_unique<DBClientConnection>();
-    uassert(15908, errmsg, tmpConn->connect(_source, StringData(), errmsg));
-    uassertStatusOK(replAuthenticate(tmpConn.get()));
-
-    // cloner owns _conn in unique_ptr
-    Cloner cloner;
-    cloner.setConnection(std::move(tmpConn));
-    uassert(15909,
-            str::stream() << "replSet rollback error resyncing collection " << nss.ns() << ' '
-                          << errmsg,
-            cloner.copyCollection(
-                opCtx, nss.ns(), BSONObj(), errmsg, true, CollectionOptions::parseForStorage));
+    return _getConnection()->findOneByUUID(db, uuid, filter, ReadConcernArgs::kImplicitDefault);
 }
 
 StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const std::string& db,

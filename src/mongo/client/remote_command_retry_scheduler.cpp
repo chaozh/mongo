@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kExecutor
-
 #include "mongo/platform/basic.h"
 
 #include <algorithm>
@@ -38,7 +36,6 @@
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/destructor_guard.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 

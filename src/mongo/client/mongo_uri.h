@@ -45,6 +45,7 @@
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
+
 /**
  * Encode a string for embedding in a URI.
  * Replaces reserved bytes with %xx sequences.
@@ -133,7 +134,7 @@ public:
     // whichever map type is used provides that guarantee.
     using OptionsMap = std::map<CaseInsensitiveString, std::string>;
 
-    static StatusWith<MongoURI> parse(const std::string& url);
+    static StatusWith<MongoURI> parse(StringData url);
 
     /*
      * Returns true if str starts with one of the uri schemes (e.g. mongodb:// or mongodb+srv://)
@@ -261,6 +262,9 @@ public:
 
     friend StringBuilder& operator<<(StringBuilder&, const MongoURI&);
 
+    boost::optional<BSONObj> makeAuthObjFromOptions(
+        int maxWireVersion, const std::vector<std::string>& saslMechsForAuth) const;
+
 private:
     MongoURI(ConnectionString connectString,
              const std::string& user,
@@ -277,10 +281,7 @@ private:
           _sslMode(sslMode),
           _options(std::move(options)) {}
 
-    boost::optional<BSONObj> _makeAuthObjFromOptions(
-        int maxWireVersion, const std::vector<std::string>& saslMechsForAuth) const;
-
-    static MongoURI parseImpl(const std::string& url);
+    static MongoURI parseImpl(StringData url);
 
     ConnectionString _connectString;
     std::string _user;

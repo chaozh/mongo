@@ -56,7 +56,8 @@ public:
                 DiskUseRequirement::kNoDiskUse,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kAllowed,
-                LookupRequirement::kAllowed};
+                LookupRequirement::kAllowed,
+                UnionRequirement::kAllowed};
     }
 
     /**
@@ -72,10 +73,13 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);
 
+
+    bool hasQuery() const override;
+
     /**
      * A query predicate to apply to the documents in addition to the "near" predicate.
      */
-    BSONObj getQuery() const {
+    BSONObj getQuery() const override {
         return query;
     };
 

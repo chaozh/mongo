@@ -28,14 +28,14 @@
  */
 
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/update_result.h"
 
 #include "mongo/db/lasterror.h"
-#include "mongo/util/log.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -53,7 +53,16 @@ UpdateResult::UpdateResult(bool existing_,
     if (!existing && numMatched == 0 && !id.eoo()) {
         upserted = id.wrap(kUpsertedFieldName);
     }
-    LOG(4) << "UpdateResult -- " << redact(toString());
+    LOGV2_DEBUG(20885,
+                4,
+                "UpdateResult -- upserted: {upserted} modifiers: {modifiers} existing: {existing} "
+                "numDocsModified: {numModified} numMatched: {numMatched}",
+                "UpdateResult",
+                "numMatched"_attr = numMatched,
+                "numModified"_attr = numDocsModified,
+                "upserted"_attr = redact(upserted),
+                "modifiers"_attr = modifiers,
+                "existing"_attr = existing);
 }
 
 std::string UpdateResult::toString() const {

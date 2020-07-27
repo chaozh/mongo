@@ -29,17 +29,15 @@
 
 #pragma once
 
-#include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/temp_dir.h"
-#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
 /**
  * Test fixture class for tests that use the "ephemeralForTest" storage engine.
  */
-class ServiceContextMongoDTest : public ServiceContextTest {
+class ServiceContextMongoDTest : public virtual ServiceContextTest {
 protected:
     enum class RepairAction { kNoRepair, kRepair };
 
@@ -52,12 +50,15 @@ protected:
     ServiceContextMongoDTest(std::string engine, RepairAction repair);
     virtual ~ServiceContextMongoDTest();
 
+    void tearDown() override;
+
 private:
     struct {
         std::string engine;
         bool engineSetByUser;
         bool repair;
     } _stashedStorageParams;
+
     unittest::TempDir _tempDir;
 };
 

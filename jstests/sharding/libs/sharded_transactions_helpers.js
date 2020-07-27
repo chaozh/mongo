@@ -1,3 +1,5 @@
+load("jstests/libs/logv2_helpers.js");
+
 const kSnapshotErrors =
     [ErrorCodes.SnapshotTooOld, ErrorCodes.SnapshotUnavailable, ErrorCodes.StaleChunkHistory];
 
@@ -97,6 +99,17 @@ function assertNoSuchTransactionOnConn(conn, lsid, txnNumber) {
 
 function waitForFailpoint(hitFailpointStr, numTimes, timeout) {
     // Don't run the hang analyzer because we don't expect waitForFailpoint() to always succeed.
+    if (isJsonLogNoConn()) {
+        const hitFailpointRe = /Hit (\w+) failpoint/;
+        const hitRe = /Hit (\w+)/;
+        const matchHitFailpoint = hitFailpointStr.match(hitFailpointRe);
+        const matchHit = hitFailpointStr.match(hitRe);
+        if (matchHitFailpoint) {
+            hitFailpointStr = `(Hit .+ failpoint.*${matchHitFailpoint[1]}|${hitFailpointStr})`;
+        } else {
+            hitFailpointStr = `(Hit .+.*${matchHit[1]}|${hitFailpointStr})`;
+        }
+    }
     assert.soon(
         function() {
             const re = new RegExp(hitFailpointStr, 'g' /* find all occurrences */);
@@ -106,6 +119,26 @@ function waitForFailpoint(hitFailpointStr, numTimes, timeout) {
         timeout,
         undefined,
         {runHangAnalyzer: false});
+}
+
+/*
+ * If all shards in the cluster have binVersion "lastest", sets the server parameter for
+ * making the transaction coordinator return decision early to true.
+ * TODO (SERVER-48114): Remove this function.
+ */
+function enableCoordinateCommitReturnImmediatelyAfterPersistingDecision(st) {
+    if (jsTest.options().shardMixedBinVersions ||
+        jsTest.options().useRandomBinVersionsWithinReplicaSet)
+        return;
+
+    st._rs.forEach(rs => {
+        rs.nodes.forEach(node => {
+            assert.commandWorked(node.getDB('admin').runCommand({
+                setParameter: 1,
+                "coordinateCommitReturnImmediatelyAfterPersistingDecision": true
+            }));
+        });
+    });
 }
 
 // Enables the transaction router to retry on stale version (db or shard version) and snapshot

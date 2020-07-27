@@ -33,6 +33,7 @@
 #include "mongo/base/data_type_validated.h"
 #include "mongo/bson/bson_depth.h"
 #include "mongo/client/dbclient_base.h"
+#include "mongo/config.h"
 #include "mongo/crypto/aead_encryption.h"
 #include "mongo/crypto/symmetric_crypto.h"
 #include "mongo/db/client.h"
@@ -118,13 +119,15 @@ public:
     void trace(JSTracer* trc) final;
 
     using DBClientBase::query;
-    std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
-                                          Query query,
-                                          int nToReturn,
-                                          int nToSkip,
-                                          const BSONObj* fieldsToReturn,
-                                          int queryOptions,
-                                          int batchSize) final;
+    std::unique_ptr<DBClientCursor> query(
+        const NamespaceStringOrUUID& nsOrUuid,
+        Query query,
+        int nToReturn,
+        int nToSkip,
+        const BSONObj* fieldsToReturn,
+        int queryOptions,
+        int batchSize,
+        boost::optional<BSONObj> readConcernObj = boost::none) final;
 
     bool isFailed() const final;
 
@@ -137,6 +140,10 @@ public:
     bool isReplicaSetMember() const final;
 
     bool isMongos() const final;
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() override;
+#endif
 
 protected:
     std::pair<rpc::UniqueReply, DBClientBase*> processResponse(rpc::UniqueReply result,

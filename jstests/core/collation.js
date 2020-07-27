@@ -1,14 +1,11 @@
 // Cannot implicitly shard accessed collections because of collection existing when none
 // expected.
-// Tagged with requires_fcv_44 due to change in the implementation of the returnKey query
-// modifier, along with stricter rules for $-prefixed field name, which are not compatible
-// with older versions.
 // @tags: [
 //   assumes_no_implicit_collection_creation_after_drop,
 //   does_not_support_stepdowns,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
-//   requires_fcv_44
+//   requires_capped,
 // ]
 
 // Integration tests for the collation feature.
@@ -32,6 +29,7 @@ var planStage;
 var isMaster = db.runCommand("ismaster");
 assert.commandWorked(isMaster);
 var isMongos = (isMaster.msg === "isdbgrid");
+var isStandalone = !isMongos && !isMaster.hasOwnProperty('setName');
 
 var assertIndexHasCollation = function(keyPattern, collation) {
     var indexSpecs = coll.getIndexes();
@@ -139,8 +137,9 @@ assertIndexHasCollation({d: 1}, {locale: "simple"});
 assert.commandWorked(coll.ensureIndex({c: 1}, {v: 1}));
 assertIndexHasCollation({c: 1}, {locale: "simple"});
 
-// Test that all indexes retain their current collation when the collection is re-indexed.
-if (!isMongos) {
+// Test that all indexes retain their current collation when the collection is re-indexed. (Only
+// standalone mode supports the reIndex command.)
+if (isStandalone) {
     assert.commandWorked(coll.reIndex());
     assertIndexHasCollation({a: 1}, {
         locale: "fr_CA",
@@ -939,7 +938,21 @@ assert.commandWorked(
     db.createCollection(coll.getName(), {collation: {locale: "en_US", strength: 2}}));
 assert.commandWorked(coll.insert({_id: 1, str: "foo"}));
 assert.eq({_id: 1, str: "foo"}, coll.findAndModify({query: {str: "FOO"}, update: {$set: {x: 1}}}));
-assert.eq({_id: 1, str: "foo", x: 1}, coll.findAndModify({query: {str: "FOO"}, remove: true}));
+
+// Case of _id lookup and projection on a collection with collection-default collation. Note that
+// retryable writes do not always respect the 'fields' option (SERVER-31242) so we must include
+// all fields in the document.
+assert.eq({_id: 1, str: "foo", x: 1},
+          coll.findAndModify({query: {_id: 1}, update: {$inc: {x: 1}}, fields: {str: 1, x: 1}}));
+// Case of _id lookup and hint on a collection with collection-default collation.
+assert.commandWorked(coll.createIndex({x: 1}));
+assert.eq({_id: 1, str: "foo", x: 2},
+          coll.findAndModify({query: {_id: 1}, update: {$inc: {x: 1}}, hint: {x: 1}}));
+assert.eq({_id: 1, str: "foo", x: 3},
+          coll.findAndModify({query: {_id: 1}, update: {$inc: {x: 1}}, hint: {_id: 1}}));
+
+// Remove the document.
+assert.eq({_id: 1, str: "foo", x: 4}, coll.findAndModify({query: {str: "FOO"}, remove: true}));
 
 // findAndModify should return correct results when "simple" collation specified and collection
 // has a default collation.
@@ -1055,6 +1068,14 @@ assert.commandWorked(
     db.createCollection(coll.getName(), {collation: {locale: "en_US", strength: 2}}));
 assert.commandWorked(coll.insert({_id: "foo"}));
 writeRes = coll.remove({_id: "FOO"}, {justOne: true});
+assert.commandWorked(writeRes);
+assert.eq(1, writeRes.nRemoved);
+
+// Remove should return correct results for an IDHACK eligible query when no collation is specified
+// but a hint is specified.
+assert.commandWorked(coll.insert({_id: "foo"}));
+assert.commandWorked(coll.createIndex({a: 1}));
+writeRes = coll.remove({_id: "FOO"}, {justOne: true, hint: {a: 1}});
 assert.commandWorked(writeRes);
 assert.eq(1, writeRes.nRemoved);
 

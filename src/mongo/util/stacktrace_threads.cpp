@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/util/stacktrace.h"
@@ -59,9 +58,7 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/stdx/unordered_map.h"
-#include "mongo/util/log.h"
 #include "mongo/util/signal_handlers_synchronous.h"
-#include "mongo/util/stacktrace_json.h"
 #include "mongo/util/stacktrace_somap.h"
 
 namespace mongo {
@@ -144,7 +141,11 @@ public:
     CachedMetaGenerator() = default;
 
     ~CachedMetaGenerator() {
-        log() << "CachedMetaGenerator: " << _hits << "/" << (_hits + _misses);
+        LOGV2(23393,
+              "CachedMetaGenerator: {hits}/{hitsAndMisses}",
+              "CachedMetaGenerator",
+              "hits"_attr = _hits,
+              "hitsAndMisses"_attr = (_hits + _misses));
     }
 
     const RedactedMeta& load(void* addr) {
@@ -406,7 +407,10 @@ void State::collectStacks(std::vector<ThreadBacktrace>& messageStorage,
                           std::vector<int>& missedTids) {
     std::set<int> pendingTids;
     iterateTids([&](int tid) { pendingTids.insert(tid); });
-    log() << "Preparing to dump up to " << pendingTids.size() << " thread stacks";
+    LOGV2(23394,
+          "Preparing to dump up to {numThreads} thread stacks",
+          "Preparing to dump thread stacks",
+          "numThreads"_attr = pendingTids.size());
 
     messageStorage.resize(pendingTids.size());
     received.reserve(pendingTids.size());
@@ -422,14 +426,21 @@ void State::collectStacks(std::vector<ThreadBacktrace>& messageStorage,
         errno = 0;
         if (int r = tgkill(getpid(), *iter, _signal); r < 0) {
             int errsv = errno;
-            log() << "failed to signal thread (" << *iter << "):" << strerror(errsv);
+            LOGV2(23395,
+                  "Failed to signal thread ({tid}): {error}",
+                  "Failed to signal thread",
+                  "tid"_attr = *iter,
+                  "error"_attr = strerror(errsv));
             missedTids.push_back(*iter);
             iter = pendingTids.erase(iter);
         } else {
             ++iter;
         }
     }
-    log() << "signalled " << pendingTids.size() << " threads";
+    LOGV2(23396,
+          "Signalled {numThreads} threads",
+          "Signalled threads",
+          "numThreads"_attr = pendingTids.size());
 
     size_t napMicros = 0;
     while (!pendingTids.empty()) {
@@ -496,11 +507,17 @@ void State::printStacks() {
             LOGV2(31423, "===== multithread stacktrace session begin =====");
         }
         void prologue(const BSONObj& obj) override {
-            LOGV2(31424, "stacktrace prologue: {}", "prologue"_attr = obj);
+            LOGV2(31424,
+                  "Stacktrace Prologue: {prologue}",
+                  "Stacktrace Prologue",
+                  "prologue"_attr = obj);
         }
         void threadRecordsOpen() override {}
         void threadRecord(const BSONObj& obj) override {
-            LOGV2(31425, "stacktrace record: {}", "threadRecord"_attr = obj);
+            LOGV2(31425,  //
+                  "Stacktrace Record: {record}",
+                  "Stacktrace Record",
+                  "record"_attr = obj);
         }
         void threadRecordsClose() override {}
         void close() override {
@@ -599,6 +616,7 @@ void State::printToEmitter(AbstractEmitter& emitter) {
 }
 
 void State::action(siginfo_t* si) {
+    const auto errnoGuard = makeGuard([e = errno] { errno = e; });
     switch (si->si_code) {
         case SI_USER:
         case SI_QUEUE:
@@ -630,14 +648,18 @@ void initialize(int signal) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
+    // We should never need to add to this lambda because it simply sets up handler
+    // execution. Any changes should either be in State::action or in the signal
+    // handler itself.
     sa.sa_sigaction = [](int, siginfo_t* si, void*) { stateSingleton->action(si); };
-    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
     if (sigaction(signal, &sa, nullptr) != 0) {
         int savedErr = errno;
-        severe() << format(FMT_STRING("Failed to install sigaction for signal {} ({})"),
-                           signal,
-                           strerror(savedErr));
-        fassertFailed(31376);
+        LOGV2_FATAL(31376,
+                    "Failed to install sigaction for signal {signal}: {error}",
+                    "Failed to install sigaction for signal",
+                    "signal"_attr = signal,
+                    "error"_attr = strerror(savedErr));
     }
 }
 

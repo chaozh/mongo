@@ -2,6 +2,9 @@ test_kind: cpp_integration_test
 
 selector:
   root: build/integration_tests.txt
+  exclude_files:
+  # Tests replica set monitor.
+  - build/**/replica_set_monitor_integration_test*
 
 executor:
   archive:
@@ -16,4 +19,6 @@ executor:
     class: MongoDFixture
     mongod_options:
       set_parameters:
+        logComponentVerbosity:
+          command: 2
         enableTestCommands: 1

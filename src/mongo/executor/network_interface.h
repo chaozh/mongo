@@ -42,8 +42,11 @@
 namespace mongo {
 namespace executor {
 
+extern FailPoint networkInterfaceSendRequestsToTargetHostsInAlphabeticalOrder;
 extern FailPoint networkInterfaceDiscardCommandsBeforeAcquireConn;
-extern FailPoint networkInterfaceDiscardCommandsAfterAcquireConn;
+extern FailPoint networkInterfaceHangCommandsAfterAcquireConn;
+extern FailPoint networkInterfaceCommandsFailedWithErrorCode;
+extern FailPoint networkInterfaceShouldNotKillPendingRequests;
 
 /**
  * Interface to networking for use by TaskExecutor implementations.
@@ -56,6 +59,10 @@ public:
     using Response = RemoteCommandResponse;
     using RemoteCommandCompletionFn =
         unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
+    using RemoteCommandOnReplyFn = unique_function<void(const TaskExecutor::ResponseOnAnyStatus&)>;
+
+    // Indicates that there is no expiration time by when a request needs to complete
+    static constexpr Date_t kNoExpirationDate{Date_t::max()};
 
     virtual ~NetworkInterface();
 
@@ -130,7 +137,7 @@ public:
     };
     /*
      * Returns a copy of the operation counters (see struct Counters above). This method should
-     * only be used in tests, and will invariant if getTestCommands() returns false.
+     * only be used in tests, and will invariant if testing diagnostics are not enabled.
      */
     virtual Counters getCounters() const = 0;
 
@@ -145,11 +152,17 @@ public:
      *
      * Note that if you pass a baton to startCommand and that baton refuses work, then your onFinish
      * function will not run.
+     *
+     * These methods may throw.
      */
     virtual Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
                                 RemoteCommandRequestOnAny& request,
                                 RemoteCommandCompletionFn&& onFinish,
                                 const BatonHandle& baton = nullptr) = 0;
+    virtual Status startExhaustCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                                       RemoteCommandRequestOnAny& request,
+                                       RemoteCommandOnReplyFn&& onReply,
+                                       const BatonHandle& baton = nullptr) = 0;
 
     Future<TaskExecutor::ResponseOnAnyStatus> startCommand(
         const TaskExecutor::CallbackHandle& cbHandle,
@@ -224,6 +237,16 @@ public:
      * Drops all connections to the given host in the connection pool.
      */
     virtual void dropConnections(const HostAndPort& hostAndPort) = 0;
+
+    /**
+     * Acquire a connection and subsequently release it.
+     * If status is not OK, the connection will be dropped,
+     * otherwise the connection will be returned to the pool.
+     */
+    virtual void testEgress(const HostAndPort& hostAndPort,
+                            transport::ConnectSSLMode sslMode,
+                            Milliseconds timeout,
+                            Status status) = 0;
 
 protected:
     NetworkInterface();

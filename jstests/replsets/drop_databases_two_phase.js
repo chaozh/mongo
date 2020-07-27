@@ -12,8 +12,6 @@
  * metadata for the database from the server and appends the 'dropDatabase' operation to the oplog.
  * Unlike the 'Collections' phase, we do not wait for the 'dropDatabase' to propagate to a majority
  * unless explicitly requested by the user with a write concern.
- *
- * @tags: [requires_fcv_44]
  */
 
 (function() {
@@ -21,6 +19,7 @@
 
 load('jstests/replsets/libs/two_phase_drops.js');  // For TwoPhaseDropCollectionTest.
 load("jstests/replsets/rslib.js");
+load("jstests/libs/logv2_helpers.js");
 
 // Returns a list of all collections in a given database. Use 'args' as the
 // 'listCollections' command arguments.
@@ -125,10 +124,6 @@ assert.commandFailedWithCode(
     ErrorCodes.DatabaseDropPending,
     'collection creation should fail while we are in the process of dropping the database');
 
-assert.commandFailedWithCode(dbToDrop.adminCommand('restartCatalog'),
-                             ErrorCodes.DatabaseDropPending,
-                             'restartCatalog should fail if any databases are marked drop-pending');
-
 /**
  * DROP DATABASE 'Database' PHASE
  */
@@ -155,8 +150,15 @@ jsTestLog('Waiting for dropDatabase command on ' + primary.host + ' to complete.
 var exitCode = dropDatabaseProcess();
 
 let db = primary.getDB(dbNameToDrop);
-checkLog.contains(db.getMongo(), "dropping collection: " + dbNameToDrop + "." + collNameToDrop);
-checkLog.contains(db.getMongo(), "dropped 1 collection(s)");
+if (isJsonLog(db.getMongo())) {
+    checkLog.contains(db.getMongo(),
+                      `dropDatabase - dropping collection","attr":{"db":"${
+                          dbNameToDrop}","namespace":"${dbNameToDrop}.${collNameToDrop}"`);
+    checkLog.containsJson(db.getMongo(), 20336, {"db": "dbToDrop"});
+} else {
+    checkLog.contains(db.getMongo(), "dropping collection: " + dbNameToDrop + "." + collNameToDrop);
+    checkLog.contains(db.getMongo(), "dropped 1 collection(s)");
+}
 
 assert.eq(0, exitCode, 'dropDatabase command on ' + primary.host + ' failed.');
 jsTestLog('Completed dropDatabase command on ' + primary.host);

@@ -29,10 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/intrusive_ptr.hpp>
 #include <string>
 
 #include "mongo/db/pipeline/accumulation_statement.h"
 
+#include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/util/assert_util.h"
@@ -41,38 +43,52 @@
 
 namespace mongo {
 
-using boost::intrusive_ptr;
 using std::string;
 
 namespace {
 // Used to keep track of which Accumulators are registered under which name.
-static StringMap<AccumulationStatement::Parser> parserMap;
+using ParserRegistration =
+    std::pair<AccumulationStatement::Parser,
+              boost::optional<ServerGlobalParams::FeatureCompatibility::Version>>;
+static StringMap<ParserRegistration> parserMap;
 }  // namespace
 
-void AccumulationStatement::registerAccumulator(std::string name,
-                                                AccumulationStatement::Parser parser) {
+void AccumulationStatement::registerAccumulator(
+    std::string name,
+    AccumulationStatement::Parser parser,
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion) {
     auto it = parserMap.find(name);
     massert(28722,
             str::stream() << "Duplicate accumulator (" << name << ") registered.",
             it == parserMap.end());
-    parserMap[name] = parser;
+    parserMap[name] = {parser, requiredMinVersion};
 }
 
-AccumulationStatement::Parser& AccumulationStatement::getParser(StringData name) {
+AccumulationStatement::Parser& AccumulationStatement::getParser(
+    StringData name,
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> allowedMaxVersion) {
     auto it = parserMap.find(name);
     uassert(
         15952, str::stream() << "unknown group operator '" << name << "'", it != parserMap.end());
-    return it->second;
+    auto& [parser, requiredMinVersion] = it->second;
+    uassert(ErrorCodes::QueryFeatureNotAllowed,
+            // We would like to include the current version and the required minimum version in this
+            // error message, but using FeatureCompatibilityVersion::toString() would introduce a
+            // dependency cycle (see SERVER-31968).
+            str::stream() << name
+                          << " is not allowed in the current feature compatibility version. See "
+                          << feature_compatibility_version_documentation::kCompatibilityLink
+                          << " for more information.",
+            !requiredMinVersion || !allowedMaxVersion || *requiredMinVersion <= *allowedMaxVersion);
+    return parser;
 }
 
-boost::intrusive_ptr<Accumulator> AccumulationStatement::makeAccumulator() const {
-    return _factory();
+boost::intrusive_ptr<AccumulatorState> AccumulationStatement::makeAccumulator() const {
+    return expr.factory();
 }
 
 AccumulationStatement AccumulationStatement::parseAccumulationStatement(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const BSONElement& elem,
-    const VariablesParseState& vps) {
+    ExpressionContext* const expCtx, const BSONElement& elem, const VariablesParseState& vps) {
     auto fieldName = elem.fieldNameStringData();
     uassert(40234,
             str::stream() << "The field '" << fieldName << "' must be an accumulator object",
@@ -97,10 +113,12 @@ AccumulationStatement AccumulationStatement::parseAccumulationStatement(
             str::stream() << "The " << accName << " accumulator is a unary operator",
             specElem.type() != BSONType::Array);
 
-    auto&& parser = AccumulationStatement::getParser(accName);
-    auto [expression, factory] = parser(expCtx, specElem, vps);
+    auto&& parser =
+        AccumulationStatement::getParser(accName, expCtx->maxFeatureCompatibilityVersion);
+    auto [initializer, argument, factory] = parser(expCtx, specElem, vps);
 
-    return AccumulationStatement(fieldName.toString(), expression, factory);
+    return AccumulationStatement(fieldName.toString(),
+                                 AccumulationExpression(initializer, argument, factory));
 }
 
 }  // namespace mongo

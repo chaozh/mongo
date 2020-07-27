@@ -30,11 +30,11 @@
 #include "mongo/platform/basic.h"
 
 
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/capped_utils.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/internal_plans.h"
@@ -112,22 +112,25 @@ public:
             return false;
         }
 
-        AutoGetDb autoDb(opCtx, dbname, MODE_X);
+        NamespaceString fromNs(dbname, from);
+        NamespaceString toNs(dbname, to);
 
-        NamespaceString nss(dbname, to);
-        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
+        AutoGetCollection autoColl(opCtx, fromNs, MODE_X);
+        Lock::CollectionLock collLock(opCtx, toNs, MODE_X);
+
+        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, toNs)) {
             uasserted(ErrorCodes::NotMaster,
                       str::stream() << "Not primary while cloning collection " << from << " to "
                                     << to << " (as capped)");
         }
 
-        Database* const db = autoDb.getDb();
+        Database* const db = autoColl.getDb();
         if (!db) {
             uasserted(ErrorCodes::NamespaceNotFound,
                       str::stream() << "database " << dbname << " not found");
         }
 
-        cloneCollectionAsCapped(opCtx, db, from.toString(), to.toString(), size, temp);
+        cloneCollectionAsCapped(opCtx, db, fromNs, toNs, size, temp);
         return true;
     }
 

@@ -43,8 +43,9 @@ public:
 
     class LiteParsed : public LiteParsedDocumentSourceForeignCollection {
     public:
-        LiteParsed(NamespaceString foreignNss)
-            : LiteParsedDocumentSourceForeignCollection(std::move(foreignNss)) {}
+        LiteParsed(std::string parseTimeName, NamespaceString foreignNss)
+            : LiteParsedDocumentSourceForeignCollection(std::move(parseTimeName),
+                                                        std::move(foreignNss)) {}
 
         static std::unique_ptr<LiteParsed> parse(const NamespaceString& nss,
                                                  const BSONElement& spec);
@@ -97,7 +98,8 @@ public:
                                      DiskUseRequirement::kNoDiskUse,
                                      FacetRequirement::kAllowed,
                                      TransactionRequirement::kAllowed,
-                                     LookupRequirement::kAllowed);
+                                     LookupRequirement::kAllowed,
+                                     UnionRequirement::kAllowed);
 
         constraints.canSwapWithMatch = true;
         return constraints;
@@ -256,6 +258,12 @@ private:
     // If we absorbed a $unwind that specified 'includeArrayIndex', this is used to populate that
     // field, tracking how many results we've returned so far for the current input document.
     long long _outputIndex;
+
+    // Holds variables defined both in this stage and in parent pipelines. These are copied to the
+    // '_fromExpCtx' ExpressionContext's 'variables' and 'variablesParseState' for use in the
+    // '_fromPipeline' execution.
+    Variables _variables;
+    VariablesParseState _variablesParseState;
 };
 
 }  // namespace mongo

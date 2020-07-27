@@ -29,14 +29,18 @@
 
 #pragma once
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_mock.h"
 #include "mongo/db/catalog_raii.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -46,7 +50,11 @@ public:
         : ServiceContextMongoDTest("ephemeralForTest", repair),
           _storageEngine(getServiceContext()->getStorageEngine()) {}
 
-    StorageEngineTest() : StorageEngineTest(RepairAction::kNoRepair) {}
+    StorageEngineTest() : StorageEngineTest(RepairAction::kNoRepair) {
+        auto serviceCtx = getServiceContext();
+        repl::ReplicationCoordinator::set(
+            serviceCtx, std::make_unique<repl::ReplicationCoordinatorMock>(serviceCtx));
+    }
 
     StatusWith<DurableCatalog::Entry> createCollection(OperationContext* opCtx,
                                                        NamespaceString ns) {
@@ -55,9 +63,12 @@ public:
         options.uuid = UUID::gen();
         RecordId catalogId;
         std::unique_ptr<RecordStore> rs;
-        std::tie(catalogId, rs) = unittest::assertGet(
-            _storageEngine->getCatalog()->createCollection(opCtx, ns, options, true));
-
+        {
+            WriteUnitOfWork wuow(opCtx);
+            std::tie(catalogId, rs) = unittest::assertGet(
+                _storageEngine->getCatalog()->createCollection(opCtx, ns, options, true));
+            wuow.commit();
+        }
         std::unique_ptr<Collection> coll = std::make_unique<CollectionMock>(ns, catalogId);
         CollectionCatalog::get(opCtx).registerCollection(options.uuid.get(), &coll);
 
@@ -176,10 +187,15 @@ public:
         auto repairObserver = StorageRepairObserver::get(getGlobalServiceContext());
         ASSERT(repairObserver->isDone());
 
-        unittest::log() << "Modifications: ";
-        for (const auto& mod : repairObserver->getModifications()) {
-            unittest::log() << "  " << mod.getDescription();
-        }
+        auto asString = [](const StorageRepairObserver::Modification& mod) {
+            return mod.getDescription();
+        };
+        auto modifications = repairObserver->getModifications();
+        LOGV2(24150,
+              "Modifications",
+              "modifications"_attr =
+                  logv2::seqLog(boost::make_transform_iterator(modifications.begin(), asString),
+                                boost::make_transform_iterator(modifications.end(), asString)));
     }
 };
 }  // namespace mongo

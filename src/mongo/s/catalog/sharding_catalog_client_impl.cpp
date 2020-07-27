@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -48,6 +48,7 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/executor/network_interface.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/s/catalog/config_server_version.h"
@@ -69,7 +70,6 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/log.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
@@ -154,7 +154,7 @@ void ShardingCatalogClientImpl::startup() {
 }
 
 void ShardingCatalogClientImpl::shutDown(OperationContext* opCtx) {
-    LOG(1) << "ShardingCatalogClientImpl::shutDown() called.";
+    LOGV2_DEBUG(22673, 1, "ShardingCatalogClientImpl::shutDown() called.");
     {
         stdx::lock_guard<Latch> lk(_mutex);
         _inShutdown = true;
@@ -580,11 +580,11 @@ StatusWith<repl::OpTimeWith<std::vector<ShardType>>> ShardingCatalogClientImpl::
                                                     findStatus.getValue().opTime};
 }
 
-bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* opCtx,
-                                                              const std::string& commandName,
-                                                              const std::string& dbname,
-                                                              const BSONObj& cmdObj,
-                                                              BSONObjBuilder* result) {
+Status ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* opCtx,
+                                                                StringData commandName,
+                                                                StringData dbname,
+                                                                const BSONObj& cmdObj,
+                                                                BSONObjBuilder* result) {
     BSONObj cmdToRun = cmdObj;
     {
         // Make sure that if the command has a write concern that it is w:1 or w:majority, and
@@ -596,18 +596,16 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
         if (initialCmdHadWriteConcern) {
             auto sw = WriteConcernOptions::parse(writeConcernElement.Obj());
             if (!sw.isOK()) {
-                return CommandHelpers::appendCommandStatusNoThrow(*result, sw.getStatus());
+                return sw.getStatus();
             }
             writeConcern = sw.getValue();
 
-            if (!(writeConcern.wNumNodes == 1 ||
-                  writeConcern.wMode == WriteConcernOptions::kMajority)) {
-                return CommandHelpers::appendCommandStatusNoThrow(
-                    *result,
-                    {ErrorCodes::InvalidOptions,
-                     str::stream() << "Invalid replication write concern. User management write "
-                                      "commands may only use w:1 or w:'majority', got: "
-                                   << writeConcern.toBSON()});
+            if ((writeConcern.wNumNodes != 1) &&
+                (writeConcern.wMode != WriteConcernOptions::kMajority)) {
+                return {ErrorCodes::InvalidOptions,
+                        str::stream() << "Invalid replication write concern. User management write "
+                                         "commands may only use w:1 or w:'majority', got: "
+                                      << writeConcern.toBSON()};
             }
         }
 
@@ -631,29 +629,31 @@ bool ShardingCatalogClientImpl::runUserManagementWriteCommand(OperationContext* 
         cmdToRun = modifiedCmd.obj();
     }
 
-    auto response =
+    auto swResponse =
         Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            dbname,
+            dbname.toString(),
             cmdToRun,
             Shard::kDefaultConfigCommandTimeout,
             Shard::RetryPolicy::kNotIdempotent);
 
-    if (!response.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result, response.getStatus());
-    }
-    if (!response.getValue().commandStatus.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result,
-                                                          response.getValue().commandStatus);
-    }
-    if (!response.getValue().writeConcernStatus.isOK()) {
-        return CommandHelpers::appendCommandStatusNoThrow(*result,
-                                                          response.getValue().writeConcernStatus);
+    if (!swResponse.isOK()) {
+        return swResponse.getStatus();
     }
 
-    CommandHelpers::filterCommandReplyForPassthrough(response.getValue().response, result);
-    return true;
+    auto response = std::move(swResponse.getValue());
+
+    if (!response.commandStatus.isOK()) {
+        return response.commandStatus;
+    }
+
+    if (!response.writeConcernStatus.isOK()) {
+        return response.writeConcernStatus;
+    }
+
+    CommandHelpers::filterCommandReplyForPassthrough(response.response, result);
+    return Status::OK();
 }
 
 bool ShardingCatalogClientImpl::runUserManagementReadCommand(OperationContext* opCtx,
@@ -722,8 +722,11 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
         // document in the list of updates should be returned from a query to the chunks
         // collection. The last chunk can be identified by namespace and version number.
 
-        warning() << "chunk operation commit failed and metadata will be revalidated"
-                  << causedBy(redact(status));
+        LOGV2_WARNING(
+            22675,
+            "Error committing chunk operation, metadata will be revalidated. Caused by {error}",
+            "Error committing chunk operation, metadata will be revalidated",
+            "error"_attr = redact(status));
 
         // Look for the chunk in this shard whose version got bumped. We assume that if that
         // mod made it to the config server, then transaction was successful.
@@ -810,7 +813,8 @@ Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
         // or it is because we failed to wait for write concern on the first attempt. In order to
         // differentiate, fetch the entry and check.
         if (retry > 1 && status == ErrorCodes::DuplicateKey) {
-            LOG(1) << "Insert retry failed because of duplicate key error, rechecking.";
+            LOGV2_DEBUG(
+                22674, 1, "Insert retry failed because of duplicate key error, rechecking.");
 
             auto fetchDuplicate =
                 _exhaustiveFindOnConfig(opCtx,
@@ -859,30 +863,28 @@ void ShardingCatalogClientImpl::insertConfigDocumentsAsRetryableWrite(
 
     std::vector<BSONObj> workingBatch;
     size_t workingBatchItemSize = 0;
-
-    int workingBatchDocSize = kRetryableBatchWriteBSONSizeOverhead;
+    int workingBatchDocSize = 0;
 
     while (!docs.empty()) {
         BSONObj toAdd = docs.back();
         docs.pop_back();
 
-        int docSize = toAdd.objsize();
-        bool batchAtSizeLimit = (workingBatchItemSize + 1 > write_ops::kMaxWriteBatchSize) ||
-            (workingBatchDocSize + docSize > BSONObjMaxUserSize);
-
-        if (batchAtSizeLimit) {
+        const int docSizePlusOverhead = toAdd.objsize() + kRetryableBatchWriteBSONSizeOverhead;
+        // Check if pushing this object will exceed the batch size limit or the max object size
+        if ((workingBatchItemSize + 1 > write_ops::kMaxWriteBatchSize) ||
+            (workingBatchDocSize + docSizePlusOverhead > BSONObjMaxUserSize)) {
             sendRetryableWriteBatchRequestToConfig(
                 asr.opCtx(), nss, workingBatch, currentTxnNumber, writeConcern);
             ++currentTxnNumber;
 
             workingBatch.clear();
             workingBatchItemSize = 0;
-            workingBatchDocSize = kRetryableBatchWriteBSONSizeOverhead;
+            workingBatchDocSize = 0;
         }
 
         workingBatch.push_back(toAdd);
         ++workingBatchItemSize;
-        workingBatchDocSize += docSize;
+        workingBatchDocSize += docSizePlusOverhead;
     }
 
     if (!workingBatch.empty()) {

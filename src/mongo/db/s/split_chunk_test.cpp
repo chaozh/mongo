@@ -27,21 +27,21 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
 #include "mongo/platform/basic.h"
 
 #include <boost/optional.hpp>
 
-#include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/json.h"
+#include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/split_chunk.h"
 #include "mongo/db/server_options.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -50,11 +50,8 @@
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard_server_test_fixture.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
@@ -169,8 +166,8 @@ void SplitChunkTest::expectLock() {
     dynamic_cast<DistLockManagerMock*>(distLock())
         ->expectLock(
             [this](StringData name, StringData whyMessage, Milliseconds) {
-                LOG(0) << name;
-                LOG(0) << whyMessage;
+                LOGV2(22105, "Lock name", "name"_attr = name);
+                LOGV2(22106, "Reason for lock", "reason"_attr = whyMessage);
             },
             Status::OK());
 }

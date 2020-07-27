@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
 
 #include "mongo/platform/basic.h"
 
@@ -39,7 +39,7 @@
 #include <termios.h>
 #endif
 
-#include "mongo/util/log.h"
+#include "mongo/util/errno_util.h"
 #include "mongo/util/password_params_gen.h"
 
 namespace mongo {

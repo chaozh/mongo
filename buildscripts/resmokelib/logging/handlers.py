@@ -2,7 +2,6 @@
 
 import json
 import logging
-import sys
 import threading
 import warnings
 
@@ -18,10 +17,10 @@ except ImportError:
 
 import urllib3.util.retry as urllib3_retry
 
-from . import flush
-from .. import utils
+from buildscripts.resmokelib.logging import flush
+from buildscripts.resmokelib import utils
 
-_TIMEOUT_SECS = 10
+_TIMEOUT_SECS = 65
 
 
 class BufferedHandler(logging.Handler):

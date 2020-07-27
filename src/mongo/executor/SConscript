@@ -113,6 +113,16 @@ env.Library(target='egress_tag_closer_manager',
             ])
 
 env.Library(
+    target='hedging_metrics',
+    source=[
+        'hedging_metrics.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+
+env.Library(
     target='network_interface_tl',
     source=[
         'connection_pool_tl.cpp',
@@ -121,9 +131,10 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/async_client',
         '$BUILD_DIR/mongo/transport/transport_layer',
+        'hedging_metrics',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/transport/transport_layer_manager',
         'connection_pool_executor',
         'network_interface',
@@ -234,20 +245,6 @@ env.Library(
     ],
 )
 
-env.Library(
-    target='non_auth_task_executor',
-    source=[
-        'non_auth_task_executor.cpp',
-    ],
-    LIBDEPS=[
-        'task_executor_interface',
-        '$BUILD_DIR/mongo/executor/network_interface_factory',
-        '$BUILD_DIR/mongo/executor/network_interface_thread_pool',
-        '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
-        '$BUILD_DIR/mongo/util/concurrency/thread_pool',
-    ],
-)
-
 env.CppUnitTest(
     target='executor_test',
     source=[
@@ -274,11 +271,10 @@ env.CppIntegrationTest(
     source=[
         'network_interface_integration_test.cpp',
         'task_executor_cursor_integration_test.cpp',
-        'non_auth_task_executor_integration_test.cpp',
+        'thread_pool_task_executor_integration_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver_network',
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/wire_version',
         '$BUILD_DIR/mongo/executor/network_interface_factory',
         '$BUILD_DIR/mongo/executor/network_interface_thread_pool',
@@ -287,7 +283,6 @@ env.CppIntegrationTest(
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
         '$BUILD_DIR/mongo/util/version_impl',
         'network_interface_fixture',
-        'non_auth_task_executor',
         'task_executor_cursor',
     ],
 )

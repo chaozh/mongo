@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -44,7 +44,6 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_source_manager.h"
-#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/start_chunk_clone_request.h"
 #include "mongo/db/service_context.h"
@@ -52,11 +51,11 @@
 #include "mongo/executor/remote_command_response.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/elapsed_tracker.h"
-#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
@@ -92,8 +91,8 @@ BSONObj createRequestWithSessionId(StringData commandName,
     return builder.obj();
 }
 
-const BSONObj& getDocumentKeyFromReplOperation(repl::ReplOperation replOperation,
-                                               repl::OpTypeEnum opType) {
+BSONObj getDocumentKeyFromReplOperation(repl::ReplOperation replOperation,
+                                        repl::OpTypeEnum opType) {
     switch (opType) {
         case repl::OpTypeEnum::kInsert:
         case repl::OpTypeEnum::kDelete:
@@ -164,10 +163,10 @@ void LogTransactionOperationsForShardingHandler::commit(boost::optional<Timestam
 
     for (const auto& stmt : _stmts) {
         const auto& nss = stmt.getNss();
-
-        auto csr = CollectionShardingRuntime::get_UNSAFE(_svcCtx, nss);
-
         auto opCtx = cc().getOperationContext();
+
+        auto csr = CollectionShardingRuntime::get(opCtx, nss);
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
 
         auto msm = MigrationSourceManager::get(csr, csrLock);
@@ -182,7 +181,10 @@ void LogTransactionOperationsForShardingHandler::commit(boost::optional<Timestam
 
         auto idElement = documentKey["_id"];
         if (idElement.eoo()) {
-            warning() << "Received a document with no id, ignoring: " << redact(documentKey);
+            LOGV2_WARNING(21994,
+                          "Received a document without an _id field, ignoring: {documentKey}",
+                          "Received a document without an _id and will ignore that document",
+                          "documentKey"_attr = redact(documentKey));
             continue;
         }
 
@@ -281,35 +283,26 @@ Status MigrationChunkClonerSourceLegacy::startClone(OperationContext* opCtx,
     // Tell the recipient shard to start cloning
     BSONObjBuilder cmdBuilder;
 
-    auto fcvVersion = serverGlobalParams.featureCompatibility.getVersion();
-    if (fcvVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo44 &&
-        !disableResumableRangeDeleter.load()) {
-        StartChunkCloneRequest::appendAsCommand(&cmdBuilder,
-                                                _args.getNss(),
-                                                migrationId,
-                                                lsid,
-                                                txnNumber,
-                                                _sessionId,
-                                                _donorConnStr,
-                                                _args.getFromShardId(),
-                                                _args.getToShardId(),
-                                                _args.getMinKey(),
-                                                _args.getMaxKey(),
-                                                _shardKeyPattern.toBSON(),
-                                                _args.getSecondaryThrottle());
-    } else {
-        // TODO (SERVER-44787): Remove this overload after 4.4 is released AND
-        // disableResumableRangeDeleter has been removed from server parameters.
-        StartChunkCloneRequest::appendAsCommand(&cmdBuilder,
-                                                _args.getNss(),
-                                                _sessionId,
-                                                _donorConnStr,
-                                                _args.getFromShardId(),
-                                                _args.getToShardId(),
-                                                _args.getMinKey(),
-                                                _args.getMaxKey(),
-                                                _shardKeyPattern.toBSON(),
-                                                _args.getSecondaryThrottle());
+    StartChunkCloneRequest::appendAsCommand(&cmdBuilder,
+                                            _args.getNss(),
+                                            migrationId,
+                                            lsid,
+                                            txnNumber,
+                                            _sessionId,
+                                            _donorConnStr,
+                                            _args.getFromShardId(),
+                                            _args.getToShardId(),
+                                            _args.getMinKey(),
+                                            _args.getMaxKey(),
+                                            _shardKeyPattern.toBSON(),
+                                            _args.getSecondaryThrottle());
+
+    // Commands sent to shards that accept writeConcern, must always have writeConcern. So if the
+    // StartChunkCloneRequest didn't add writeConcern (from secondaryThrottle), then we add the
+    // implicit server default writeConcern.
+    if (!cmdBuilder.hasField(WriteConcernOptions::kWriteConcernField)) {
+        cmdBuilder.append(WriteConcernOptions::kWriteConcernField,
+                          WriteConcernOptions::kImplicitDefault);
     }
 
     auto startChunkCloneResponseStatus = _callRecipient(cmdBuilder.obj());
@@ -396,7 +389,10 @@ void MigrationChunkClonerSourceLegacy::cancelClone(OperationContext* opCtx) {
                                                    kRecvChunkAbort, _args.getNss(), _sessionId))
                                     .getStatus();
             if (!status.isOK()) {
-                LOG(0) << "Failed to cancel migration " << causedBy(redact(status));
+                LOGV2(21991,
+                      "Failed to cancel migration: {error}",
+                      "Failed to cancel migration",
+                      "error"_attr = redact(status));
             }
         }
         // Intentional fall through
@@ -419,8 +415,12 @@ void MigrationChunkClonerSourceLegacy::onInsertOp(OperationContext* opCtx,
 
     BSONElement idElement = insertedDoc["_id"];
     if (idElement.eoo()) {
-        warning() << "logInsertOp got a document with no _id field, ignoring inserted document: "
-                  << redact(insertedDoc);
+        LOGV2_WARNING(21995,
+                      "logInsertOp received a document without an _id field, ignoring inserted "
+                      "document: {insertedDoc}",
+                      "logInsertOp received a document without an _id field and will ignore that "
+                      "document",
+                      "insertedDoc"_attr = redact(insertedDoc));
         return;
     }
 
@@ -450,8 +450,12 @@ void MigrationChunkClonerSourceLegacy::onUpdateOp(OperationContext* opCtx,
 
     BSONElement idElement = postImageDoc["_id"];
     if (idElement.eoo()) {
-        warning() << "logUpdateOp got a document with no _id field, ignoring updatedDoc: "
-                  << redact(postImageDoc);
+        LOGV2_WARNING(
+            21996,
+            "logUpdateOp received a document without an _id field, ignoring the updated document: "
+            "{postImageDoc}",
+            "logUpdateOp received a document without an _id field and will ignore that document",
+            "postImageDoc"_attr = redact(postImageDoc));
         return;
     }
 
@@ -488,8 +492,12 @@ void MigrationChunkClonerSourceLegacy::onDeleteOp(OperationContext* opCtx,
 
     BSONElement idElement = deletedDocId["_id"];
     if (idElement.eoo()) {
-        warning() << "logDeleteOp got a document with no _id field, ignoring deleted doc: "
-                  << redact(deletedDocId);
+        LOGV2_WARNING(
+            21997,
+            "logDeleteOp received a document without an _id field, ignoring deleted doc: "
+            "{deletedDocId}",
+            "logDeleteOp received a document without an _id field and will ignore that document",
+            "deletedDocId"_attr = redact(deletedDocId));
         return;
     }
 
@@ -592,46 +600,50 @@ void MigrationChunkClonerSourceLegacy::_nextCloneBatchFromIndexScan(OperationCon
         _jumboChunkCloneState->clonerExec->restoreState();
     }
 
-    BSONObj obj;
-    RecordId recordId;
     PlanExecutor::ExecState execState;
+    try {
+        BSONObj obj;
+        RecordId recordId;
+        while (PlanExecutor::ADVANCED ==
+               (execState = _jumboChunkCloneState->clonerExec->getNext(
+                    &obj, _jumboChunkCloneState->stashedRecordId ? nullptr : &recordId))) {
 
-    while (PlanExecutor::ADVANCED ==
-           (execState = _jumboChunkCloneState->clonerExec->getNext(
-                &obj, _jumboChunkCloneState->stashedRecordId ? nullptr : &recordId))) {
+            stdx::unique_lock<Latch> lk(_mutex);
+            _jumboChunkCloneState->clonerState = execState;
+            lk.unlock();
 
-        stdx::unique_lock<Latch> lk(_mutex);
-        _jumboChunkCloneState->clonerState = execState;
-        lk.unlock();
+            opCtx->checkForInterrupt();
 
-        opCtx->checkForInterrupt();
+            // Use the builder size instead of accumulating the document sizes directly so
+            // that we take into consideration the overhead of BSONArray indices.
+            if (arrBuilder->arrSize() &&
+                (arrBuilder->len() + obj.objsize() + 1024) > BSONObjMaxUserSize) {
+                _jumboChunkCloneState->clonerExec->enqueue(obj);
 
-        // Use the builder size instead of accumulating the document sizes directly so
-        // that we take into consideration the overhead of BSONArray indices.
-        if (arrBuilder->arrSize() &&
-            (arrBuilder->len() + obj.objsize() + 1024) > BSONObjMaxUserSize) {
-            _jumboChunkCloneState->clonerExec->enqueue(obj);
+                // Stash the recordId we just read to add to the next batch.
+                if (!recordId.isNull()) {
+                    invariant(!_jumboChunkCloneState->stashedRecordId);
+                    _jumboChunkCloneState->stashedRecordId = std::move(recordId);
+                }
 
-            // Stash the recordId we just read to add to the next batch.
-            if (!recordId.isNull()) {
-                invariant(!_jumboChunkCloneState->stashedRecordId);
-                _jumboChunkCloneState->stashedRecordId = std::move(recordId);
+                break;
             }
 
-            break;
+            Snapshotted<BSONObj> doc;
+            invariant(collection->findDoc(
+                opCtx, _jumboChunkCloneState->stashedRecordId.value_or(recordId), &doc));
+            arrBuilder->append(doc.value());
+            _jumboChunkCloneState->stashedRecordId = boost::none;
+
+            lk.lock();
+            _jumboChunkCloneState->docsCloned++;
+            lk.unlock();
+
+            ShardingStatistics::get(opCtx).countDocsClonedOnDonor.addAndFetch(1);
         }
-
-        Snapshotted<BSONObj> doc;
-        invariant(collection->findDoc(
-            opCtx, _jumboChunkCloneState->stashedRecordId.value_or(recordId), &doc));
-        arrBuilder->append(doc.value());
-        _jumboChunkCloneState->stashedRecordId = boost::none;
-
-        lk.lock();
-        _jumboChunkCloneState->docsCloned++;
-        lk.unlock();
-
-        ShardingStatistics::get(opCtx).countDocsClonedOnDonor.addAndFetch(1);
+    } catch (DBException& exception) {
+        exception.addContext("Executor error while scanning for documents belonging to chunk");
+        throw;
     }
 
     stdx::unique_lock<Latch> lk(_mutex);
@@ -640,10 +652,6 @@ void MigrationChunkClonerSourceLegacy::_nextCloneBatchFromIndexScan(OperationCon
 
     _jumboChunkCloneState->clonerExec->saveState();
     _jumboChunkCloneState->clonerExec->detachFromOperationContext();
-
-    if (PlanExecutor::FAILURE == execState)
-        uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-            "Executor error while scanning for documents belonging to chunk"));
 }
 
 void MigrationChunkClonerSourceLegacy::_nextCloneBatchFromCloneLocs(OperationContext* opCtx,
@@ -821,7 +829,7 @@ MigrationChunkClonerSourceLegacy::_getIndexScanExecutor(OperationContext* opCtx,
                                       min,
                                       max,
                                       BoundInclusion::kIncludeStartKeyOnly,
-                                      PlanExecutor::YIELD_AUTO);
+                                      PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
 }
 
 Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* opCtx) {
@@ -866,33 +874,32 @@ Status MigrationChunkClonerSourceLegacy::_storeCurrentLocs(OperationContext* opC
     bool isLargeChunk = false;
     unsigned long long recCount = 0;
 
-    BSONObj obj;
-    RecordId recordId;
-    PlanExecutor::ExecState state;
-    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, &recordId))) {
-        Status interruptStatus = opCtx->checkForInterruptNoAssert();
-        if (!interruptStatus.isOK()) {
-            return interruptStatus;
-        }
+    try {
+        BSONObj obj;
+        RecordId recordId;
+        while (PlanExecutor::ADVANCED == exec->getNext(&obj, &recordId)) {
+            Status interruptStatus = opCtx->checkForInterruptNoAssert();
+            if (!interruptStatus.isOK()) {
+                return interruptStatus;
+            }
 
-        if (!isLargeChunk) {
-            stdx::lock_guard<Latch> lk(_mutex);
-            _cloneLocs.insert(recordId);
-        }
+            if (!isLargeChunk) {
+                stdx::lock_guard<Latch> lk(_mutex);
+                _cloneLocs.insert(recordId);
+            }
 
-        if (++recCount > maxRecsWhenFull) {
-            isLargeChunk = true;
+            if (++recCount > maxRecsWhenFull) {
+                isLargeChunk = true;
 
-            if (_forceJumbo) {
-                _cloneLocs.clear();
-                break;
+                if (_forceJumbo) {
+                    _cloneLocs.clear();
+                    break;
+                }
             }
         }
-    }
-
-    if (PlanExecutor::FAILURE == state) {
-        return WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-            "Executor error while scanning for documents belonging to chunk");
+    } catch (DBException& exception) {
+        exception.addContext("Executor error while scanning for documents belonging to chunk");
+        throw;
     }
 
     const uint64_t collectionAverageObjectSize = collection->averageObjectSize(opCtx);
@@ -994,13 +1001,21 @@ Status MigrationChunkClonerSourceLegacy::_checkRecipientCloningStatus(OperationC
         const std::size_t cloneLocsRemaining = _cloneLocs.size();
 
         if (_forceJumbo && _jumboChunkCloneState) {
-            log() << "moveChunk data transfer progress: " << redact(res)
-                  << " mem used: " << _memoryUsed
-                  << " documents cloned so far: " << _jumboChunkCloneState->docsCloned;
+            LOGV2(21992,
+                  "moveChunk data transfer progress: {response} mem used: {memoryUsedBytes} "
+                  "documents cloned so far: {docsCloned}",
+                  "moveChunk data transfer progress",
+                  "response"_attr = redact(res),
+                  "memoryUsedBytes"_attr = _memoryUsed,
+                  "docsCloned"_attr = _jumboChunkCloneState->docsCloned);
         } else {
-            log() << "moveChunk data transfer progress: " << redact(res)
-                  << " mem used: " << _memoryUsed
-                  << " documents remaining to clone: " << cloneLocsRemaining;
+            LOGV2(21993,
+                  "moveChunk data transfer progress: {response} mem used: {memoryUsedBytes} "
+                  "documents remaining to clone: {docsRemainingToClone}",
+                  "moveChunk data transfer progress",
+                  "response"_attr = redact(res),
+                  "memoryUsedBytes"_attr = _memoryUsed,
+                  "docsRemainingToClone"_attr = cloneLocsRemaining);
         }
 
         if (res["state"].String() == "steady") {

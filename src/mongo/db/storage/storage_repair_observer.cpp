@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
 #include "mongo/db/storage/storage_repair_observer.h"
 
@@ -49,8 +49,8 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_file_util.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/file.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -123,9 +123,11 @@ void StorageRepairObserver::_touchRepairIncompleteFile() {
     boost::filesystem::ofstream fileStream(_repairIncompleteFilePath);
     fileStream << "This file indicates that a repair operation is in progress or incomplete.";
     if (fileStream.fail()) {
-        severe() << "Failed to write to file " << _repairIncompleteFilePath.string() << ": "
-                 << errnoWithDescription();
-        fassertFailedNoTrace(50920);
+        LOGV2_FATAL_NOTRACE(50920,
+                            "Failed to write to file {file}: {error}",
+                            "Failed to write to file",
+                            "file"_attr = _repairIncompleteFilePath.generic_string(),
+                            "error"_attr = errnoWithDescription());
     }
     fileStream.close();
 
@@ -138,9 +140,11 @@ void StorageRepairObserver::_removeRepairIncompleteFile() {
     boost::filesystem::remove(_repairIncompleteFilePath, ec);
 
     if (ec) {
-        severe() << "Failed to remove file " << _repairIncompleteFilePath.string() << ": "
-                 << ec.message();
-        fassertFailedNoTrace(50921);
+        LOGV2_FATAL_NOTRACE(50921,
+                            "Failed to remove file {file}: {error}",
+                            "Failed to remove file",
+                            "file"_attr = _repairIncompleteFilePath.generic_string(),
+                            "error"_attr = ec.message());
     }
     fassertNoTrace(50927, fsyncParentDirectory(_repairIncompleteFilePath));
 }

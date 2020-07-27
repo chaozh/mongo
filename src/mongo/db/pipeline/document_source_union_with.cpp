@@ -26,29 +26,47 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include <iterator>
 
+#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_union_with.h"
 #include "mongo/db/pipeline/document_source_union_with_gen.h"
-#include "mongo/util/log.h"
+#include "mongo/db/views/resolved_view.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
-REGISTER_TEST_DOCUMENT_SOURCE(unionWith,
-                              DocumentSourceUnionWith::LiteParsed::parse,
-                              DocumentSourceUnionWith::createFromBson);
+REGISTER_DOCUMENT_SOURCE(unionWith,
+                         DocumentSourceUnionWith::LiteParsed::parse,
+                         DocumentSourceUnionWith::createFromBson);
 
 namespace {
 std::unique_ptr<Pipeline, PipelineDeleter> buildPipelineFromViewDefinition(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     ExpressionContext::ResolvedNamespace resolvedNs,
     std::vector<BSONObj> currentPipeline) {
+
+    auto validatorCallback = [](const Pipeline& pipeline) {
+        const auto& sources = pipeline.getSources();
+        std::for_each(sources.begin(), sources.end(), [](auto& src) {
+            uassert(31441,
+                    str::stream() << src->getSourceName()
+                                  << " is not allowed within a $unionWith's sub-pipeline",
+                    src->constraints().isAllowedInUnionPipeline());
+        });
+    };
+
+    // Copy the ExpressionContext of the base aggregation, using the inner namespace instead.
+    auto unionExpCtx = expCtx->copyForSubPipeline(resolvedNs.ns);
+
     if (resolvedNs.pipeline.empty()) {
-        return uassertStatusOK(Pipeline::parse(currentPipeline, expCtx->copyWith(resolvedNs.ns)));
+        return Pipeline::parse(std::move(currentPipeline), unionExpCtx, validatorCallback);
     }
     auto resolvedPipeline = std::move(resolvedNs.pipeline);
     resolvedPipeline.reserve(currentPipeline.size() + resolvedPipeline.size());
@@ -56,12 +74,20 @@ std::unique_ptr<Pipeline, PipelineDeleter> buildPipelineFromViewDefinition(
                             std::make_move_iterator(currentPipeline.begin()),
                             std::make_move_iterator(currentPipeline.end()));
 
-    return uassertStatusOK(
-        Pipeline::parse(std::move(resolvedPipeline), expCtx->copyWith(resolvedNs.ns)));
+    MakePipelineOptions opts;
+    opts.attachCursorSource = false;
+    opts.validator = validatorCallback;
+    return Pipeline::makePipeline(std::move(resolvedPipeline), unionExpCtx, opts);
 }
 
 }  // namespace
 
+DocumentSourceUnionWith::~DocumentSourceUnionWith() {
+    if (_pipeline && _pipeline->getContext()->explain) {
+        _pipeline->dispose(pExpCtx->opCtx);
+        _pipeline.reset();
+    }
+}
 std::unique_ptr<DocumentSourceUnionWith::LiteParsed> DocumentSourceUnionWith::LiteParsed::parse(
     const NamespaceString& nss, const BSONElement& spec) {
     uassert(ErrorCodes::FailedToParse,
@@ -85,8 +111,8 @@ std::unique_ptr<DocumentSourceUnionWith::LiteParsed> DocumentSourceUnionWith::Li
         }
     }
 
-    return std::make_unique<DocumentSourceUnionWith::LiteParsed>(std::move(unionNss),
-                                                                 std::move(liteParsedPipeline));
+    return std::make_unique<DocumentSourceUnionWith::LiteParsed>(
+        spec.fieldName(), std::move(unionNss), std::move(liteParsedPipeline));
 }
 
 PrivilegeVector DocumentSourceUnionWith::LiteParsed::requiredPrivileges(
@@ -139,52 +165,119 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceUnionWith::createFromBson(
 }
 
 DocumentSource::GetNextResult DocumentSourceUnionWith::doGetNext() {
-    if (!_sourceExhausted) {
+    if (!_pipeline) {
+        // We must have already been disposed, so we're finished.
+        return GetNextResult::makeEOF();
+    }
+
+    if (_executionState == ExecutionProgress::kIteratingSource) {
         auto nextInput = pSource->getNext();
         if (!nextInput.isEOF()) {
             return nextInput;
         }
-        _sourceExhausted = true;
+        _executionState = ExecutionProgress::kStartingSubPipeline;
         // All documents from the base collection have been returned, switch to iterating the sub-
         // pipeline by falling through below.
     }
 
-    if (!_cursorAttached) {
-        auto ctx = _pipeline->getContext();
-        _pipeline =
-            pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(ctx, _pipeline.release());
-        _cursorAttached = true;
-        LOG(3) << "$unionWith attached cursor to pipeline";
+    if (_executionState == ExecutionProgress::kStartingSubPipeline) {
+        auto serializedPipe = _pipeline->serializeToBson();
+        LOGV2_DEBUG(23869,
+                    1,
+                    "$unionWith attaching cursor to pipeline {pipeline}",
+                    "pipeline"_attr = serializedPipe);
+        try {
+            _pipeline =
+                pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(_pipeline.release());
+            _executionState = ExecutionProgress::kIteratingSubPipeline;
+        } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& e) {
+            _pipeline = buildPipelineFromViewDefinition(
+                pExpCtx,
+                ExpressionContext::ResolvedNamespace{e->getNamespace(), e->getPipeline()},
+                serializedPipe);
+            LOGV2_DEBUG(4556300,
+                        3,
+                        "$unionWith found view definition. ns: {ns}, pipeline: {pipeline}. New "
+                        "$unionWith sub-pipeline: {new_pipe}",
+                        "ns"_attr = e->getNamespace(),
+                        "pipeline"_attr = Value(e->getPipeline()),
+                        "new_pipe"_attr = _pipeline->serializeToBson());
+            return doGetNext();
+        }
     }
 
-    if (auto res = _pipeline->getNext())
+    auto res = _pipeline->getNext();
+    if (res)
         return std::move(*res);
 
+    _executionState = ExecutionProgress::kFinished;
     return GetNextResult::makeEOF();
 }
 
-DocumentSource::GetModPathsReturn DocumentSourceUnionWith::getModifiedPaths() const {
-    // Since we might have a document arrive from the foreign pipeline with the same path as a
-    // document in the main pipeline. Without introspecting the sub-pipeline, we must report that
-    // all paths have been modified.
-    return {GetModPathsReturn::Type::kAllPaths, {}, {}};
+Pipeline::SourceContainer::iterator DocumentSourceUnionWith::doOptimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    auto duplicateAcrossUnion = [&](auto&& nextStage) {
+        _pipeline->addFinalSource(nextStage->clone());
+        auto newStageItr = container->insert(itr, std::move(nextStage));
+        container->erase(std::next(itr));
+        return newStageItr == container->begin() ? newStageItr : std::prev(newStageItr);
+    };
+    if (std::next(itr) != container->end()) {
+        if (auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get()))
+            return duplicateAcrossUnion(nextMatch);
+        else if (auto nextProject = dynamic_cast<DocumentSourceSingleDocumentTransformation*>(
+                     (*std::next(itr)).get()))
+            return duplicateAcrossUnion(nextProject);
+    }
+    return std::next(itr);
+};
+
+bool DocumentSourceUnionWith::usedDisk() {
+    if (_pipeline) {
+        _usedDisk = _usedDisk || _pipeline->usedDisk();
+    }
+    return _usedDisk;
 }
 
 void DocumentSourceUnionWith::doDispose() {
     if (_pipeline) {
-        _pipeline->dispose(pExpCtx->opCtx);
-        _pipeline.reset();
+        _usedDisk = _usedDisk || _pipeline->usedDisk();
+        if (!_pipeline->getContext()->explain) {
+            _pipeline->dispose(pExpCtx->opCtx);
+            _pipeline.reset();
+        }
     }
 }
 
-void DocumentSourceUnionWith::serializeToArray(
-    std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
-    BSONArrayBuilder bab;
-    for (auto&& stage : _pipeline->serialize())
-        bab << stage;
-    Document doc = DOC(getSourceName() << DOC("coll" << _pipeline->getContext()->ns.coll()
-                                                     << "pipeline" << bab.arr()));
-    array.push_back(Value(doc));
+Value DocumentSourceUnionWith::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+    if (explain) {
+
+        auto pipeCopy = Pipeline::create(_pipeline->getSources(), _pipeline->getContext());
+
+        // If we have already started getting documents from the sub-pipeline, this is an explain
+        // that has done some execution. We don't want to serialize the mergeCursors stage, and
+        // explain will attach a new cursor stage if we were reading local only. Therefore, remove
+        // the cursor stage of the pipeline. There is an implicit invariant that if we are in
+        // either of these states, the pipeline starts with one of the two cursor stages.
+        if (_executionState != ExecutionProgress::kStartingSubPipeline &&
+            _executionState != ExecutionProgress::kIteratingSource) {
+            pipeCopy->popFront();
+        }
+        BSONObj explainObj = pExpCtx->mongoProcessInterface->attachCursorSourceAndExplain(
+            pipeCopy.release(), *explain);
+        LOGV2_DEBUG(4553501, 3, "$unionWith attached cursor to pipeline for explain");
+        // We expect this to be an explanation of a pipeline -- there should only be one field.
+        invariant(explainObj.nFields() == 1);
+        return Value(
+            DOC(getSourceName() << DOC("coll" << _pipeline->getContext()->ns.coll() << "pipeline"
+                                              << explainObj.firstElement())));
+    } else {
+        BSONArrayBuilder bab;
+        for (auto&& stage : _pipeline->serialize())
+            bab << stage;
+        return Value(DOC(getSourceName() << DOC("coll" << _pipeline->getContext()->ns.coll()
+                                                       << "pipeline" << bab.arr())));
+    }
 }
 
 DepsTracker::State DocumentSourceUnionWith::getDependencies(DepsTracker* deps) const {

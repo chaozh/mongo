@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
@@ -74,7 +74,7 @@ public:
         auto privileges = uassertStatusOK(
             AuthorizationSession::get(opCtx->getClient())
                 ->getPrivilegesForAggregate(
-                    aggregationRequest.getNamespaceString(), opMsgRequest.body, true));
+                    aggregationRequest.getNamespaceString(), aggregationRequest, true));
 
         return std::make_unique<Invocation>(
             this, opMsgRequest, std::move(aggregationRequest), std::move(privileges));

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kAccessControl
 
 #include "mongo/platform/basic.h"
 
@@ -41,8 +41,10 @@
 #include "mongo/base/shim.h"
 #include "mongo/base/status.h"
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/config.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/address_restriction.h"
+#include "mongo/db/auth/authorization_manager_global_parameters_gen.h"
 #include "mongo/db/auth/authorization_manager_impl_parameters_gen.h"
 #include "mongo/db/auth/authorization_session_impl.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
@@ -51,8 +53,10 @@
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/mongod_options.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/log.h"
+#include "mongo/util/net/ssl_peer_info.h"
+#include "mongo/util/net/ssl_types.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -284,8 +288,33 @@ Status initializeUserFromPrivilegeDocument(User* user, const BSONObj& privDoc) {
     return Status::OK();
 }
 
-std::unique_ptr<AuthorizationManager> authorizationManagerCreateImpl() {
-    return std::make_unique<AuthorizationManagerImpl>();
+/**
+ * Returns true if roles for this user were provided by the client, and can be obtained from
+ * the connection.
+ */
+bool shouldUseRolesFromConnection(OperationContext* opCtx, const UserName& userName) {
+#ifdef MONGO_CONFIG_SSL
+    if (!opCtx || !opCtx->getClient() || !opCtx->getClient()->session()) {
+        return false;
+    }
+
+    if (!allowRolesFromX509Certificates) {
+        return false;
+    }
+
+    auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
+    return sslPeerInfo.subjectName.toString() == userName.getUser() &&
+        userName.getDB() == "$external"_sd && !sslPeerInfo.roles.empty();
+#else
+    return false;
+#endif
+}
+
+
+std::unique_ptr<AuthorizationManager> authorizationManagerCreateImpl(
+    ServiceContext* serviceContext) {
+    return std::make_unique<AuthorizationManagerImpl>(serviceContext,
+                                                      AuthzManagerExternalState::create());
 }
 
 auto authorizationManagerCreateRegistration =
@@ -309,17 +338,27 @@ Status AuthorizationManagerPinnedUsersServerParameter::setFromString(const std::
     return authorizationManagerPinnedUsers.setFromString(str);
 }
 
-AuthorizationManagerImpl::AuthorizationManagerImpl()
-    : AuthorizationManagerImpl(AuthzManagerExternalState::create(),
-                               InstallMockForTestingOrAuthImpl{}) {}
-
 AuthorizationManagerImpl::AuthorizationManagerImpl(
-    std::unique_ptr<AuthzManagerExternalState> externalState, InstallMockForTestingOrAuthImpl)
+    ServiceContext* service, std::unique_ptr<AuthzManagerExternalState> externalState)
     : _externalState(std::move(externalState)),
-      _authSchemaVersionCache(_externalState.get()),
-      _userCache(&_authSchemaVersionCache, _externalState.get(), authorizationManagerCacheSize) {}
+      _authSchemaVersionCache(service, _threadPool, _externalState.get()),
+      _userCache(service,
+                 _threadPool,
+                 authorizationManagerCacheSize,
+                 &_authSchemaVersionCache,
+                 _externalState.get()),
+      _threadPool([] {
+          ThreadPool::Options options;
+          options.poolName = "AuthorizationManager";
+          options.minThreads = 0;
+          options.maxThreads = ThreadPool::Options::kUnlimited;
 
-AuthorizationManagerImpl::~AuthorizationManagerImpl() {}
+          return options;
+      }()) {
+    _threadPool.startup();
+}
+
+AuthorizationManagerImpl::~AuthorizationManagerImpl() = default;
 
 std::unique_ptr<AuthorizationSession> AuthorizationManagerImpl::makeAuthorizationSession() {
     return std::make_unique<AuthorizationSessionImpl>(
@@ -344,7 +383,8 @@ Status AuthorizationManagerImpl::getAuthorizationVersion(OperationContext* opCtx
 }
 
 OID AuthorizationManagerImpl::getCacheGeneration() {
-    return _userCache.getCacheGeneration();
+    stdx::lock_guard lg(_cacheGenerationMutex);
+    return _cacheGeneration;
 }
 
 void AuthorizationManagerImpl::setAuthEnabled(bool enabled) {
@@ -373,7 +413,7 @@ bool AuthorizationManagerImpl::hasAnyPrivilegeDocuments(OperationContext* opCtx)
 Status AuthorizationManagerImpl::getUserDescription(OperationContext* opCtx,
                                                     const UserName& userName,
                                                     BSONObj* result) {
-    return _externalState->getUserDescription(opCtx, userName, result);
+    return _externalState->getUserDescription(opCtx, UserRequest(userName, boost::none), result);
 }
 
 Status AuthorizationManagerImpl::getRoleDescription(OperationContext* opCtx,
@@ -410,10 +450,25 @@ StatusWith<UserHandle> AuthorizationManagerImpl::acquireUser(OperationContext* o
         return internalSecurity.user;
     }
 
-    auto cachedUser = _userCache.acquire(opCtx, userName);
+    UserRequest request(userName, boost::none);
+
+    // Clients connected via TLS may present an X.509 certificate which contains an authorization
+    // grant. If this is the case, the roles must be provided to the external state, for expansion
+    // into privileges.
+    if (shouldUseRolesFromConnection(opCtx, userName)) {
+        auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
+        request.roles = std::set<RoleName>();
+
+        // In order to be hashable, the role names must be converted from unordered_set to a set.
+        std::copy(sslPeerInfo.roles.begin(),
+                  sslPeerInfo.roles.end(),
+                  std::inserter(*request.roles, request.roles->begin()));
+    }
+
+    auto cachedUser = _userCache.acquire(opCtx, request);
     invariant(cachedUser);
 
-    LOG(1) << "Returning user " << userName << " from cache";
+    LOGV2_DEBUG(20226, 1, "Returning user from cache", "user"_attr = userName);
     return cachedUser;
 } catch (const DBException& ex) {
     return ex.toStatus();
@@ -442,7 +497,7 @@ void AuthorizationManagerImpl::updatePinnedUsersList(std::vector<UserName> names
     bool noUsersToPin = _usersToPin->empty();
     _pinnedUsersCond.notify_one();
     if (noUsersToPin) {
-        LOG(1) << "There were no users to pin, not starting tracker thread";
+        LOGV2_DEBUG(20227, 1, "There were no users to pin, not starting tracker thread");
         return;
     }
 
@@ -452,11 +507,16 @@ void AuthorizationManagerImpl::updatePinnedUsersList(std::vector<UserName> names
     });
 }
 
+void AuthorizationManagerImpl::_updateCacheGeneration() {
+    stdx::lock_guard lg(_cacheGenerationMutex);
+    _cacheGeneration = OID::gen();
+}
+
 void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
     Client::initThread("PinnedUsersTracker");
     std::list<UserHandle> pinnedUsers;
     std::vector<UserName> usersToPin;
-    LOG(1) << "Starting pinned users tracking thread";
+    LOGV2_DEBUG(20228, 1, "Starting pinned users tracking thread");
     while (true) {
         auto opCtx = cc().makeOperationContext();
 
@@ -485,13 +545,19 @@ void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
 
             if (!user.isValid() || !shouldPin) {
                 if (!shouldPin) {
-                    LOG(2) << "Unpinning user " << user->getName();
+                    LOGV2_DEBUG(20229, 2, "Unpinning user", "user"_attr = user->getName());
                 } else {
-                    LOG(2) << "Pinned user no longer valid, will re-pin " << user->getName();
+                    LOGV2_DEBUG(20230,
+                                2,
+                                "Pinned user no longer valid, will re-pin",
+                                "user"_attr = user->getName());
                 }
                 it = pinnedUsers.erase(it);
             } else {
-                LOG(3) << "Pinned user is still valid and pinned " << user->getName();
+                LOGV2_DEBUG(20231,
+                            3,
+                            "Pinned user is still valid and pinned",
+                            "user"_attr = user->getName());
                 ++it;
             }
         }
@@ -506,42 +572,49 @@ void AuthorizationManagerImpl::_pinnedUsersThreadRoutine() noexcept try {
             auto swUser = acquireUser(opCtx.get(), userName);
 
             if (swUser.isOK()) {
-                LOG(2) << "Pinned user " << userName;
+                LOGV2_DEBUG(20232, 2, "Pinned user", "user"_attr = userName);
                 pinnedUsers.emplace_back(std::move(swUser.getValue()));
             } else {
                 const auto& status = swUser.getStatus();
                 // If the user is not found, then it might just not exist yet. Skip this user for
                 // now.
                 if (status != ErrorCodes::UserNotFound) {
-                    warning() << "Unable to fetch pinned user " << userName.toString() << ": "
-                              << status;
+                    LOGV2_WARNING(20239,
+                                  "Unable to fetch pinned user",
+                                  "user"_attr = userName.toString(),
+                                  "error"_attr = status);
                 } else {
-                    LOG(2) << "Pinned user not found: " << userName;
+                    LOGV2_DEBUG(20233, 2, "Pinned user not found", "user"_attr = userName);
                 }
             }
         }
     }
 } catch (const ExceptionFor<ErrorCodes::InterruptedAtShutdown>&) {
-    LOG(1) << "Ending pinned users tracking thread";
+    LOGV2_DEBUG(20234, 1, "Ending pinned users tracking thread");
     return;
 }
 
 void AuthorizationManagerImpl::invalidateUserByName(OperationContext* opCtx,
                                                     const UserName& userName) {
-    LOG(2) << "Invalidating user " << userName;
+    LOGV2_DEBUG(20235, 2, "Invalidating user", "user"_attr = userName);
+    _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
-    _userCache.invalidate(userName);
+    // Invalidate the named User, assuming no externally provided roles. When roles are defined
+    // externally, there exists no user document which may become invalid.
+    _userCache.invalidate(UserRequest(userName, boost::none));
 }
 
 void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx, StringData dbname) {
-    LOG(2) << "Invalidating all users from database " << dbname;
+    LOGV2_DEBUG(20236, 2, "Invalidating all users from database", "database"_attr = dbname);
+    _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
     _userCache.invalidateIf(
-        [&](const UserName& user, const User*) { return user.getDB() == dbname; });
+        [&](const UserRequest& userRequest) { return userRequest.name.getDB() == dbname; });
 }
 
 void AuthorizationManagerImpl::invalidateUserCache(OperationContext* opCtx) {
-    LOG(2) << "Invalidating user cache";
+    LOGV2_DEBUG(20237, 2, "Invalidating user cache");
+    _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
     _userCache.invalidateAll();
 }
@@ -573,37 +646,58 @@ std::vector<AuthorizationManager::CachedUserInfo> AuthorizationManagerImpl::getU
     ret.reserve(cacheData.size());
     std::transform(
         cacheData.begin(), cacheData.end(), std::back_inserter(ret), [](const auto& info) {
-            return AuthorizationManager::CachedUserInfo{info.key, info.useCount > 0};
+            return AuthorizationManager::CachedUserInfo{info.key.name, info.useCount > 0};
         });
 
     return ret;
 }
 
 AuthorizationManagerImpl::AuthSchemaVersionCache::AuthSchemaVersionCache(
+    ServiceContext* service,
+    ThreadPoolInterface& threadPool,
     AuthzManagerExternalState* externalState)
-    : ReadThroughCache(1, _mutex), _externalState(externalState) {}
+    : ReadThroughCache(_mutex,
+                       service,
+                       threadPool,
+                       [this](OperationContext* opCtx, int key, const ValueHandle& cachedValue) {
+                           return _lookup(opCtx, key, cachedValue);
+                       },
+                       1 /* cacheSize */),
+      _externalState(externalState) {}
 
-boost::optional<int> AuthorizationManagerImpl::AuthSchemaVersionCache::lookup(
-    OperationContext* opCtx, const int& unusedKey) {
+AuthorizationManagerImpl::AuthSchemaVersionCache::LookupResult
+AuthorizationManagerImpl::AuthSchemaVersionCache::_lookup(OperationContext* opCtx,
+                                                          int unusedKey,
+                                                          const ValueHandle& unusedCachedValue) {
     invariant(unusedKey == 0);
 
     int authzVersion;
     uassertStatusOK(_externalState->getStoredAuthorizationVersion(opCtx, &authzVersion));
 
-    return authzVersion;
+    return LookupResult(authzVersion);
 }
 
 AuthorizationManagerImpl::UserCacheImpl::UserCacheImpl(
+    ServiceContext* service,
+    ThreadPoolInterface& threadPool,
+    int cacheSize,
     AuthSchemaVersionCache* authSchemaVersionCache,
-    AuthzManagerExternalState* externalState,
-    int cacheSize)
-    : UserCache(cacheSize, _mutex),
+    AuthzManagerExternalState* externalState)
+    : UserCache(_mutex,
+                service,
+                threadPool,
+                [this](OperationContext* opCtx, const UserRequest& userReq, UserHandle cachedUser) {
+                    return _lookup(opCtx, userReq, cachedUser);
+                },
+                cacheSize),
       _authSchemaVersionCache(authSchemaVersionCache),
       _externalState(externalState) {}
 
-boost::optional<User> AuthorizationManagerImpl::UserCacheImpl::lookup(OperationContext* opCtx,
-                                                                      const UserName& userName) {
-    LOG(1) << "Getting user " << userName << " from disk";
+AuthorizationManagerImpl::UserCacheImpl::LookupResult
+AuthorizationManagerImpl::UserCacheImpl::_lookup(OperationContext* opCtx,
+                                                 const UserRequest& userReq,
+                                                 const UserHandle& unusedCachedUser) {
+    LOGV2_DEBUG(20238, 1, "Getting user record", "user"_attr = userReq.name);
 
     // Number of times to retry a user document that fetches due to transient AuthSchemaIncompatible
     // errors. These errors should only ever occur during and shortly after schema upgrades.
@@ -621,11 +715,11 @@ boost::optional<User> AuthorizationManagerImpl::UserCacheImpl::lookup(OperationC
             case schemaVersion26Final:
             case schemaVersion26Upgrade: {
                 BSONObj userObj;
-                uassertStatusOK(_externalState->getUserDescription(opCtx, userName, &userObj));
+                uassertStatusOK(_externalState->getUserDescription(opCtx, userReq, &userObj));
 
-                User user(userName);
+                User user(userReq.name);
                 uassertStatusOK(initializeUserFromPrivilegeDocument(&user, userObj));
-                return user;
+                return LookupResult(std::move(user));
             }
             case schemaVersion24:
                 _authSchemaVersionCache->invalidateAll();
